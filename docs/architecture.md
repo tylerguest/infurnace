@@ -1,13 +1,15 @@
 # Architecture
 
-Infurnace is a single-GPU inference server for decoder-only language models. It uses
-tinygrad as its only production tensor compiler and device runtime. It does not
-define a tensor framework, render device code independently, or wrap
+Infurnace is an inference server for decoder-only language models. It uses tinygrad
+as its only production tensor compiler and device runtime. It does not define a
+tensor framework, render device code independently, or wrap
 `tinygrad.llm.Transformer.generate()` as a multi-request serving interface.
 
-The first supported system is deliberately narrow: Qwen3-0.6B, one NVIDIA GPU,
-`DEV=NV`, one worker, external KV state, and a constrained network API. New model
-architectures and serving optimizations are added only after this path is correct.
+The first validated model and backend are deliberately narrow: Qwen3-0.6B and
+`DEV=NV`, with external KV state and a constrained network API. The execution
+topology is explicit configuration. Request, scheduler, cache-ownership, and protocol
+contracts do not assume a device count or bind a request to a specific placement
+strategy.
 
 ## Product Boundary
 
@@ -17,6 +19,7 @@ Infurnace owns the inference server:
 - request admission, state transitions, cancellation, and completion;
 - prefill and decode scheduling, batching, and fairness policy;
 - model execution contracts expressed with tinygrad tensors;
+- execution topology, model placement, replication, sharding, and request routing;
 - KV-cache layout, capacity, lifetime, logical allocation, and prefix policy;
 - serving-specific custom UOp algorithms such as indexed KV store and paged
   attention;
@@ -33,11 +36,11 @@ Tinygrad owns the compute substrate:
 - device graph support where the selected backend provides it;
 - the NV backend and other hardware runtimes.
 
-Infurnace decides which buffers exist, their shapes and dtypes, and how long they
-must live. The tinygrad executor retains the corresponding Tensor objects while
-tinygrad allocates and executes their physical backing buffers. Infurnace custom
-kernels are defined through tinygrad UOps; Infurnace does not ship a parallel CUDA,
-PTX, or device-runtime implementation.
+Infurnace decides which buffers exist, their shapes, dtypes, placement, and lifetime.
+The tinygrad executor retains the corresponding Tensor objects while tinygrad
+allocates and executes their physical backing buffers. Infurnace custom kernels are
+defined through tinygrad UOps; Infurnace does not ship a parallel CUDA, PTX, or
+device-runtime implementation.
 
 PyTorch may be used only as an independent test reference. It is not a production
 dependency or fallback execution path.
@@ -121,10 +124,10 @@ tensors or model-specific weight state.
 An execution plan is immutable after submission. It identifies request IDs, token
 spans, positions, cache assignments, the exact execution contract, and output
 routing. Cancelling an in-flight request suppresses its output immediately, but its
-cache cannot be reclaimed until device work that references it has completed. The
-initial synchronous worker obtains this guarantee when sampled results are copied
-to the control plane. Any later overlap requires explicit in-flight ownership or a
-device completion fence before page reuse.
+cache cannot be reclaimed until device work that references it has completed. A
+synchronous execution path obtains this guarantee when sampled results are copied to
+the control plane. Any overlap or distributed execution requires explicit in-flight
+ownership and completion tracking before cache reuse.
 
 ## Model Runner
 
@@ -194,9 +197,9 @@ replacement must match the complete TinyJit input contract: argument position,
 shape, dtype, device, view structure, and symbolic-variable definition.
 
 The contiguous implementation is intentionally simple and remains the independent
-device reference for paged execution. The first server may expose a context limit
-below the model maximum so multiple cache slots, model weights, JIT workspaces, and
-backend overhead fit in memory.
+reference for paged execution. The server may expose a context limit below the model
+maximum so cache slots, model weights, JIT workspaces, and backend overhead fit the
+configured execution topology.
 
 ## Paged KV Target
 
@@ -284,26 +287,29 @@ debug path remains available for numerical validation.
 
 ## Server and Process Model
 
-The first network milestone runs protocol handling, tokenization, engine,
-scheduler, and tinygrad executor in one process on one GPU. This is a deployment
-constraint, not a coupling between the protocol and model layers. It exposes a
-small documented completion API, streaming output, cancellation on disconnect,
-bounded output queues, health status, and deterministic capacity errors.
+The first network milestone may run protocol handling, tokenization, engine,
+scheduler, and tinygrad execution in one process for implementation simplicity. This
+is not a device-topology contract or a coupling between protocol and model layers.
+It exposes a small documented completion API, streaming output, cancellation on
+disconnect, bounded output queues, health status, and deterministic capacity errors.
 
-After the single-process server is correct, API and tokenization move to a separate
-process:
+Process isolation separates API and tokenization from an execution worker set:
 
 ```text
 API and tokenizer process
            |
           IPC
            |
-one engine worker per GPU
+engine and execution workers
+           |
+   configured tinygrad devices
 ```
 
-Each worker selects its tinygrad device before creating tensors and owns one model,
-one scheduler loop, its KV capacity, and its captured function registry. Multi-GPU
-model execution is deferred.
+The engine owns global request and scheduling state. Execution workers select their
+assigned tinygrad devices before creating tensors and own the model replicas or
+shards, local KV capacity, and captured-function registries required by their
+placement. Replication and sharding must preserve the same request, cache-ownership,
+sampling, and output contracts as any other execution topology.
 
 ## Memory and Admission
 
@@ -322,9 +328,10 @@ For a dense attention model, unquantized KV bytes per token are:
 layers * 2 * kv_heads * head_dim * cache_dtype_bytes
 ```
 
-The server rejects requests that exceed the configured per-request context or
-available cache capacity before mutating allocator state. Allocation of multiple
-pages is atomic from the request's perspective.
+Budgets are recorded per device and for the complete execution topology. The server
+rejects requests that exceed the configured per-request context or available cache
+capacity before mutating allocator state. Allocation across placements is atomic
+from the request's perspective.
 
 ## Prefix Cache
 
@@ -355,5 +362,5 @@ Local execution is represented by a versioned set of model, prefill, decode, and
 sampler contracts. Artifact loading is deferred until tinygrad provides a validated
 format suitable for the selected backend. Any artifact records at least the GGUF
 hash, compatibility metadata required by tinygrad, device target, full input
-contract, workspace, and validation results. It cannot change scheduler, request,
-or KV-ownership semantics.
+contract, execution topology, workspace, and validation results. It cannot change
+scheduler, request, or KV-ownership semantics.

@@ -12,7 +12,7 @@ Every numerical result records:
 - quantization format and weight realization policy;
 - model, accumulation, and KV-cache dtypes;
 - prompt tokens, context length, and execution shape;
-- tinygrad checkout under test, JIT mode, device backend, and GPU;
+- tinygrad checkout under test, JIT mode, device backend, and execution topology;
 - absolute and relative tolerances and the reason they are appropriate.
 
 The tinygrad checkout is diagnostic provenance only. Infurnace follows current

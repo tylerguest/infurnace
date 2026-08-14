@@ -1,7 +1,7 @@
 # Infurnace
 
-Infurnace is a single-GPU inference server for decoder-only language models. It uses
-tinygrad as its only production tensor compiler and device runtime.
+Infurnace is an inference server for decoder-only language models. It uses tinygrad
+as its only production tensor compiler and device runtime.
 
 Infurnace owns the server: protocol handling, tokenization integration, request
 lifecycle, scheduling, batching, KV-cache layout and lifetime, sampling policy,
@@ -12,8 +12,10 @@ execution.
 
 Infurnace is not another tensor framework or hardware backend, and it does not use
 `tinygrad.llm.Transformer.generate()` as its serving interface. The first model
-runner targets Qwen3-0.6B on one NVIDIA GPU with `DEV=NV`, explicit external KV
-state, and logits returned to an Infurnace sampling stage.
+contract targets Qwen3-0.6B, with `DEV=NV` as the initial measured backend, explicit
+external KV state, and logits returned to an Infurnace sampling stage. Execution
+topology, model placement, replication, and sharding are executor concerns rather
+than assumptions embedded in request or protocol contracts.
 
 Infurnace follows current tinygrad development. It does not pin a tinygrad commit,
 publish a supported-version matrix, or preserve adapters for old tinygrad APIs.

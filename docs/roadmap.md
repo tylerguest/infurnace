@@ -6,13 +6,14 @@ real server early, and then improves concurrency and cache utilization without
 changing the request or protocol contracts.
 
 Every phase has a correctness gate. A feature is not part of a release until its
-gate passes on the selected model, the current tinygrad codebase, backend, and GPU.
+gate passes on the selected model, current tinygrad codebase, backend, and execution
+topology.
 
 Each phase is divided into lettered subphases. A subphase is a reviewable,
 independently tested implementation increment; completing one does not imply that
 the parent phase gate has passed. CPU-only contract and state tests should remain
-separate from model-dependent and NV-only tests so normal development does not
-require the checkpoint or an idle GPU.
+separate from model-dependent and accelerator tests so normal development does not
+require the checkpoint or execution hardware.
 
 ## Phase 0: Current NV Baseline
 
@@ -23,11 +24,13 @@ require the checkpoint or an idle GPU.
   supported-version matrix.
 - Treat Infurnace's tinygrad contract tests as the compatibility boundary and adapt
   them when upstream APIs or semantics change.
-- Use the tinygrad `NV` backend explicitly on the NVIDIA GeForce RTX 5060.
+- Make backend and execution topology explicit test and benchmark inputs. Use the
+  available NVIDIA GeForce RTX 5060 with tinygrad `DEV=NV` for the first recorded
+  baseline without making it a product boundary.
 
 **Subphase gate:** Infurnace installs as a source-layout package, its CPU-only tests
-run without initializing a GPU, and NV, model, and slow tests can be selected
-explicitly.
+run without initializing an accelerator, and NV, model, and slow tests can be
+selected explicitly.
 
 ### Phase 0B: Checkpoint Identity and Acquisition
 
@@ -71,7 +74,7 @@ weight-realization policies are identified separately.
 
 **Subphase gate:** Benchmark entry points synchronize device work correctly, emit
 validated structured results, and a committed report covers the required Phase 0
-measurements on an otherwise idle GPU.
+measurements on execution devices without competing workloads.
 
 **Gate:** The current environment produces a documented baseline with recorded
 output, latency, generated-token throughput, startup time, and memory measurements.
@@ -133,7 +136,8 @@ size matches the contract, and the model cannot allocate or retain conversation 
 ### Phase 2B: Eager Prefill and Decode
 
 - Implement single-request bounded chunked prefill and one-token decode.
-- Use a conservative context limit derived from the RTX 5060 memory budget.
+- Use a conservative context limit derived from measured per-device and aggregate
+  memory budgets for the selected execution topology.
 - Represent cache writes and write-before-read dependencies explicitly.
 - Validate eager execution before adding TinyJit.
 
@@ -221,7 +225,7 @@ disconnect, backpressure, health, and capacity errors preserve engine invariants
 without leaked cache state or a protocol path that bypasses the engine. Repeated
 runs produce the same schedule and greedy output.
 
-**Release:** `v0.1`, constrained single-GPU tinygrad inference server.
+**Release:** `v0.1`, constrained tinygrad inference server.
 
 ## Phase 4: Fixed Batched Decode
 
@@ -420,9 +424,9 @@ execution.
 
 ## Phase 9: Server Hardening and Isolation
 
-### Phase 9A: Worker Isolation
+### Phase 9A: Execution Isolation
 
-- Separate API and tokenization from the GPU worker process.
+- Separate API and tokenization from execution worker processes.
 - Define a versioned IPC request, cancellation, result, and health protocol.
 - Add worker startup failure, crash, timeout, and graceful-shutdown behavior.
 
@@ -448,7 +452,7 @@ policy cannot alter or bypass engine semantics.
 **Gate:** Concurrent clients stream independently under backpressure, worker failure
 does not hang API requests, and process isolation does not change engine output.
 
-**Release:** `v0.4`, hardened single-GPU network server.
+**Release:** `v0.4`, hardened network inference server.
 
 ## Phase 10: Batched Prefill Evaluation
 
@@ -513,9 +517,59 @@ deployment behavior without changing runtime contracts or steady performance.
 **Gate:** A compatible artifact replaces local compilation without changing model,
 scheduler, cache-manager, sampling, or request semantics.
 
+## Phase 12: Scalable Execution Topologies
+
+### Phase 12A: Topology and Placement Contracts
+
+- Represent devices, workers, model replicas, model shards, and communication groups
+  as explicit versioned configuration.
+- Keep request state, scheduling policy, cache ownership, and protocol behavior
+  independent of placement.
+- Validate capacity and admission atomically across every resource participating in
+  an execution plan.
+
+**Subphase gate:** Equivalent placements expose the same engine contract, and invalid
+or partially available topologies fail before accepting traffic.
+
+### Phase 12B: Replicated Serving
+
+- Route requests across model replicas with deterministic capacity and health-aware
+  policy.
+- Isolate cache, random state, compilation, cancellation, and failures by replica.
+- Measure throughput scaling, load balance, and tail latency under mixed workloads.
+
+**Subphase gate:** Replication improves measured capacity without changing request
+output or allowing one replica's lifecycle to corrupt another.
+
+### Phase 12C: Sharded Model Execution
+
+- Select tensor, pipeline, or other sharding strategies from model and hardware
+  measurements rather than embedding one strategy in the engine.
+- Define collective operations, intermediate ownership, synchronization, cache
+  placement, and failure semantics through tinygrad execution contracts.
+- Compare sharded logits and generated tokens with an unsharded numerical reference.
+
+**Subphase gate:** Sharded execution meets documented numerical tolerances and
+preserves cache mutation, sampling, cancellation, and output-ordering invariants.
+
+### Phase 12D: Distributed Fault and Performance Validation
+
+- Extend execution topology across hosts without changing the public request API.
+- Define startup, membership, timeout, partial failure, draining, and recovery
+  behavior for distributed workers.
+- Measure communication cost, scaling efficiency, throughput, and latency against
+  local execution topologies.
+
+**Subphase gate:** Distributed execution has deterministic failure behavior, does not
+leak or duplicate requests, and is retained only for workloads where it provides a
+measured benefit.
+
+**Gate:** Replicated, sharded, and distributed placements preserve engine semantics,
+numerical output, cache ownership, and request isolation while providing documented
+capacity or performance gains.
+
 ## Deferred Scope
 
-- Multi-GPU and multi-node execution
 - MoE and multimodal models
 - Speculative decoding
 - LoRA

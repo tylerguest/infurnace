@@ -19,7 +19,7 @@ Every result records:
 
 - GGUF source, SHA-256, and quantization;
 - weight realization, model dtype, accumulation dtype, and cache dtype;
-- current tinygrad checkout, device backend, driver, and GPU;
+- current tinygrad checkout, device backend, driver, and execution topology;
 - context length, prefill chunk, decode bucket, page size, and active-row count;
 - eager, warmup, capture, replay, and device-graph state;
 - cold or warm compilation and allocator-cache state.

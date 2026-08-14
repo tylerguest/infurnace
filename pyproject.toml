@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "infurnace"
 version = "0.0.0"
-description = "Single-GPU language-model inference serving with tinygrad"
+description = "Language-model inference serving with tinygrad"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = ["tinygrad"]
@@ -26,7 +26,7 @@ addopts = [
   "not nv and not model and not slow",
 ]
 markers = [
-  "nv: requires the tinygrad NV backend and an NVIDIA GPU",
+  "nv: requires the tinygrad NV backend and NVIDIA execution hardware",
   "model: requires the verified model artifact",
   "slow: excluded from the normal development suite",
 ]
