@@ -1,0 +1,57 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+
+# Virtual environments and local configuration
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+
+# Packaging and coverage output
+build/
+dist/
+*.egg-info/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Model weights and exported model files
+*.gguf
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Local runtime, profiling, and benchmark output
+.cache/
+/artifacts/
+/profiles/
+/results/
+/benchmark-results/
+*.trace
+*.nsys-rep
+*.ncu-rep
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
