@@ -27,9 +27,43 @@ only after the simpler path is correct and measured.
 
 ## Current State
 
-The repository contains an empty implementation scaffold and design documents. No
+The repository contains an implementation scaffold and design documents. No
 runtime behavior has been implemented. The documents define phase gates rather than
 claiming support for features that have not passed their correctness tests.
+
+## Development
+
+Infurnace requires Python 3.11 or newer and develops against the current tinygrad
+codebase. Tinygrad is intentionally not version-pinned. With the repositories in
+adjacent directories, create an isolated environment and install both packages in
+editable mode:
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install -e ../tinygrad
+.venv/bin/python -m pip install -e ".[test]"
+```
+
+Tests use `unittest.TestCase` for structure and pytest as the runner. The default
+suite excludes tests requiring the NV backend, a model artifact, or an explicitly
+slow workload:
+
+```sh
+.venv/bin/python -m pytest
+```
+
+Hardware and model suites must be selected explicitly. Set `DEV` before pytest
+starts so tinygrad observes the intended backend during import:
+
+```sh
+DEV=NV .venv/bin/python -m pytest -m nv
+DEV=NV .venv/bin/python -m pytest -m "nv and model"
+DEV=NV .venv/bin/python -m pytest -m "nv and model and slow"
+```
+
+These selectors are populated as their roadmap subphases are implemented. Benchmark
+records identify the exact tinygrad checkout used for a result without making that
+checkout a compatibility promise.
 
 ## Structure
 

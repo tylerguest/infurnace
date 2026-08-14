@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "infurnace"
+version = "0.0.0"
+description = "Single-GPU language-model inference serving with tinygrad"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["tinygrad"]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = [
+  "-ra",
+  "--strict-config",
+  "--strict-markers",
+  "-m",
+  "not nv and not model and not slow",
+]
+markers = [
+  "nv: requires the tinygrad NV backend and an NVIDIA GPU",
+  "model: requires the verified model artifact",
+  "slow: excluded from the normal development suite",
+]
