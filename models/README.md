@@ -5,8 +5,9 @@ supported only after its manifest records:
 
 - source repository, exact model revision, file URL, byte size, and SHA-256;
 - license and any redistribution constraints;
-- GGUF version, architecture, quantization, and complete metadata dump;
-- tokenizer vocabulary, special token IDs, chat template, and EOS behavior;
+- GGUF version, architecture, quantization, and typed metadata inventory;
+- tokenizer vocabulary and merge hashes, special token IDs, chat template, and EOS
+  behavior;
 - every required tensor name, shape, GGUF dtype, logical dtype, and layout;
 - model, accumulation, and KV-cache dtypes used by Infurnace;
 - lazy quantized or realized weight policy and measured peak loading memory;
@@ -34,8 +35,10 @@ license:   Apache-2.0
 ```
 
 The manifest currently establishes artifact identity and acquisition. GGUF metadata,
-tokenizer data, and the complete tensor inventory are added only after Phase 0C
-inspection validates them from this exact artifact.
+tokenizer data, and the complete tensor inventory are recorded in
+[`qwen3-0.6b-q8_0.inspection.json`](qwen3-0.6b-q8_0.inspection.json), generated only
+after Phase 0C inspection validates them from this exact artifact through current
+tinygrad.
 
 Acquire the model into ignored local artifact storage with:
 
@@ -48,6 +51,20 @@ Acquire the model into ignored local artifact storage with:
 The tool streams into a temporary file, verifies the exact byte count and SHA-256,
 and atomically publishes the destination. It reuses a matching destination and
 refuses to overwrite a mismatched one.
+
+Generate or verify the canonical inspection report on CPU with:
+
+```sh
+DEV=CPU .venv/bin/python tools/inspect_artifact.py \
+  --manifest models/qwen3-0.6b-q8_0.json \
+  --artifact artifacts/models/Qwen3-0.6B-Q8_0.gguf \
+  --check models/qwen3-0.6b-q8_0.inspection.json
+```
+
+The report records GGUF version 3, 28 metadata entries, and all 310 tensor
+descriptors. It records 197 Q8_0 tensors and 113 F32 tensors. Large tokenizer arrays
+are represented by their element count and a canonical SHA-256 rather than copied
+verbatim into the repository.
 
 Expected Qwen3-0.6B values used to validate the GGUF metadata are:
 
@@ -66,10 +83,10 @@ tied token embeddings:  true
 source model dtype:     bfloat16
 ```
 
-The upstream Transformers configuration reports 40,960 maximum positions, while
-the GGUF model card describes a 32,768 context length. Infurnace does not silently
-choose between them. The pinned GGUF metadata, numerical tests, and measured memory
-budget determine the model contract and the server may expose a lower limit.
+The pinned GGUF metadata reports 40,960 maximum positions, resolving the artifact
+contract even though the GGUF model card describes a 32,768 context length. The
+server may expose a lower limit based on measured memory budgets for its configured
+execution topology.
 
 Qwen3-0.6B exercises RMSNorm, Q/K normalization, RoPE, grouped-query attention,
 SwiGLU, and tied embeddings while remaining small enough for rapid iteration.

@@ -67,6 +67,13 @@ These selectors are populated as their roadmap subphases are implemented. Benchm
 records identify the exact tinygrad checkout used for a result without making that
 checkout a compatibility promise.
 
+The pinned GGUF inspection test runs on CPU and requires an explicit artifact path:
+
+```sh
+DEV=CPU INFURNACE_MODEL_ARTIFACT="$PWD/artifacts/models/Qwen3-0.6B-Q8_0.gguf" \
+  .venv/bin/python -m pytest -m "model and slow"
+```
+
 ## Structure
 
 ```text
