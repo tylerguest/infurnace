@@ -20,11 +20,34 @@ than pinning tinygrad itself.
 The first development target is the official Qwen3-0.6B Q8_0 GGUF:
 
 ```text
-https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf
+https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/23749fefcc72300e3a2ad315e1317431b06b590a/Qwen3-0.6B-Q8_0.gguf
 ```
 
-The artifact revision and SHA-256 must be added to its manifest before integration.
-The upstream model is Apache-2.0 licensed.
+Its identity is pinned in
+[`qwen3-0.6b-q8_0.json`](qwen3-0.6b-q8_0.json):
+
+```text
+revision:  23749fefcc72300e3a2ad315e1317431b06b590a
+size:      639446688 bytes
+SHA-256:   9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031
+license:   Apache-2.0
+```
+
+The manifest currently establishes artifact identity and acquisition. GGUF metadata,
+tokenizer data, and the complete tensor inventory are added only after Phase 0C
+inspection validates them from this exact artifact.
+
+Acquire the model into ignored local artifact storage with:
+
+```sh
+.venv/bin/python tools/fetch_model.py \
+  --manifest models/qwen3-0.6b-q8_0.json \
+  --output artifacts/models/Qwen3-0.6B-Q8_0.gguf
+```
+
+The tool streams into a temporary file, verifies the exact byte count and SHA-256,
+and atomically publishes the destination. It reuses a matching destination and
+refuses to overwrite a mismatched one.
 
 Expected Qwen3-0.6B values used to validate the GGUF metadata are:
 
