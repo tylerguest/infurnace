@@ -90,6 +90,21 @@ Phase 0 benchmark commands and measurement semantics are documented in
 under the ignored `results/` directory; reproducible summaries belong in
 `docs/baselines/`.
 
+Track production code size with:
+
+```sh
+.venv/bin/python sz.py
+```
+
+Like tinygrad's line-count tool, this counts token-bearing Python lines rather than
+physical lines. The total includes only `src/infurnace/**/*.py` and excludes blank
+lines, comments, docstrings, tests, benchmarks, and development tools. An optional
+limit makes the command fail when the total grows beyond a chosen budget:
+
+```sh
+MAX_LINE_COUNT=5000 .venv/bin/python sz.py
+```
+
 ## Structure
 
 ```text
@@ -111,6 +126,8 @@ tools/                         Development-only comparison utilities
 See [the architecture](docs/architecture.md) for the server and execution contracts,
 [the roadmap](docs/roadmap.md) for implementation gates, and
 [numerical validation](docs/numerical_validation.md) for correctness requirements.
-The current performance records are the Phase 0E upstream
-[prefill](docs/baselines/phase0e-upstream-prefill.md) and
-[decode](docs/baselines/phase0e-upstream-decode.md) baselines.
+The current performance records are consolidated in the
+[Phase 0E baseline report](docs/baselines/phase0e-report.md), with separate upstream
+[prefill](docs/baselines/phase0e-upstream-prefill.md),
+[decode](docs/baselines/phase0e-upstream-decode.md), and
+[end-to-end generation](docs/baselines/phase0e-upstream-end-to-end.md) results.
