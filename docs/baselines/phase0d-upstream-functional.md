@@ -13,7 +13,7 @@ backend:      DEV=NV
 JIT:          enabled
 context:      1024 tokens
 chunk size:   32 tokens
-weight path:  lazy Q8_0 expressions with logical FP16 model weights
+weight paths: lazy Q8_0 expressions and fully realized FP16 model weights
 ```
 
 The run started with approximately 6.4 GiB of device memory free and no competing
@@ -48,22 +48,42 @@ performance and memory measurements.
 DEV=NV JIT=1 .venv/bin/python tools/run_upstream_model.py \
   --manifest models/qwen3-0.6b-q8_0.json \
   --artifact artifacts/models/Qwen3-0.6B-Q8_0.gguf \
+  --weight-policy lazy \
+  --workload fixed \
   --max-context 1024 \
-  --fixed-output-tokens 4 \
-  --text-output-tokens 16
+  --fixed-output-tokens 4
 ```
 
-The fixed token prompt generated:
+The equivalent realized-weight run replaces `--weight-policy lazy` with
+`--weight-policy realized-fp16`. The runner passes these policies to
+`Transformer.from_gguf` as `realize=False` and `realize=True`, respectively, and
+records both the selected policy and the upstream realization flag in its JSON
+output.
+
+Both policies generated the same fixed-token result:
 
 ```text
 [657, 198, 9, 0]
 ```
 
-Two clean-process runs produced identical fixed-token and text results. Repeating
-the same prompt on one upstream `Transformer` instance did not provide fresh,
-independent conversation semantics because the instance retains model-owned prefix
-and KV state. Infurnace therefore validates this baseline across clean processes and
-does not adopt the stateful interface as its serving model contract.
+Two clean-process runs per policy produced identical fixed-token results. The lazy
+and fully realized FP16 policies also agreed with each other. Repeating workloads on
+one upstream `Transformer` instance would not provide fresh, independent
+conversation semantics because the instance retains model-owned prefix and KV state.
+Infurnace therefore runs exactly one functional workload per process and does not
+adopt the stateful interface as its serving model contract.
+
+The text workload was run in separate clean processes with:
+
+```sh
+DEV=NV JIT=1 .venv/bin/python tools/run_upstream_model.py \
+  --manifest models/qwen3-0.6b-q8_0.json \
+  --artifact artifacts/models/Qwen3-0.6B-Q8_0.gguf \
+  --weight-policy lazy \
+  --workload text \
+  --max-context 1024 \
+  --text-output-tokens 16
+```
 
 The bounded text prompt decoded successfully as:
 
@@ -76,3 +96,11 @@ The bounded text prompt decoded successfully as:
 
 This is a functional tokenizer and decoding smoke test, not a language-quality
 assertion or the final Infurnace chat-template contract.
+
+## Token Accounting
+
+The upstream `benchmark_llm.py --decode-tokens 4` workload reports five generated
+IDs: one TTFT token attributed to prefill followed by four timed decode tokens. The
+Infurnace functional runner's `--fixed-output-tokens 4` means four generated IDs in
+total and does not report throughput. Phase 0E benchmark records must name prompt
+tokens, TTFT tokens, timed decode tokens, and total generated tokens separately.

@@ -21,6 +21,8 @@ def main() -> int:
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument("--manifest", required=True, type=Path, help="checkpoint manifest path")
   parser.add_argument("--artifact", required=True, type=Path, help="verified GGUF artifact path")
+  parser.add_argument("--weight-policy", required=True, choices=("lazy", "realized-fp16"))
+  parser.add_argument("--workload", required=True, choices=("fixed", "text"))
   parser.add_argument("--max-context", type=int, default=1024)
   parser.add_argument("--chunk-size", type=int, default=32)
   parser.add_argument("--fixed-output-tokens", type=int, default=4)
@@ -30,8 +32,9 @@ def main() -> int:
   if os.environ.get("DEV") != "NV":
     print("error: upstream model smoke test requires DEV=NV", file=sys.stderr)
     return 1
-  if min(args.max_context, args.chunk_size, args.fixed_output_tokens, args.text_output_tokens) <= 0:
-    print("error: context, chunk, and output token counts must be positive", file=sys.stderr)
+  output_tokens = args.fixed_output_tokens if args.workload == "fixed" else args.text_output_tokens
+  if min(args.max_context, args.chunk_size, output_tokens) <= 0:
+    print("error: context, chunk, and selected workload output token counts must be positive", file=sys.stderr)
     return 1
 
   try:
@@ -45,7 +48,8 @@ def main() -> int:
     with stable_artifact_path(args.artifact) as stable_path:
       verify_artifact(stable_path, manifest)
       gguf_tensor = Tensor.empty(manifest.size_bytes, dtype=dtypes.uint8, device=f"disk:{stable_path}")
-      model, metadata = Transformer.from_gguf(gguf_tensor, args.max_context, realize=False)
+      realize_weights = args.weight_policy == "realized-fp16"
+      model, metadata = Transformer.from_gguf(gguf_tensor, args.max_context, realize=realize_weights)
     tokenizer = SimpleTokenizer.from_gguf_kv(metadata)
     model.warmup()
 
@@ -61,28 +65,32 @@ def main() -> int:
       Device["NV"].synchronize()
       return output
 
-    fixed_prompt = [257] + [1000 + index for index in range(15)]
-    fixed_output = generate(fixed_prompt, args.fixed_output_tokens)
-
-    text_prompt_ids = tokenizer.encode(TEXT_PROMPT)
-    text_output = generate(text_prompt_ids, args.text_output_tokens)
+    if args.workload == "fixed":
+      prompt = [257] + [1000 + index for index in range(15)]
+      output = generate(prompt, output_tokens)
+      workload = {"name": "fixed", "prompt_token_ids": prompt, "generated_token_ids": output}
+    else:
+      prompt = tokenizer.encode(TEXT_PROMPT)
+      output = generate(prompt, output_tokens)
+      workload = {
+        "name": "text",
+        "prompt": TEXT_PROMPT,
+        "prompt_token_ids": prompt,
+        "generated_token_ids": output,
+        "generated_text": tokenizer.decode(output),
+      }
     result = {
       "artifact": {"id": manifest.id, "sha256": manifest.sha256},
       "execution": {
         "device": Device.DEFAULT,
         "max_context": model.max_context,
         "chunk_size": args.chunk_size,
-        "weight_policy": "lazy",
+        "weight_policy": args.weight_policy,
+        "upstream_realize": realize_weights,
         "weight_dtype": "float16",
         "sampling": "greedy",
       },
-      "fixed": {"prompt_token_ids": fixed_prompt, "generated_token_ids": fixed_output},
-      "text": {
-        "prompt": TEXT_PROMPT,
-        "prompt_token_ids": text_prompt_ids,
-        "generated_token_ids": text_output,
-        "generated_text": tokenizer.decode(text_output),
-      },
+      "workload": workload,
     }
     print(json.dumps(result, ensure_ascii=False, indent=2))
   except (ArtifactError, ManifestError, OSError, RuntimeError, ValueError) as error:

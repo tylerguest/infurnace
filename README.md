@@ -82,6 +82,9 @@ DEV=NV JIT=1 INFURNACE_MODEL_ARTIFACT="$PWD/artifacts/models/Qwen3-0.6B-Q8_0.ggu
   .venv/bin/python -m pytest -m "nv and model and slow"
 ```
 
+This suite runs each functional workload in a clean process and covers both lazy
+quantized expressions and fully realized FP16 weights.
+
 ## Structure
 
 ```text
