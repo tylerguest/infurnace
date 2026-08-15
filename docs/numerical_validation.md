@@ -42,7 +42,13 @@ source checkout or supported-version matrix.
 9. Compare deterministic end-to-end server output with the offline engine under the
    same request arrival and cancellation schedule.
 10. Compare locally compiled and loaded-artifact outputs if artifact support is ever
-    enabled.
+     enabled.
+11. Compare Infurnace `Qwen3Model` greedy token agreement with the
+    `tinygrad.llm.Transformer.from_gguf` baseline using the comparison tool at
+    `tools/compare_outputs.py`. The fixed prompt is `[257] + [1000 + i for i in
+    range(15)]` with both `lazy-fp16` and `realized-fp16` weight policies. Token
+    agreement is the gate; logit numerical tolerances are deferred pending a
+    PyTorch reference or upstream logits hook.
 
 ## Comparison Rules
 
@@ -88,3 +94,14 @@ Serving correctness includes non-numerical state guarantees:
 
 Correctness is a phase gate. Optimization and new runtime features do not proceed
 while numerical differences or state invariants remain unexplained.
+
+## Phase 1D Tolerances
+
+- Checkpoint: pinned Qwen3-0.6B Q8_0 GGUF
+- Backend: `DEV=NV`
+- Weight policies: `lazy-fp16` and `realized-fp16`
+- Workload: fixed 16-token prompt `[257] + [1000 + i for i in range(15)]`
+- Gate: greedy token matches the `tinygrad.llm.Transformer.from_gguf` baseline
+  exactly for both weight policies.
+- Logit numerical tolerances: deferred until a logits-exposing independent
+  reference (PyTorch or upstream hook) is added.
