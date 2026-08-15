@@ -2,10 +2,11 @@ from __future__ import annotations
 import math
 from tinygrad import Tensor, dtypes
 from infurnace.models.config import Qwen3Config
+from .buffers import ContiguousKVCache
 from .weights import Qwen3Weights
 
 class Qwen3ModelError(ValueError):
-  """Inputs or weights do not satisfy the stateless Qwen3 forward contract."""
+  """Inputs or weights do not satisfy the Qwen3 forward contract."""
 
 def _rms_norm(x: Tensor, weight: Tensor, eps: float) -> Tensor:
   xf = x.float()
@@ -43,23 +44,56 @@ class Qwen3Model:
 
     self.config = config
     self._w = tensors
+    self.kv_cache: ContiguousKVCache | None = None
     device = tensors["token_embd.weight"].device
     self._rope = _precompute_rope(config.rope_dimension_count, config.context_length, config.rope_freq_base, device)
 
-  def forward(self, input_ids: Tensor) -> Tensor:
-    config, w = self.config, self._w
+  def _validate_forward_inputs(self, input_ids: Tensor, start_position: int, kv: Tensor | None, slot: int) -> tuple[int, int]:
+    config = self.config
 
     if not isinstance(input_ids, Tensor): raise Qwen3ModelError("input_ids must be a Tensor")
     if input_ids.ndim != 2: raise Qwen3ModelError(f"input_ids must be rank 2 [B, T], got rank {input_ids.ndim}")
     batch, seq_len = input_ids.shape
     if batch < 1: raise Qwen3ModelError("batch must be at least 1")
     if seq_len < 1: raise Qwen3ModelError("sequence length must be at least 1")
-    if seq_len > config.context_length:
-      raise Qwen3ModelError(f"sequence length {seq_len} exceeds context length {config.context_length}")
     if input_ids.dtype not in dtypes.ints: raise Qwen3ModelError(f"input_ids must have integer dtype, got {input_ids.dtype}")
 
+    if start_position < 0: raise Qwen3ModelError(f"start_position must be non-negative, got {start_position}")
+    end_position = start_position + seq_len
+    if end_position > config.context_length:
+      raise Qwen3ModelError(f"end_position {end_position} exceeds context length {config.context_length}")
+
+    if kv is not None:
+      if not isinstance(kv, Tensor): raise Qwen3ModelError("kv must be a Tensor or None")
+      if kv.ndim != 6:
+        raise Qwen3ModelError(f"kv must be rank 6 [layer, 2, slot, position, head, dim], got rank {kv.ndim}")
+      if tuple(kv.shape[:2]) != (config.block_count, 2):
+        raise Qwen3ModelError(f"kv leading shape mismatch: expected ({config.block_count}, 2), got {tuple(kv.shape[:2])}")
+      if tuple(kv.shape[4:]) != (config.attention_head_count_kv, config.key_length):
+        raise Qwen3ModelError(
+          f"kv trailing shape mismatch: expected ({config.attention_head_count_kv}, {config.key_length}), "
+          f"got {tuple(kv.shape[4:])}"
+        )
+      if kv.dtype != dtypes.float16:
+        raise Qwen3ModelError(f"kv dtype must be float16, got {kv.dtype}")
+      num_slots = kv.shape[2]
+      if slot < 0 or slot >= num_slots:
+        raise Qwen3ModelError(f"slot {slot} out of range [0, {num_slots})")
+      max_context = kv.shape[3]
+      if end_position > max_context:
+        raise Qwen3ModelError(f"end_position {end_position} exceeds kv max_context {max_context}")
+      if batch != 1:
+        raise Qwen3ModelError("cached forward requires batch size 1")
+
+    return batch, seq_len
+
+  def forward(self, input_ids: Tensor, start_position: int = 0, kv: Tensor | None = None, slot: int = 0) -> Tensor:
+    config, w = self.config, self._w
+    batch, seq_len = self._validate_forward_inputs(input_ids, start_position, kv, slot)
+    end_position = start_position + seq_len
+
     x = w["token_embd.weight"][input_ids].float()
-    rope = self._rope[:seq_len]
+    rope = self._rope[start_position:end_position]
 
     for i in range(config.block_count):
       p = f"blk.{i}"
@@ -79,7 +113,32 @@ class Qwen3Model:
       q = _apply_rope(q, rope)
       k = _apply_rope(k, rope)
 
-      attn = q.scaled_dot_product_attention(k, v, is_causal=True, enable_gqa=True)
+      if kv is not None:
+        if start_position == 0:
+          attn = q.scaled_dot_product_attention(k, v, is_causal=True, enable_gqa=True)
+        else:
+          cached_k = kv[i, 0, slot, :start_position].permute(1, 0, 2).unsqueeze(0)
+          cached_v = kv[i, 1, slot, :start_position].permute(1, 0, 2).unsqueeze(0)
+          full_k = cached_k.cat(k, dim=2)
+          full_v = cached_v.cat(v, dim=2)
+
+          if seq_len == 1:
+            attn = q.scaled_dot_product_attention(full_k, full_v, is_causal=False, enable_gqa=True)
+          else:
+            total_len = start_position + seq_len
+            key_pos = Tensor.arange(total_len, dtype=dtypes.int32).to(q.device)
+            query_pos = Tensor.arange(start_position, end_position, dtype=dtypes.int32).to(q.device)
+            mask = (key_pos.unsqueeze(0) <= query_pos.unsqueeze(1)).reshape(1, 1, seq_len, total_len)
+            attn = q.scaled_dot_product_attention(full_k, full_v, attn_mask=mask, is_causal=False, enable_gqa=True)
+
+        k_store = k[0].permute(1, 0, 2).contiguous().cast(kv.dtype)
+        v_store = v[0].permute(1, 0, 2).contiguous().cast(kv.dtype)
+        k_write = kv[i, 0, slot, start_position:end_position].assign(k_store)
+        v_write = kv[i, 1, slot, start_position:end_position].assign(v_store)
+        Tensor.realize(k_write, v_write)
+      else:
+        attn = q.scaled_dot_product_attention(k, v, is_causal=True, enable_gqa=True)
+
       attn = attn.transpose(1, 2).reshape(batch, seq_len, -1)
       x = x + _linear(attn, w[f"{p}.attn_output.weight"])
 
@@ -91,5 +150,73 @@ class Qwen3Model:
     x = _rms_norm(x[:, -1:], w["output_norm.weight"], config.rms_norm_epsilon)
     return _linear(x, w["output.weight"])[:, -1, :]
 
-  def __call__(self, input_ids: Tensor) -> Tensor:
-    return self.forward(input_ids)
+  def _decode_step(self, input_ids: Tensor, attn_mask: Tensor, rope: Tensor, slot: int = 0) -> tuple[Tensor, Tensor, Tensor]:
+    """Single-token decode using the model's attached KV cache and a fixed-shape mask.
+
+    Reads the full KV cache (fixed shape) and applies `attn_mask` so positions
+    >= current position are ignored. This keeps the UOp graph fixed-shape and
+    allows TinyJit to reuse one captured program for every decode position.
+
+    `rope` must be the pre-sliced rope for the current position.
+
+    Returns `(logits, k_stores, v_stores)`. The caller must write the stores
+    into the KV cache at the current position.
+    """
+    if self.kv_cache is None: raise Qwen3ModelError("kv_cache must be attached to the model before decode")
+    kv = self.kv_cache.kv
+    config, w = self.config, self._w
+    batch, seq_len = input_ids.shape
+    x = w["token_embd.weight"][input_ids].float()
+
+    k_stores = []
+    v_stores = []
+    for i in range(config.block_count):
+      p = f"blk.{i}"
+
+      h = _rms_norm(x, w[f"{p}.attn_norm.weight"], config.rms_norm_epsilon)
+      q = _linear(h, w[f"{p}.attn_q.weight"])
+      k = _linear(h, w[f"{p}.attn_k.weight"])
+      v = _linear(h, w[f"{p}.attn_v.weight"])
+
+      q = q.reshape(batch, seq_len, config.attention_head_count, config.key_length).transpose(1, 2)
+      k = k.reshape(batch, seq_len, config.attention_head_count_kv, config.key_length).transpose(1, 2)
+      v = v.reshape(batch, seq_len, config.attention_head_count_kv, config.value_length).transpose(1, 2)
+
+      q = _rms_norm(q, w[f"{p}.attn_q_norm.weight"], config.rms_norm_epsilon)
+      k = _rms_norm(k, w[f"{p}.attn_k_norm.weight"], config.rms_norm_epsilon)
+
+      q = _apply_rope(q, rope)
+      k = _apply_rope(k, rope)
+
+      # Read the full cache; mask hides positions that are not yet populated.
+      cached_k = kv[i, 0, slot].permute(1, 0, 2).unsqueeze(0)
+      cached_v = kv[i, 1, slot].permute(1, 0, 2).unsqueeze(0)
+      full_k = cached_k.cat(k, dim=2)
+      full_v = cached_v.cat(v, dim=2)
+
+      attn = q.scaled_dot_product_attention(full_k, full_v, attn_mask=attn_mask, is_causal=False, enable_gqa=True)
+      attn = attn.transpose(1, 2).reshape(batch, seq_len, -1)
+      x = x + _linear(attn, w[f"{p}.attn_output.weight"])
+
+      h = _rms_norm(x, w[f"{p}.ffn_norm.weight"], config.rms_norm_epsilon)
+      gate = _linear(h, w[f"{p}.ffn_gate.weight"])
+      up = _linear(h, w[f"{p}.ffn_up.weight"])
+      x = (x + _linear(gate.silu().contiguous() * up, w[f"{p}.ffn_down.weight"])).contiguous()
+
+      k_stores.append(k[0].permute(1, 0, 2).contiguous().cast(kv.dtype))
+      v_stores.append(v[0].permute(1, 0, 2).contiguous().cast(kv.dtype))
+
+    x = _rms_norm(x[:, -1:], w["output_norm.weight"], config.rms_norm_epsilon)
+    logits = _linear(x, w["output.weight"])[:, -1, :]
+    return logits, Tensor.stack(k_stores), Tensor.stack(v_stores)
+
+  def prefill(self, input_ids: Tensor, kv_cache: ContiguousKVCache, slot: int = 0) -> Tensor:
+    if not isinstance(kv_cache, ContiguousKVCache): raise Qwen3ModelError("kv_cache must be a ContiguousKVCache")
+    return self.forward(input_ids, start_position=0, kv=kv_cache.kv, slot=slot)
+
+  def decode(self, input_ids: Tensor, position: int, kv_cache: ContiguousKVCache, slot: int = 0) -> Tensor:
+    if not isinstance(kv_cache, ContiguousKVCache): raise Qwen3ModelError("kv_cache must be a ContiguousKVCache")
+    return self.forward(input_ids, start_position=position, kv=kv_cache.kv, slot=slot)
+
+  def __call__(self, input_ids: Tensor, **kwargs) -> Tensor:
+    return self.forward(input_ids, **kwargs)

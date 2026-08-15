@@ -151,14 +151,19 @@ prefill matches unchunked execution, and cached decode matches full recomputatio
 
 ### Phase 2C: TinyJit Execution Contracts
 
-- Capture independent prefill and decode contracts only after their input shapes,
-  views, and symbolic variables are documented.
-- Give each contract its own `TinyJit` instance.
-- Use disposable cache state during both warmup and capture.
-- Replay with a different cache allocation matching the complete input contract.
+- Capture a fixed-shape decode contract using a full-cache read with a float attention
+  mask, avoiding symbolic `Variable` slicing that hung during capture on NV at full
+  model scale.
+- Give each slot its own `TinyJit` instance bound to the slot's KV cache as a model
+  attribute (closure buffer).
+- Pass position-dependent inputs (mask, rope slice) as realized Tensor arguments;
+  write the new K/V stores to the cache outside the JIT.
+- Wrap capture in `Context(BEAM=0)` to reduce one-time compilation cost.
+- Prefill remains eager (Phase 2B path).
 
-**Subphase gate:** Warmup, capture, immediate post-capture execution, and replay have
-explicitly validated mutations and work with a compatible replacement cache.
+**Subphase gate:** JIT capture completes on NV, decode replays across positions without
+recompilation, and greedy output matches Phase 2B eager decode. Decode is O(max_context)
+per token as a known provisional tradeoff.
 
 ### Phase 2D: Stateful Stress Validation
 
