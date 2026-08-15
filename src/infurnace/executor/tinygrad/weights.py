@@ -23,7 +23,6 @@ class Qwen3Weights:
   tensors: Mapping[str, Tensor]
   policy: WeightPolicy
 
-
 _PINNED_IDENTITY = (
   "qwen3-0.6b-q8_0", 639446688, "9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031", "GGUF", "Q8_0",
 )
