@@ -29,9 +29,12 @@ only after the simpler path is correct and measured.
 
 ## Current State
 
-The repository contains an implementation scaffold and design documents. No
-runtime behavior has been implemented. The documents define phase gates rather than
-claiming support for features that have not passed their correctness tests.
+Phase 0 is complete. The repository implements verified checkpoint acquisition,
+GGUF inspection, focused tinygrad execution contracts, and recorded upstream
+functional and performance baselines. It does not yet contain an Infurnace model
+runner or server runtime; Phase 1 begins with the exact Qwen3 model contract. The
+documents define phase gates rather than claiming support for features that have not
+passed their correctness tests.
 
 ## Development
 

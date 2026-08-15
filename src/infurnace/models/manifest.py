@@ -1,5 +1,3 @@
-"""Checkpoint identity, verification, and acquisition."""
-
 from __future__ import annotations
 
 import hashlib
@@ -16,7 +14,6 @@ from urllib.error import URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
-
 _CHUNK_SIZE = 1024 * 1024
 _EXPECTED_SCHEMA_VERSION = 1
 _REPOSITORY_PATTERN = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
@@ -25,14 +22,11 @@ _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _ID_PATTERN = re.compile(r"[a-z0-9][a-z0-9._-]*")
 _QUANTIZATION_PATTERN = re.compile(r"[A-Z0-9_]+")
 
-
 class ManifestError(ValueError):
   """The checkpoint manifest is malformed or internally inconsistent."""
 
-
 class ArtifactError(RuntimeError):
   """The checkpoint artifact could not be acquired or verified."""
-
 
 @dataclass(frozen=True)
 class CheckpointManifest:
@@ -49,14 +43,12 @@ class CheckpointManifest:
   license_spdx: str
   license_url: str
 
-
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
   result: dict[str, Any] = {}
   for key, value in pairs:
     if key in result: raise ManifestError(f"duplicate field: {key}")
     result[key] = value
   return result
-
 
 def _object(value: Any, name: str, fields: set[str]) -> dict[str, Any]:
   if not isinstance(value, dict): raise ManifestError(f"{name} must be an object")
@@ -65,11 +57,9 @@ def _object(value: Any, name: str, fields: set[str]) -> dict[str, Any]:
   if unknown: raise ManifestError(f"{name} has unknown fields: {', '.join(sorted(unknown))}")
   return value
 
-
 def _string(value: Any, name: str) -> str:
   if not isinstance(value, str) or not value: raise ManifestError(f"{name} must be a non-empty string")
   return value
-
 
 def _https_url(value: Any, name: str) -> str:
   url = _string(value, name)
@@ -81,7 +71,6 @@ def _https_url(value: Any, name: str) -> str:
   if parsed.scheme != "https" or parsed.hostname is None or parsed.username is not None or parsed.password is not None:
     raise ManifestError(f"{name} must be an HTTPS URL without credentials")
   return url
-
 
 def load_manifest(path: str | Path) -> CheckpointManifest:
   manifest_path = Path(path)
@@ -134,13 +123,11 @@ def load_manifest(path: str | Path) -> CheckpointManifest:
   return CheckpointManifest(schema_version, checkpoint_id, repository, revision, url, filename, artifact_format,
                             quantization, size_bytes, sha256, license_spdx, license_url)
 
-
 def _check_identity(size_bytes: int, sha256: str, manifest: CheckpointManifest) -> None:
   if size_bytes != manifest.size_bytes:
     raise ArtifactError(f"artifact size mismatch: expected {manifest.size_bytes}, got {size_bytes}")
   if sha256 != manifest.sha256:
     raise ArtifactError(f"artifact SHA-256 mismatch: expected {manifest.sha256}, got {sha256}")
-
 
 def verify_artifact(path: str | Path, manifest: CheckpointManifest) -> None:
   artifact_path = Path(path)
@@ -157,7 +144,6 @@ def verify_artifact(path: str | Path, manifest: CheckpointManifest) -> None:
   except OSError as error:
     raise ArtifactError(f"cannot read artifact {artifact_path}: {error}") from error
   _check_identity(size_bytes, digest.hexdigest(), manifest)
-
 
 def acquire_artifact(manifest: CheckpointManifest, destination: str | Path, timeout: float = 30) -> Path:
   destination_path = Path(destination)

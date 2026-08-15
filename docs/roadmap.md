@@ -92,11 +92,15 @@ the model.
 
 ### Phase 1B: Strict Weight Mapping
 
-- Load GGUF metadata and weights through tinygrad.
+- Keep the verified artifact open through parsing so tinygrad loads the same file
+  contents whose size and SHA-256 were checked, rather than reopening a replaceable
+  pathname.
+- Load GGUF metadata and weights through tinygrad from that stable artifact.
 - Decide and document whether serving uses lazy quantized expressions or realized
   FP16 weights based on measured memory and latency.
 
-**Subphase gate:** Every required model parameter maps to one validated GGUF tensor;
+**Subphase gate:** Tinygrad parses the verified artifact through a stable file
+identity and every required model parameter maps to one validated GGUF tensor;
 missing, duplicate, incorrectly shaped, and unexpected tensors fail loading.
 
 ### Phase 1C: Stateless Eager Forward
