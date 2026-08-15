@@ -63,15 +63,23 @@ DEV=NV .venv/bin/python -m pytest -m "nv and model"
 DEV=NV .venv/bin/python -m pytest -m "nv and model and slow"
 ```
 
-These selectors are populated as their roadmap subphases are implemented. Benchmark
-records identify the exact tinygrad checkout used for a result without making that
-checkout a compatibility promise.
+These selectors are populated as their roadmap subphases are implemented. Contract
+tests expose changes in the currently installed tinygrad behavior without pinning or
+recording a source checkout.
 
 The pinned GGUF inspection test runs on CPU and requires an explicit artifact path:
 
 ```sh
 DEV=CPU INFURNACE_MODEL_ARTIFACT="$PWD/artifacts/models/Qwen3-0.6B-Q8_0.gguf" \
-  .venv/bin/python -m pytest -m "model and slow"
+  .venv/bin/python -m pytest -m "model and slow and not nv"
+```
+
+The upstream NV model smoke test requires the same artifact and an otherwise idle
+execution device:
+
+```sh
+DEV=NV JIT=1 INFURNACE_MODEL_ARTIFACT="$PWD/artifacts/models/Qwen3-0.6B-Q8_0.gguf" \
+  .venv/bin/python -m pytest -m "nv and model and slow"
 ```
 
 ## Structure

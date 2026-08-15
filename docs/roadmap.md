@@ -67,8 +67,8 @@ weight-realization policies are identified separately.
 - Establish separate model, decode, and end-to-end benchmark entry points.
 - Measure GGUF loading peak memory, lazy-weight behavior, and fully realized FP16
   weight behavior.
-- Record a schema version, checkpoint identity, tinygrad provenance, device and
-  driver information, execution settings, raw timing samples, and memory sources.
+- Record a schema version, checkpoint identity, device and driver information,
+  execution settings, raw timing samples, and memory sources.
 - Keep raw benchmark output separate from a committed summary of reproducible
   commands, results, and known measurement limitations.
 

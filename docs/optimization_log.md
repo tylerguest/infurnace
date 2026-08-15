@@ -19,13 +19,13 @@ Every result records:
 
 - GGUF source, SHA-256, and quantization;
 - weight realization, model dtype, accumulation dtype, and cache dtype;
-- current tinygrad checkout, device backend, driver, and execution topology;
+- device backend, driver, and execution topology;
 - context length, prefill chunk, decode bucket, page size, and active-row count;
 - eager, warmup, capture, replay, and device-graph state;
 - cold or warm compilation and allocator-cache state.
 
-The tinygrad checkout identifies the experiment without declaring a supported
-version. New work always targets current tinygrad.
+New work always targets current tinygrad, with contract tests exposing behavior
+changes instead of result records pinning a source checkout.
 
 ## Model Metrics
 

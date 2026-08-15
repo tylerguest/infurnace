@@ -12,11 +12,11 @@ Every numerical result records:
 - quantization format and weight realization policy;
 - model, accumulation, and KV-cache dtypes;
 - prompt tokens, context length, and execution shape;
-- tinygrad checkout under test, JIT mode, device backend, and execution topology;
+- JIT mode, device backend, and execution topology;
 - absolute and relative tolerances and the reason they are appropriate.
 
-The tinygrad checkout is diagnostic provenance only. Infurnace follows current
-tinygrad and does not maintain a supported-version matrix.
+Infurnace follows current tinygrad and uses contract tests rather than a recorded
+source checkout or supported-version matrix.
 
 ## Validation Chain
 

@@ -55,9 +55,8 @@ dependencies, TinyJit input replacement, replay, output reuse, random primitives
 and custom UOps.
 
 When upstream behavior changes, Infurnace updates to the current contract rather
-than retaining the old one. Test and benchmark records may identify the checkout
-that produced a result for diagnosis, but that identity is not a compatibility
-promise.
+than retaining the old one. Focused contract tests expose behavior changes directly;
+source-checkout identity is not part of an Infurnace result or compatibility claim.
 
 ## End-to-End Path
 

@@ -41,3 +41,23 @@ dimensions, offsets, and sizes. Current tinygrad independently loads the artifac
 the tool requires its metadata, tensor names, logical shapes, and logical dtypes to
 agree with the descriptor scan. Production model loading continues to use tinygrad
 exclusively.
+
+## Upstream Model Smoke Test
+
+Run the pinned checkpoint through tinygrad's current model-owned-cache generation
+path with bounded fixed-token and text workloads:
+
+```sh
+DEV=NV JIT=1 .venv/bin/python tools/run_upstream_model.py \
+  --manifest models/qwen3-0.6b-q8_0.json \
+  --artifact artifacts/models/Qwen3-0.6B-Q8_0.gguf \
+  --max-context 1024 \
+  --fixed-output-tokens 4 \
+  --text-output-tokens 16
+```
+
+The runner uses greedy sampling and emits JSON. Determinism is checked across clean
+processes because tinygrad's upstream `Transformer` intentionally retains prefix and
+KV state between calls. See
+[`phase0d-upstream-functional.md`](../docs/baselines/phase0d-upstream-functional.md)
+for the recorded functional result.
