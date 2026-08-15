@@ -6,10 +6,11 @@ import math
 import os
 import re
 import tempfile
+from contextlib import contextmanager
 from http.client import HTTPException
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from urllib.error import URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
@@ -42,6 +43,11 @@ class CheckpointManifest:
   sha256: str
   license_spdx: str
   license_url: str
+
+@dataclass(frozen=True)
+class VerifiedArtifact:
+  path: Path
+  size_bytes: int
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
   result: dict[str, Any] = {}
@@ -144,6 +150,28 @@ def verify_artifact(path: str | Path, manifest: CheckpointManifest) -> None:
   except OSError as error:
     raise ArtifactError(f"cannot read artifact {artifact_path}: {error}") from error
   _check_identity(size_bytes, digest.hexdigest(), manifest)
+
+@contextmanager
+def verified_artifact(path: str | Path, manifest: CheckpointManifest) -> Iterator[VerifiedArtifact]:
+  artifact_path = Path(path)
+  try:
+    with artifact_path.open("rb") as artifact, tempfile.TemporaryFile(mode="w+b") as snapshot:
+      digest, size_bytes = hashlib.sha256(), 0
+      while chunk := artifact.read(_CHUNK_SIZE):
+        size_bytes += len(chunk)
+        if size_bytes > manifest.size_bytes:
+          raise ArtifactError(f"artifact size exceeds expected {manifest.size_bytes} bytes")
+        snapshot.write(chunk)
+        digest.update(chunk)
+      _check_identity(size_bytes, digest.hexdigest(), manifest)
+      snapshot.flush()
+      stable_path = Path(f"/proc/self/fd/{snapshot.fileno()}")
+      if not stable_path.exists(): raise ArtifactError("stable artifact descriptors require /proc/self/fd")
+      yield VerifiedArtifact(stable_path, manifest.size_bytes)
+  except ArtifactError:
+    raise
+  except OSError as error:
+    raise ArtifactError(f"cannot hold verified artifact {artifact_path}: {error}") from error
 
 def acquire_artifact(manifest: CheckpointManifest, destination: str | Path, timeout: float = 30) -> Path:
   destination_path = Path(destination)

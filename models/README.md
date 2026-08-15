@@ -97,6 +97,21 @@ model. GGUF storage and tinygrad's logical float values are part of Phase 1A;
 serving weight, accumulation, and KV-cache dtypes remain separate execution-policy
 decisions.
 
+The Phase 1B loader copies the artifact into a private temporary snapshot while
+verifying its identity, then keeps that snapshot open through tinygrad parsing. This
+prevents pathname replacement or in-place source mutation from changing the parsed
+contents. The loader accepts only the pinned identity, whose hash connects those
+contents to Phase 0's unique tensor descriptors and storage dtypes. It additionally
+requires the exact 310 live tensor names, logical shapes, and tinygrad dtypes before
+Infurnace's policy cast or weight realization, then adds `output.weight` as the same
+object as `token_embd.weight`.
+
+Both supported policies cast weights to FP16. `lazy-fp16` retains the Q8_0
+dequantization and cast expressions, while `realized-fp16` makes each weight
+contiguous and realized. Realized FP16 remains the provisional default based on the
+Phase 0 latency measurements. Phase 1C must remeasure both policies with Infurnace's
+stateless forward pass before the choice becomes a permanent serving default.
+
 The pinned GGUF metadata reports 40,960 maximum positions, resolving the artifact
 contract even though the GGUF model card describes a 32,768 context length. The
 server may expose a lower limit based on measured memory budgets for its configured

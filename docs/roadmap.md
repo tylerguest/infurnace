@@ -92,15 +92,16 @@ the model.
 
 ### Phase 1B: Strict Weight Mapping
 
-- Keep the verified artifact open through parsing so tinygrad loads the same file
-  contents whose size and SHA-256 were checked, rather than reopening a replaceable
-  pathname.
-- Load GGUF metadata and weights through tinygrad from that stable artifact.
-- Decide and document whether serving uses lazy quantized expressions or realized
-  FP16 weights based on measured memory and latency.
+- Copy the artifact into a private snapshot while verifying it, then keep that
+  snapshot open through parsing so pathname replacement or in-place mutation cannot
+  change the contents tinygrad loads.
+- Load GGUF metadata and weights through tinygrad from that verified snapshot.
+- Support lazy quantized FP16 expressions and realized FP16 weights. Retain realized
+  FP16 as the provisional default from Phase 0, then remeasure both policies with the
+  stateless Infurnace forward pass in Phase 1C.
 
-**Subphase gate:** Tinygrad parses the verified artifact through a stable file
-identity and every required model parameter maps to one validated GGUF tensor;
+**Subphase gate:** Tinygrad parses the private verified snapshot and every required
+model parameter maps to one validated GGUF tensor;
 missing, duplicate, incorrectly shaped, and unexpected tensors fail loading.
 
 ### Phase 1C: Stateless Eager Forward

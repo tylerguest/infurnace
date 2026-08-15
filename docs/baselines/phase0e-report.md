@@ -42,8 +42,9 @@ current 1,024-token baseline context.
 
 Lazy Q8_0 remains an explicit memory-oriented alternative. It loads faster, improves
 short-prompt prefill, and preserves approximately 1.1 GiB for future KV capacity.
-Phase 1B must revisit the choice against Infurnace's stateless model and external-KV
-runner rather than treating upstream behavior as a permanent serving policy.
+Phase 1B implements both policies and retains realized FP16 as the provisional
+default. Phase 1C must revisit the choice against Infurnace's stateless model rather
+than treating upstream behavior as a permanent serving policy.
 
 ## Phase Gate
 

@@ -9,8 +9,7 @@ from pathlib import Path
 import pytest
 
 from infurnace.models import ModelConfigError, qwen3_config_from_gguf
-from infurnace.models.manifest import load_manifest, verify_artifact
-from tools.gguf_inspection import stable_artifact_path
+from infurnace.models.manifest import load_manifest, verified_artifact
 
 
 REPOSITORY_ROOT = Path(__file__).parents[1]
@@ -136,11 +135,10 @@ class TestPinnedQwen3Config(unittest.TestCase):
     if artifact_value is None: self.skipTest("set INFURNACE_MODEL_ARTIFACT to the pinned GGUF")
 
     manifest = load_manifest(PINNED_MANIFEST)
-    with stable_artifact_path(artifact_value) as stable_path:
-      verify_artifact(stable_path, manifest)
+    with verified_artifact(artifact_value, manifest) as artifact:
       from tinygrad import Tensor, dtypes
       from tinygrad.llm.gguf import gguf_load
-      gguf_tensor = Tensor.empty(manifest.size_bytes, dtype=dtypes.uint8, device=f"disk:{stable_path}")
+      gguf_tensor = Tensor.empty(artifact.size_bytes, dtype=dtypes.uint8, device=f"disk:{artifact.path}")
       metadata, tensors = gguf_load(gguf_tensor)
       config = qwen3_config_from_gguf(metadata)
 
