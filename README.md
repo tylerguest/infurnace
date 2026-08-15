@@ -111,5 +111,6 @@ tools/                         Development-only comparison utilities
 See [the architecture](docs/architecture.md) for the server and execution contracts,
 [the roadmap](docs/roadmap.md) for implementation gates, and
 [numerical validation](docs/numerical_validation.md) for correctness requirements.
-The current performance record is the
-[Phase 0E upstream prefill baseline](docs/baselines/phase0e-upstream-prefill.md).
+The current performance records are the Phase 0E upstream
+[prefill](docs/baselines/phase0e-upstream-prefill.md) and
+[decode](docs/baselines/phase0e-upstream-decode.md) baselines.

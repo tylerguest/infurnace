@@ -94,9 +94,9 @@ Both policies produced setup tokens `[657, 198]` and measured tokens
 
 For this short-prefill workload, lazy Q8_0 expressions loaded 2.86 times faster,
 used 1,145 MiB less sampled peak process GPU memory, and delivered 27 percent more
-prompt throughput than fully realized FP16 weights. This result favors the lazy
-policy for prefill, but the serving policy remains undecided until the dedicated
-decode benchmark measures steady token latency and memory under its own contract.
+prompt throughput than fully realized FP16 weights. The separate
+[decode baseline](phase0e-upstream-decode.md) reverses the latency result for steady
+generation and records the combined provisional policy decision.
 
 ## Measurement Limits
 

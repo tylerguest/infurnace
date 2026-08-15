@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from benchmarks.benchmark_decode import measure_generation
 from benchmarks.common import parse_compute_app_rows, sampled_peak_bytes, timing_summary, validate_result, write_result
 
 
@@ -27,7 +28,7 @@ def valid_result() -> dict:
     },
     "workload": {
       "prompt_tokens": 16, "ttft_tokens_per_sample": 1, "timed_decode_tokens_per_sample": 0,
-      "total_generated_tokens": 2, "contract_setup_calls": 2, "measured_samples": 2, "sampling": "greedy",
+      "total_generated_tokens": 4, "contract_setup_calls": 2, "measured_samples": 2, "sampling": "greedy",
     },
     "timings": {
       "artifact_verification_ns": 1, "model_load_ns": 2, "contract_setup_ns": [3, 4],
@@ -68,6 +69,43 @@ def valid_result() -> dict:
   }
 
 
+def valid_decode_result() -> dict:
+  result = copy.deepcopy(valid_result())
+  measured = [10, 20]
+  result["benchmark"] = "upstream_decode"
+  result["workload"] = {
+    "prompt_tokens": 16, "ttft_tokens": 1, "contract_setup_tokens": 2,
+    "timed_decode_tokens": 2, "total_generated_tokens": 5, "measured_samples": 2, "sampling": "greedy",
+  }
+  result["timings"] = {
+    "artifact_verification_ns": 1, "model_load_ns": 2, "cold_prefill_ttft_ns": 3,
+    "contract_setup_ns": [4, 5], "decode_ns": measured, "decode_summary": timing_summary(measured),
+    "generated_tokens_per_second": [100_000_000.0, 50_000_000.0],
+  }
+  result["outputs"] = {
+    "prefill_token_id": 1, "contract_setup_token_ids": [2, 3], "measured_token_ids": [4, 5],
+  }
+  result["memory"]["host"]["after_prefill"] = {"current_rss_bytes": 2, "peak_rss_bytes": 3}
+  result["memory"]["tinygrad"]["after_prefill"] = 15
+  result["memory"]["device"].update(
+    phase_windows_ns={
+      "model_load": {"start_ns": 1, "end_ns": 2},
+      "prefill": {"start_ns": 2, "end_ns": 3},
+      "contract_setup": {"start_ns": 3, "end_ns": 4},
+      "measurement": {"start_ns": 4, "end_ns": 5},
+    },
+    phase_sampled_peak_bytes={"model_load": 10, "prefill": 15, "contract_setup": 20, "measurement": 20},
+    samples=[
+      {"query_start_ns": 1, "query_end_ns": 1, "gpu_uuid": None, "used_bytes": None},
+      {"query_start_ns": 2, "query_end_ns": 2, "gpu_uuid": "GPU-a", "used_bytes": 10},
+      {"query_start_ns": 3, "query_end_ns": 3, "gpu_uuid": "GPU-a", "used_bytes": 15},
+      {"query_start_ns": 4, "query_end_ns": 4, "gpu_uuid": "GPU-a", "used_bytes": 20},
+      {"query_start_ns": 5, "query_end_ns": 5, "gpu_uuid": "GPU-a", "used_bytes": 20},
+    ],
+  )
+  return result
+
+
 class TestBenchmarkCalculations(unittest.TestCase):
   def test_timing_summary(self):
     self.assertEqual(timing_summary([10, 30, 20]), {
@@ -94,6 +132,20 @@ class TestBenchmarkCalculations(unittest.TestCase):
     with self.assertRaises(ValueError): parse_compute_app_rows("12, malformed\n", 12)
     with self.assertRaises(ValueError): parse_compute_app_rows("12, GPU-a, N/A\n", 12)
 
+  def test_decode_generation_uses_one_generator_and_synchronizes_each_token(self):
+    class Device:
+      synchronizations = 0
+      def synchronize(self): self.synchronizations += 1
+
+    device = Device()
+    generator = iter(range(5))
+    result = measure_generation(generator, device, 2)
+    self.assertEqual(result["prefill_token"], 0)
+    self.assertEqual(result["setup_tokens"], [1, 2])
+    self.assertEqual(result["measured_tokens"], [3, 4])
+    self.assertEqual(device.synchronizations, 10)
+    with self.assertRaises(StopIteration): next(generator)
+
 
 class TestBenchmarkResultContract(unittest.TestCase):
   def test_accepts_valid_result_and_publishes_atomically(self):
@@ -112,9 +164,28 @@ class TestBenchmarkResultContract(unittest.TestCase):
       lambda result: result["memory"]["device"].update(sampled_peak_bytes=10),
       lambda result: result["workload"].update(ttft_tokens_per_sample=2),
       lambda result: result["execution"].update(weight_dtype="float32"),
+      lambda result: result["timings"].pop("model_load_ns"),
+      lambda result: result["timings"].update(contract_setup_ns=1),
     ]
     for mutate in mutations:
       with self.subTest(mutate=mutate):
         result = copy.deepcopy(valid_result())
+        mutate(result)
+        with self.assertRaises(ValueError): validate_result(result)
+
+  def test_accepts_decode_result_and_rejects_accounting_mismatches(self):
+    validate_result(valid_decode_result())
+    mutations = [
+      lambda result: result["workload"].update(total_generated_tokens=4),
+      lambda result: result["workload"].update(timed_decode_tokens=3),
+      lambda result: result["timings"].update(decode_ns=[10]),
+      lambda result: result["timings"].update(decode_ns=1),
+      lambda result: result["timings"].update(decode_ns=[0, 20]),
+      lambda result: result["outputs"].update(measured_token_ids=[4]),
+      lambda result: result["memory"]["device"]["phase_sampled_peak_bytes"].update(prefill=20),
+    ]
+    for mutate in mutations:
+      with self.subTest(mutate=mutate):
+        result = valid_decode_result()
         mutate(result)
         with self.assertRaises(ValueError): validate_result(result)

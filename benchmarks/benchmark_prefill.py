@@ -6,51 +6,22 @@ from __future__ import annotations
 import argparse
 import os
 import platform
-import subprocess
 import sys
 import time
 from contextlib import ExitStack
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 try:
-  from benchmarks.common import NvidiaMemorySampler, read_linux_memory, sampled_peak_bytes, timing_summary, write_result
+  from benchmarks.common import NvidiaMemorySampler, positive_int, query_device, read_linux_memory, sampled_peak_bytes, timing_summary, write_result
 except ModuleNotFoundError:
-  from common import NvidiaMemorySampler, read_linux_memory, sampled_peak_bytes, timing_summary, write_result
+  from common import NvidiaMemorySampler, positive_int, query_device, read_linux_memory, sampled_peak_bytes, timing_summary, write_result
 from infurnace.models.manifest import ArtifactError, ManifestError, load_manifest, verify_artifact
 try:
   from tools.gguf_inspection import stable_artifact_path
 except ModuleNotFoundError:
   sys.path.insert(0, str(Path(__file__).parents[1] / "tools"))
   from gguf_inspection import stable_artifact_path
-
-
-def positive_int(value: str) -> int:
-  parsed = int(value)
-  if parsed <= 0: raise argparse.ArgumentTypeError("must be positive")
-  return parsed
-
-
-def query_device() -> dict[str, Any]:
-  command = [
-    "nvidia-smi", "--query-gpu=index,uuid,name,driver_version,memory.total,memory.used,memory.free",
-    "--format=csv,noheader,nounits",
-  ]
-  result = subprocess.run(command, capture_output=True, text=True, timeout=10)
-  if result.returncode != 0: raise RuntimeError(result.stderr.strip() or f"nvidia-smi exited {result.returncode}")
-  rows = [line for line in result.stdout.splitlines() if line.strip()]
-  if len(rows) != 1: raise RuntimeError("the initial benchmark contract requires exactly one NVIDIA GPU")
-  fields = [field.strip() for field in rows[0].split(",")]
-  if len(fields) != 7: raise RuntimeError(f"unexpected nvidia-smi GPU row: {rows[0]!r}")
-  try: index, total_mib, used_mib, free_mib = int(fields[0]), int(fields[4]), int(fields[5]), int(fields[6])
-  except ValueError as error: raise RuntimeError(f"invalid nvidia-smi GPU row: {rows[0]!r}") from error
-  return {
-    "index": index, "uuid": fields[1], "name": fields[2], "driver_version": fields[3],
-    "total_memory_bytes": total_mib * 1024 * 1024,
-    "baseline_used_memory_bytes": used_mib * 1024 * 1024,
-    "baseline_free_memory_bytes": free_mib * 1024 * 1024,
-  }
 
 
 def make_prompt(length: int, sequence: int) -> list[int]:
@@ -160,7 +131,7 @@ def main() -> int:
       },
       "workload": {
         "prompt_tokens": args.prompt_tokens, "ttft_tokens_per_sample": 1, "timed_decode_tokens_per_sample": 0,
-        "total_generated_tokens": args.samples, "contract_setup_calls": 2, "measured_samples": args.samples,
+        "total_generated_tokens": 2 + args.samples, "contract_setup_calls": 2, "measured_samples": args.samples,
         "sampling": "greedy",
       },
       "timings": {

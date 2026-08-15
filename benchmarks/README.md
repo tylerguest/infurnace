@@ -64,3 +64,39 @@ compute workload.
 
 The recorded comparison is in
 [`phase0e-upstream-prefill.md`](../docs/baselines/phase0e-upstream-prefill.md).
+
+## Upstream Decode
+
+The decode entry point uses one generator for a complete conversation. It produces
+one cold prefill/TTFT token, two one-token rollout calls for TinyJit warmup and
+capture, and then individually times steady replay tokens:
+
+```sh
+DEV=NV JIT=1 .venv/bin/python benchmarks/benchmark_decode.py \
+  --manifest models/qwen3-0.6b-q8_0.json \
+  --artifact artifacts/models/Qwen3-0.6B-Q8_0.gguf \
+  --weight-policy lazy \
+  --max-context 1024 \
+  --chunk-size 32 \
+  --prompt-tokens 16 \
+  --decode-tokens 16 \
+  --memory-sample-ms 50 \
+  --output results/phase0e-decode-lazy.json
+
+DEV=NV JIT=1 .venv/bin/python benchmarks/benchmark_decode.py \
+  --manifest models/qwen3-0.6b-q8_0.json \
+  --artifact artifacts/models/Qwen3-0.6B-Q8_0.gguf \
+  --weight-policy realized-fp16 \
+  --max-context 1024 \
+  --chunk-size 32 \
+  --prompt-tokens 16 \
+  --decode-tokens 16 \
+  --memory-sample-ms 50 \
+  --output results/phase0e-decode-realized-fp16.json
+```
+
+The cold prefill value includes first-execution and JIT overhead and is not
+comparable with the steady prefill replay metric. Decode throughput is one generated
+token divided by each synchronized replay latency. See the recorded
+[`phase0e-upstream-decode.md`](../docs/baselines/phase0e-upstream-decode.md)
+comparison.

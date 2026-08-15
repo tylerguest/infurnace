@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import math
 import os
@@ -16,6 +17,34 @@ from typing import Any
 
 SCHEMA_VERSION = 1
 MIB = 1024 * 1024
+
+
+def positive_int(value: str) -> int:
+  parsed = int(value)
+  if parsed <= 0: raise argparse.ArgumentTypeError("must be positive")
+  return parsed
+
+
+def query_device() -> dict[str, Any]:
+  command = [
+    "nvidia-smi", "--query-gpu=index,uuid,name,driver_version,memory.total,memory.used,memory.free",
+    "--format=csv,noheader,nounits",
+  ]
+  try: result = subprocess.run(command, capture_output=True, text=True, timeout=10)
+  except subprocess.TimeoutExpired as error: raise RuntimeError("nvidia-smi device query timed out") from error
+  if result.returncode != 0: raise RuntimeError(result.stderr.strip() or f"nvidia-smi exited {result.returncode}")
+  rows = [line for line in result.stdout.splitlines() if line.strip()]
+  if len(rows) != 1: raise RuntimeError("the initial benchmark contract requires exactly one NVIDIA GPU")
+  fields = [field.strip() for field in rows[0].split(",")]
+  if len(fields) != 7: raise RuntimeError(f"unexpected nvidia-smi GPU row: {rows[0]!r}")
+  try: index, total_mib, used_mib, free_mib = int(fields[0]), int(fields[4]), int(fields[5]), int(fields[6])
+  except ValueError as error: raise RuntimeError(f"invalid nvidia-smi GPU row: {rows[0]!r}") from error
+  return {
+    "index": index, "uuid": fields[1], "name": fields[2], "driver_version": fields[3],
+    "total_memory_bytes": total_mib * MIB,
+    "baseline_used_memory_bytes": used_mib * MIB,
+    "baseline_free_memory_bytes": free_mib * MIB,
+  }
 
 
 def timing_summary(samples_ns: list[int]) -> dict[str, int | float]:
@@ -120,7 +149,8 @@ def validate_result(result: dict[str, Any]) -> None:
   required_root = {"schema_version", "benchmark", "created_at_utc", "checkpoint", "system", "execution", "workload", "timings", "outputs", "memory"}
   if set(result) != required_root: raise ValueError("benchmark result fields are incomplete or unknown")
   if result.get("schema_version") != SCHEMA_VERSION: raise ValueError(f"schema_version must be {SCHEMA_VERSION}")
-  if result.get("benchmark") != "upstream_prefill": raise ValueError("benchmark must be upstream_prefill")
+  benchmark = result.get("benchmark")
+  if benchmark not in ("upstream_prefill", "upstream_decode"): raise ValueError("benchmark type is invalid")
   if not isinstance(result.get("created_at_utc"), str) or not result["created_at_utc"].endswith("+00:00"):
     raise ValueError("created_at_utc must be an explicit UTC timestamp")
 
@@ -157,45 +187,80 @@ def validate_result(result: dict[str, Any]) -> None:
   for field in ("max_context", "chunk_size"):
     if type(execution[field]) is not int or execution[field] <= 0: raise ValueError(f"{field} must be positive")
 
-  workload = result.get("workload")
-  required_workload = {"prompt_tokens", "ttft_tokens_per_sample", "timed_decode_tokens_per_sample", "total_generated_tokens", "contract_setup_calls", "measured_samples", "sampling"}
-  if not isinstance(workload, dict) or set(workload) != required_workload: raise ValueError("workload is incomplete")
-  for field in ("prompt_tokens", "contract_setup_calls", "measured_samples"):
-    if type(workload[field]) is not int or workload[field] <= 0: raise ValueError(f"{field} must be positive")
-  if workload["ttft_tokens_per_sample"] != 1 or workload["timed_decode_tokens_per_sample"] != 0:
-    raise ValueError("workload token accounting is invalid")
-  if workload["total_generated_tokens"] != workload["measured_samples"] or workload["sampling"] != "greedy":
-    raise ValueError("workload token accounting is invalid")
+  workload, timings, outputs = result.get("workload"), result.get("timings"), result.get("outputs")
+  if not isinstance(workload, dict) or not isinstance(timings, dict) or not isinstance(outputs, dict):
+    raise ValueError("benchmark-specific result fields are invalid")
 
-  timings = result.get("timings")
-  required_timings = {"artifact_verification_ns", "model_load_ns", "contract_setup_ns", "prefill_ttft_ns", "prefill_ttft_summary", "prompt_tokens_per_second"}
-  if not isinstance(timings, dict) or set(timings) != required_timings: raise ValueError("timings are incomplete")
+  if benchmark == "upstream_prefill":
+    required_workload = {"prompt_tokens", "ttft_tokens_per_sample", "timed_decode_tokens_per_sample", "total_generated_tokens", "contract_setup_calls", "measured_samples", "sampling"}
+    required_timings = {"artifact_verification_ns", "model_load_ns", "contract_setup_ns", "prefill_ttft_ns", "prefill_ttft_summary", "prompt_tokens_per_second"}
+    if set(workload) != required_workload or set(timings) != required_timings: raise ValueError("prefill result fields are incomplete")
+    for field in ("prompt_tokens", "contract_setup_calls", "measured_samples"):
+      if type(workload[field]) is not int or workload[field] <= 0: raise ValueError(f"{field} must be positive")
+    if workload["contract_setup_calls"] != 2 or workload["ttft_tokens_per_sample"] != 1 or workload["timed_decode_tokens_per_sample"] != 0 \
+        or workload["total_generated_tokens"] != workload["contract_setup_calls"] + workload["measured_samples"] \
+        or workload["sampling"] != "greedy":
+      raise ValueError("prefill token accounting is invalid")
+    if workload["prompt_tokens"] < 2 or workload["prompt_tokens"] > execution["chunk_size"] \
+        or workload["prompt_tokens"] + workload["ttft_tokens_per_sample"] > execution["max_context"]:
+      raise ValueError("prefill workload exceeds its execution contract")
+    setup, measured = timings["contract_setup_ns"], timings["prefill_ttft_ns"]
+    summary, rates = timings["prefill_ttft_summary"], timings["prompt_tokens_per_second"]
+    rate_numerator = workload["prompt_tokens"] * 1e9
+    required_outputs = {"contract_setup_token_ids", "measured_token_ids"}
+    expected_output_lengths = (workload["contract_setup_calls"], workload["measured_samples"])
+    host_boundaries = {"before_artifact_verification", "after_artifact_verification", "after_model_load", "after_contract_setup", "after_measurement"}
+    tinygrad_boundaries = {"before_model_load", "after_model_load", "after_contract_setup", "after_measurement"}
+    phases = ("model_load", "contract_setup", "measurement")
+  else:
+    required_workload = {"prompt_tokens", "ttft_tokens", "contract_setup_tokens", "timed_decode_tokens", "total_generated_tokens", "measured_samples", "sampling"}
+    required_timings = {"artifact_verification_ns", "model_load_ns", "cold_prefill_ttft_ns", "contract_setup_ns", "decode_ns", "decode_summary", "generated_tokens_per_second"}
+    if set(workload) != required_workload or set(timings) != required_timings: raise ValueError("decode result fields are incomplete")
+    for field in ("prompt_tokens", "ttft_tokens", "contract_setup_tokens", "timed_decode_tokens", "total_generated_tokens", "measured_samples"):
+      if type(workload[field]) is not int or workload[field] <= 0: raise ValueError(f"{field} must be positive")
+    if workload["ttft_tokens"] != 1 or workload["contract_setup_tokens"] != 2 \
+        or workload["timed_decode_tokens"] != workload["measured_samples"] \
+        or workload["total_generated_tokens"] != workload["ttft_tokens"] + workload["contract_setup_tokens"] + workload["timed_decode_tokens"] \
+        or workload["sampling"] != "greedy":
+      raise ValueError("decode token accounting is invalid")
+    if workload["prompt_tokens"] < 2 or workload["prompt_tokens"] > execution["chunk_size"] \
+        or workload["prompt_tokens"] + workload["total_generated_tokens"] > execution["max_context"]:
+      raise ValueError("decode workload exceeds its execution contract")
+    if type(timings["cold_prefill_ttft_ns"]) is not int or timings["cold_prefill_ttft_ns"] <= 0:
+      raise ValueError("decode cold prefill timing is invalid")
+    setup, measured = timings["contract_setup_ns"], timings["decode_ns"]
+    summary, rates = timings["decode_summary"], timings["generated_tokens_per_second"]
+    rate_numerator = 1e9
+    required_outputs = {"prefill_token_id", "contract_setup_token_ids", "measured_token_ids"}
+    expected_output_lengths = (workload["contract_setup_tokens"], workload["measured_samples"])
+    host_boundaries = {"before_artifact_verification", "after_artifact_verification", "after_model_load", "after_prefill", "after_contract_setup", "after_measurement"}
+    tinygrad_boundaries = {"before_model_load", "after_model_load", "after_prefill", "after_contract_setup", "after_measurement"}
+    phases = ("model_load", "prefill", "contract_setup", "measurement")
+
   for field in ("artifact_verification_ns", "model_load_ns"):
     if type(timings[field]) is not int or timings[field] <= 0: raise ValueError(f"{field} must be positive")
-  setup, measured = timings["contract_setup_ns"], timings["prefill_ttft_ns"]
-  if not isinstance(setup, list) or len(setup) != workload["contract_setup_calls"]: raise ValueError("contract setup sample count is invalid")
-  if any(type(sample) is not int or sample <= 0 for sample in setup): raise ValueError("contract setup timings are invalid")
-  if not isinstance(measured, list) or len(measured) != workload["measured_samples"]: raise ValueError("prefill sample count is invalid")
-  if timing_summary(measured) != timings["prefill_ttft_summary"]: raise ValueError("prefill timing summary is invalid")
-  rates = timings["prompt_tokens_per_second"]
+  if not isinstance(setup, list) or len(setup) != 2 or any(type(sample) is not int or sample <= 0 for sample in setup):
+    raise ValueError("contract setup timings are invalid")
+  if not isinstance(measured, list) or len(measured) != workload["measured_samples"]: raise ValueError("measured sample count is invalid")
+  if timing_summary(measured) != summary: raise ValueError("timing summary is invalid")
   if not isinstance(rates, list) or len(rates) != len(measured) or any(type(rate) not in (int, float) or rate <= 0 for rate in rates):
-    raise ValueError("prompt throughput samples are invalid")
-  expected_rates = [workload["prompt_tokens"] * 1e9 / sample for sample in measured]
+    raise ValueError("throughput samples are invalid")
+  expected_rates = [rate_numerator / sample for sample in measured]
   if any(not math.isclose(actual, expected, rel_tol=1e-12) for actual, expected in zip(rates, expected_rates)):
-    raise ValueError("prompt throughput does not match timing samples")
-
-  outputs = result.get("outputs")
-  if not isinstance(outputs, dict) or set(outputs) != {"contract_setup_token_ids", "measured_token_ids"}:
+    raise ValueError("throughput does not match timing samples")
+  if set(outputs) != required_outputs or not isinstance(outputs["contract_setup_token_ids"], list) \
+      or not isinstance(outputs["measured_token_ids"], list):
     raise ValueError("outputs are incomplete")
-  if any(not isinstance(tokens, list) for tokens in outputs.values()): raise ValueError("output token containers are invalid")
-  if len(outputs["contract_setup_token_ids"]) != len(setup) or len(outputs["measured_token_ids"]) != len(measured):
+  if len(outputs["contract_setup_token_ids"]) != expected_output_lengths[0] \
+      or len(outputs["measured_token_ids"]) != expected_output_lengths[1]:
     raise ValueError("output count does not match timing count")
-  if any(type(token) is not int or token < 0 for tokens in outputs.values() for token in tokens): raise ValueError("output token is invalid")
+  output_tokens = outputs["contract_setup_token_ids"] + outputs["measured_token_ids"]
+  if benchmark == "upstream_decode": output_tokens.append(outputs["prefill_token_id"])
+  if any(type(token) is not int or token < 0 for token in output_tokens): raise ValueError("output token is invalid")
 
   memory = result.get("memory")
   if not isinstance(memory, dict) or set(memory) != {"host", "tinygrad", "device"}: raise ValueError("memory measurements are incomplete")
   host = memory["host"]
-  host_boundaries = {"before_artifact_verification", "after_artifact_verification", "after_model_load", "after_contract_setup", "after_measurement"}
   if not isinstance(host, dict) or set(host) != host_boundaries | {"source"} or host.get("source") != "/proc/self/status":
     raise ValueError("host memory measurements are invalid")
   for boundary in host_boundaries:
@@ -206,7 +271,6 @@ def validate_result(result: dict[str, Any]) -> None:
     if snapshot["peak_rss_bytes"] < snapshot["current_rss_bytes"]: raise ValueError(f"host memory snapshot {boundary} has an invalid peak")
 
   tinygrad = memory["tinygrad"]
-  tinygrad_boundaries = {"before_model_load", "after_model_load", "after_contract_setup", "after_measurement"}
   if not isinstance(tinygrad, dict) or set(tinygrad) != tinygrad_boundaries | {"source", "unit"}: raise ValueError("tinygrad memory measurements are incomplete")
   if tinygrad.get("source") != "tinygrad.GlobalCounters.mem_used_per_device":
     raise ValueError("tinygrad memory source is invalid")
@@ -239,7 +303,7 @@ def validate_result(result: dict[str, Any]) -> None:
   if type(sampled_peak) is not int or sampled_peak <= 0 or sampled_peak_bytes(samples) != sampled_peak:
     raise ValueError("device sampled peak is invalid")
   phase_peaks = device_memory.get("phase_sampled_peak_bytes")
-  if not isinstance(phase_peaks, dict) or set(phase_peaks) != {"model_load", "contract_setup", "measurement"}:
+  if not isinstance(phase_peaks, dict) or set(phase_peaks) != set(phases):
     raise ValueError("device phase peaks are incomplete")
   phase_windows = device_memory.get("phase_windows_ns")
   if not isinstance(phase_windows, dict) or set(phase_windows) != set(phase_peaks): raise ValueError("device phase windows are incomplete")
@@ -249,9 +313,9 @@ def validate_result(result: dict[str, Any]) -> None:
       raise ValueError(f"device phase window {phase} is invalid")
     expected_peak = sampled_peak_bytes(samples, window["start_ns"], window["end_ns"])
     if phase_peaks[phase] != expected_peak: raise ValueError(f"device phase peak {phase} is invalid")
-  if not (phase_windows["model_load"]["end_ns"] <= phase_windows["contract_setup"]["start_ns"]
-          <= phase_windows["contract_setup"]["end_ns"] <= phase_windows["measurement"]["start_ns"]):
-    raise ValueError("device phase windows are out of order")
+  for previous, current in zip(phases, phases[1:]):
+    if phase_windows[previous]["end_ns"] > phase_windows[current]["start_ns"]:
+      raise ValueError("device phase windows are out of order")
   if not isinstance(device_memory.get("limitations"), list) or not device_memory["limitations"]:
     raise ValueError("device memory limitations are missing")
 
