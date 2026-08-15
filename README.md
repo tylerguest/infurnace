@@ -85,6 +85,11 @@ DEV=NV JIT=1 INFURNACE_MODEL_ARTIFACT="$PWD/artifacts/models/Qwen3-0.6B-Q8_0.ggu
 This suite runs each functional workload in a clean process and covers both lazy
 quantized expressions and fully realized FP16 weights.
 
+Phase 0 benchmark commands and measurement semantics are documented in
+[`benchmarks/README.md`](benchmarks/README.md). Raw structured results are written
+under the ignored `results/` directory; reproducible summaries belong in
+`docs/baselines/`.
+
 ## Structure
 
 ```text
@@ -106,3 +111,5 @@ tools/                         Development-only comparison utilities
 See [the architecture](docs/architecture.md) for the server and execution contracts,
 [the roadmap](docs/roadmap.md) for implementation gates, and
 [numerical validation](docs/numerical_validation.md) for correctness requirements.
+The current performance record is the
+[Phase 0E upstream prefill baseline](docs/baselines/phase0e-upstream-prefill.md).

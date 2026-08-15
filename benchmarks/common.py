@@ -1,0 +1,276 @@
+"""Shared contracts and telemetry helpers for development benchmarks."""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import statistics
+import subprocess
+import tempfile
+import threading
+import time
+from pathlib import Path
+from typing import Any
+
+
+SCHEMA_VERSION = 1
+MIB = 1024 * 1024
+
+
+def timing_summary(samples_ns: list[int]) -> dict[str, int | float]:
+  if not samples_ns or any(type(sample) is not int or sample <= 0 for sample in samples_ns):
+    raise ValueError("timing samples must be positive integers")
+  return {
+    "count": len(samples_ns),
+    "min_ns": min(samples_ns),
+    "max_ns": max(samples_ns),
+    "mean_ns": statistics.fmean(samples_ns),
+    "median_ns": statistics.median(samples_ns),
+  }
+
+
+def sampled_peak_bytes(samples: list[dict[str, Any]], start_ns: int | None = None, end_ns: int | None = None) -> int | None:
+  values = [sample["used_bytes"] for sample in samples
+            if sample["used_bytes"] is not None
+            and (start_ns is None or sample["query_end_ns"] >= start_ns)
+            and (end_ns is None or sample["query_start_ns"] <= end_ns)]
+  return max(values) if values else None
+
+
+def parse_compute_app_rows(output: str, pid: int) -> tuple[str | None, int | None]:
+  matches: list[tuple[str, int]] = []
+  for line in output.splitlines():
+    if not line.strip(): continue
+    fields = [field.strip() for field in line.split(",")]
+    if len(fields) != 3: raise ValueError(f"unexpected nvidia-smi compute-app row: {line!r}")
+    try: row_pid = int(fields[0])
+    except ValueError as error: raise ValueError(f"invalid nvidia-smi compute-app row: {line!r}") from error
+    if row_pid != pid: continue
+    try: used_mib = int(fields[2])
+    except ValueError as error: raise ValueError(f"invalid nvidia-smi compute-app row: {line!r}") from error
+    matches.append((fields[1], used_mib * MIB))
+  if len(matches) > 1: raise ValueError(f"process {pid} appears on multiple NVIDIA devices")
+  return matches[0] if matches else (None, None)
+
+
+def read_linux_memory() -> dict[str, int]:
+  values: dict[str, int] = {}
+  with Path("/proc/self/status").open(encoding="utf-8") as status:
+    for line in status:
+      name, separator, value = line.partition(":")
+      if separator and name in ("VmRSS", "VmHWM"):
+        fields = value.split()
+        if len(fields) != 2 or fields[1] != "kB": raise RuntimeError(f"unexpected /proc memory value: {line.strip()}")
+        values[name] = int(fields[0]) * 1024
+  if values.keys() != {"VmRSS", "VmHWM"}: raise RuntimeError("/proc/self/status does not expose VmRSS and VmHWM")
+  return {"current_rss_bytes": values["VmRSS"], "peak_rss_bytes": values["VmHWM"]}
+
+
+class NvidiaMemorySampler:
+  """Sample driver-reported memory for one process without an NVML dependency."""
+
+  def __init__(self, pid: int, interval_ms: int):
+    if interval_ms <= 0: raise ValueError("sample interval must be positive")
+    self.pid, self.interval_ms = pid, interval_ms
+    self.samples: list[dict[str, Any]] = []
+    self.errors: list[str] = []
+    self._stop = threading.Event()
+    self._lock = threading.Lock()
+    self._thread = threading.Thread(target=self._run, name="nvidia-memory-sampler", daemon=True)
+
+  def start(self) -> None:
+    self._thread.start()
+
+  def stop(self) -> None:
+    self.sample_once()
+    self._stop.set()
+    self._thread.join(timeout=10)
+    if self._thread.is_alive(): raise RuntimeError("nvidia-smi sampler did not stop")
+
+  @property
+  def is_alive(self) -> bool:
+    return self._thread.is_alive()
+
+  def sample_once(self) -> None:
+    command = [
+      "nvidia-smi", "--query-compute-apps=pid,gpu_uuid,used_gpu_memory",
+      "--format=csv,noheader,nounits",
+    ]
+    try:
+      query_start_ns = time.monotonic_ns()
+      result = subprocess.run(command, capture_output=True, text=True, timeout=5)
+      query_end_ns = time.monotonic_ns()
+      if result.returncode != 0: raise RuntimeError(result.stderr.strip() or f"nvidia-smi exited {result.returncode}")
+      gpu_uuid, used_bytes = parse_compute_app_rows(result.stdout, self.pid)
+      sample = {"query_start_ns": query_start_ns, "query_end_ns": query_end_ns, "gpu_uuid": gpu_uuid, "used_bytes": used_bytes}
+      with self._lock: self.samples.append(sample)
+    except (OSError, RuntimeError, subprocess.TimeoutExpired, ValueError) as error:
+      with self._lock: self.errors.append(str(error))
+
+  def _run(self) -> None:
+    interval_seconds = self.interval_ms / 1000
+    while not self._stop.is_set():
+      started = time.monotonic()
+      self.sample_once()
+      self._stop.wait(max(0.0, interval_seconds - (time.monotonic() - started)))
+
+
+def validate_result(result: dict[str, Any]) -> None:
+  required_root = {"schema_version", "benchmark", "created_at_utc", "checkpoint", "system", "execution", "workload", "timings", "outputs", "memory"}
+  if set(result) != required_root: raise ValueError("benchmark result fields are incomplete or unknown")
+  if result.get("schema_version") != SCHEMA_VERSION: raise ValueError(f"schema_version must be {SCHEMA_VERSION}")
+  if result.get("benchmark") != "upstream_prefill": raise ValueError("benchmark must be upstream_prefill")
+  if not isinstance(result.get("created_at_utc"), str) or not result["created_at_utc"].endswith("+00:00"):
+    raise ValueError("created_at_utc must be an explicit UTC timestamp")
+
+  checkpoint = result.get("checkpoint")
+  if not isinstance(checkpoint, dict) or set(checkpoint) != {"id", "sha256", "size_bytes"}:
+    raise ValueError("checkpoint identity is incomplete")
+  if not isinstance(checkpoint["id"], str) or not checkpoint["id"]: raise ValueError("checkpoint id must be nonempty")
+  if not isinstance(checkpoint["sha256"], str) or len(checkpoint["sha256"]) != 64: raise ValueError("checkpoint sha256 is invalid")
+  try: int(checkpoint["sha256"], 16)
+  except ValueError as error: raise ValueError("checkpoint sha256 is invalid") from error
+  if type(checkpoint["size_bytes"]) is not int or checkpoint["size_bytes"] <= 0: raise ValueError("checkpoint size is invalid")
+
+  system = result.get("system")
+  if not isinstance(system, dict) or set(system) != {"python", "platform", "device"}: raise ValueError("system metadata is incomplete")
+  if any(not isinstance(system[field], str) or not system[field] for field in ("python", "platform")):
+    raise ValueError("system software metadata is invalid")
+  device = system["device"]
+  required_device = {"index", "uuid", "name", "driver_version", "total_memory_bytes", "baseline_used_memory_bytes", "baseline_free_memory_bytes"}
+  if not isinstance(device, dict) or set(device) != required_device: raise ValueError("device metadata is incomplete")
+  if any(not isinstance(device[field], str) or not device[field] for field in ("uuid", "name", "driver_version")):
+    raise ValueError("device identity is invalid")
+  for field in ("index", "total_memory_bytes", "baseline_used_memory_bytes", "baseline_free_memory_bytes"):
+    if type(device[field]) is not int or device[field] < 0: raise ValueError(f"device {field} is invalid")
+
+  execution = result.get("execution")
+  required_execution = {"device", "jit", "weight_policy", "upstream_realize", "weight_dtype", "max_context", "chunk_size"}
+  if not isinstance(execution, dict) or set(execution) != required_execution: raise ValueError("execution settings are incomplete")
+  if execution["device"] != "NV" or type(execution["jit"]) is not int or execution["jit"] != 1:
+    raise ValueError("benchmark requires DEV=NV and JIT=1")
+  if execution["weight_policy"] not in ("lazy", "realized-fp16"): raise ValueError("weight policy is invalid")
+  if execution["upstream_realize"] is not (execution["weight_policy"] == "realized-fp16"):
+    raise ValueError("weight policy does not match upstream realization")
+  if execution["weight_dtype"] != "float16": raise ValueError("weight dtype is invalid")
+  for field in ("max_context", "chunk_size"):
+    if type(execution[field]) is not int or execution[field] <= 0: raise ValueError(f"{field} must be positive")
+
+  workload = result.get("workload")
+  required_workload = {"prompt_tokens", "ttft_tokens_per_sample", "timed_decode_tokens_per_sample", "total_generated_tokens", "contract_setup_calls", "measured_samples", "sampling"}
+  if not isinstance(workload, dict) or set(workload) != required_workload: raise ValueError("workload is incomplete")
+  for field in ("prompt_tokens", "contract_setup_calls", "measured_samples"):
+    if type(workload[field]) is not int or workload[field] <= 0: raise ValueError(f"{field} must be positive")
+  if workload["ttft_tokens_per_sample"] != 1 or workload["timed_decode_tokens_per_sample"] != 0:
+    raise ValueError("workload token accounting is invalid")
+  if workload["total_generated_tokens"] != workload["measured_samples"] or workload["sampling"] != "greedy":
+    raise ValueError("workload token accounting is invalid")
+
+  timings = result.get("timings")
+  required_timings = {"artifact_verification_ns", "model_load_ns", "contract_setup_ns", "prefill_ttft_ns", "prefill_ttft_summary", "prompt_tokens_per_second"}
+  if not isinstance(timings, dict) or set(timings) != required_timings: raise ValueError("timings are incomplete")
+  for field in ("artifact_verification_ns", "model_load_ns"):
+    if type(timings[field]) is not int or timings[field] <= 0: raise ValueError(f"{field} must be positive")
+  setup, measured = timings["contract_setup_ns"], timings["prefill_ttft_ns"]
+  if not isinstance(setup, list) or len(setup) != workload["contract_setup_calls"]: raise ValueError("contract setup sample count is invalid")
+  if any(type(sample) is not int or sample <= 0 for sample in setup): raise ValueError("contract setup timings are invalid")
+  if not isinstance(measured, list) or len(measured) != workload["measured_samples"]: raise ValueError("prefill sample count is invalid")
+  if timing_summary(measured) != timings["prefill_ttft_summary"]: raise ValueError("prefill timing summary is invalid")
+  rates = timings["prompt_tokens_per_second"]
+  if not isinstance(rates, list) or len(rates) != len(measured) or any(type(rate) not in (int, float) or rate <= 0 for rate in rates):
+    raise ValueError("prompt throughput samples are invalid")
+  expected_rates = [workload["prompt_tokens"] * 1e9 / sample for sample in measured]
+  if any(not math.isclose(actual, expected, rel_tol=1e-12) for actual, expected in zip(rates, expected_rates)):
+    raise ValueError("prompt throughput does not match timing samples")
+
+  outputs = result.get("outputs")
+  if not isinstance(outputs, dict) or set(outputs) != {"contract_setup_token_ids", "measured_token_ids"}:
+    raise ValueError("outputs are incomplete")
+  if any(not isinstance(tokens, list) for tokens in outputs.values()): raise ValueError("output token containers are invalid")
+  if len(outputs["contract_setup_token_ids"]) != len(setup) or len(outputs["measured_token_ids"]) != len(measured):
+    raise ValueError("output count does not match timing count")
+  if any(type(token) is not int or token < 0 for tokens in outputs.values() for token in tokens): raise ValueError("output token is invalid")
+
+  memory = result.get("memory")
+  if not isinstance(memory, dict) or set(memory) != {"host", "tinygrad", "device"}: raise ValueError("memory measurements are incomplete")
+  host = memory["host"]
+  host_boundaries = {"before_artifact_verification", "after_artifact_verification", "after_model_load", "after_contract_setup", "after_measurement"}
+  if not isinstance(host, dict) or set(host) != host_boundaries | {"source"} or host.get("source") != "/proc/self/status":
+    raise ValueError("host memory measurements are invalid")
+  for boundary in host_boundaries:
+    snapshot = host[boundary]
+    if not isinstance(snapshot, dict) or set(snapshot) != {"current_rss_bytes", "peak_rss_bytes"}:
+      raise ValueError(f"host memory snapshot {boundary} is invalid")
+    if any(type(value) is not int or value < 0 for value in snapshot.values()): raise ValueError(f"host memory snapshot {boundary} is invalid")
+    if snapshot["peak_rss_bytes"] < snapshot["current_rss_bytes"]: raise ValueError(f"host memory snapshot {boundary} has an invalid peak")
+
+  tinygrad = memory["tinygrad"]
+  tinygrad_boundaries = {"before_model_load", "after_model_load", "after_contract_setup", "after_measurement"}
+  if not isinstance(tinygrad, dict) or set(tinygrad) != tinygrad_boundaries | {"source", "unit"}: raise ValueError("tinygrad memory measurements are incomplete")
+  if tinygrad.get("source") != "tinygrad.GlobalCounters.mem_used_per_device":
+    raise ValueError("tinygrad memory source is invalid")
+  if tinygrad.get("unit") != "live_requested_bytes_not_peak": raise ValueError("tinygrad memory unit is invalid")
+  if any(type(tinygrad[field]) is not int or tinygrad[field] < 0 for field in tinygrad_boundaries):
+    raise ValueError("tinygrad memory snapshot is invalid")
+
+  device_memory = memory["device"]
+  required_device_memory = {"source", "sample_interval_ms", "sampled_peak_bytes", "phase_windows_ns", "phase_sampled_peak_bytes", "samples", "limitations"}
+  if not isinstance(device_memory, dict) or set(device_memory) != required_device_memory:
+    raise ValueError("device memory measurements are incomplete")
+  if device_memory.get("source") != "nvidia-smi.compute-apps.sampled": raise ValueError("device memory source is invalid")
+  if type(device_memory.get("sample_interval_ms")) is not int or device_memory["sample_interval_ms"] <= 0:
+    raise ValueError("device sample interval is invalid")
+  samples = device_memory.get("samples")
+  if not isinstance(samples, list) or not samples: raise ValueError("device memory samples are missing")
+  for sample in samples:
+    if not isinstance(sample, dict) or set(sample) != {"query_start_ns", "query_end_ns", "gpu_uuid", "used_bytes"}:
+      raise ValueError("device memory sample is invalid")
+    if type(sample["query_start_ns"]) is not int or type(sample["query_end_ns"]) is not int \
+        or sample["query_start_ns"] <= 0 or sample["query_end_ns"] < sample["query_start_ns"]:
+      raise ValueError("device sample timestamps are invalid")
+    if sample["gpu_uuid"] is not None and (not isinstance(sample["gpu_uuid"], str) or not sample["gpu_uuid"]):
+      raise ValueError("device sample UUID is invalid")
+    if sample["used_bytes"] is not None and (type(sample["used_bytes"]) is not int or sample["used_bytes"] < 0):
+      raise ValueError("device sample memory is invalid")
+    if sample["used_bytes"] is not None and sample["gpu_uuid"] != device["uuid"]:
+      raise ValueError("device sample UUID does not match execution device")
+  sampled_peak = device_memory.get("sampled_peak_bytes")
+  if type(sampled_peak) is not int or sampled_peak <= 0 or sampled_peak_bytes(samples) != sampled_peak:
+    raise ValueError("device sampled peak is invalid")
+  phase_peaks = device_memory.get("phase_sampled_peak_bytes")
+  if not isinstance(phase_peaks, dict) or set(phase_peaks) != {"model_load", "contract_setup", "measurement"}:
+    raise ValueError("device phase peaks are incomplete")
+  phase_windows = device_memory.get("phase_windows_ns")
+  if not isinstance(phase_windows, dict) or set(phase_windows) != set(phase_peaks): raise ValueError("device phase windows are incomplete")
+  for phase, window in phase_windows.items():
+    if not isinstance(window, dict) or set(window) != {"start_ns", "end_ns"}: raise ValueError(f"device phase window {phase} is invalid")
+    if type(window["start_ns"]) is not int or type(window["end_ns"]) is not int or window["start_ns"] <= 0 or window["end_ns"] < window["start_ns"]:
+      raise ValueError(f"device phase window {phase} is invalid")
+    expected_peak = sampled_peak_bytes(samples, window["start_ns"], window["end_ns"])
+    if phase_peaks[phase] != expected_peak: raise ValueError(f"device phase peak {phase} is invalid")
+  if not (phase_windows["model_load"]["end_ns"] <= phase_windows["contract_setup"]["start_ns"]
+          <= phase_windows["contract_setup"]["end_ns"] <= phase_windows["measurement"]["start_ns"]):
+    raise ValueError("device phase windows are out of order")
+  if not isinstance(device_memory.get("limitations"), list) or not device_memory["limitations"]:
+    raise ValueError("device memory limitations are missing")
+
+
+def write_result(result: dict[str, Any], output: Path | None) -> None:
+  validate_result(result)
+  serialized = json.dumps(result, indent=2, sort_keys=True) + "\n"
+  if output is None:
+    print(serialized, end="")
+    return
+  output.parent.mkdir(parents=True, exist_ok=True)
+  descriptor, temporary_name = tempfile.mkstemp(prefix=f".{output.name}.", suffix=".tmp", dir=output.parent)
+  temporary = Path(temporary_name)
+  try:
+    with os.fdopen(descriptor, "w", encoding="utf-8") as destination:
+      destination.write(serialized)
+      destination.flush()
+      os.fsync(destination.fileno())
+    os.replace(temporary, output)
+  except BaseException:
+    temporary.unlink(missing_ok=True)
+    raise
