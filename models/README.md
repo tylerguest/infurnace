@@ -83,6 +83,20 @@ tied token embeddings:  true
 source model dtype:     bfloat16
 ```
 
+Phase 1A implements this as a frozen, tinygrad-independent `Qwen3Config` derived
+from live GGUF metadata. The exact contract requires full 128-dimensional RoPE,
+per-head Q/K RMS normalization, bias-free attention and MLP projections, a dense
+SwiGLU MLP, and an output projection tied to `token_embd.weight`. It generates all
+310 required tensor names, logical shapes, and storage dtypes: 113 normalization
+tensors stored as F32 and 197 matrix or embedding tensors stored as Q8_0.
+
+The committed inspection report is audit and test evidence, not a production
+configuration input. Phase 1B loads the verified artifact through tinygrad and
+compares its actual tensor mapping with the Phase 1A contract before constructing a
+model. GGUF storage and tinygrad's logical float values are part of Phase 1A;
+serving weight, accumulation, and KV-cache dtypes remain separate execution-policy
+decisions.
+
 The pinned GGUF metadata reports 40,960 maximum positions, resolving the artifact
 contract even though the GGUF model card describes a 32,768 context length. The
 server may expose a lower limit based on measured memory budgets for its configured

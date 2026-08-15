@@ -29,12 +29,13 @@ only after the simpler path is correct and measured.
 
 ## Current State
 
-Phase 0 is complete. The repository implements verified checkpoint acquisition,
-GGUF inspection, focused tinygrad execution contracts, and recorded upstream
-functional and performance baselines. It does not yet contain an Infurnace model
-runner or server runtime; Phase 1 begins with the exact Qwen3 model contract. The
-documents define phase gates rather than claiming support for features that have not
-passed their correctness tests.
+Phase 0 and Phase 1A are complete. The repository implements verified checkpoint
+acquisition, GGUF inspection, focused tinygrad execution contracts, recorded
+upstream functional and performance baselines, and the exact immutable Qwen3-0.6B
+model and tensor contract. It does not yet contain an Infurnace model runner or
+server runtime; Phase 1B adds strict weight mapping. The documents define phase
+gates rather than claiming support for features that have not passed their
+correctness tests.
 
 ## Development
 
