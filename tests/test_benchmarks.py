@@ -6,6 +6,8 @@ from pathlib import Path
 
 from benchmarks.benchmark_decode import measure_generation
 from benchmarks.common import parse_compute_app_rows, sampled_peak_bytes, timing_summary, validate_result, write_result
+from benchmarks.benchmark_serving import make_prompt as make_serving_prompt
+from benchmarks.benchmark_serving import measure_generation as measure_end_to_end_generation
 
 
 def valid_result() -> dict:
@@ -106,6 +108,57 @@ def valid_decode_result() -> dict:
   return result
 
 
+def valid_end_to_end_result() -> dict:
+  result = copy.deepcopy(valid_result())
+  result["benchmark"] = "upstream_end_to_end"
+  result["execution"].update(
+    path="tinygrad.llm.Transformer.generate", server_runtime=False, transport="none",
+    tokenization="none", scheduling="none", concurrency=1,
+    jit_state={"prefill_count": 2, "prefill_captured": True, "rollout_count": 4, "rollout_captured": True},
+  )
+  result["workload"] = {
+    "prompt_tokens": 2, "setup_generations": 2, "setup_output_tokens_per_generation": 3,
+    "measured_generations": 2, "measured_output_tokens_per_generation": 3,
+    "total_setup_generated_tokens": 6, "total_measured_generated_tokens": 6,
+    "sampling": "greedy", "arrival_pattern": "closed_loop_sequential",
+  }
+  setup = {"ttft_ns": [10, 11], "inter_token_ns": [[2, 3], [3, 4]], "end_to_end_ns": [15, 18]}
+  measured_ttft, measured_inter, measured_end_to_end = [20, 30], [[4, 5], [6, 7]], [29, 43]
+  result["timings"] = {
+    "artifact_verification_ns": 1, "model_load_ns": 2, "startup_to_ready_ns": 41,
+    "contract_setup_elapsed_ns": 34, "measurement_elapsed_ns": 73,
+    "contract_setup": setup,
+    "measured_ttft_ns": measured_ttft, "measured_ttft_summary": timing_summary(measured_ttft),
+    "measured_inter_token_ns": measured_inter,
+    "measured_inter_token_summary": timing_summary([4, 5, 6, 7]),
+    "measured_end_to_end_ns": measured_end_to_end,
+    "measured_end_to_end_summary": timing_summary(measured_end_to_end),
+    "generated_tokens_per_second": [3e9 / 29, 3e9 / 43],
+    "aggregate_generated_tokens_per_second": 6e9 / 73,
+  }
+  result["outputs"] = {
+    "contract_setup_prompt_token_ids": [[1, 5], [2, 5]],
+    "contract_setup_token_ids": [[10, 11, 12], [13, 14, 15]],
+    "measured_prompt_token_ids": [[3, 5], [4, 5]],
+    "measured_token_ids": [[16, 17, 18], [19, 20, 21]],
+  }
+  result["memory"]["device"].update(
+    phase_windows_ns={
+      "model_load": {"start_ns": 1, "end_ns": 2},
+      "contract_setup": {"start_ns": 10, "end_ns": 44},
+      "measurement": {"start_ns": 50, "end_ns": 123},
+    },
+    phase_sampled_peak_bytes={"model_load": 10, "contract_setup": 15, "measurement": 20},
+    samples=[
+      {"query_start_ns": 1, "query_end_ns": 1, "gpu_uuid": None, "used_bytes": None},
+      {"query_start_ns": 2, "query_end_ns": 2, "gpu_uuid": "GPU-a", "used_bytes": 10},
+      {"query_start_ns": 20, "query_end_ns": 20, "gpu_uuid": "GPU-a", "used_bytes": 15},
+      {"query_start_ns": 60, "query_end_ns": 60, "gpu_uuid": "GPU-a", "used_bytes": 20},
+    ],
+  )
+  return result
+
+
 class TestBenchmarkCalculations(unittest.TestCase):
   def test_timing_summary(self):
     self.assertEqual(timing_summary([10, 30, 20]), {
@@ -145,6 +198,20 @@ class TestBenchmarkCalculations(unittest.TestCase):
     self.assertEqual(result["measured_tokens"], [3, 4])
     self.assertEqual(device.synchronizations, 10)
     with self.assertRaises(StopIteration): next(generator)
+
+  def test_end_to_end_timeline_and_divergent_prompts(self):
+    class Device:
+      synchronizations = 0
+      def synchronize(self): self.synchronizations += 1
+
+    device = Device()
+    result = measure_end_to_end_generation(iter([7, 8, 9]), device, 3)
+    self.assertEqual(result["token_ids"], [7, 8, 9])
+    self.assertEqual(result["end_to_end_ns"], result["ttft_ns"] + sum(result["inter_token_ns"]))
+    self.assertEqual(device.synchronizations, 4)
+    prompts = [make_serving_prompt(4, sequence) for sequence in range(4)]
+    self.assertEqual(len({prompt[0] for prompt in prompts}), 4)
+    self.assertTrue(all(len(prompt) == 4 for prompt in prompts))
 
 
 class TestBenchmarkResultContract(unittest.TestCase):
@@ -187,5 +254,27 @@ class TestBenchmarkResultContract(unittest.TestCase):
     for mutate in mutations:
       with self.subTest(mutate=mutate):
         result = valid_decode_result()
+        mutate(result)
+        with self.assertRaises(ValueError): validate_result(result)
+
+  def test_accepts_end_to_end_result_and_rejects_server_or_timing_claims(self):
+    validate_result(valid_end_to_end_result())
+    mutations = [
+      lambda result: result["execution"].update(server_runtime=True),
+      lambda result: result["execution"].update(concurrency=2),
+      lambda result: result["execution"].update(transport="http"),
+      lambda result: result["execution"]["jit_state"].update(prefill_captured=False),
+      lambda result: result["workload"].update(total_measured_generated_tokens=5),
+      lambda result: result["workload"].update(measured_output_tokens_per_generation=127),
+      lambda result: result["timings"]["contract_setup"]["end_to_end_ns"].__setitem__(0, 14),
+      lambda result: result["timings"].update(aggregate_generated_tokens_per_second=1.0),
+      lambda result: result["outputs"]["measured_prompt_token_ids"][0].__setitem__(0, 1),
+      lambda result: result["outputs"]["measured_token_ids"].__setitem__(0, [16, 17]),
+      lambda result: result["timings"].update(measurement_elapsed_ns=71),
+      lambda result: result["timings"].update(startup_to_ready_ns=36),
+    ]
+    for mutate in mutations:
+      with self.subTest(mutate=mutate):
+        result = valid_end_to_end_result()
         mutate(result)
         with self.assertRaises(ValueError): validate_result(result)

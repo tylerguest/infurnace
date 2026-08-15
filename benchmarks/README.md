@@ -100,3 +100,50 @@ comparable with the steady prefill replay metric. Decode throughput is one gener
 token divided by each synchronized replay latency. See the recorded
 [`phase0e-upstream-decode.md`](../docs/baselines/phase0e-upstream-decode.md)
 comparison.
+
+## Upstream End-to-End Generation
+
+The roadmap's initial end-to-end entry point remains an upstream generation
+benchmark because Infurnace has no server runtime yet. Despite the placeholder
+filename, its result identity is `upstream_end_to_end` and its schema explicitly
+records that transport, tokenization, scheduling, and server runtime are absent.
+
+Run two setup generations followed by five closed-loop measured generations:
+
+```sh
+DEV=NV JIT=1 .venv/bin/python benchmarks/benchmark_serving.py \
+  --manifest models/qwen3-0.6b-q8_0.json \
+  --artifact artifacts/models/Qwen3-0.6B-Q8_0.gguf \
+  --weight-policy lazy \
+  --max-context 1024 \
+  --chunk-size 32 \
+  --prompt-tokens 16 \
+  --setup-output-tokens 3 \
+  --measured-generations 5 \
+  --output-tokens 16 \
+  --memory-sample-ms 50 \
+  --output results/phase0e-end-to-end-lazy.json
+
+DEV=NV JIT=1 .venv/bin/python benchmarks/benchmark_serving.py \
+  --manifest models/qwen3-0.6b-q8_0.json \
+  --artifact artifacts/models/Qwen3-0.6B-Q8_0.gguf \
+  --weight-policy realized-fp16 \
+  --max-context 1024 \
+  --chunk-size 32 \
+  --prompt-tokens 16 \
+  --setup-output-tokens 3 \
+  --measured-generations 5 \
+  --output-tokens 16 \
+  --memory-sample-ms 50 \
+  --output results/phase0e-end-to-end-realized-fp16.json
+```
+
+Setup must leave both upstream prefill and rollout TinyJit contracts captured.
+Measured prompts have distinct first tokens so upstream cannot reuse a cached prefix.
+Each generation records one TTFT, 15 inter-token intervals, and exact end-to-end
+latency. Aggregate throughput uses the complete closed-loop measurement window,
+including generator construction, synchronization, and inter-generation overhead.
+
+See the recorded
+[`phase0e-upstream-end-to-end.md`](../docs/baselines/phase0e-upstream-end-to-end.md)
+comparison and the consolidated [`phase0e-report.md`](../docs/baselines/phase0e-report.md).

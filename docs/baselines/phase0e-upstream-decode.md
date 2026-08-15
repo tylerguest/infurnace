@@ -105,8 +105,8 @@ Combined with the steady prefill baseline, the extra realized-FP16 prefill laten
 recovered after approximately seven decoded tokens. The provisional latency-oriented
 policy for the constrained single-request milestone is therefore realized FP16.
 Lazy Q8_0 remains a viable memory-oriented policy when additional context or cache
-capacity is more valuable than decode latency. The end-to-end serving benchmark must
-confirm the provisional choice before Phase 0E closes.
+capacity is more valuable than decode latency. The subsequent upstream end-to-end
+generation baseline confirms this provisional choice without claiming server support.
 
 ## Measurement Limits
 
