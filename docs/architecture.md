@@ -172,33 +172,35 @@ by interpreting a total-token bucket as one sequence.
 
 ## Contiguous KV Baseline
 
-The first cache is a persistent, external contiguous tensor conceptually shaped as:
+The first cache is a persistent, external contiguous tensor shaped as:
 
 ```text
 kv_storage[
   layer,
   K_or_V,
   request_slot,
-  kv_head,
   token_position,
+  kv_head,
   head_dim
 ]
 ```
 
-The exact axis order is selected by measurement, but it is part of the executor
-contract once captured. The cache dtype, maximum context, and number of request
-slots are explicit server configuration derived from a measured memory budget.
+For Qwen3-0.6B the concrete Phase 2A contract is:
 
-Persistent caches are initialized allocations, for example with `Tensor.zeros`,
-made contiguous, and realized before TinyJit capture. `Tensor.empty(...).realize()`
-is not treated as proof that a replaceable backing buffer was allocated. A cache
-replacement must match the complete TinyJit input contract: argument position,
-shape, dtype, device, view structure, and symbolic-variable definition.
+- dtype: `float16`
+- max_context: `1024` (conservative initial limit; model max is 32768)
+- num_slots: `1` (single-request prefill/decode for Phase 2B)
+- shape: `[28, 2, 1, 1024, 4, 128]`
+- size: `28 * 2 * 1 * 1024 * 4 * 128 * 2 = 58,982,400` bytes (~56.25 MiB)
 
-The contiguous implementation is intentionally simple and remains the independent
-reference for paged execution. The server may expose a context limit below the model
-maximum so cache slots, model weights, JIT workspaces, and backend overhead fit the
-configured execution topology.
+The tensor is allocated with `Tensor.zeros`, made contiguous, and realized
+before use. `Tensor.empty(...).realize()` is not used because an initialized
+backing buffer is required. The model receives the cache as an explicit input
+and owns no conversation KV state.
+
+The exact axis order is part of the executor contract once captured. The server
+may expose a context limit below the model maximum so cache slots, model
+weights, JIT workspaces, and backend overhead fit the configured execution topology.
 
 ## Paged KV Target
 
