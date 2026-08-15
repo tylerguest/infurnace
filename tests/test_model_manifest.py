@@ -10,15 +10,10 @@ from http.client import HTTPException
 from pathlib import Path
 from unittest.mock import patch
 from urllib.error import URLError
-
-from infurnace.models.manifest import (
-  ArtifactError, CheckpointManifest, ManifestError, acquire_artifact, load_manifest, verify_artifact,
-)
-
+from infurnace.models.manifest import (ArtifactError, CheckpointManifest, ManifestError, acquire_artifact, load_manifest, verify_artifact,)
 
 REPOSITORY_ROOT = Path(__file__).parents[1]
 PINNED_MANIFEST = REPOSITORY_ROOT / "models" / "qwen3-0.6b-q8_0.json"
-
 
 def valid_manifest_data():
   return {
@@ -39,13 +34,11 @@ def valid_manifest_data():
     "license": {"spdx": "Apache-2.0", "url": "https://example.com/LICENSE"},
   }
 
-
 def manifest_for(content: bytes) -> CheckpointManifest:
   return CheckpointManifest(1, "test-model", "owner/model", "a" * 40,
                             f"https://huggingface.co/owner/model/resolve/{'a' * 40}/model.gguf",
                             "model.gguf", "GGUF", "Q8_0", len(content), hashlib.sha256(content).hexdigest(),
                             "Apache-2.0", "https://example.com/LICENSE")
-
 
 class TestCheckpointManifest(unittest.TestCase):
   def write_manifest(self, directory: str, data) -> Path:
@@ -114,7 +107,6 @@ class TestCheckpointManifest(unittest.TestCase):
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     self.assertEqual(result.returncode, 0, result.stderr)
 
-
 class TestArtifactVerification(unittest.TestCase):
   def test_accepts_exact_artifact(self):
     content = b"verified artifact"
@@ -132,7 +124,6 @@ class TestArtifactVerification(unittest.TestCase):
         path.write_bytes(content)
         with self.subTest(name=name), self.assertRaises(ArtifactError):
           verify_artifact(path, manifest_for(expected))
-
 
 class TestArtifactAcquisition(unittest.TestCase):
   def test_downloads_and_atomically_publishes_verified_artifact(self):

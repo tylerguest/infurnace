@@ -3,9 +3,7 @@ import subprocess
 import sys
 import textwrap
 import unittest
-
 import pytest
-
 
 class TinygradContractTest(unittest.TestCase):
   def run_contract(self, source: str, device: str):
@@ -13,7 +11,6 @@ class TinygradContractTest(unittest.TestCase):
     environment.update(DEV=device, JIT="1")
     result = subprocess.run([sys.executable, "-c", textwrap.dedent(source)], env=environment, capture_output=True, text=True)
     self.assertEqual(result.returncode, 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}")
-
 
 class TestTinygradCPUContracts(TinygradContractTest):
   def test_device_selection_and_initialized_storage(self):
@@ -122,7 +119,6 @@ class TestTinygradCPUContracts(TinygradContractTest):
       except JitError: pass
       else: raise AssertionError("duplicate backing input was accepted")
     """, "CPU")
-
 
 @pytest.mark.nv
 class TestTinygradNVContracts(TinygradContractTest):

@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """Benchmark upstream Qwen model loading and steady prefill TTFT on DEV=NV."""
-
 from __future__ import annotations
-
 import argparse
 import os
 import platform
@@ -23,10 +21,8 @@ except ModuleNotFoundError:
   sys.path.insert(0, str(Path(__file__).parents[1] / "tools"))
   from gguf_inspection import stable_artifact_path
 
-
 def make_prompt(length: int, sequence: int) -> list[int]:
   return [257 + sequence] + [1000 + (sequence * length + index) % 1000 for index in range(length - 1)]
-
 
 def main() -> int:
   parser = argparse.ArgumentParser(description=__doc__)
@@ -187,6 +183,5 @@ def main() -> int:
   finally:
     resources.close()
   return 0
-
 
 if __name__ == "__main__": raise SystemExit(main())

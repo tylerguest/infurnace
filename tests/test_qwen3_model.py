@@ -3,19 +3,15 @@ import os
 import unittest
 from pathlib import Path
 from types import MappingProxyType
-
 import pytest
 from tinygrad import Tensor, dtypes
-
 from infurnace.executor.tinygrad.model import Qwen3Model, Qwen3ModelError, _apply_rope, _linear, _precompute_rope, _rms_norm
 from infurnace.executor.tinygrad.weights import Qwen3Weights, WeightPolicy, load_qwen3_weights
 from infurnace.models.config import Qwen3Config, TensorSpec
 from infurnace.models.manifest import load_manifest
 
-
 REPOSITORY_ROOT = Path(__file__).parents[1]
 PINNED_MANIFEST = REPOSITORY_ROOT / "models" / "qwen3-0.6b-q8_0.json"
-
 
 def _tensor_specs(config: Qwen3Config) -> tuple[TensorSpec, ...]:
   specs = [
@@ -43,7 +39,6 @@ def _tensor_specs(config: Qwen3Config) -> tuple[TensorSpec, ...]:
     ))
   return tuple(specs)
 
-
 def _make_config(**overrides) -> Qwen3Config:
   defaults = dict(
     architecture="qwen3", block_count=2, context_length=8, embedding_length=8,
@@ -58,7 +53,6 @@ def _make_config(**overrides) -> Qwen3Config:
     from dataclasses import replace
     config = replace(config, tensors=_tensor_specs(config))
   return config
-
 
 def _make_weights(config: Qwen3Config, seed: int = 42) -> Qwen3Weights:
   tensors = {}
@@ -83,7 +77,6 @@ def _make_weights(config: Qwen3Config, seed: int = 42) -> Qwen3Weights:
   tensors["output.weight"] = tensors["token_embd.weight"]
   return Qwen3Weights(config, MappingProxyType(tensors), WeightPolicy.LAZY_FP16)
 
-
 class TestRMSNorm(unittest.TestCase):
   def test_normalizes_over_last_dimension(self):
     x = Tensor([[1.0, 2.0, 3.0, 4.0]])
@@ -100,7 +93,6 @@ class TestRMSNorm(unittest.TestCase):
     result = _rms_norm(x, Tensor.ones(2, dtype=dtypes.float16), 1e-6)
     self.assertEqual(result.dtype, dtypes.float16)
 
-
 class TestLinear(unittest.TestCase):
   def test_gguf_out_in_orientation(self):
     x = Tensor([[1.0, 2.0, 3.0]])
@@ -108,7 +100,6 @@ class TestLinear(unittest.TestCase):
     result = _linear(x, weight)
     self.assertEqual(result.shape, (1, 2))
     self.assertEqual(result.realize().tolist(), [[1.0, 2.0]])
-
 
 class TestRoPE(unittest.TestCase):
   def test_position_zero_is_identity(self):
@@ -131,7 +122,6 @@ class TestRoPE(unittest.TestCase):
     self.assertAlmostEqual(r[1], 0.0, places=5)
     self.assertAlmostEqual(r[2], cos_f0, places=5)
     self.assertAlmostEqual(r[3], 0.0, places=5)
-
 
 class TestQwen3Model(unittest.TestCase):
   def setUp(self):
@@ -199,7 +189,6 @@ class TestQwen3Model(unittest.TestCase):
     tensors["extra.weight"] = Tensor.zeros(1)
     weights = Qwen3Weights(config, MappingProxyType(tensors), WeightPolicy.LAZY_FP16)
     with self.assertRaisesRegex(Qwen3ModelError, "unexpected weight tensors"): Qwen3Model(weights)
-
 
 @pytest.mark.model
 @pytest.mark.slow

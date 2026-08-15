@@ -1,7 +1,5 @@
 """Shared contracts and telemetry helpers for development benchmarks."""
-
 from __future__ import annotations
-
 import argparse
 import json
 import math
@@ -14,16 +12,13 @@ import time
 from pathlib import Path
 from typing import Any
 
-
 SCHEMA_VERSION = 1
 MIB = 1024 * 1024
-
 
 def positive_int(value: str) -> int:
   parsed = int(value)
   if parsed <= 0: raise argparse.ArgumentTypeError("must be positive")
   return parsed
-
 
 def query_device() -> dict[str, Any]:
   command = [
@@ -46,7 +41,6 @@ def query_device() -> dict[str, Any]:
     "baseline_free_memory_bytes": free_mib * MIB,
   }
 
-
 def timing_summary(samples_ns: list[int]) -> dict[str, int | float]:
   if not samples_ns or any(type(sample) is not int or sample <= 0 for sample in samples_ns):
     raise ValueError("timing samples must be positive integers")
@@ -58,14 +52,12 @@ def timing_summary(samples_ns: list[int]) -> dict[str, int | float]:
     "median_ns": statistics.median(samples_ns),
   }
 
-
 def sampled_peak_bytes(samples: list[dict[str, Any]], start_ns: int | None = None, end_ns: int | None = None) -> int | None:
   values = [sample["used_bytes"] for sample in samples
             if sample["used_bytes"] is not None
             and (start_ns is None or sample["query_end_ns"] >= start_ns)
             and (end_ns is None or sample["query_start_ns"] <= end_ns)]
   return max(values) if values else None
-
 
 def validate_generation_timings(group: dict[str, Any], generations: int, output_tokens: int, label: str) -> tuple[list[int], list[list[int]], list[int]]:
   if not isinstance(group, dict) or set(group) != {"ttft_ns", "inter_token_ns", "end_to_end_ns"}:
@@ -83,7 +75,6 @@ def validate_generation_timings(group: dict[str, Any], generations: int, output_
       raise ValueError(f"{label} end-to-end timing does not decompose exactly")
   return ttft, inter_token, end_to_end
 
-
 def parse_compute_app_rows(output: str, pid: int) -> tuple[str | None, int | None]:
   matches: list[tuple[str, int]] = []
   for line in output.splitlines():
@@ -99,7 +90,6 @@ def parse_compute_app_rows(output: str, pid: int) -> tuple[str | None, int | Non
   if len(matches) > 1: raise ValueError(f"process {pid} appears on multiple NVIDIA devices")
   return matches[0] if matches else (None, None)
 
-
 def read_linux_memory() -> dict[str, int]:
   values: dict[str, int] = {}
   with Path("/proc/self/status").open(encoding="utf-8") as status:
@@ -112,10 +102,8 @@ def read_linux_memory() -> dict[str, int]:
   if values.keys() != {"VmRSS", "VmHWM"}: raise RuntimeError("/proc/self/status does not expose VmRSS and VmHWM")
   return {"current_rss_bytes": values["VmRSS"], "peak_rss_bytes": values["VmHWM"]}
 
-
 class NvidiaMemorySampler:
   """Sample driver-reported memory for one process without an NVML dependency."""
-
   def __init__(self, pid: int, interval_ms: int):
     if interval_ms <= 0: raise ValueError("sample interval must be positive")
     self.pid, self.interval_ms = pid, interval_ms
@@ -160,7 +148,6 @@ class NvidiaMemorySampler:
       started = time.monotonic()
       self.sample_once()
       self._stop.wait(max(0.0, interval_seconds - (time.monotonic() - started)))
-
 
 def validate_result(result: dict[str, Any]) -> None:
   required_root = {"schema_version", "benchmark", "created_at_utc", "checkpoint", "system", "execution", "workload", "timings", "outputs", "memory"}
@@ -445,7 +432,6 @@ def validate_result(result: dict[str, Any]) -> None:
     raise ValueError("end-to-end elapsed times do not match phase windows")
   if not isinstance(device_memory.get("limitations"), list) or not device_memory["limitations"]:
     raise ValueError("device memory limitations are missing")
-
 
 def write_result(result: dict[str, Any], output: Path | None) -> None:
   validate_result(result)

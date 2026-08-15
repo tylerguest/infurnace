@@ -3,12 +3,10 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-
 from benchmarks.benchmark_decode import measure_generation
 from benchmarks.common import parse_compute_app_rows, sampled_peak_bytes, timing_summary, validate_result, write_result
 from benchmarks.benchmark_serving import make_prompt as make_serving_prompt
 from benchmarks.benchmark_serving import measure_generation as measure_end_to_end_generation
-
 
 def valid_result() -> dict:
   measured = [10, 20]
@@ -70,7 +68,6 @@ def valid_result() -> dict:
     },
   }
 
-
 def valid_decode_result() -> dict:
   result = copy.deepcopy(valid_result())
   measured = [10, 20]
@@ -106,7 +103,6 @@ def valid_decode_result() -> dict:
     ],
   )
   return result
-
 
 def valid_end_to_end_result() -> dict:
   result = copy.deepcopy(valid_result())
@@ -157,7 +153,6 @@ def valid_end_to_end_result() -> dict:
     ],
   )
   return result
-
 
 class TestBenchmarkCalculations(unittest.TestCase):
   def test_timing_summary(self):
@@ -212,7 +207,6 @@ class TestBenchmarkCalculations(unittest.TestCase):
     prompts = [make_serving_prompt(4, sequence) for sequence in range(4)]
     self.assertEqual(len({prompt[0] for prompt in prompts}), 4)
     self.assertTrue(all(len(prompt) == 4 for prompt in prompts))
-
 
 class TestBenchmarkResultContract(unittest.TestCase):
   def test_accepts_valid_result_and_publishes_atomically(self):

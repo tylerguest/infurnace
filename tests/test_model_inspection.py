@@ -6,25 +6,18 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-
 import pytest
-
 from infurnace.models.manifest import load_manifest, verify_artifact
-from tools.gguf_inspection import (
-  GGUFInspectionError, build_report, crosscheck_tinygrad, scan_gguf, serialize_report, stable_artifact_path,
-)
+from tools.gguf_inspection import (GGUFInspectionError, build_report, crosscheck_tinygrad, scan_gguf, serialize_report, stable_artifact_path,)
 from tools.inspect_artifact import _write_atomic
-
 
 REPOSITORY_ROOT = Path(__file__).parents[1]
 PINNED_MANIFEST = REPOSITORY_ROOT / "models" / "qwen3-0.6b-q8_0.json"
 PINNED_INSPECTION = REPOSITORY_ROOT / "models" / "qwen3-0.6b-q8_0.inspection.json"
 
-
 def gguf_string(value: str) -> bytes:
   encoded = value.encode("utf-8")
   return struct.pack("<Q", len(encoded)) + encoded
-
 
 def metadata_value(type_id: int, value) -> bytes:
   formats = {0: "B", 1: "b", 2: "H", 3: "h", 4: "I", 5: "i", 6: "f", 7: "?", 10: "Q", 11: "q", 12: "d"}
@@ -32,7 +25,6 @@ def metadata_value(type_id: int, value) -> bytes:
   if type_id == 8: return gguf_string(value)
   element_type, values = value
   return struct.pack("<IQ", element_type, len(values)) + b"".join(metadata_value(element_type, item) for item in values)
-
 
 def build_gguf(metadata, tensors, data: bytes | None = None) -> bytes:
   descriptors = b""
@@ -51,15 +43,12 @@ def build_gguf(metadata, tensors, data: bytes | None = None) -> bytes:
     data = b"\x00" * final_size
   return prefix + padding + data
 
-
 class FakeDType:
   name = "float"
-
 
 class FakeTensor:
   def __init__(self, shape):
     self.shape, self.dtype = shape, FakeDType()
-
 
 class TestGGUFInspection(unittest.TestCase):
   def write_gguf(self, directory: str, content: bytes) -> Path:
@@ -152,7 +141,6 @@ class TestGGUFInspection(unittest.TestCase):
         with self.assertRaises(OSError): _write_atomic(output, "second\n")
       self.assertEqual(output.read_text(encoding="utf-8"), "first\n")
       self.assertEqual(list(output.parent.glob("*.part")), [])
-
 
 @pytest.mark.model
 @pytest.mark.slow

@@ -5,9 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-
 import sz
-
 
 class TestLineCount(unittest.TestCase):
   def test_counts_code_lines_without_comments_blanks_or_docstrings(self):

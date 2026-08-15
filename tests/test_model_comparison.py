@@ -4,12 +4,9 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
-
 import pytest
 
-
 REPOSITORY_ROOT = Path(__file__).parents[1]
-
 
 @pytest.mark.nv
 @pytest.mark.model

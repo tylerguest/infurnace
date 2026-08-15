@@ -1,15 +1,10 @@
 from __future__ import annotations
-
 from dataclasses import dataclass, field
-
 from tinygrad import Tensor, dtypes
-
 from infurnace.models.config import Qwen3Config
-
 
 class KVCacheError(ValueError):
   """KV cache configuration or allocation does not satisfy the contract."""
-
 
 @dataclass(frozen=True)
 class ContiguousKVCache:
@@ -36,9 +31,7 @@ class ContiguousKVCache:
     if self.num_slots < 1:
       raise KVCacheError(f"num_slots must be positive, got {self.num_slots}")
     if self.max_context > self.config.context_length:
-      raise KVCacheError(
-        f"max_context {self.max_context} exceeds model context_length {self.config.context_length}"
-      )
+      raise KVCacheError(f"max_context {self.max_context} exceeds model context_length {self.config.context_length}")
 
     shape = (
       self.config.block_count,

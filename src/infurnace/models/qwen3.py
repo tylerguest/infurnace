@@ -1,11 +1,8 @@
 from __future__ import annotations
-
 import math
 from collections.abc import Mapping
 from typing import Any
-
 from .config import ModelConfigError, Qwen3Config, TensorSpec
-
 
 _MODEL_KEYS = {
   "qwen3.block_count", "qwen3.context_length", "qwen3.embedding_length", "qwen3.feed_forward_length",
@@ -29,7 +26,6 @@ _EXPECTED = {
   "general.file_type": (int, 7),
 }
 
-
 def _expected(metadata: Mapping[str, Any], key: str) -> Any:
   if key not in metadata: raise ModelConfigError(f"missing GGUF metadata: {key}")
   expected_type, expected_value = _EXPECTED[key]
@@ -37,7 +33,6 @@ def _expected(metadata: Mapping[str, Any], key: str) -> Any:
   if type(value) is not expected_type: raise ModelConfigError(f"{key} must be {expected_type.__name__}")
   if value != expected_value: raise ModelConfigError(f"unsupported {key}: expected {expected_value!r}, got {value!r}")
   return value
-
 
 def _tensor_specs(blocks: int, hidden: int, intermediate: int, heads: int, kv_heads: int,
                   key_length: int, value_length: int, vocab_size: int) -> tuple[TensorSpec, ...]:
@@ -63,7 +58,6 @@ def _tensor_specs(blocks: int, hidden: int, intermediate: int, heads: int, kv_he
       TensorSpec(f"{prefix}.ffn_up.weight", (intermediate, hidden), "Q8_0", "float"),
     ))
   return tuple(specs)
-
 
 def qwen3_config_from_gguf(metadata: Mapping[str, Any]) -> Qwen3Config:
   """Derive the pinned Qwen3-0.6B contract from tinygrad GGUF metadata."""

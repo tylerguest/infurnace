@@ -1,25 +1,18 @@
 from __future__ import annotations
-
 import math
-
 from tinygrad import Tensor, dtypes
-
 from infurnace.models.config import Qwen3Config
 from .weights import Qwen3Weights
 
-
 class Qwen3ModelError(ValueError):
   """Inputs or weights do not satisfy the stateless Qwen3 forward contract."""
-
 
 def _rms_norm(x: Tensor, weight: Tensor, eps: float) -> Tensor:
   xf = x.float()
   return (xf * (xf.square().mean(-1, keepdim=True) + eps).rsqrt()).cast(x.dtype) * weight
 
-
 def _linear(x: Tensor, weight: Tensor) -> Tensor:
   return x.linear(weight.transpose())
-
 
 def _precompute_rope(dim: int, context_length: int, theta: float, device) -> Tensor:
   inv_freq = 1.0 / (theta ** (Tensor.arange(0, dim, 2, dtype=dtypes.float) / dim))
@@ -27,12 +20,10 @@ def _precompute_rope(dim: int, context_length: int, theta: float, device) -> Ten
   freqs = positions.unsqueeze(-1) * inv_freq.unsqueeze(0)
   return freqs.cos().cat(freqs.sin(), dim=-1).to(device).contiguous().realize()
 
-
 def _apply_rope(x: Tensor, rope: Tensor) -> Tensor:
   cos, sin = rope.reshape(1, 1, x.shape[2], -1).chunk(2, dim=-1)
   x1, x2 = x.chunk(2, dim=-1)
   return (x1 * cos - x2 * sin).cat(x2 * cos + x1 * sin, dim=-1)
-
 
 class Qwen3Model:
   def __init__(self, weights: Qwen3Weights):

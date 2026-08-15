@@ -1,11 +1,8 @@
 from __future__ import annotations
-
 from dataclasses import dataclass
-
 
 class ModelConfigError(ValueError):
   """GGUF metadata does not satisfy a supported model contract."""
-
 
 @dataclass(frozen=True, slots=True)
 class TensorSpec:
@@ -13,7 +10,6 @@ class TensorSpec:
   shape: tuple[int, ...]
   storage_dtype: str
   logical_dtype: str
-
 
 @dataclass(frozen=True, slots=True)
 class Qwen3Config:

@@ -1,7 +1,5 @@
 """Development-only GGUF descriptor inspection."""
-
 from __future__ import annotations
-
 import hashlib
 import json
 import math
@@ -10,7 +8,6 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO
-
 
 GGUF_VALUE_TYPES = {
   0: ("UINT8", "B"), 1: ("INT8", "b"), 2: ("UINT16", "H"), 3: ("INT16", "h"),
@@ -28,11 +25,8 @@ GGML_TYPES = {
   30: ("BF16", 1, 2), 39: ("MXFP4", 32, 17), 41: ("Q1_0", 128, 18),
 }
 
-
 class GGUFInspectionError(ValueError):
   """The GGUF descriptor stream is malformed or inconsistent."""
-
-
 @dataclass(frozen=True)
 class MetadataInfo:
   key: str
@@ -41,7 +35,6 @@ class MetadataInfo:
   element_type_id: int | None
   element_type_name: str | None
   value: Any
-
 
 @dataclass(frozen=True)
 class TensorInfo:
@@ -53,7 +46,6 @@ class TensorInfo:
   data_offset: int
   serialized_nbytes: int
 
-
 @dataclass(frozen=True)
 class GGUFInfo:
   version: int
@@ -63,14 +55,12 @@ class GGUFInfo:
   metadata: tuple[MetadataInfo, ...]
   tensors: tuple[TensorInfo, ...]
 
-
 @contextmanager
 def stable_artifact_path(path: str | Path):
   with Path(path).open("rb") as artifact_file:
     stable_path = Path(f"/proc/self/fd/{artifact_file.fileno()}")
     if not stable_path.exists(): raise GGUFInspectionError("inspection requires stable /proc/self/fd file descriptors")
     yield stable_path
-
 
 class _Reader:
   def __init__(self, stream: BinaryIO, file_size: int): self.stream, self.file_size = stream, file_size
@@ -107,7 +97,6 @@ class _Reader:
     if count > self.remaining() // minimum_size: raise GGUFInspectionError("GGUF array count exceeds artifact bounds")
     return [self.value(element_type, allow_array=False)[0] for _ in range(count)], element_type
 
-
 def _tensor_nbytes(dimensions: tuple[int, ...], ggml_type: int) -> int:
   if ggml_type not in GGML_TYPES: raise GGUFInspectionError(f"unsupported GGML tensor type {ggml_type}")
   elements = math.prod(dimensions)
@@ -116,7 +105,6 @@ def _tensor_nbytes(dimensions: tuple[int, ...], ggml_type: int) -> int:
   if dimensions[0] % block_elements:
     raise GGUFInspectionError(f"tensor row width {dimensions[0]} is not divisible by {block_elements}")
   return elements // block_elements * block_bytes
-
 
 def scan_gguf(path: str | Path) -> GGUFInfo:
   artifact_path = Path(path)
@@ -172,7 +160,6 @@ def scan_gguf(path: str | Path) -> GGUFInfo:
 
   return GGUFInfo(version, alignment, data_start, file_size, tuple(metadata), tuple(tensors))
 
-
 def crosscheck_tinygrad(info: GGUFInfo, metadata: dict[str, Any], tensors: dict[str, Any]) -> dict[str, str]:
   scanned_metadata = {item.key: item.value for item in info.metadata}
   if scanned_metadata.keys() != metadata.keys():
@@ -192,13 +179,11 @@ def crosscheck_tinygrad(info: GGUFInfo, metadata: dict[str, Any], tensors: dict[
     logical_dtypes[name] = tensor.dtype.name
   return logical_dtypes
 
-
 def _metadata_value(value: Any) -> Any:
   if isinstance(value, list) and len(value) > 256:
     encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
     return {"count": len(value), "sha256": hashlib.sha256(encoded).hexdigest()}
   return value
-
 
 def build_report(info: GGUFInfo, artifact_id: str, artifact_size: int, artifact_sha256: str,
                  logical_dtypes: dict[str, str]) -> dict[str, Any]:
@@ -242,7 +227,6 @@ def build_report(info: GGUFInfo, artifact_id: str, artifact_size: int, artifact_
       ],
     },
   }
-
 
 def serialize_report(report: dict[str, Any]) -> str:
   return json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n"

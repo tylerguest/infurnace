@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """Benchmark sequential upstream generation without claiming a server runtime."""
-
 from __future__ import annotations
-
 import argparse
 import os
 import platform
@@ -23,10 +21,8 @@ except ModuleNotFoundError:
   sys.path.insert(0, str(Path(__file__).parents[1] / "tools"))
   from gguf_inspection import stable_artifact_path
 
-
 def make_prompt(length: int, sequence: int) -> list[int]:
   return [257 + sequence] + [1000 + (sequence * length + index) % 1000 for index in range(length - 1)]
-
 
 def measure_generation(generator, device, output_tokens: int) -> dict:
   device.synchronize()
@@ -45,7 +41,6 @@ def measure_generation(generator, device, output_tokens: int) -> dict:
     "end_to_end_ns": completions[-1] - generation_start,
   }
 
-
 def measure_generations(model, device, prompts: list[list[int]], output_tokens: int, chunk_size: int) -> dict:
   results = [measure_generation(model.generate(list(prompt), chunk_size=chunk_size, temperature=0.0), device, output_tokens)
              for prompt in prompts]
@@ -55,7 +50,6 @@ def measure_generations(model, device, prompts: list[list[int]], output_tokens: 
     "end_to_end_ns": [result["end_to_end_ns"] for result in results],
     "token_ids": [result["token_ids"] for result in results],
   }
-
 
 def main() -> int:
   parser = argparse.ArgumentParser(description=__doc__)
@@ -244,6 +238,5 @@ def main() -> int:
   finally:
     resources.close()
   return 0
-
 
 if __name__ == "__main__": raise SystemExit(main())

@@ -5,17 +5,13 @@ import sys
 import unittest
 from dataclasses import FrozenInstanceError
 from pathlib import Path
-
 import pytest
-
 from infurnace.models import ModelConfigError, qwen3_config_from_gguf
 from infurnace.models.manifest import load_manifest, verified_artifact
-
 
 REPOSITORY_ROOT = Path(__file__).parents[1]
 PINNED_MANIFEST = REPOSITORY_ROOT / "models" / "qwen3-0.6b-q8_0.json"
 PINNED_INSPECTION = REPOSITORY_ROOT / "models" / "qwen3-0.6b-q8_0.inspection.json"
-
 
 def valid_metadata():
   return {
@@ -35,7 +31,6 @@ def valid_metadata():
     "qwen3.attention.value_length": 128,
     "tokenizer.ggml.tokens": [""] * 151936,
   }
-
 
 class TestQwen3Config(unittest.TestCase):
   def test_derives_exact_pinned_configuration(self):
@@ -124,7 +119,6 @@ class TestQwen3Config(unittest.TestCase):
     code = "import sys; import infurnace.models; assert not any(x == 'tinygrad' or x.startswith('tinygrad.') for x in sys.modules)"
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     self.assertEqual(result.returncode, 0, result.stderr)
-
 
 @pytest.mark.model
 @pytest.mark.slow

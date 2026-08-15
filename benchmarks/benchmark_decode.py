@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """Benchmark upstream Qwen steady one-token decode on DEV=NV."""
-
 from __future__ import annotations
-
 import argparse
 import os
 import platform
@@ -23,10 +21,8 @@ except ModuleNotFoundError:
   sys.path.insert(0, str(Path(__file__).parents[1] / "tools"))
   from gguf_inspection import stable_artifact_path
 
-
 def make_prompt(length: int) -> list[int]:
   return [257] + [1000 + index for index in range(length - 1)]
-
 
 def measure_generation(generator, device, decode_tokens: int, snapshot=lambda: None) -> dict:
   def next_token() -> tuple[int, int]:
@@ -71,7 +67,6 @@ def measure_generation(generator, device, decode_tokens: int, snapshot=lambda: N
       "measurement": (measurement_start, measurement_end),
     },
   }
-
 
 def main() -> int:
   parser = argparse.ArgumentParser(description=__doc__)
@@ -227,6 +222,5 @@ def main() -> int:
   finally:
     resources.close()
   return 0
-
 
 if __name__ == "__main__": raise SystemExit(main())

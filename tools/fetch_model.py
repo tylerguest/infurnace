@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 """Acquire a checkpoint only after verifying its pinned identity."""
-
 import argparse
 import sys
 from pathlib import Path
-
 from infurnace.models.manifest import ArtifactError, ManifestError, acquire_artifact, load_manifest
-
 
 def main() -> int:
   parser = argparse.ArgumentParser(description=__doc__)
@@ -26,6 +23,5 @@ def main() -> int:
   print(f"size: {manifest.size_bytes}")
   print(f"sha256: {manifest.sha256}")
   return 0
-
 
 if __name__ == "__main__": raise SystemExit(main())

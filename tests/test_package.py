@@ -3,7 +3,6 @@ import sys
 import unittest
 from importlib.metadata import metadata, version
 
-
 class TestPackage(unittest.TestCase):
   def test_distribution_metadata(self):
     self.assertEqual(metadata("infurnace")["Name"], "infurnace")

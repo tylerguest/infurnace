@@ -1,10 +1,7 @@
 import unittest
-
 from tinygrad import Tensor, dtypes
-
 from infurnace.executor.tinygrad.buffers import ContiguousKVCache, KVCacheError
 from infurnace.models.config import Qwen3Config
-
 
 def _make_config(**overrides) -> Qwen3Config:
   defaults = dict(
@@ -16,7 +13,6 @@ def _make_config(**overrides) -> Qwen3Config:
     tied_embeddings=True, mlp_type="swiglu", tensors=(),
   )
   return Qwen3Config(**{**defaults, **overrides})
-
 
 class TestContiguousKVCache(unittest.TestCase):
   def test_default_allocation_shape_and_size(self):

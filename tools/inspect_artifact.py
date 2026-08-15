@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """Inspect a verified GGUF artifact and cross-check current tinygrad."""
-
 import argparse
 import os
 import sys
@@ -12,7 +11,6 @@ try:
 except ModuleNotFoundError:
   from gguf_inspection import GGUFInspectionError, build_report, crosscheck_tinygrad, scan_gguf, serialize_report, stable_artifact_path
 from infurnace.models.manifest import ArtifactError, ManifestError, load_manifest, verify_artifact
-
 
 def _write_atomic(path: Path, content: str) -> None:
   missing_directories, directory = [], path.parent
@@ -41,7 +39,6 @@ def _write_atomic(path: Path, content: str) -> None:
       finally: os.close(directory_fd)
   finally:
     if temporary_path is not None: temporary_path.unlink(missing_ok=True)
-
 
 def main() -> int:
   parser = argparse.ArgumentParser(description=__doc__)
@@ -81,6 +78,5 @@ def main() -> int:
     print(f"error: {error}", file=sys.stderr)
     return 1
   return 0
-
 
 if __name__ == "__main__": raise SystemExit(main())

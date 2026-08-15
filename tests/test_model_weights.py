@@ -4,9 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-
 import pytest
-
 from infurnace.executor.tinygrad.weights import (
   WeightMappingError, WeightPolicy, load_qwen3_weights, map_qwen3_weights,
 )
@@ -14,14 +12,11 @@ from infurnace.models import qwen3_config_from_gguf
 from infurnace.models.manifest import CheckpointManifest, load_manifest, verified_artifact
 from test_model_config import valid_metadata
 
-
 REPOSITORY_ROOT = Path(__file__).parents[1]
 PINNED_MANIFEST = REPOSITORY_ROOT / "models" / "qwen3-0.6b-q8_0.json"
 
-
 class FakeDType:
   def __init__(self, name): self.name = name
-
 
 class FakeTensor:
   def __init__(self, shape, dtype="float", cast_count=None, contiguous=False):
@@ -34,18 +29,15 @@ class FakeTensor:
 
   def contiguous(self): return FakeTensor(self.shape, self.dtype.name, self.cast_count, True)
 
-
 def valid_tensors():
   specs = qwen3_config_from_gguf(valid_metadata()).tensors
   return {spec.name: FakeTensor(spec.shape, spec.logical_dtype) for spec in specs}
-
 
 def manifest_for(content: bytes) -> CheckpointManifest:
   import hashlib
   return CheckpointManifest(1, "test", "owner/model", "a" * 40, "https://example.com/model.gguf", "model.gguf",
                             "GGUF", "Q8_0", len(content), hashlib.sha256(content).hexdigest(),
                             "Apache-2.0", "https://example.com/LICENSE")
-
 
 class TestVerifiedArtifact(unittest.TestCase):
   def test_holds_private_verified_snapshot_after_source_mutation(self):
@@ -65,7 +57,6 @@ class TestVerifiedArtifact(unittest.TestCase):
       path.chmod(0o444)
       with verified_artifact(path, manifest_for(b"verified")) as artifact:
         self.assertEqual(artifact.path.read_bytes(), b"verified")
-
 
 class TestQwen3WeightMapping(unittest.TestCase):
   def test_maps_lazy_weights_and_ties_output(self):
@@ -116,7 +107,6 @@ class TestQwen3WeightMapping(unittest.TestCase):
       with self.assertRaisesRegex(WeightMappingError, "not the pinned"):
         load_qwen3_weights("missing.gguf", manifest_for(b"other"))
     verify.assert_not_called()
-
 
 @pytest.mark.model
 @pytest.mark.slow

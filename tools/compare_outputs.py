@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
 """Compare Infurnace Qwen3Model greedy output with the tinygrad upstream baseline."""
-
 import argparse
 import json
 import os
 import sys
 from pathlib import Path
-
 from tinygrad import Device, Tensor, dtypes
-
 from infurnace.executor.tinygrad.model import Qwen3Model
 from infurnace.executor.tinygrad.weights import WeightPolicy, load_qwen3_weights
 from infurnace.models.manifest import ArtifactError, ManifestError, load_manifest
@@ -18,9 +15,7 @@ try:
 except ModuleNotFoundError:
   from gguf_inspection import stable_artifact_path
 
-
 FIXED_PROMPT = [257] + [1000 + i for i in range(15)]
-
 
 def _load_upstream_model(artifact: Path, manifest, max_context: int, realize: bool):
   from tinygrad.llm.model import Transformer
@@ -32,7 +27,6 @@ def _load_upstream_model(artifact: Path, manifest, max_context: int, realize: bo
     os.environ["HALF"] = "1"
     model, metadata = Transformer.from_gguf(gguf_tensor, max_context, realize=realize)
   return model, metadata
-
 
 def main() -> int:
   parser = argparse.ArgumentParser(description=__doc__)
@@ -95,7 +89,6 @@ def main() -> int:
   except (ArtifactError, ManifestError, OSError, RuntimeError, ValueError) as error:
     print(f"error: {error}", file=sys.stderr)
     return 1
-
 
 if __name__ == "__main__":
   raise SystemExit(main())
