@@ -1,5 +1,5 @@
 from __future__ import annotations
-from tinygrad import Tensor, TinyJit, dtypes
+from tinygrad import Tensor, TinyJit, UOp, Variable, dtypes
 from tinygrad.helpers import Context
 from .buffers import ContiguousKVCache
 from .model import Qwen3Model
@@ -10,9 +10,10 @@ class RunnerError(ValueError):
 class Qwen3Runner:
   """Serving runner with TinyJit-captured decode contracts.
 
-  Prefill currently uses the eager stateless forward. Decode is captured per slot
-  with a symbolic position Variable so the same compiled program replays for every
-  token position without recompilation.
+  Prefill currently uses the eager stateless forward (Phase 2B). Decode is
+  captured per slot with a symbolic ``Variable("position")``; the JIT contract
+  uses ``@function`` + SSA cache writes so one compiled program replays for
+  every token position without recompilation.
   """
 
   def __init__(self, model: Qwen3Model, kv_cache: ContiguousKVCache):
@@ -22,8 +23,6 @@ class Qwen3Runner:
     self.kv_cache = kv_cache
     self.model.kv_cache = kv_cache
     self._decode_jit: dict[int, TinyJit] = {}
-    # Capture the decode contract immediately on the production cache. Warmup writes
-    # a dummy token at position 0, which the subsequent prefill overwrites.
     for slot in range(kv_cache.num_slots):
       self._decode_jit[slot] = self._capture_decode(slot)
 
@@ -40,44 +39,21 @@ class Qwen3Runner:
       raise RunnerError(f"position {position} out of range [0, {self.kv_cache.max_context})")
 
     ids = input_ids if input_ids.uop.is_realized else input_ids.contiguous().realize()
-    mask = self._decode_mask(position)
-    rope = self.model._rope[position:position+1].contiguous().realize()
-    if not rope.uop.is_realized: rope = rope.clone()
-    logits, k_stores, v_stores = self._decode_jit[slot](ids, mask, rope)
-    self._write_kv_stores(k_stores, v_stores, position, slot)
+    pos_var = Variable("position", 0, self.kv_cache.max_context - 1).bind(position)
+    logits = self._decode_jit[slot](ids, pos_var)
     return logits
-
-  def _decode_mask(self, position: int) -> Tensor:
-    mc = self.kv_cache.max_context
-    device = self.kv_cache.kv.device
-    idx = Tensor.arange(mc + 1, dtype=dtypes.int32).to(device)
-    keep = (idx < position) | (idx == mc)
-    zero = Tensor.zeros(1, dtype=dtypes.float32).to(device)
-    negi = Tensor.full((1,), float("-inf"), dtype=dtypes.float32).to(device)
-    return keep.where(zero, negi).reshape(1, 1, 1, mc + 1).contiguous().realize()
-
-  def _write_kv_stores(self, k_stores: Tensor, v_stores: Tensor, position: int, slot: int) -> None:
-    kv = self.kv_cache.kv
-    writes = []
-    for i in range(self.model.config.block_count):
-      k_write = kv[i, 0, slot, position:position+1, :, :].assign(k_stores[i])
-      v_write = kv[i, 1, slot, position:position+1, :, :].assign(v_stores[i])
-      writes.extend([k_write, v_write])
-    Tensor.realize(*writes)
 
   def _capture_decode(self, slot: int) -> TinyJit:
     @TinyJit
-    def _jit_decode(input_ids: Tensor, attn_mask: Tensor, rope: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-      return self.model._decode_step(input_ids, attn_mask, rope, slot)
+    def _jit_decode(input_ids: Tensor, position: UOp) -> Tensor:
+      return self.model._decode_step(input_ids, position, slot)
 
     max_context = self.kv_cache.max_context
     warmup_ids = Tensor([[0]], dtype=dtypes.int32).contiguous().realize()
-    warmup_mask = self._decode_mask(0)
-    warmup_rope = self.model._rope[0:1].contiguous().realize()
-    if not warmup_rope.uop.is_realized: warmup_rope = warmup_rope.clone()
+    warmup_pos = Variable("position", 0, max_context - 1).bind(0)
 
     with Context(BEAM=0):
-      _jit_decode(warmup_ids, warmup_mask, warmup_rope)
-      _jit_decode(warmup_ids, warmup_mask, warmup_rope)
+      _jit_decode(warmup_ids, warmup_pos)
+      _jit_decode(warmup_ids, warmup_pos)
 
     return _jit_decode

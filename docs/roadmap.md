@@ -151,19 +151,18 @@ prefill matches unchunked execution, and cached decode matches full recomputatio
 
 ### Phase 2C: TinyJit Execution Contracts
 
-- Capture a fixed-shape decode contract using a full-cache read with a float attention
-  mask, avoiding symbolic `Variable` slicing that hung during capture on NV at full
-  model scale.
-- Give each slot its own `TinyJit` instance bound to the slot's KV cache as a model
-  attribute (closure buffer).
-- Pass position-dependent inputs (mask, rope slice) as realized Tensor arguments;
-  write the new K/V stores to the cache outside the JIT.
+- Capture a decode contract with a symbolic `Variable("position")` and SSA
+  `uop.store`/`uop.after` cache writes, so the JIT reads O(position) cache
+  positions per token (no full-cache mask).
+- Give each slot its own `TinyJit` instance bound to the slot's KV cache as
+  a model attribute (closure buffer, like weights).
+- Pass position as a bound `Variable("position")` JIT argument; the captured
+  linear substitutes the value via `var_vals`, reshaping slices per replay.
 - Wrap capture in `Context(BEAM=0)` to reduce one-time compilation cost.
 - Prefill remains eager (Phase 2B path).
 
-**Subphase gate:** JIT capture completes on NV, decode replays across positions without
-recompilation, and greedy output matches Phase 2B eager decode. Decode is O(max_context)
-per token as a known provisional tradeoff.
+**Subphase gate:** JIT capture completes on NV, decode replays across positions
+without recompilation, and greedy output matches Phase 2B eager decode.
 
 ### Phase 2D: Stateful Stress Validation
 

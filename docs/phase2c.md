@@ -1,5 +1,10 @@
 # Phase 2C: TinyJit Decode Contract
 
+> **Note:** This document describes the original Phase 2C mask-based approach,
+> which has been **superseded by Phase 2E** (SSA cache writes + symbolic
+> `Variable` position). Phase 2E reduces decode latency from ~900ms/token to
+> ~3ms/token. See `docs/phase2e.md` for the current implementation.
+
 Phase 2C captures a fixed-shape TinyJit decode contract so a single compiled program
 replays for every decode position without recompilation.
 

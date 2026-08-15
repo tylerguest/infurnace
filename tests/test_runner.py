@@ -139,11 +139,11 @@ class TestQwen3RunnerDecode(unittest.TestCase):
     _logits_close(logits1, logits2)
 
   def test_model_rejects_decode_without_cache(self):
+    from tinygrad import Variable
     with self.assertRaises(ValueError):
       self.model._decode_step(
-        Tensor([[1]], dtype=dtypes.int32),
-        Tensor.full((1, 1, 1, 16), 0.0, dtype=dtypes.float32).contiguous().realize(),
-        self.model._rope[0:1].contiguous().realize(),
+        Tensor([[1]], dtype=dtypes.int32).contiguous().realize(),
+        Variable("position", 0, 15).bind(0),
       )
 
   def test_rejects_decode_input_wrong_shape(self):

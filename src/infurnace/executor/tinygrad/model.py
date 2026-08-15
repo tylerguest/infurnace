@@ -1,6 +1,6 @@
 from __future__ import annotations
 import math
-from tinygrad import Tensor, dtypes
+from tinygrad import Tensor, UOp, dtypes
 from infurnace.models.config import Qwen3Config
 from .buffers import ContiguousKVCache
 from .weights import Qwen3Weights
@@ -150,26 +150,24 @@ class Qwen3Model:
     x = _rms_norm(x[:, -1:], w["output_norm.weight"], config.rms_norm_epsilon)
     return _linear(x, w["output.weight"])[:, -1, :]
 
-  def _decode_step(self, input_ids: Tensor, attn_mask: Tensor, rope: Tensor, slot: int = 0) -> tuple[Tensor, Tensor, Tensor]:
-    """Single-token decode using the model's attached KV cache and a fixed-shape mask.
+  def _decode_step(self, input_ids: Tensor, position: UOp, slot: int = 0) -> Tensor:
+    """Single-token decode using SSA cache writes inside the TinyJit graph.
 
-    Reads the full KV cache (fixed shape) and applies `attn_mask` so positions
-    >= current position are ignored. This keeps the UOp graph fixed-shape and
-    allows TinyJit to reuse one captured program for every decode position.
+    Uses `uop.store` / `uop.after` to write new K/V into the cache at a
+    symbolic position, then reads positions [0:position+1] back. The cache
+    buffer is captured by TinyJit as a closure buffer (like the model weights)
+    so its mutations persist across JIT replays. No `@function` boundary —
+    TinyJit captures the whole graph.
 
-    `rope` must be the pre-sliced rope for the current position.
-
-    Returns `(logits, k_stores, v_stores)`. The caller must write the stores
-    into the KV cache at the current position.
+    ``position`` is a bound ``UOp`` (Variable); the JIT captures its range so
+    one compiled program replays for every position.
     """
     if self.kv_cache is None: raise Qwen3ModelError("kv_cache must be attached to the model before decode")
     kv = self.kv_cache.kv
     config, w = self.config, self._w
-    batch, seq_len = input_ids.shape
+    rope = self._rope[position:position+1]
     x = w["token_embd.weight"][input_ids].float()
 
-    k_stores = []
-    v_stores = []
     for i in range(config.block_count):
       p = f"blk.{i}"
 
@@ -178,9 +176,9 @@ class Qwen3Model:
       k = _linear(h, w[f"{p}.attn_k.weight"])
       v = _linear(h, w[f"{p}.attn_v.weight"])
 
-      q = q.reshape(batch, seq_len, config.attention_head_count, config.key_length).transpose(1, 2)
-      k = k.reshape(batch, seq_len, config.attention_head_count_kv, config.key_length).transpose(1, 2)
-      v = v.reshape(batch, seq_len, config.attention_head_count_kv, config.value_length).transpose(1, 2)
+      q = q.reshape(1, 1, config.attention_head_count, config.key_length).transpose(1, 2)
+      k = k.reshape(1, 1, config.attention_head_count_kv, config.key_length).transpose(1, 2)
+      v = v.reshape(1, 1, config.attention_head_count_kv, config.value_length).transpose(1, 2)
 
       q = _rms_norm(q, w[f"{p}.attn_q_norm.weight"], config.rms_norm_epsilon)
       k = _rms_norm(k, w[f"{p}.attn_k_norm.weight"], config.rms_norm_epsilon)
@@ -188,14 +186,19 @@ class Qwen3Model:
       q = _apply_rope(q, rope)
       k = _apply_rope(k, rope)
 
-      # Read the full cache; mask hides positions that are not yet populated.
-      cached_k = kv[i, 0, slot].permute(1, 0, 2).unsqueeze(0)
-      cached_v = kv[i, 1, slot].permute(1, 0, 2).unsqueeze(0)
-      full_k = cached_k.cat(k, dim=2)
-      full_v = cached_v.cat(v, dim=2)
+      # SSA store k/v into cache at symbolic position, then observe the
+      # cache after the store to read positions [0:position+1].
+      k_for_store = k[0].permute(1, 0, 2).contiguous().cast(kv.dtype)
+      v_for_store = v[0].permute(1, 0, 2).contiguous().cast(kv.dtype)
+      store_uop = kv[i, :, slot, position:position+1, :, :].uop.store(
+        Tensor.stack(k_for_store, v_for_store).uop
+      )
+      assigned = Tensor(kv[i, :, slot].uop.after(store_uop))
+      cached_k = assigned[0, 0:position+1, :, :].permute(1, 0, 2).unsqueeze(0).float()
+      cached_v = assigned[1, 0:position+1, :, :].permute(1, 0, 2).unsqueeze(0).float()
 
-      attn = q.scaled_dot_product_attention(full_k, full_v, attn_mask=attn_mask, is_causal=False, enable_gqa=True)
-      attn = attn.transpose(1, 2).reshape(batch, seq_len, -1)
+      attn = q.scaled_dot_product_attention(cached_k, cached_v, is_causal=False, enable_gqa=True)
+      attn = attn.transpose(1, 2).reshape(1, 1, -1)
       x = x + _linear(attn, w[f"{p}.attn_output.weight"])
 
       h = _rms_norm(x, w[f"{p}.ffn_norm.weight"], config.rms_norm_epsilon)
@@ -203,12 +206,8 @@ class Qwen3Model:
       up = _linear(h, w[f"{p}.ffn_up.weight"])
       x = (x + _linear(gate.silu().contiguous() * up, w[f"{p}.ffn_down.weight"])).contiguous()
 
-      k_stores.append(k[0].permute(1, 0, 2).contiguous().cast(kv.dtype))
-      v_stores.append(v[0].permute(1, 0, 2).contiguous().cast(kv.dtype))
-
     x = _rms_norm(x[:, -1:], w["output_norm.weight"], config.rms_norm_epsilon)
-    logits = _linear(x, w["output.weight"])[:, -1, :]
-    return logits, Tensor.stack(k_stores), Tensor.stack(v_stores)
+    return _linear(x, w["output.weight"])[:, -1, :]
 
   def prefill(self, input_ids: Tensor, kv_cache: ContiguousKVCache, slot: int = 0) -> Tensor:
     if not isinstance(kv_cache, ContiguousKVCache): raise Qwen3ModelError("kv_cache must be a ContiguousKVCache")

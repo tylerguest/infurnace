@@ -195,8 +195,11 @@ For Qwen3-0.6B the concrete Phase 2A contract is:
 
 The tensor is allocated with `Tensor.zeros`, made contiguous, and realized
 before use. `Tensor.empty(...).realize()` is not used because an initialized
-backing buffer is required. The model receives the cache as an explicit input
-and owns no conversation KV state.
+backing buffer is required. The runner assigns the cache to the model as a
+transient `kv_cache` attribute during JIT capture so the cache buffer is
+captured by `TinyJit` as a closure buffer (like model weights). The runner
+owns cache allocation, clearing (`clear_slot`), and replacement; the model
+holds no conversation history or KV lifecycle state.
 
 The exact axis order is part of the executor contract once captured. The server
 may expose a context limit below the model maximum so cache slots, model
