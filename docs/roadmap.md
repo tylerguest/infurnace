@@ -170,7 +170,7 @@ per token as a known provisional tradeoff.
 - Compare cached decode logits with full-sequence recomputation at every position,
   including chunk and cache boundaries.
 - Repeat conversations, cache replacement, cancellation-equivalent cleanup, and
-  context-boundary workloads without reusing stale state.
+  context-boundary workloads without reusing stale state via `clear_slot`.
 
 **Subphase gate:** Repeated and boundary-heavy traces preserve logits and caller-owned
 cache contents without state leaking between conversations.

@@ -63,3 +63,19 @@ class ContiguousKVCache:
   @property
   def head_dim(self) -> int:
     return self.config.key_length
+
+  def clear_slot(self, slot: int) -> None:
+    """Zero out all KV entries for *slot*, enabling reuse without stale state.
+
+    After clearing, the slot is in the same state as a freshly allocated cache.
+    The caller is responsible for re-prefilling before decoding.
+    """
+    if slot < 0 or slot >= self.num_slots:
+      raise KVCacheError(f"slot {slot} out of range [0, {self.num_slots})")
+    shape = (
+      self.config.block_count, 2, 1, self.max_context,
+      self.config.attention_head_count_kv, self.config.key_length,
+    )
+    self.kv[:, :, slot:slot+1].assign(
+      Tensor.zeros(*shape, dtype=self.dtype, device=self.kv.device)
+    ).realize()

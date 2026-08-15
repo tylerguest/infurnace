@@ -157,3 +157,159 @@ class TestQwen3RunnerDecode(unittest.TestCase):
     runner = Qwen3Runner(self.model, cache)
     with self.assertRaises(RunnerError):
       runner.decode(Tensor([[1]], dtype=dtypes.int32), position=16)
+
+
+class TestQwen3RunnerStress(unittest.TestCase):
+  """Phase 2D: stateful stress validation across positions, conversations, and slots."""
+
+  def setUp(self):
+    self.config = _make_config()
+    self.weights = _make_weights(self.config)
+    self.model = Qwen3Model(self.weights)
+
+  def _stateless_logits(self, token_ids: list[int]) -> list[float]:
+    return self.model(Tensor([token_ids], dtype=dtypes.int32)).realize().tolist()[0]
+
+  def _run_jit_conversation(self, runner: Qwen3Runner, tokens: list[int], slot: int = 0) -> list[list[float]]:
+    logits = runner.prefill(Tensor([[tokens[0]]], dtype=dtypes.int32), slot=slot).realize()
+    all_logits = [logits.tolist()[0]]
+    for i in range(1, len(tokens)):
+      logits = runner.decode(Tensor([[tokens[i]]], dtype=dtypes.int32), position=i, slot=slot).realize()
+      all_logits.append(logits.tolist()[0])
+    return all_logits
+
+  # ------------------------------------------------------------------
+  # Per-position correctness
+  # ------------------------------------------------------------------
+
+  def test_decode_matches_recompute_every_position(self):
+    tokens = list(range(1, 17))
+    expected = [self._stateless_logits(tokens[:i+1]) for i in range(len(tokens))]
+
+    cache = ContiguousKVCache(self.config, max_context=16, num_slots=1)
+    runner = Qwen3Runner(self.model, cache)
+    actual = self._run_jit_conversation(runner, tokens)
+
+    for j, (e, a) in enumerate(zip(expected, actual)):
+      _logits_close(e, a, abs_tol=2e-3)
+
+  def test_context_boundary_decode(self):
+    mc = 4
+    tokens = list(range(1, mc + 1))
+    expected = self._stateless_logits(tokens)
+
+    cache = ContiguousKVCache(self.config, max_context=mc, num_slots=1)
+    runner = Qwen3Runner(self.model, cache)
+    _logits_close(expected, self._run_jit_conversation(runner, tokens)[-1])
+
+    with self.assertRaises(RunnerError):
+      runner.decode(Tensor([[1]], dtype=dtypes.int32), position=mc)
+
+  def test_chunked_prefill_then_jit_decode(self):
+    prefill_tokens = [1, 2, 3, 4]
+    decode_tokens = [5, 6, 7]
+    all_tokens = prefill_tokens + decode_tokens
+    expected = [self._stateless_logits(all_tokens[:i+1]) for i in range(len(all_tokens))]
+
+    cache = ContiguousKVCache(self.config, max_context=16, num_slots=1)
+    chunk_prefill_logits = None
+    for cs in range(0, len(prefill_tokens), 2):
+      chunk = prefill_tokens[cs:cs+2]
+      chunk_prefill_logits = self.model.forward(
+        Tensor([chunk], dtype=dtypes.int32), start_position=cs, kv=cache.kv
+      ).realize()
+    _logits_close(expected[len(prefill_tokens)-1], chunk_prefill_logits.tolist()[0])
+
+    runner = Qwen3Runner(self.model, cache)
+    actual = [expected[len(prefill_tokens)-1]]
+    for i, tok in enumerate(decode_tokens):
+      pos = len(prefill_tokens) + i
+      logits = runner.decode(Tensor([[tok]], dtype=dtypes.int32), position=pos).realize()
+      actual.append(logits.tolist()[0])
+
+    for j in range(len(prefill_tokens)-1, len(all_tokens)):
+      _logits_close(expected[j], actual[j - (len(prefill_tokens)-1)])
+
+  # ------------------------------------------------------------------
+  # Conversation reuse and cancellation cleanup
+  # ------------------------------------------------------------------
+
+  def test_repeated_conversation_no_leak(self):
+    conv_a = [1, 2, 3, 4]
+    conv_b = [5, 6, 7, 8]
+    expected_b = [self._stateless_logits(conv_b[:i+1]) for i in range(len(conv_b))]
+
+    cache = ContiguousKVCache(self.config, max_context=16, num_slots=1)
+    runner = Qwen3Runner(self.model, cache)
+    self._run_jit_conversation(runner, conv_a)
+    cache.clear_slot(0)
+    actual_b = self._run_jit_conversation(runner, conv_b)
+
+    for e, a in zip(expected_b, actual_b):
+      _logits_close(e, a, abs_tol=2e-3)
+
+  def test_cancellation_cleanup(self):
+    conv_a = [1, 2, 3, 4, 5]
+    conv_b = [6, 7, 8, 9, 10]
+    expected_b = [self._stateless_logits(conv_b[:i+1]) for i in range(len(conv_b))]
+
+    cache = ContiguousKVCache(self.config, max_context=16, num_slots=1)
+    runner = Qwen3Runner(self.model, cache)
+    # Start conversation A, decode only 2 tokens, then cancel
+    runner.prefill(Tensor([[conv_a[0]]], dtype=dtypes.int32)).realize()
+    for i in range(1, 3):
+      runner.decode(Tensor([[conv_a[i]]], dtype=dtypes.int32), position=i).realize()
+    cache.clear_slot(0)
+    actual_b = self._run_jit_conversation(runner, conv_b)
+
+    for e, a in zip(expected_b, actual_b):
+      _logits_close(e, a, abs_tol=2e-3)
+
+  def test_clear_slot_rejects_out_of_range(self):
+    cache = ContiguousKVCache(self.config, max_context=8, num_slots=2)
+    from infurnace.executor.tinygrad.buffers import KVCacheError
+    with self.assertRaises(KVCacheError):
+      cache.clear_slot(2)
+    with self.assertRaises(KVCacheError):
+      cache.clear_slot(-1)
+
+  # ------------------------------------------------------------------
+  # Cache replacement
+  # ------------------------------------------------------------------
+
+  def test_cache_replacement_same_output(self):
+    tokens = [1, 2, 3, 4, 5]
+
+    cache1 = ContiguousKVCache(self.config, max_context=16, num_slots=1)
+    model1 = Qwen3Model(self.weights)
+    runner1 = Qwen3Runner(model1, cache1)
+    logits1 = self._run_jit_conversation(runner1, tokens)
+
+    cache2 = ContiguousKVCache(self.config, max_context=16, num_slots=1)
+    model2 = Qwen3Model(self.weights)
+    runner2 = Qwen3Runner(model2, cache2)
+    logits2 = self._run_jit_conversation(runner2, tokens)
+
+    for l1, l2 in zip(logits1, logits2):
+      _logits_close(l1, l2)
+
+  # ------------------------------------------------------------------
+  # Multi-slot isolation
+  # ------------------------------------------------------------------
+
+  def test_multi_slot_runner_isolation(self):
+    tokens_a = [1, 2, 3, 4]
+    tokens_b = [5, 6, 7, 8]
+    expected_a = [self._stateless_logits(tokens_a[:i+1]) for i in range(len(tokens_a))]
+    expected_b = [self._stateless_logits(tokens_b[:i+1]) for i in range(len(tokens_b))]
+
+    cache = ContiguousKVCache(self.config, max_context=16, num_slots=2)
+    runner = Qwen3Runner(self.model, cache)
+
+    actual_a = self._run_jit_conversation(runner, tokens_a, slot=0)
+    actual_b = self._run_jit_conversation(runner, tokens_b, slot=1)
+
+    for e, a in zip(expected_a, actual_a):
+      _logits_close(e, a, abs_tol=2e-3)
+    for e, a in zip(expected_b, actual_b):
+      _logits_close(e, a, abs_tol=2e-3)
