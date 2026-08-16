@@ -120,6 +120,17 @@ A request records token IDs, sampling parameters, computed-token count, status,
 output-queue state, and logical cache ownership. It does not contain tinygrad
 tensors or model-specific weight state.
 
+**Request metrics:** Each request tracks `arrival_time`, `first_token_time` (TTFT),
+and `completion_time` for observability.
+
+**Stop conditions:** Requests support `stop_token_ids` (EOS), `min_tokens` (minimum
+generation), and `stop` strings (future). The `check_finished(new_token_id)` method
+evaluates all conditions and returns the stop reason.
+
+**Read-only token views:** `output_token_ids` and `all_token_ids` are exposed as
+read-only views (ConstantList pattern) to prevent accidental mutation by scheduler
+or engine components.
+
 An execution plan is immutable after submission. It identifies request IDs, token
 spans, positions, cache assignments, the exact execution contract, and output
 routing. Cancelling an in-flight request suppresses its output immediately, but its
@@ -288,6 +299,30 @@ slot is reused.
 Production may capture model and sampling together if profiling shows that avoiding
 a materialized batch-by-vocabulary logits buffer is important. A logits-returning
 debug path remains available for numerical validation.
+
+## Tokenization and Incremental Detokenization
+
+Infurnace uses incremental detokenization with `prefix_offset`/`read_offset`
+(vLLM/SGLang/llama.cpp pattern) — NOT byte buffering. This defeats tokenizer
+cleanup algorithms (SentencePiece leading space `▁`, BPE merge rules) and works
+for all tokenizer types.
+
+The detokenizer maintains:
+- `prefix_offset`: start of the context window used for decoding
+- `read_offset`: end of the context window
+- `output_text`: accumulated decoded text
+
+On each new token, `detokenize_incrementally(tokenizer, all_token_ids, prev_tokens,
+prefix_offset, read_offset, skip_special_tokens)` returns new tokens, new text,
+and updated offsets. This is the only correct approach for streaming output with
+SentencePiece-based tokenizers (Qwen, Llama, Mistral).
+
+Tokenizer abstraction supports loading from GGUF-embedded tokenizer and external
+`tokenizer.json` (Hugging Face format). The engine injects the tokenizer into
+the output queue for incremental decoding.
+
+Stop string evaluation uses `check_stop_strings(text, new_char_count, stop_strings,
+include_in_output)` returning matched string and truncation point.
 
 ## Server and Process Model
 

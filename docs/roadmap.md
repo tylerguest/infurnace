@@ -185,43 +185,80 @@ owns no conversation history or KV state.
 - Implement request IDs, waiting, prefilling, decoding, and terminal outcomes.
 - Support rejection, failure, and cancellation from every nonterminal state.
 - Add bounded input, output, context, and generated-token limits.
+- **Stop condition handling:** `stop` strings, `stop_token_ids`, `min_tokens`, `include_stop_str_in_output`.
+- **Request metrics:** `arrival_time`, `first_token_time` (TTFT), `completion_time`.
+- **Read-only token views:** `output_token_ids`, `all_token_ids` via `ConstantList` pattern to prevent accidental mutation.
+- **Session/conversation ID:** `session_id` field for Phase 8 prefix cache preparation.
+- **Finish checking:** `check_finished(new_token_id) -> Optional[str]` returning stop reason.
 
 **Subphase gate:** CPU-only transition tests prove that every request reaches at most
-one terminal outcome and releases logical resources exactly once.
+one terminal outcome and releases logical resources exactly once. Stop condition
+tests verify `stop_token_ids`, `min_tokens`, and `stop` strings (if implemented).
+Metrics collection verified at each transition.
 
 ### Phase 3B: Scheduler and Execution Plans
 
 - Add immutable prefill and decode execution plans.
 - Keep prefill single-request and execution serial in this phase. Concurrent clients
   may queue, but the server makes no throughput claim yet.
+- **Prefill plan fields:** `request_id`, `input_ids`, `chunk_bounds` (for bounded chunked prefill), `cache_slot`, `prefix_token_ids`, `prefix_cache_hit`.
+- **Decode plan fields:** `request_ids[]`, `input_ids[]`, `positions[]`, `slots[]`, `active_mask[]`, `block_tables[]` (paged KV prep), `sampling_params[]` (per-request for batched sampling).
+- **Priority/fairness metadata** in plans (FIFO for v0.1, extensible).
+- **Prefix cache lookup integration point** in scheduler admission.
 
 **Subphase gate:** A fake runner produces deterministic queue order and plans that do
 not change after submission; cancellation suppresses in-flight output safely.
+Chunked prefill plans match unchunked execution. Plan structure supports future
+paged KV and prefix cache without modification.
 
 ### Phase 3C: Offline Engine
 
 - Expose an offline `add_request`, `step`, cancellation, and token-output API.
+- **Engine step result:** `completed_requests`, `new_tokens` per request, `metrics` per request, `cache_slots_freed`.
+- **Async scheduling interface:** `prepare_step() -> list[ExecutionPlan]`, `execute_step(plans) -> EngineStepResult`, `commit_step(result)`.
+- **Cache slot manager:** allocate on prefill start, clear on finish/cancel, track ownership (active + in-flight).
+- **Metrics collection** at engine level per step.
 
 **Subphase gate:** The complete request and scheduler path works with a deterministic
 fake runner, including queueing, completion, failure, rejection, and cancellation.
+Cache slots allocated/cleared correctly on all terminal paths. Metrics recorded
+for each request.
 
 ### Phase 3D: Tokenization and Output Streaming
 
-- Add tokenizer and detokenizer integration, including incremental UTF-8 decoding.
+- Add tokenizer and detokenizer integration.
+- **Incremental detokenization with `prefix_offset`/`read_offset`** (vLLM/SGLang/llama.cpp pattern) — NOT byte buffering. Defeats tokenizer cleanup algorithms (SentencePiece leading space, BPE merge). Works for all tokenizers.
+- **Tokenizer abstraction:** load from GGUF-embedded tokenizer and/or external `tokenizer.json` (Hugging Face format).
+- **Stop string evaluation:** `check_stop_strings(text, new_char_count, stop_strings, include_in_output)` returning matched string and truncation point.
 - Bound output queues to enforce backpressure without blocking scheduler progress.
 - Use greedy sampling so end-to-end behavior is deterministic.
+- **Logprobs streaming infrastructure** (stub for Phase 7).
 
 **Subphase gate:** Offline output never emits malformed UTF-8, terminal output is
 emitted once, and slow consumers cannot grow memory without bound.
+Incremental detokenization matches reference `detokenize_incrementally` behavior
+for Qwen3 tokenizer (SentencePiece). Stop strings evaluated correctly.
 
 ### Phase 3E: Real Runner Integration
 
 - Connect the external contiguous-KV runner to the same offline engine contracts.
+- **Cache slot allocation** on prefill start, **clearance** on finish/cancel.
+- **EOS handling** via `stop_token_ids` from model config.
+- **Metrics collection** at each engine step (TTFT, decode latency, token throughput).
 
 **Subphase gate:** Fixed requests produce the same greedy tokens through direct model
 execution and the offline engine, with no cache state leaked on any terminal path.
+Metrics match between direct runner and engine-driven execution.
 
-### Phase 3F: HTTP Adapter
+**Gate (CLI v0.1):** Offline engine drives correct greedy generation through
+request lifecycle, scheduler, tokenizer, and runner without leaked cache state.
+Repeated runs produce identical schedule and output. Incremental detokenization
+produces valid UTF-8. Stop conditions (`stop_token_ids`, `min_tokens`) enforced.
+
+**Release:** `v0.1`, constrained tinygrad inference server (CLI/offline API).
+HTTP adapter deferred to post-v0.1.
+
+### Phase 3F: HTTP Adapter (Deferred)
 
 - Put a small documented HTTP completion and streaming adapter over that same engine.
 - Cancel disconnected clients and bound output queues to enforce backpressure.
@@ -230,11 +267,8 @@ execution and the offline engine, with no cache state leaked on any terminal pat
 **Subphase gate:** Protocol tests prove that HTTP cannot bypass the engine and that
 disconnect, backpressure, health, and capacity errors preserve engine invariants.
 
-**Gate:** Concurrent clients can queue, stream, finish, fail, and cancel independently
-without leaked cache state or a protocol path that bypasses the engine. Repeated
-runs produce the same schedule and greedy output.
-
-**Release:** `v0.1`, constrained tinygrad inference server.
+**Status:** Deferred. CLI-first development targets v0.1 via offline engine (Phase 3E).
+HTTP adapter will be added in a subsequent release after CLI path is validated.
 
 ## Phase 4: Fixed Batched Decode
 
