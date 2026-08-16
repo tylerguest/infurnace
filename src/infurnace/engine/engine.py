@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Mapping, Sequence
+from typing import Mapping
 
 from tinygrad import Tensor, dtypes
 
@@ -9,6 +9,7 @@ from infurnace.scheduler.plan import ExecutionPlan, PrefillPlan, DecodePlan
 from infurnace.scheduler.scheduler import Scheduler, SchedulerError
 from infurnace.executor.runner import Runner
 from infurnace.sampler import Sampler, GreedySampler
+from infurnace.tokenizer import Tokenizer, StreamingDetokenizer, check_stop_strings
 
 
 @dataclass(frozen=True)
@@ -17,8 +18,10 @@ class EngineStepResult:
 
     completed_requests: tuple[str, ...]
     new_tokens: Mapping[str, tuple[int, ...]]
-    metrics: Mapping[str, RequestMetrics]
-    cache_slots_freed: tuple[int, ...]
+    new_text: Mapping[str, str] = field(default_factory=dict)
+    metrics: Mapping[str, RequestMetrics] = field(default_factory=dict)
+    cache_slots_freed: tuple[int, ...] = ()
+    logprobs: Mapping[str, object] = field(default_factory=dict)  # Phase 7 stub
 
 
 @dataclass
@@ -40,15 +43,9 @@ class RawStep:
 class Engine:
     """Offline inference engine driving the scheduler and a ``Runner``.
 
-    The engine owns request lifecycle application, sampling, cache-slot
-    clearance, and metrics. It is runner-agnostic: a ``FakeRunner`` (CPU-only)
-    validates the control plane, and the real ``Qwen3Runner`` is injected in
-    Phase 3E without engine changes.
-
-    The per-iteration path is split into ``prepare_step`` (scheduling),
-    ``execute_step`` (runner + sampler only), and ``commit_step`` (apply to
-    requests/scheduler). ``step`` composes them; the split is the seam for
-    future device-overlap (Phase 6).
+    Optionally tokenized: when a ``Tokenizer`` is supplied, prompts may be added
+    as text (``add_text_request``), generated tokens are streamed as incremental
+    text (``new_text``), and ``stop_strings`` are evaluated per request.
     """
 
     def __init__(
@@ -56,21 +53,44 @@ class Engine:
         runner: Runner,
         scheduler: Scheduler | None = None,
         sampler: Sampler | None = None,
+        tokenizer: Tokenizer | None = None,
     ) -> None:
         self.runner = runner
         self.scheduler = scheduler or Scheduler(num_slots=runner.num_slots)
         self.sampler = sampler or GreedySampler()
+        self.tokenizer = tokenizer
+        self._detoks: dict[str, StreamingDetokenizer] = {}
 
     # --- Offline request API ---
     def add_request(self, req: Request) -> None:
         try:
             self.scheduler.add_request(req)
         except SchedulerError:
-            # Admission failure surfaces as a terminal REJECTED outcome.
             req.transition(RequestState.REJECTED)
 
+    def add_text_request(
+        self,
+        prompt: str,
+        sampling_params=None,
+        stop_strings: list[str] | None = None,
+        request_id: str | None = None,
+        context_limit: int = 1024,
+        **kw,
+    ) -> Request:
+        if self.tokenizer is None:
+            raise RuntimeError("engine has no tokenizer; cannot add a text request")
+        token_ids = self.tokenizer.encode(prompt)
+        rid = request_id or f"req-{len(self._detoks) + 1}"
+        req = Request(
+            rid, token_ids, sampling_params or SamplingParams(),
+            context_limit, prompt=prompt, stop_strings=stop_strings or [], **kw,
+        )
+        self._detoks[req.request_id] = StreamingDetokenizer(self.tokenizer, skip_prompt_len=len(token_ids))
+        self.add_request(req)
+        return req
+
     def cancel(self, request_id: str) -> None:
-        req = self._try_get(req_id=request_id)
+        req = self._try_get(request_id)
         slot = req.cache_slot if req is not None else None
         self.scheduler.cancel(request_id)
         if slot is not None:
@@ -81,6 +101,10 @@ class Engine:
 
     def metrics_of(self, request_id: str) -> RequestMetrics:
         return self.scheduler.get_request(request_id).metrics
+
+    def final_text(self, request_id: str) -> str:
+        detok = self._detoks.get(request_id)
+        return detok.text if detok else ""
 
     def is_done(self) -> bool:
         return self.scheduler.is_idle
@@ -101,6 +125,7 @@ class Engine:
     def commit_step(self, raw: RawStep) -> EngineStepResult:
         completed: list[str] = []
         new_tokens: dict[str, list[int]] = {}
+        new_text: dict[str, list[str]] = {}
         metrics: dict[str, RequestMetrics] = {}
         freed: list[int] = []
         for r in raw.results:
@@ -115,11 +140,29 @@ class Engine:
                 continue
             req.append_output_token(r.token)
             new_tokens.setdefault(r.request_id, []).append(r.token)
+            delta = ""
+            if self.tokenizer is not None:
+                detok = self._detoks.get(r.request_id)
+                if detok is not None:
+                    delta = detok.update(req.all_token_ids)
+                    new_text.setdefault(r.request_id, []).append(delta)
             if r.is_prefill:
                 # Sampling the first token consumed the prefill logits; the
                 # request now enters DECODING so the next step feeds it back.
                 self.scheduler.mark_prefill_chunk_done(r.request_id, len(r.plan.chunk_bounds) - 1)
             reason = req.check_finished(r.token)
+            if reason is None and self.tokenizer is not None and req.stop_strings:
+                detok = self._detoks.get(r.request_id)
+                if detok is not None:
+                    matched, _stop, trunc = check_stop_strings(
+                        detok.text, len(delta), req.stop_strings,
+                        req.sampling_params.include_stop_str_in_output)
+                    if matched:
+                        reason = "stop"
+                        if not req.sampling_params.include_stop_str_in_output:
+                            before = len(detok.text) - len(delta)
+                            detok._text = detok._text[:trunc]
+                            new_text[r.request_id][-1] = detok._text[before:]
             if reason is not None:
                 slot = req.cache_slot
                 self.scheduler.mark_finished(r.request_id)
@@ -131,6 +174,7 @@ class Engine:
         return EngineStepResult(
             completed_requests=tuple(completed),
             new_tokens={k: tuple(v) for k, v in new_tokens.items()},
+            new_text={k: "".join(v) for k, v in new_text.items()},
             metrics=metrics,
             cache_slots_freed=tuple(freed),
         )

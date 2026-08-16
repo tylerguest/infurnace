@@ -70,6 +70,8 @@ class Request:
     context_limit: int
     eos_token_ids: list[int] = field(default_factory=list)
     session_id: Optional[str] = None
+    prompt: Optional[str] = None
+    stop_strings: list[str] = field(default_factory=list)
 
     # Mutable state
     state: RequestState = RequestState.WAITING
@@ -121,7 +123,7 @@ class Request:
         self.computed_tokens += 1
 
     def check_finished(self, new_token_id: int) -> Optional[str]:
-        """Return stop reason or None. Integer-based only (no tokenizer)."""
+        """Return stop reason or None (token-id based). Stop strings are checked at the engine."""
         # min_tokens floor: force continuation until reached (blocks EOS/stop)
         if len(self._output_token_ids) < self.sampling_params.min_tokens:
             return None
