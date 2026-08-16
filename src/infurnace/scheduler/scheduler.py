@@ -60,6 +60,15 @@ class Scheduler:
         self._prefill_chunk.pop(request_id, None)
         req.transition(RequestState.CANCELLED)
 
+    def get_request(self, request_id: str) -> Request:
+        """Return the live request object (read access for the engine)."""
+        return self._requests[request_id]
+
+    @property
+    def is_idle(self) -> bool:
+        """True when nothing is waiting, active, or mid-prefill."""
+        return not (self._waiting or self._active or self._prefill_chunk)
+
     # --- Scheduling ---
     def schedule(self) -> list[ExecutionPlan]:
         # 1) Continue an in-progress prefill (serial: one at a time)

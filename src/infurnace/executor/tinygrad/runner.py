@@ -26,6 +26,13 @@ class Qwen3Runner:
     for slot in range(kv_cache.num_slots):
       self._decode_jit[slot] = self._capture_decode(slot)
 
+  @property
+  def num_slots(self) -> int:
+    return self.kv_cache.num_slots
+
+  def clear_slot(self, slot: int) -> None:
+    self.kv_cache.clear_slot(slot)
+
   def prefill(self, input_ids: Tensor, slot: int = 0) -> Tensor:
     """Eager prefill at position 0."""
     return self.model.prefill(input_ids, self.kv_cache, slot=slot)

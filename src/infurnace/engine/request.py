@@ -100,8 +100,6 @@ class Request:
             raise ValueError(f"invalid transition: {self.state} -> {new_state}")
         if new_state == RequestState.FINISHED:
             self.metrics.completion_time = monotonic()
-        elif new_state == RequestState.DECODING and self.metrics.first_token_time is None:
-            self.metrics.first_token_time = monotonic()
         self.state = new_state
 
     def is_terminal(self) -> bool:
@@ -115,6 +113,9 @@ class Request:
 
     # --- Token append + stop check ---
     def append_output_token(self, token_id: int) -> None:
+        # TTFT is the time of the first *generated* token (standard definition).
+        if self.metrics.first_token_time is None:
+            self.metrics.first_token_time = monotonic()
         self._output_token_ids.append(token_id)
         self._all_token_ids.append(token_id)
         self.computed_tokens += 1

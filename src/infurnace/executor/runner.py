@@ -10,6 +10,12 @@ class Runner(ABC):
     cache ownership. The engine drives it through prefill and decode steps.
     """
 
+    @property
+    @abstractmethod
+    def num_slots(self) -> int:
+        """Number of independent cache slots the runner can execute concurrently."""
+        ...
+
     @abstractmethod
     def prefill(self, input_ids: Tensor, slot: int = 0) -> Tensor:
         """Eager prefill at position 0. ``input_ids`` has shape ``[1, T]``.
@@ -24,5 +30,14 @@ class Runner(ABC):
 
         ``position`` is the absolute position of the decoded token. Returns
         logits of shape ``[1, vocab_size]``.
+        """
+        ...
+
+    @abstractmethod
+    def clear_slot(self, slot: int) -> None:
+        """Reset the KV cache contents of ``slot`` so it can be reused.
+
+        Called by the engine on every terminal transition (finished, cancelled,
+        failed) after the request's cache slot is reclaimed.
         """
         ...

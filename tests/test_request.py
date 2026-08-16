@@ -84,10 +84,13 @@ class TestMetrics(unittest.TestCase):
         req = _make()
         self.assertIsNotNone(req.metrics.arrival_time)
 
-    def test_first_token_on_decode(self):
+    def test_first_token_on_first_output(self):
         req = _make()
         req.transition(RequestState.PREFILLING)
         req.transition(RequestState.DECODING)
+        # TTFT is recorded at the first *generated* token, not at prefill end.
+        self.assertIsNone(req.metrics.first_token_time)
+        req.append_output_token(7)
         self.assertIsNotNone(req.metrics.first_token_time)
         self.assertIsNotNone(req.metrics.ttft)
 
