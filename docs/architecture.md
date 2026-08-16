@@ -300,22 +300,28 @@ Production may capture model and sampling together if profiling shows that avoid
 a materialized batch-by-vocabulary logits buffer is important. A logits-returning
 debug path remains available for numerical validation.
 
-## Tokenization and Incremental Detokenization
+## Tokenization and Detokenization
 
-Infurnace uses incremental detokenization with `prefix_offset`/`read_offset`
-(vLLM/SGLang/llama.cpp pattern) — NOT byte buffering. This defeats tokenizer
-cleanup algorithms (SentencePiece leading space `▁`, BPE merge rules) and works
-for all tokenizer types.
+Infurnace streamed output is produced by a per-request `StreamingDetokenizer`
+that re-decodes the full accumulated token sequence on each new token and returns
+only the bytes past its previous read offset. The `prefix_offset`/`read_offset`
+interface is accepted for signature compatibility with the vLLM/SGLang/llama.cpp
+pattern, but the current implementation does not window-decode: it keeps the
+streaming invariant `''.join(deltas) == tokenizer.decode(all_token_ids)`, which
+is correct for per-character and byte-fallback tokenizers where window-only
+decoding would drop characters at prefix boundaries.
+
+This full-re-decode strategy is simple and correct but O(n²) in the number of
+generated tokens. True window-based incremental detokenization with
+`prefix_offset`/`read_offset` remains future work; it is the only change needed
+once per-character/boundary handling matters for very long streams.
 
 The detokenizer maintains:
-- `prefix_offset`: start of the context window used for decoding
-- `read_offset`: end of the context window
-- `output_text`: accumulated decoded text
+- `read_offset`: number of characters already emitted;
+- `text`: the accumulated decoded text.
 
-On each new token, `detokenize_incrementally(tokenizer, all_token_ids, prev_tokens,
-prefix_offset, read_offset, skip_special_tokens)` returns new tokens, new text,
-and updated offsets. This is the only correct approach for streaming output with
-SentencePiece-based tokenizers (Qwen, Llama, Mistral).
+`detokenize_incrementally` returns `(delta, len(all_token_ids), len(full))` for
+callers that expect the vLLM-style signature.
 
 Tokenizer abstraction supports loading from GGUF-embedded tokenizer and external
 `tokenizer.json` (Hugging Face format). The engine injects the tokenizer into

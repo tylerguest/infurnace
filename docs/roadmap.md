@@ -227,7 +227,11 @@ for each request.
 ### Phase 3D: Tokenization and Output Streaming
 
 - Add tokenizer and detokenizer integration.
-- **Incremental detokenization with `prefix_offset`/`read_offset`** (vLLM/SGLang/llama.cpp pattern) — NOT byte buffering. Defeats tokenizer cleanup algorithms (SentencePiece leading space, BPE merge). Works for all tokenizers.
+- **Streaming detokenization:** the `StreamingDetokenizer` re-decodes the full
+  accumulated token sequence each step and emits only the new suffix, preserving
+  the invariant `''.join(deltas) == tokenizer.decode(all_token_ids)`. The
+  `prefix_offset`/`read_offset` signature is accepted for compatibility; true
+  window-based incremental decoding is deferred future work.
 - **Tokenizer abstraction:** load from GGUF-embedded tokenizer and/or external `tokenizer.json` (Hugging Face format).
 - **Stop string evaluation:** `check_stop_strings(text, new_char_count, stop_strings, include_in_output)` returning matched string and truncation point.
 - Bound output queues to enforce backpressure without blocking scheduler progress.
@@ -236,8 +240,8 @@ for each request.
 
 **Subphase gate:** Offline output never emits malformed UTF-8, terminal output is
 emitted once, and slow consumers cannot grow memory without bound.
-Incremental detokenization matches reference `detokenize_incrementally` behavior
-for Qwen3 tokenizer (SentencePiece). Stop strings evaluated correctly.
+Detokenization matches `tokenizer.decode` over the full token list for Qwen3
+(SentencePiece). Stop strings evaluated correctly.
 
 ### Phase 3E: Real Runner Integration
 

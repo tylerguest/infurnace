@@ -1,8 +1,6 @@
 from __future__ import annotations
 from typing import Optional
-
 from .base import Tokenizer
-
 
 def detokenize_incrementally(tokenizer: Tokenizer, all_token_ids: list[int],
                              prefix_offset: int, read_offset: int):
@@ -22,10 +20,8 @@ def detokenize_incrementally(tokenizer: Tokenizer, all_token_ids: list[int],
     delta = full[read_offset:]
     return delta, len(all_token_ids), len(full)
 
-
 class StreamingDetokenizer:
     """Per-request incremental detokenizer state.
-
     Feed it the full ``all_token_ids`` (including any prompt) after each new
     token; it returns only the newly decodable text. ``skip_prompt_len`` starts
     the window past the prompt so only generated text is streamed.
@@ -41,13 +37,16 @@ class StreamingDetokenizer:
     def text(self) -> str:
         return self._text
 
+    def truncate(self, length: int) -> None:
+        """Keep only the first ``length`` characters of the accumulated text."""
+        self._text = self._text[:length]
+
     def update(self, all_token_ids: list[int]) -> str:
         full = self._tokenizer.decode(all_token_ids[self._skip:])
         delta = full[self._read:]
         self._read += len(delta)
         self._text += delta
         return delta
-
 
 def check_stop_strings(text: str, new_char_count: int, stop_strings: list[str],
                        include_in_output: bool):

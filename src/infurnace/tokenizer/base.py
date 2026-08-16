@@ -2,10 +2,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Callable, Optional
 
-
 class Tokenizer(ABC):
     """Text<->token interface for the engine.
-
     Implemented by ``GGUFTokenizer`` (tinygrad ``SimpleTokenizer``) and by
     test fakes. The engine depends only on this contract.
     """

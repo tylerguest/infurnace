@@ -9,8 +9,13 @@ from fakes import FakeRunner
 
 
 def _req(rid: str, prompt_len: int = 5, **overrides) -> Request:
-    sp = SamplingParams(**{**dict(max_tokens=10), **overrides.pop("sp", {})})
-    return Request(rid, list(range(prompt_len)), sp, 1024, **overrides)
+    sp = overrides.pop("sp", None)
+    if sp is None:
+        sp = SamplingParams(max_tokens=10)
+    elif isinstance(sp, dict):
+        sp = SamplingParams(**{**dict(max_tokens=10), **sp})
+    context_limit = overrides.pop("context_limit", 1024)
+    return Request(rid, list(range(prompt_len)), sp, context_limit, **overrides)
 
 
 def _tids(tokens: list[int]) -> Tensor:
@@ -53,9 +58,11 @@ class TestSchedulerAdmission(unittest.TestCase):
     def test_add_and_capacity(self):
         s = Scheduler(num_slots=1)
         s.add_request(_req("r1"))
-        with self.assertRaises(SchedulerError):
-            s.add_request(_req("r2"))  # only 1 slot, r1 still live
+        r2 = _req("r2")
+        s.add_request(r2)  # only 1 slot, r1 still live -> REJECTED, no raise
         self.assertEqual(s.num_free_slots, 0)
+        self.assertEqual(r2.state, RequestState.REJECTED)
+        self.assertEqual(s.get_request("r2").state, RequestState.REJECTED)
 
     def test_duplicate_request_id(self):
         s = Scheduler(num_slots=2)
@@ -66,6 +73,31 @@ class TestSchedulerAdmission(unittest.TestCase):
     def test_invalid_num_slots(self):
         with self.assertRaises(SchedulerError):
             Scheduler(num_slots=0)
+
+    def test_reject_prompt_exceeds_scheduler_max_context(self):
+        s = Scheduler(num_slots=1, max_context=10)
+        req = _req("r1", prompt_len=11)
+        s.add_request(req)
+        self.assertEqual(req.state, RequestState.REJECTED)
+        self.assertIn("context limit", req.error)
+
+    def test_reject_prompt_exceeds_request_context_limit(self):
+        s = Scheduler(num_slots=1, max_context=1024)
+        req = _req("r1", prompt_len=6, context_limit=5)
+        s.add_request(req)
+        self.assertEqual(req.state, RequestState.REJECTED)
+
+    def test_reject_when_max_tokens_exceeds_available_context(self):
+        s = Scheduler(num_slots=1, max_context=10)
+        sp = SamplingParams(max_tokens=4)
+        req = _req("r1", prompt_len=7, sp=sp)
+        s.add_request(req)
+        self.assertEqual(req.state, RequestState.REJECTED)
+
+    def test_admit_at_exact_boundary(self):
+        s = Scheduler(num_slots=1, max_context=10)
+        s.add_request(_req("r1", prompt_len=10, sp=SamplingParams(max_tokens=0)))
+        self.assertEqual(s.num_free_slots, 0)
 
 
 class TestSchedulerFIFOAndOrder(unittest.TestCase):
@@ -103,14 +135,14 @@ class TestSchedulerFIFOAndOrder(unittest.TestCase):
 class TestSchedulerChunkedPrefill(unittest.TestCase):
     def test_chunk_bounds_correct(self):
         s = Scheduler(num_slots=1, max_chunk_tokens=512)
-        s.add_request(_req("r1", prompt_len=1500))
+        s.add_request(_req("r1", prompt_len=1500, context_limit=1500, sp=dict(max_tokens=0)))
         plans = s.schedule()
         self.assertEqual(plans[0].chunk_bounds, ((0, 512), (512, 1024), (1024, 1500)))
 
     def test_chunked_matches_unchunked_via_fake_runner(self):
         runner = FakeRunner(vocab_size=2000, seed=0)
         s = Scheduler(num_slots=1, max_chunk_tokens=512)
-        s.add_request(_req("r1", prompt_len=1500))
+        s.add_request(_req("r1", prompt_len=1500, context_limit=1500, sp=dict(max_tokens=0)))
         plan = s.schedule()[0]
         # Execute chunks in order through the fake runner, record token sequence
         seen = []

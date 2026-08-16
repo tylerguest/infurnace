@@ -29,15 +29,15 @@ only after the simpler path is correct and measured.
 
 ## Current State
 
-Phase 0 and Phase 1A-1B are complete. The repository implements verified checkpoint
+Phases 0-3E are complete. The repository implements verified checkpoint
 acquisition, GGUF inspection, focused tinygrad execution contracts, recorded
-upstream functional and performance baselines, and the exact immutable Qwen3-0.6B
-model and tensor contract. Its strict weight loader preserves artifact identity
-through a private verified parsing snapshot, rejects invalid tensor mappings before
-policy transformation, and supports lazy and realized FP16 policies. It does not yet
-contain an Infurnace model runner or server runtime; Phase 1C adds the stateless eager
-forward pass. The documents define phase gates rather than claiming support for
-features that have not passed their correctness tests.
+upstream functional and performance baselines, the exact immutable Qwen3-0.6B
+model and tensor contract, a stateless eager forward pass, external contiguous KV
+storage, TinyJit-captured single-request decode, and an offline engine with
+request lifecycle, scheduler, tokenizer, streaming detokenization, real runner
+integration, and a CLI driver. The HTTP adapter (Phase 3F) is deferred. The
+documents define phase gates rather than claiming support for features that have
+not passed their correctness tests.
 
 ## Development
 

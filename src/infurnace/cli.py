@@ -2,13 +2,11 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-
 from infurnace.engine import Engine
 from infurnace.engine.request import SamplingParams
 from infurnace.scheduler.scheduler import Scheduler
 from infurnace.sampler import GreedySampler
 from infurnace.tokenizer import Tokenizer
-
 
 class FakeTokenizer(Tokenizer):
     """Trivial char<->token mapping for CPU-only offline runs."""
@@ -22,7 +20,6 @@ class FakeTokenizer(Tokenizer):
     def is_end(self, token_id: int) -> bool:
         return False
 
-
 def _build_fake() -> Engine:
     try:
         from tests.fakes import FakeRunner
@@ -30,7 +27,6 @@ def _build_fake() -> Engine:
         from fakes import FakeRunner
     runner = FakeRunner(vocab_size=300, num_slots=1)
     return Engine(runner, Scheduler(num_slots=1), GreedySampler(), FakeTokenizer())
-
 
 def _build_real(artifact: str, manifest: str, *, num_slots: int,
                 max_context: int | None, device: str | None) -> Engine:
@@ -40,9 +36,11 @@ def _build_real(artifact: str, manifest: str, *, num_slots: int,
     from infurnace.tokenizer import GGUFTokenizer
 
     if not os.path.exists(artifact):
-        raise SystemExit(f"artifact not found: {artifact} (download/place the GGUF locally)")
+        print(f"artifact not found: {artifact} (download/place the GGUF locally)", file=sys.stderr)
+        raise SystemExit(1)
     if not os.path.exists(manifest):
-        raise SystemExit(f"manifest not found: {manifest}")
+        print(f"manifest not found: {manifest}", file=sys.stderr)
+        raise SystemExit(1)
 
     checkpoint = load_qwen3_checkpoint(artifact, load_manifest(manifest))
     tokenizer = GGUFTokenizer.from_gguf_metadata(checkpoint.metadata)
@@ -50,7 +48,6 @@ def _build_real(artifact: str, manifest: str, *, num_slots: int,
         checkpoint.weights, num_slots=num_slots, max_context=max_context, device=device,
     )
     return Engine(runner, Scheduler(num_slots=num_slots), GreedySampler(), tokenizer)
-
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="infurnace offline text driver")
@@ -64,11 +61,11 @@ def main() -> int:
     ap.add_argument("--max-context", type=int, default=2048,
                     help="KV cache context length (default 2048; lower saves GPU memory)")
     ap.add_argument("--device", default=None,
-                    help="tinygrad device (sets TINYGRED); default: auto-detect (GPU if available)")
+                    help="tinygrad device (sets DEV); default: auto-detect (GPU if available)")
     args = ap.parse_args()
 
     if args.device:
-        os.environ["TINYGRED"] = args.device
+        os.environ["DEV"] = args.device
 
     eng = _build_fake() if args.fake else _build_real(
         args.artifact, args.manifest, num_slots=args.num_slots,
@@ -87,7 +84,6 @@ def main() -> int:
                 out.flush()
     out.write("\n")
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

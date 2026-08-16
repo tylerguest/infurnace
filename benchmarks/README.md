@@ -104,9 +104,10 @@ comparison.
 ## Upstream End-to-End Generation
 
 The roadmap's initial end-to-end entry point remains an upstream generation
-benchmark because Infurnace has no server runtime yet. Despite the placeholder
-filename, its result identity is `upstream_end_to_end` and its schema explicitly
-records that transport, tokenization, scheduling, and server runtime are absent.
+benchmark because the Phase 0 baseline predates Infurnace's server runtime.
+Despite the placeholder filename, its result identity is `upstream_end_to_end`
+and its schema explicitly records that transport, tokenization, scheduling, and
+server runtime are absent from this Phase 0 measurement.
 
 Run two setup generations followed by five closed-loop measured generations:
 

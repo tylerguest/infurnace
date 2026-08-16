@@ -1,7 +1,7 @@
 import unittest
 from infurnace.engine import Engine, EngineStepResult
 from infurnace.engine.request import Request, RequestState, SamplingParams
-from infurnace.scheduler.scheduler import Scheduler, SchedulerError
+from infurnace.scheduler.scheduler import Scheduler
 from fakes import FakeRunner
 
 
@@ -98,13 +98,22 @@ class TestEngineFIFOAndConcurrency(unittest.TestCase):
 
     def test_rejection_on_capacity(self):
         runner = FakeRunner(vocab_size=50, num_slots=1)
-        eng = Engine(runner, Scheduler(num_slots=1))
+        eng = Engine(runner, Scheduler(num_slots=1, max_context=runner.max_context))
         eng.add_request(_req("r1"))
         eng.add_request(_req("r2"))  # no free slot -> REJECTED, no raise
         self.assertEqual(eng.scheduler.get_request("r1").state, RequestState.WAITING)
-        # r2 was rejected and is not tracked by the scheduler
-        with self.assertRaises(KeyError):
-            eng.scheduler.get_request("r2")
+        # r2 was rejected but remains observable via the scheduler
+        req2 = eng.scheduler.get_request("r2")
+        self.assertEqual(req2.state, RequestState.REJECTED)
+        self.assertIsNotNone(req2.error)
+
+    def test_rejection_on_context_limit(self):
+        runner = FakeRunner(vocab_size=50, num_slots=1, max_context=10)
+        eng = Engine(runner)
+        req = _req("r1", prompt_len=11)
+        eng.add_request(req)
+        self.assertEqual(req.state, RequestState.REJECTED)
+        self.assertEqual(eng.scheduler.get_request("r1").state, RequestState.REJECTED)
 
 
 class TestEngineCancellation(unittest.TestCase):

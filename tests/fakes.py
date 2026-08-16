@@ -12,16 +12,21 @@ class FakeRunner(Runner):
     can verify cache clearance on terminal paths.
     """
 
-    def __init__(self, vocab_size: int = 100, seed: int = 0, num_slots: int = 1):
+    def __init__(self, vocab_size: int = 100, seed: int = 0, num_slots: int = 1, max_context: int = 1024):
         self.vocab_size = vocab_size
         self.calls: list[tuple[str, tuple, dict]] = []
         self._counter = seed
         self._num_slots = num_slots
+        self._max_context = max_context
         self.cleared_slots: list[int] = []
 
     @property
     def num_slots(self) -> int:
         return self._num_slots
+
+    @property
+    def max_context(self) -> int:
+        return self._max_context
 
     def prefill(self, input_ids: Tensor, slot: int = 0, start_position: int = 0) -> Tensor:
         self.calls.append(("prefill", tuple(input_ids.tolist()[0]), {"slot": slot, "start_position": start_position}))

@@ -74,3 +74,22 @@ class TestContiguousKVCache(unittest.TestCase):
     config = _make_config()
     cache = ContiguousKVCache(config, max_context=8, num_slots=1)
     self.assertEqual(cache.dtype, dtypes.float16)
+
+  def test_clear_slot_zeros_contents(self):
+    config = _make_config(block_count=2, attention_head_count_kv=1, key_length=4, value_length=4)
+    cache = ContiguousKVCache(config, max_context=8, num_slots=2)
+    # Write a non-zero value into slot 0
+    ones = Tensor.ones((2, 2, 1, 8, 1, 4), dtype=dtypes.float16)
+    cache.kv[:, :, 0:1].assign(ones).realize()
+    self.assertNotEqual(
+      cache.kv[:, :, 0:1].tolist(),
+      Tensor.zeros((2, 2, 1, 8, 1, 4), dtype=dtypes.float16).tolist(),
+    )
+    cache.clear_slot(0)
+    zeros = Tensor.zeros((2, 2, 1, 8, 1, 4), dtype=dtypes.float16)
+    self.assertEqual(cache.kv[:, :, 0:1].tolist(), zeros.tolist())
+    # Slot 1 should be untouched (still zeros from initialization)
+    self.assertEqual(
+      cache.kv[:, :, 1:2].tolist(),
+      Tensor.zeros((2, 2, 1, 8, 1, 4), dtype=dtypes.float16).tolist(),
+    )

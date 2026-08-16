@@ -1,21 +1,18 @@
 from __future__ import annotations
+import traceback
 from dataclasses import dataclass, field
 from typing import Mapping
-
 from tinygrad import Tensor, dtypes
-
 from infurnace.engine.request import Request, RequestState, RequestMetrics
 from infurnace.scheduler.plan import ExecutionPlan, PrefillPlan, DecodePlan
-from infurnace.scheduler.scheduler import Scheduler, SchedulerError
+from infurnace.scheduler.scheduler import Scheduler
 from infurnace.executor.runner import Runner
 from infurnace.sampler import Sampler, GreedySampler
 from infurnace.tokenizer import Tokenizer, StreamingDetokenizer, check_stop_strings
 
-
 @dataclass(frozen=True)
 class EngineStepResult:
     """Outcome of one engine step, for observability and the offline API."""
-
     completed_requests: tuple[str, ...]
     new_tokens: Mapping[str, tuple[int, ...]]
     new_text: Mapping[str, str] = field(default_factory=dict)
@@ -23,31 +20,25 @@ class EngineStepResult:
     cache_slots_freed: tuple[int, ...] = ()
     logprobs: Mapping[str, object] = field(default_factory=dict)  # Phase 7 stub
 
-
 @dataclass
 class _PlanResult:
     """Raw result of executing one plan on the runner, before applying state."""
-
     plan: ExecutionPlan
     request_id: str
     token: int | None = None
     error: str | None = None
     is_prefill: bool = False
 
-
 @dataclass
 class RawStep:
     results: list[_PlanResult] = field(default_factory=list)
 
-
 class Engine:
     """Offline inference engine driving the scheduler and a ``Runner``.
-
     Optionally tokenized: when a ``Tokenizer`` is supplied, prompts may be added
     as text (``add_text_request``), generated tokens are streamed as incremental
     text (``new_text``), and ``stop_strings`` are evaluated per request.
     """
-
     def __init__(
         self,
         runner: Runner,
@@ -56,17 +47,18 @@ class Engine:
         tokenizer: Tokenizer | None = None,
     ) -> None:
         self.runner = runner
-        self.scheduler = scheduler or Scheduler(num_slots=runner.num_slots)
+        self.scheduler = scheduler or Scheduler(
+            num_slots=runner.num_slots, max_context=runner.max_context
+        )
         self.sampler = sampler or GreedySampler()
         self.tokenizer = tokenizer
         self._detoks: dict[str, StreamingDetokenizer] = {}
 
     # --- Offline request API ---
     def add_request(self, req: Request) -> None:
-        try:
-            self.scheduler.add_request(req)
-        except SchedulerError:
-            req.transition(RequestState.REJECTED)
+        # Admission rejection is recorded by the scheduler (state REJECTED,
+        # observable via get_request). Duplicate IDs still raise.
+        self.scheduler.add_request(req)
 
     def add_text_request(
         self,
@@ -163,8 +155,8 @@ class Engine:
                         reason = "stop"
                         if not req.sampling_params.include_stop_str_in_output:
                             before = len(detok.text) - len(delta)
-                            detok._text = detok._text[:trunc]
-                            new_text[r.request_id][-1] = detok._text[before:]
+                            detok.truncate(trunc)
+                            new_text[r.request_id][-1] = detok.text[before:]
             if reason is not None:
                 slot = req.cache_slot
                 self.scheduler.mark_finished(r.request_id)
@@ -201,6 +193,7 @@ class Engine:
                     start_position=start,
                 )
         except Exception as e:  # runner failures become a terminal FAILED request
+            traceback.print_exc()
             return [_PlanResult(plan, plan.request_id, error=str(e), is_prefill=True)]
         req = self.scheduler.get_request(plan.request_id)
         token = self.sampler.sample(logits, req.sampling_params)
@@ -219,5 +212,6 @@ class Engine:
                 token = self.sampler.sample(logits, plan.sampling_params[i])
                 results.append(_PlanResult(plan, rid, token=token, is_prefill=False))
             except Exception as e:
+                traceback.print_exc()
                 results.append(_PlanResult(plan, rid, error=str(e), is_prefill=False))
         return results

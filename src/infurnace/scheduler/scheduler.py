@@ -5,14 +5,11 @@ from infurnace.engine.request import Request, RequestState
 from infurnace.scheduler.plan import PrefillPlan, DecodePlan, ExecutionPlan
 from infurnace.scheduler.policy import FIFOPolicy, chunk_prompt
 
-
 class SchedulerError(ValueError):
     """Scheduler inputs or state do not satisfy the admission or scheduling contract."""
 
-
 class Scheduler:
     """Admission and execution-plan generator.
-
     Single-request serial prefill in this phase: ``schedule()`` returns at most
     one plan per step (a prefill chunk, a decode batch, or nothing). The return
     type is a list so Phase 4 batched decode fits without a signature change.
@@ -22,13 +19,16 @@ class Scheduler:
     terminal outcomes.
     """
 
-    def __init__(self, num_slots: int, max_chunk_tokens: int = 512):
+    def __init__(self, num_slots: int, max_context: int = 32768, max_chunk_tokens: int = 512):
         if num_slots < 1:
             raise SchedulerError("num_slots must be >= 1")
+        if max_context < 1:
+            raise SchedulerError("max_context must be >= 1")
         if max_chunk_tokens < 1:
             raise SchedulerError("max_chunk_tokens must be >= 1")
         self._policy = FIFOPolicy(max_chunk_tokens=max_chunk_tokens)
         self._num_slots = num_slots
+        self._max_context = max_context
         self._waiting: deque[str] = deque()
         self._requests: dict[str, Request] = {}
         self._active: dict[str, Request] = {}      # prefilling or decoding
@@ -39,13 +39,37 @@ class Scheduler:
     def add_request(self, req: Request) -> None:
         if req.request_id in self._requests:
             raise SchedulerError(f"duplicate request_id: {req.request_id}")
+        effective_limit = min(req.context_limit, self._max_context)
+        prompt_len = len(req.prompt_token_ids)
+        if prompt_len > effective_limit:
+            self._reject(req, f"prompt length {prompt_len} exceeds context limit {effective_limit}")
+            return
+        total_tokens = prompt_len + req.sampling_params.max_tokens
+        if total_tokens > effective_limit:
+            self._reject(
+                req,
+                f"prompt length {prompt_len} + max_tokens {req.sampling_params.max_tokens} "
+                f"exceeds context limit {effective_limit}",
+            )
+            return
         # Admission = capacity check + slot reservation, before any execution.
         if not self._free_slots:
-            raise SchedulerError("admission rejected: capacity exceeded")
+            self._reject(req, "capacity exceeded")
+            return
         req.state = RequestState.WAITING
         req.cache_slot = self._free_slots.pop()
         self._requests[req.request_id] = req
         self._waiting.append(req.request_id)
+
+    def _reject(self, req: Request, reason: str) -> None:
+        """Record a request that failed admission without consuming a cache slot.
+
+        The request is registered with a terminal REJECTED state (no slot, not
+        queued) so rejection stays observable through ``get_request``.
+        """
+        req.error = reason
+        req.transition(RequestState.REJECTED)
+        self._requests[req.request_id] = req
 
     def cancel(self, request_id: str) -> None:
         req = self._requests.get(request_id)

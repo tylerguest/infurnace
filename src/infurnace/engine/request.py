@@ -4,7 +4,6 @@ from enum import Enum
 from time import monotonic
 from typing import Optional
 
-
 class RequestState(Enum):
     WAITING = "waiting"
     PREFILLING = "prefilling"
@@ -13,7 +12,6 @@ class RequestState(Enum):
     CANCELLED = "cancelled"
     FAILED = "failed"
     REJECTED = "rejected"
-
 
 _VALID_TRANSITIONS: dict[RequestState, set[RequestState]] = {
     RequestState.WAITING: {
@@ -25,7 +23,7 @@ _VALID_TRANSITIONS: dict[RequestState, set[RequestState]] = {
         RequestState.CANCELLED, RequestState.FAILED,
     },
     RequestState.DECODING: {
-        RequestState.DECODING, RequestState.FINISHED,
+        RequestState.FINISHED,
         RequestState.CANCELLED, RequestState.FAILED,
     },
     RequestState.FINISHED: set(),
@@ -33,7 +31,6 @@ _VALID_TRANSITIONS: dict[RequestState, set[RequestState]] = {
     RequestState.FAILED: set(),
     RequestState.REJECTED: set(),
 }
-
 
 @dataclass(slots=True)
 class SamplingParams:
@@ -45,7 +42,6 @@ class SamplingParams:
     stop_token_ids: list[int] = field(default_factory=list)
     min_tokens: int = 0
     include_stop_str_in_output: bool = False
-
 
 @dataclass(slots=True)
 class RequestMetrics:
@@ -60,7 +56,6 @@ class RequestMetrics:
     @property
     def total_latency(self) -> Optional[float]:
         return self.completion_time - self.arrival_time if self.completion_time else None
-
 
 @dataclass(slots=True)
 class Request:
@@ -100,7 +95,10 @@ class Request:
     def transition(self, new_state: RequestState) -> None:
         if new_state not in _VALID_TRANSITIONS[self.state]:
             raise ValueError(f"invalid transition: {self.state} -> {new_state}")
-        if new_state == RequestState.FINISHED:
+        if new_state in (
+            RequestState.FINISHED, RequestState.CANCELLED,
+            RequestState.FAILED, RequestState.REJECTED,
+        ):
             self.metrics.completion_time = monotonic()
         self.state = new_state
 

@@ -11,9 +11,9 @@ class Qwen3Runner:
   """Serving runner with TinyJit-captured decode contracts.
 
   Prefill currently uses the eager stateless forward (Phase 2B). Decode is
-  captured per slot with a symbolic ``Variable("position")``; the JIT contract
-  uses ``@function`` + SSA cache writes so one compiled program replays for
-  every token position without recompilation.
+  captured per slot with a symbolic ``Variable("position")`` and SSA
+  ``uop.store`` / ``uop.after`` cache writes so one compiled program replays
+  for every token position without recompilation.
   """
 
   def __init__(self, model: Qwen3Model, kv_cache: ContiguousKVCache):
@@ -29,6 +29,10 @@ class Qwen3Runner:
   @property
   def num_slots(self) -> int:
     return self.kv_cache.num_slots
+
+  @property
+  def max_context(self) -> int:
+    return self.kv_cache.max_context
 
   def clear_slot(self, slot: int) -> None:
     self.kv_cache.clear_slot(slot)
