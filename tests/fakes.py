@@ -23,8 +23,8 @@ class FakeRunner(Runner):
     def num_slots(self) -> int:
         return self._num_slots
 
-    def prefill(self, input_ids: Tensor, slot: int = 0) -> Tensor:
-        self.calls.append(("prefill", tuple(input_ids.tolist()[0]), {"slot": slot}))
+    def prefill(self, input_ids: Tensor, slot: int = 0, start_position: int = 0) -> Tensor:
+        self.calls.append(("prefill", tuple(input_ids.tolist()[0]), {"slot": slot, "start_position": start_position}))
         return self._fake_logits()
 
     def decode(self, input_ids: Tensor, position: int, slot: int = 0) -> Tensor:

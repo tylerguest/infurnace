@@ -23,6 +23,16 @@ class Qwen3Weights:
   tensors: Mapping[str, Tensor]
   policy: WeightPolicy
 
+@dataclass(frozen=True, slots=True)
+class Qwen3Checkpoint:
+  """Parsed GGUF checkpoint: validated weights plus raw GGUF metadata.
+
+  The metadata drives the tokenizer (``SimpleTokenizer.from_gguf_kv``), so the
+  checkpoint is parsed once and both products are returned together.
+  """
+  weights: Qwen3Weights
+  metadata: Mapping[str, Any]
+
 _PINNED_IDENTITY = ("qwen3-0.6b-q8_0", 639446688, "9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031", "GGUF", "Q8_0",)
 
 def _policy(value: WeightPolicy | str) -> WeightPolicy:
@@ -58,12 +68,26 @@ def map_qwen3_weights(metadata: Mapping[str, Any], tensors: Mapping[str, Tensor]
   mapped["output.weight"] = mapped["token_embd.weight"]
   return Qwen3Weights(config, MappingProxyType(mapped), selected_policy)
 
-def load_qwen3_weights(path: str | Path, manifest: CheckpointManifest,
-                       policy: WeightPolicy | str = WeightPolicy.REALIZED_FP16) -> Qwen3Weights:
-  """Verify, parse, validate, and transform the pinned Qwen3 checkpoint."""
+def load_qwen3_checkpoint(path: str | Path, manifest: CheckpointManifest,
+                           policy: WeightPolicy | str = WeightPolicy.REALIZED_FP16) -> Qwen3Checkpoint:
+  """Verify, parse, validate, and transform the pinned Qwen3 checkpoint once.
+
+  Returns both the validated ``Qwen3Weights`` and the raw GGUF ``metadata``
+  (used to build the tokenizer) so the GGUF is only read and parsed a single time.
+  """
   identity = manifest.id, manifest.size_bytes, manifest.sha256, manifest.format, manifest.quantization
   if identity != _PINNED_IDENTITY: raise WeightMappingError("manifest is not the pinned Qwen3-0.6B Q8_0 checkpoint")
   with verified_artifact(path, manifest) as artifact:
     gguf_tensor = Tensor.empty(artifact.size_bytes, dtype=dtypes.uint8, device=f"disk:{artifact.path}")
     metadata, tensors = gguf_load(gguf_tensor)
-    return map_qwen3_weights(metadata, tensors, policy)
+    weights = map_qwen3_weights(metadata, tensors, policy)
+  return Qwen3Checkpoint(weights, metadata)
+
+def load_qwen3_weights(path: str | Path, manifest: CheckpointManifest,
+                        policy: WeightPolicy | str = WeightPolicy.REALIZED_FP16) -> Qwen3Weights:
+  """Verify, parse, validate, and transform the pinned Qwen3 checkpoint.
+
+  Returns the validated weights; use ``load_qwen3_checkpoint`` when the GGUF
+  metadata (for the tokenizer) is also needed.
+  """
+  return load_qwen3_checkpoint(path, manifest, policy).weights

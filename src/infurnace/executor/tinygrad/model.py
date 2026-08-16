@@ -209,9 +209,9 @@ class Qwen3Model:
     x = _rms_norm(x[:, -1:], w["output_norm.weight"], config.rms_norm_epsilon)
     return _linear(x, w["output.weight"])[:, -1, :]
 
-  def prefill(self, input_ids: Tensor, kv_cache: ContiguousKVCache, slot: int = 0) -> Tensor:
+  def prefill(self, input_ids: Tensor, kv_cache: ContiguousKVCache, slot: int = 0, start_position: int = 0) -> Tensor:
     if not isinstance(kv_cache, ContiguousKVCache): raise Qwen3ModelError("kv_cache must be a ContiguousKVCache")
-    return self.forward(input_ids, start_position=0, kv=kv_cache.kv, slot=slot)
+    return self.forward(input_ids, start_position=start_position, kv=kv_cache.kv, slot=slot)
 
   def decode(self, input_ids: Tensor, position: int, kv_cache: ContiguousKVCache, slot: int = 0) -> Tensor:
     if not isinstance(kv_cache, ContiguousKVCache): raise Qwen3ModelError("kv_cache must be a ContiguousKVCache")

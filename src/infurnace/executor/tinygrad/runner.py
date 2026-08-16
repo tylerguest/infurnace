@@ -33,9 +33,25 @@ class Qwen3Runner:
   def clear_slot(self, slot: int) -> None:
     self.kv_cache.clear_slot(slot)
 
-  def prefill(self, input_ids: Tensor, slot: int = 0) -> Tensor:
-    """Eager prefill at position 0."""
-    return self.model.prefill(input_ids, self.kv_cache, slot=slot)
+  @classmethod
+  def from_weights(cls, weights: "Qwen3Weights", *, num_slots: int = 1,
+                   max_context: int | None = None, device: str | None = None) -> "Qwen3Runner":
+    """Build a runner from validated weights: allocate KV cache + JIT capture.
+
+    ``max_context`` defaults to the model's ``context_length``. ``device`` is the
+    tinygrad device for the KV cache (None lets tinygrad auto-detect).
+    """
+    from .buffers import ContiguousKVCache
+    from .model import Qwen3Model
+    config = weights.config
+    if max_context is None:
+      max_context = config.context_length
+    kv = ContiguousKVCache(config=config, max_context=max_context, num_slots=num_slots, device=device)
+    return cls(Qwen3Model(weights), kv)
+
+  def prefill(self, input_ids: Tensor, slot: int = 0, start_position: int = 0) -> Tensor:
+    """Eager prefill. ``start_position`` is the KV position of the chunk's first token."""
+    return self.model.prefill(input_ids, self.kv_cache, slot=slot, start_position=start_position)
 
   def decode(self, input_ids: Tensor, position: int, slot: int = 0) -> Tensor:
     if input_ids.shape != (1, 1):

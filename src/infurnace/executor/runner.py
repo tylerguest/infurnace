@@ -17,9 +17,11 @@ class Runner(ABC):
         ...
 
     @abstractmethod
-    def prefill(self, input_ids: Tensor, slot: int = 0) -> Tensor:
-        """Eager prefill at position 0. ``input_ids`` has shape ``[1, T]``.
+    def prefill(self, input_ids: Tensor, slot: int = 0, start_position: int = 0) -> Tensor:
+        """Eager prefill. ``input_ids`` has shape ``[1, T]``.
 
+        ``start_position`` is the absolute KV position where the chunk's first
+        token is written (0 for the first chunk; advanced for chunked prefill).
         Returns logits of shape ``[1, vocab_size]`` for the last token.
         """
         ...

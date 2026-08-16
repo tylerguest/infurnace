@@ -1,5 +1,6 @@
 from __future__ import annotations
 import argparse
+import os
 import sys
 
 from infurnace.engine import Engine
@@ -31,9 +32,24 @@ def _build_fake() -> Engine:
     return Engine(runner, Scheduler(num_slots=1), GreedySampler(), FakeTokenizer())
 
 
-def _build_real(artifact: str) -> Engine:
-    # Real Qwen3Runner + GGUFTokenizer wiring lands in Phase 3E.
-    raise NotImplementedError("real runner integration is Phase 3E")
+def _build_real(artifact: str, manifest: str, *, num_slots: int,
+                max_context: int | None, device: str | None) -> Engine:
+    from infurnace.models.manifest import load_manifest
+    from infurnace.executor.tinygrad.weights import load_qwen3_checkpoint
+    from infurnace.executor.tinygrad.runner import Qwen3Runner
+    from infurnace.tokenizer import GGUFTokenizer
+
+    if not os.path.exists(artifact):
+        raise SystemExit(f"artifact not found: {artifact} (download/place the GGUF locally)")
+    if not os.path.exists(manifest):
+        raise SystemExit(f"manifest not found: {manifest}")
+
+    checkpoint = load_qwen3_checkpoint(artifact, load_manifest(manifest))
+    tokenizer = GGUFTokenizer.from_gguf_metadata(checkpoint.metadata)
+    runner = Qwen3Runner.from_weights(
+        checkpoint.weights, num_slots=num_slots, max_context=max_context, device=device,
+    )
+    return Engine(runner, Scheduler(num_slots=num_slots), GreedySampler(), tokenizer)
 
 
 def main() -> int:
@@ -42,10 +58,22 @@ def main() -> int:
     ap.add_argument("--max-tokens", type=int, default=32)
     ap.add_argument("--stop-strings", nargs="*", default=[])
     ap.add_argument("--fake", action="store_true", help="CPU-only fake runner + tokenizer")
-    ap.add_argument("--artifact", default=None, help="GGUF artifact (real backend, Phase 3E)")
+    ap.add_argument("--artifact", default="artifacts/models/Qwen3-0.6B-Q8_0.gguf")
+    ap.add_argument("--manifest", default="models/qwen3-0.6b-q8_0.json")
+    ap.add_argument("--num-slots", type=int, default=1)
+    ap.add_argument("--max-context", type=int, default=2048,
+                    help="KV cache context length (default 2048; lower saves GPU memory)")
+    ap.add_argument("--device", default=None,
+                    help="tinygrad device (sets TINYGRED); default: auto-detect (GPU if available)")
     args = ap.parse_args()
 
-    eng = _build_fake() if args.fake else _build_real(args.artifact)
+    if args.device:
+        os.environ["TINYGRED"] = args.device
+
+    eng = _build_fake() if args.fake else _build_real(
+        args.artifact, args.manifest, num_slots=args.num_slots,
+        max_context=args.max_context, device=args.device,
+    )
     eng.add_text_request(
         args.prompt,
         SamplingParams(max_tokens=args.max_tokens),

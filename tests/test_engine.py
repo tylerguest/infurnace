@@ -21,7 +21,7 @@ def _run_to_done(engine, max_steps=1000):
 
 
 class RaisingRunner(FakeRunner):
-    def prefill(self, input_ids, slot=0):
+    def prefill(self, input_ids, slot=0, start_position=0):
         raise RuntimeError("boom")
 
 

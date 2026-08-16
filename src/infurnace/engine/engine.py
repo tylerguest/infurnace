@@ -151,6 +151,8 @@ class Engine:
                 # request now enters DECODING so the next step feeds it back.
                 self.scheduler.mark_prefill_chunk_done(r.request_id, len(r.plan.chunk_bounds) - 1)
             reason = req.check_finished(r.token)
+            if reason is None and self.tokenizer is not None and self.tokenizer.is_end(r.token):
+                reason = "eos"
             if reason is None and self.tokenizer is not None and req.stop_strings:
                 detok = self._detoks.get(r.request_id)
                 if detok is not None:
@@ -195,7 +197,8 @@ class Engine:
             for start, end in plan.chunk_bounds:
                 chunk = list(plan.input_ids[start:end])
                 logits = self.runner.prefill(
-                    Tensor([chunk], dtype=dtypes.int32), slot=plan.cache_slot
+                    Tensor([chunk], dtype=dtypes.int32), slot=plan.cache_slot,
+                    start_position=start,
                 )
         except Exception as e:  # runner failures become a terminal FAILED request
             return [_PlanResult(plan, plan.request_id, error=str(e), is_prefill=True)]
