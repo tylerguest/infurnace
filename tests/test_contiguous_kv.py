@@ -18,9 +18,11 @@ class TestContiguousKVCache(unittest.TestCase):
   def test_default_allocation_shape_and_size(self):
     config = _make_config(block_count=2, attention_head_count_kv=1, key_length=4, value_length=4)
     cache = ContiguousKVCache(config, max_context=8, num_slots=1)
-    self.assertEqual(cache.shape, (2, 2, 1, 8, 1, 4))
+    # Physical slots = num_slots real slots + 1 reserved dummy slot.
+    self.assertEqual(cache.shape, (2, 2, 2, 8, 1, 4))
     self.assertEqual(cache.dtype, dtypes.float16)
-    self.assertEqual(cache.size_bytes, 2 * 2 * 1 * 8 * 1 * 4 * 2)
+    self.assertEqual(cache.size_bytes, 2 * 2 * 2 * 8 * 1 * 4 * 2)
+    self.assertEqual(cache.dummy_slot, 1)
 
   def test_zeros_initialized(self):
     config = _make_config()
@@ -40,9 +42,9 @@ class TestContiguousKVCache(unittest.TestCase):
       context_length=32768,
     )
     cache = ContiguousKVCache(config, max_context=1024, num_slots=1)
-    expected = 28 * 2 * 1 * 1024 * 4 * 128 * 2
+    expected = 28 * 2 * 2 * 1024 * 4 * 128 * 2
     self.assertEqual(cache.size_bytes, expected)
-    self.assertEqual(cache.shape, (28, 2, 1, 1024, 4, 128))
+    self.assertEqual(cache.shape, (28, 2, 2, 1024, 4, 128))
 
   def test_rejects_zero_max_context(self):
     config = _make_config()

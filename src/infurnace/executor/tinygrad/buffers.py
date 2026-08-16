@@ -13,6 +13,10 @@ class ContiguousKVCache:
   Axis order: [layer, K_or_V, slot, token_position, kv_head, head_dim].
   The tensor is allocated with zeros, made contiguous, and realized so it can
   be passed as a stable TinyJit input and replaced by a compatible buffer later.
+
+  One extra physical slot (index ``num_slots``) is reserved as the ``dummy_slot``:
+  a harmless write target for padded/inactive rows in fixed-shape batched decode.
+  It is never assigned to a request and never cleared.
   """
   config: Qwen3Config
   max_context: int
@@ -36,13 +40,18 @@ class ContiguousKVCache:
     shape = (
       self.config.block_count,
       2,  # K and V
-      self.num_slots,
+      self.num_slots + 1,  # real slots plus the reserved dummy slot
       self.max_context,
       self.config.attention_head_count_kv,
       self.config.key_length,
     )
     kv = Tensor.zeros(*shape, dtype=self.dtype, device=self.device).contiguous().realize()
     object.__setattr__(self, "kv", kv)
+
+  @property
+  def dummy_slot(self) -> int:
+    """Physical slot index reserved for padded/inactive batched-decode writes."""
+    return self.num_slots
 
   @property
   def shape(self) -> tuple[int, ...]:

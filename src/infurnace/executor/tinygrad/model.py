@@ -1,5 +1,6 @@
 from __future__ import annotations
 import math
+from typing import Sequence
 from tinygrad import Tensor, UOp, dtypes
 from infurnace.models.config import Qwen3Config
 from .buffers import ContiguousKVCache
@@ -76,7 +77,7 @@ class Qwen3Model:
         )
       if kv.dtype != dtypes.float16:
         raise Qwen3ModelError(f"kv dtype must be float16, got {kv.dtype}")
-      num_slots = kv.shape[2]
+      num_slots = kv.shape[2] - 1  # last physical slot is the reserved dummy
       if slot < 0 or slot >= num_slots:
         raise Qwen3ModelError(f"slot {slot} out of range [0, {num_slots})")
       max_context = kv.shape[3]
@@ -208,6 +209,85 @@ class Qwen3Model:
 
     x = _rms_norm(x[:, -1:], w["output_norm.weight"], config.rms_norm_epsilon)
     return _linear(x, w["output.weight"])[:, -1, :]
+
+  def _decode_batch_step(self, input_ids: Tensor, positions: Sequence[int | UOp], slots: Sequence[int]) -> Tensor:
+    """Batched single-token decode for a fixed shape ``[S, 1]``.
+
+    Row ``i`` writes its K/V into ``kv[.., slots[i], ..]`` at the row's symbolic
+    ``positions[i]`` and attends over ``kv[.., slots[i], 0:positions[i]+1]``, so
+    each row reads only O(position) cache entries (no full-cache mask). Store
+    targets are Python constants (``slots``), so a fixed-shape contract can be
+    captured once by TinyJit. The reserved dummy slot is the write target for
+    padded/inactive rows.
+    """
+    if self.kv_cache is None: raise Qwen3ModelError("kv_cache must be attached to the model before decode")
+    kv = self.kv_cache.kv
+    if input_ids.ndim != 2 or input_ids.shape[1] != 1:
+      raise Qwen3ModelError(f"decode_batch input_ids must have shape [S, 1], got {tuple(input_ids.shape)}")
+    if input_ids.dtype not in dtypes.ints:
+      raise Qwen3ModelError("decode_batch input_ids must have integer dtype")
+    S = input_ids.shape[0]
+    if S < 1: raise Qwen3ModelError("decode_batch requires at least one row")
+    if len(positions) != S or len(slots) != S:
+      raise Qwen3ModelError("decode_batch positions and slots must have one entry per row")
+    max_slot = kv.shape[2] - 1
+    for i, (pos, slot) in enumerate(zip(positions, slots)):
+      if slot < 0 or slot > max_slot:
+        raise Qwen3ModelError(f"slot {slot} out of range [0, {max_slot}]")
+      if isinstance(pos, int) and (pos < 0 or pos >= self.kv_cache.max_context):
+        raise Qwen3ModelError(f"position {pos} out of range [0, {self.kv_cache.max_context})")
+
+    config, w = self.config, self._w
+    x = w["token_embd.weight"][input_ids].float()  # [S, 1, dim]
+
+    for l in range(config.block_count):
+      p = f"blk.{l}"
+
+      h = _rms_norm(x, w[f"{p}.attn_norm.weight"], config.rms_norm_epsilon)
+      q = _linear(h, w[f"{p}.attn_q.weight"])
+      k = _linear(h, w[f"{p}.attn_k.weight"])
+      v = _linear(h, w[f"{p}.attn_v.weight"])
+
+      q = q.reshape(S, 1, config.attention_head_count, config.key_length).transpose(1, 2)
+      k = k.reshape(S, 1, config.attention_head_count_kv, config.key_length).transpose(1, 2)
+      v = v.reshape(S, 1, config.attention_head_count_kv, config.value_length).transpose(1, 2)
+
+      q = _rms_norm(q, w[f"{p}.attn_q_norm.weight"], config.rms_norm_epsilon)
+      k = _rms_norm(k, w[f"{p}.attn_k_norm.weight"], config.rms_norm_epsilon)
+
+      row_q = [_apply_rope(q[i:i+1], self._rope[positions[i]:positions[i]+1]) for i in range(S)]
+      row_k = [_apply_rope(k[i:i+1], self._rope[positions[i]:positions[i]+1]) for i in range(S)]
+
+      stores = []
+      for i in range(S):
+        k_for_store = row_k[i][0].permute(1, 0, 2).contiguous().cast(kv.dtype)
+        v_for_store = v[i].permute(1, 0, 2).contiguous().cast(kv.dtype)
+        stores.append(
+          kv[l, :, slots[i], positions[i]:positions[i]+1, :, :].uop.store(
+            Tensor.stack(k_for_store, v_for_store).uop
+          )
+        )
+
+      row_attn = []
+      for i in range(S):
+        # Observe every store in the layer so the scheduler sees one AFTER per
+        # buffer slice with a single superseding write set (no WAR cycle).
+        assigned = Tensor(kv[l, :, slots[i]].uop.after(*stores))
+        cached_k = assigned[0, 0:positions[i]+1, :, :].permute(1, 0, 2).unsqueeze(0).float()
+        cached_v = assigned[1, 0:positions[i]+1, :, :].permute(1, 0, 2).unsqueeze(0).float()
+        attn = row_q[i].scaled_dot_product_attention(cached_k, cached_v, is_causal=False, enable_gqa=True)
+        row_attn.append(attn.transpose(1, 2).reshape(1, 1, -1))
+
+      attn = row_attn[0].stack(*row_attn[1:], dim=0).reshape(S, 1, -1)  # [S, 1, out_dim]
+      x = x + _linear(attn, w[f"{p}.attn_output.weight"])
+
+      h = _rms_norm(x, w[f"{p}.ffn_norm.weight"], config.rms_norm_epsilon)
+      gate = _linear(h, w[f"{p}.ffn_gate.weight"])
+      up = _linear(h, w[f"{p}.ffn_up.weight"])
+      x = (x + _linear(gate.silu().contiguous() * up, w[f"{p}.ffn_down.weight"])).contiguous()
+
+    x = _rms_norm(x[:, -1:], w["output_norm.weight"], config.rms_norm_epsilon)
+    return _linear(x, w["output.weight"])[:, -1, :]  # [S, V]
 
   def prefill(self, input_ids: Tensor, kv_cache: ContiguousKVCache, slot: int = 0, start_position: int = 0) -> Tensor:
     if not isinstance(kv_cache, ContiguousKVCache): raise Qwen3ModelError("kv_cache must be a ContiguousKVCache")
