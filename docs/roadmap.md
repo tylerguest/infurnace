@@ -15,6 +15,30 @@ the parent phase gate has passed. CPU-only contract and state tests should remai
 separate from model-dependent and accelerator tests so normal development does not
 require the checkpoint or execution hardware.
 
+## Current Work
+
+Phase 4 is complete (v0.2 gates PASS). The active work is Phase 5 (Paged Decode
+KV). One CLI polish fix lands before Phase 5 implementation begins:
+
+- **CLI `--device` flag** (`src/infurnace/cli.py`): the flag sets
+  `os.environ["DEV"]` after tinygrad has already been imported by the module's
+  top-level imports, so it has no effect. Fix by removing the top-level
+  `infurnace` imports and setting `DEV` before the lazy imports inside
+  `main()`; strengthen `test_device_env_set` to assert `Device.DEFAULT == "CPU"`
+  instead of only checking the environment variable.
+
+Two items are explicitly deferred and are not Phase 5 blockers:
+
+- **StreamingDetokenizer window decode** (Phase 3D, deferred post-Phase 5): the
+  current full re-decode is correct but O(n²) in generated tokens. True
+  window-based incremental decoding is planned after Phase 5 for the chat/CLI
+  path.
+- **Persistent decode input buffers** (Phase 4D note): `decode_batch` still
+  builds a fresh padded input tensor with a host `.tolist()` roundtrip each
+  step. The fix is folded into Phase 5D, which replaces the decode contract
+  with paged store/gather and persistent `block_tables`/`seq_len` device
+  inputs.
+
 ## Phase 0: Current NV Baseline
 
 ### Phase 0A: Repository Foundation
@@ -338,9 +362,20 @@ CPU and NV.
 
 ## Phase 5: Paged Decode KV
 
+**Status:** Active. Implementation is scaffolded but not yet started: the
+`kernels/` modules (`kv_store.py`, `paged_attention.py`) and their test files
+(`test_block_pool.py`, `test_kv_store.py`, `test_paged_attention.py`) are empty
+stubs, and `DecodePlan.block_tables` is already present for Phase 5 prep. The
+physical page layout follows `architecture.md`: `kv_pool[layer, K_or_V,
+physical_page, page_offset, kv_head, head_dim]`.
+
 ### Phase 5A: Logical Page Allocator
 
 - Choose and benchmark a page size using the selected model and backend.
+  Page size is **measured before a default is fixed**: candidate sizes
+  (16/32/64 tokens) are benchmarked for store and attention cost at the start
+  of 5A rather than assumed. The pool budget is derived from the measured
+  device budget, not only the model maximum context.
 - Add a logical page pool, request block tables, reference counts, and reserved dummy
   read state.
 - Preallocate the physical KV pool as initialized tinygrad tensors.
@@ -356,8 +391,16 @@ invariants, including atomic failure and delayed in-flight reclamation.
 
 - Implement a custom UOp indexed KV-store operation with masked inactive writes.
 
-**Subphase gate:** Indexed stores match dense reference updates across page and dtype
-boundaries without inactive or aliased dummy writes.
+**Subphase gate:** Indexed stores match dense reference updates across page and
+dtype boundaries without inactive or aliased dummy writes.
+
+**Planned approach:** decode stores use a per-row bound `Variable` over the pool
+write position via the existing SSA `uop.store` / `uop.after` mechanism (masked
+with `active_mask`; padded rows write unique reserved dummy pages at constant
+positions), extending the Phase 2C precedent. Prefill stores are eager per-page
+contiguous `assign` calls. A measurement checkpoint records memory traffic and
+time versus the dense `assign` reference; the persistent-buffer optimization is
+tracked but not gated.
 
 ### Phase 5C: Paged Decode Attention
 
@@ -369,6 +412,12 @@ boundaries without inactive or aliased dummy writes.
 **Subphase gate:** Paged attention and contiguous attention agree independently of
 physical page assignment, partial tails, and GQA head mapping.
 
+**Planned approach:** first implementation gathers per-request K/V from the pool
+via `block_tables`/`seq_len` device inputs into dense `[S, seq_len, head, dim]`
+tensors and uses `scaled_dot_product_attention`, preserving the explicit
+store-before-attention dependency. A fused custom UOp attention kernel is
+evaluation-only and retained only if it beats the gather path.
+
 ### Phase 5D: Engine Integration
 
 - Replace contiguous slot ownership with page ownership without changing request,
@@ -376,6 +425,16 @@ physical page assignment, partial tails, and GQA head mapping.
 
 **Subphase gate:** Completion, failure, cancellation, and in-flight execution reclaim
 pages at the correct time under end-to-end request traces.
+
+**Planned approach:** contiguous-slot ownership is replaced by page ownership
+without changing the request, scheduler, execution-plan, or protocol contract
+shapes: `PrefillPlan.cache_slot` is re-read as the request's logical pool base,
+`DecodePlan.block_tables`/`active_mask` are populated by the scheduler, and
+page reclaim replaces `clear_slot`/`move_slot`/compaction (each request carries
+its own block table, so slot compaction disappears). Paged decode contracts are
+captured per supported batch shape with the Phase 4D stability invariants
+(no recapture, flat memory), and the persistent fixed-shape input buffers from
+the Phase 4D note land here.
 
 **Gate:** Paged and contiguous decode agree numerically, allocator invariants hold
 under stress, and pages are reclaimed only after active and in-flight ownership ends.

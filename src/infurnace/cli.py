@@ -2,25 +2,25 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from infurnace.engine import Engine
-from infurnace.engine.request import SamplingParams
-from infurnace.scheduler.scheduler import Scheduler
-from infurnace.sampler import GreedySampler
-from infurnace.tokenizer import Tokenizer
-
-class FakeTokenizer(Tokenizer):
-    """Trivial char<->token mapping for CPU-only offline runs."""
-
-    def encode(self, text: str) -> list[int]:
-        return [ord(c) for c in text]
-
-    def decode(self, ids: list[int]) -> str:
-        return "".join(chr(i) for i in ids)
-
-    def is_end(self, token_id: int) -> bool:
-        return False
 
 def _build_fake() -> Engine:
+    from infurnace.tokenizer import Tokenizer
+    from infurnace.engine import Engine
+    from infurnace.scheduler.scheduler import Scheduler
+    from infurnace.sampler import GreedySampler
+
+    class FakeTokenizer(Tokenizer):
+        """Trivial char<->token mapping for CPU-only offline runs."""
+
+        def encode(self, text: str) -> list[int]:
+            return [ord(c) for c in text]
+
+        def decode(self, ids: list[int]) -> str:
+            return "".join(chr(i) for i in ids)
+
+        def is_end(self, token_id: int) -> bool:
+            return False
+
     try:
         from tests.fakes import FakeRunner
     except Exception:
@@ -66,6 +66,8 @@ def main() -> int:
 
     if args.device:
         os.environ["DEV"] = args.device
+
+    from infurnace.engine.request import SamplingParams
 
     eng = _build_fake() if args.fake else _build_real(
         args.artifact, args.manifest, num_slots=args.num_slots,

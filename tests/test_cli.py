@@ -1,5 +1,6 @@
 import io
 import os
+import subprocess
 import sys
 import unittest
 from unittest.mock import patch
@@ -50,6 +51,29 @@ class TestCLIRealBuildPath(unittest.TestCase):
                 with patch.object(sys, "stdout", out):
                     main()
             self.assertEqual(os.environ.get("DEV"), "CPU")
+
+    def test_import_cli_has_no_tinygrad_side_effects(self):
+        # cli.py must not import tinygrad at module level, or --device (which
+        # sets os.environ["DEV"] before lazy imports in main) cannot take effect.
+        code = ("import sys; import infurnace.cli; "
+                "assert not any(n == 'tinygrad' or n.startswith('tinygrad.') for n in sys.modules)")
+        result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_device_applied_before_tinygrad_import(self):
+        # tinygrad captures DEV once at import; only a clean subprocess can prove
+        # the CLI sets DEV before tinygrad is imported.
+        code = (
+            "import os, sys; "
+            "sys.argv = ['infurnace', '--fake', '--prompt', 'x', '--max-tokens', '1', '--device', 'CPU']; "
+            "from infurnace.cli import main; rc = main(); "
+            "from tinygrad.device import Device; "
+            "print(rc, Device.DEFAULT)"
+        )
+        env = {k: v for k, v in os.environ.items() if k != "DEV"}
+        result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(result.stdout.strip().endswith("0 CPU"), result.stdout)
 
 
 if __name__ == "__main__":

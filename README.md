@@ -43,6 +43,13 @@ decode traces). The HTTP adapter (Phase 3F) is deferred. The documents define
 phase gates rather than claiming support for features that have not passed their
 correctness tests.
 
+The active work is Phase 5 (paged decode KV): the `kernels/` modules and their
+test stubs exist but are unimplemented. Before Phase 5 begins, one CLI polish fix
+lands first -- the `--device` flag currently sets `DEV` after tinygrad is
+imported and has no effect. Two deferred items are recorded in the roadmap
+(StreamingDetokenizer window decode, post-Phase 5; persistent decode input
+buffers, folded into Phase 5D) and are not Phase 5 blockers.
+
 ## Development
 
 Infurnace requires Python 3.11 or newer and develops against the current tinygrad
