@@ -43,3 +43,11 @@ class Runner(ABC):
         failed) after the request's cache slot is reclaimed.
         """
         ...
+
+    @abstractmethod
+    def move_slot(self, from_slot: int, to_slot: int) -> None:
+        """Copy the KV contents of ``from_slot`` into ``to_slot`` and zero the
+        source. The engine uses this to compact active requests into a prefix of
+        slots so fixed-shape batched decode can bind row ``i`` to slot ``i``.
+        """
+        ...

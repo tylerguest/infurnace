@@ -57,7 +57,8 @@ class Scheduler:
             self._reject(req, "capacity exceeded")
             return
         req.state = RequestState.WAITING
-        req.cache_slot = self._free_slots.pop()
+        req.cache_slot = min(self._free_slots)  # lowest free slot keeps a prefix
+        self._free_slots.discard(req.cache_slot)
         self._requests[req.request_id] = req
         self._waiting.append(req.request_id)
 
@@ -141,6 +142,45 @@ class Scheduler:
         self._active.pop(request_id, None)
         self._prefill_chunk.pop(request_id, None)
 
+    def release(self, request_id: str) -> None:
+        """Release a request's slot and drop it from queues on a terminal path.
+
+        The engine sets the terminal state (e.g. ``FAILED``) before calling
+        this; ``release`` frees the reserved slot so admission and idle state
+        stay correct without overwriting that state.
+        """
+        req = self._requests.get(request_id)
+        if req is None or req.cache_slot is None:
+            return
+        self._free_slots.add(req.cache_slot)
+        req.cache_slot = None
+        self._waiting = deque(r for r in self._waiting if r != request_id)
+        self._active.pop(request_id, None)
+        self._prefill_chunk.pop(request_id, None)
+
+    def compact(self) -> list[tuple[str, int, int]]:
+        """Return ``(request_id, from_slot, to_slot)`` moves that restore active
+        requests to a contiguous prefix of slots ``0..B-1``.
+
+        The engine applies the moves with ``runner.move_slot`` and updates each
+        request's ``cache_slot``. Fixed-shape batched decode relies on this
+        prefix (row ``i`` is bound to physical slot ``i``).
+        """
+        active = [r for r in self._active.values() if r.cache_slot is not None]
+        if not active:
+            return []
+        occupied = sorted(r.cache_slot for r in active)
+        moves: list[tuple[str, int, int]] = []
+        for target in range(len(active)):
+            if target in occupied:
+                continue
+            mover = max(occupied)  # move the highest-slot request into the hole
+            req = next(r for r in active if r.cache_slot == mover)
+            moves.append((req.request_id, mover, target))
+            occupied.remove(mover)
+            occupied.append(target)
+        return moves
+
     @property
     def num_free_slots(self) -> int:
         return len(self._free_slots)
@@ -158,6 +198,9 @@ class Scheduler:
         )
 
     def _make_decode_plan(self, reqs: list[Request]) -> DecodePlan:
+        # Row order is slot order (compaction keeps active requests in a prefix),
+        # so batched decode can bind row ``i`` to physical slot ``i``.
+        reqs = sorted(reqs, key=lambda r: r.cache_slot)
         # input_ids: the most recent token of each sequence (the token whose KV
         # is about to be written). positions: absolute index where it is written,
         # equal to the current sequence length (len(all_token_ids) - 1).

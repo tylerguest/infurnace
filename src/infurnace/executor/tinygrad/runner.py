@@ -29,9 +29,9 @@ class Qwen3Runner:
     self._decode_jit: dict[int, TinyJit] = {}
     for slot in range(kv_cache.num_slots):
       self._decode_jit[slot] = self._capture_decode(slot)
+    # Batched decode contracts are captured lazily on first decode_batch call so
+    # a runner that never batch-decodes does not pay the compile/workspace cost.
     self._decode_batch_jit: dict[tuple[int, ...], TinyJit] = {}
-    for slots in self._batch_slot_configs():
-      self._decode_batch_jit[slots] = self._capture_decode_batch(slots)
 
   @property
   def num_slots(self) -> int:
@@ -57,22 +57,6 @@ class Qwen3Runner:
     kv = self.kv_cache.kv
     kv[:, :, to_slot:to_slot+1].assign(kv[:, :, from_slot:from_slot+1]).realize()
     self.kv_cache.clear_slot(from_slot)
-
-  def _batch_slot_configs(self) -> tuple[tuple[int, ...], ...]:
-    """Slot tuples used by fixed-shape batched decode for this runner.
-
-    Rows ``0..B-1`` are active; a padded tail (only shape 4 with ``B=3``) uses
-    the reserved dummy slot. One TinyJit is captured per configuration.
-    """
-    dummy = self.kv_cache.dummy_slot
-    num_slots = self.kv_cache.num_slots
-    configs = []
-    if num_slots >= 1: configs.append((0,))
-    if num_slots >= 2: configs.append((0, 1))
-    if num_slots >= 4:
-      configs.append((0, 1, 2, 3))
-      configs.append((0, 1, 2, dummy))
-    return tuple(configs)
 
   @classmethod
   def from_weights(cls, weights: "Qwen3Weights", *, num_slots: int = 1,
@@ -139,7 +123,11 @@ class Qwen3Runner:
       Variable(f"position_{i}", 0, self.kv_cache.max_context - 1).bind(p)
       for i, p in enumerate(padded_positions)
     ]
-    logits = self._decode_batch_jit[padded_slots](padded_ids, *bound)
+    jit = self._decode_batch_jit.get(padded_slots)
+    if jit is None:
+      jit = self._capture_decode_batch(padded_slots)
+      self._decode_batch_jit[padded_slots] = jit
+    logits = jit(padded_ids, *bound)
     return logits[:B]
 
   def _capture_decode(self, slot: int) -> TinyJit:

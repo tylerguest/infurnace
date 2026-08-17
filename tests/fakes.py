@@ -40,6 +40,9 @@ class FakeRunner(Runner):
     def clear_slot(self, slot: int) -> None:
         self.cleared_slots.append(slot)
 
+    def move_slot(self, from_slot: int, to_slot: int) -> None:
+        self.calls.append(("move_slot", (), {"from_slot": from_slot, "to_slot": to_slot}))
+
     def _fake_logits(self) -> Tensor:
         t = self._counter % self.vocab_size
         self._counter += 1

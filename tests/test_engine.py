@@ -115,6 +115,16 @@ class TestEngineFIFOAndConcurrency(unittest.TestCase):
         self.assertEqual(req.state, RequestState.REJECTED)
         self.assertEqual(eng.scheduler.get_request("r1").state, RequestState.REJECTED)
 
+    def test_slot_reuse_assigns_lowest_free_slot(self):
+        runner = FakeRunner(vocab_size=50, seed=0, num_slots=2)
+        eng = Engine(runner, Scheduler(num_slots=2))
+        eng.add_request(_req("r1", sp=SamplingParams(max_tokens=1)))
+        eng.add_request(_req("r2", sp=SamplingParams(max_tokens=3)))
+        _run_to_done(eng)
+        # r1 finishes first and frees slot 0; a new request reuses the lowest slot.
+        eng.add_request(_req("r3", sp=SamplingParams(max_tokens=1)))
+        self.assertEqual(eng.scheduler.get_request("r3").cache_slot, 0)
+
 
 class TestEngineCancellation(unittest.TestCase):
     def test_cancel_waiting_is_cancelled_no_runner_calls(self):
@@ -156,6 +166,15 @@ class TestEngineFailure(unittest.TestCase):
         self.assertEqual(req.error, "boom")
         self.assertEqual(eng.output_tokens("r1"), ())
         self.assertEqual(runner.cleared_slots, [0])
+
+    def test_failure_releases_slot_and_engine_goes_idle(self):
+        runner = RaisingRunner(vocab_size=50, seed=0, num_slots=1)
+        eng = Engine(runner, Scheduler(num_slots=1))
+        eng.add_request(_req("r1", prompt_len=3))
+        _run_to_done(eng)  # must terminate despite the failure
+        self.assertEqual(eng.scheduler.get_request("r1").state, RequestState.FAILED)
+        self.assertTrue(eng.is_done())
+        self.assertEqual(eng.scheduler.num_free_slots, 1)
 
 
 class TestEngineStepAPI(unittest.TestCase):

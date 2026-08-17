@@ -87,6 +87,7 @@ class Engine:
         self.scheduler.cancel(request_id)
         if slot is not None:
             self.runner.clear_slot(slot)
+        self._apply_compaction()
 
     def output_tokens(self, request_id: str) -> tuple[int, ...]:
         return self.scheduler.get_request(request_id).output_token_ids
@@ -100,6 +101,12 @@ class Engine:
 
     def is_done(self) -> bool:
         return self.scheduler.is_idle
+
+    def _apply_compaction(self) -> None:
+        """Move active requests into a prefix of slots 0..B-1 (Phase 4A)."""
+        for request_id, from_slot, to_slot in self.scheduler.compact():
+            self.runner.move_slot(from_slot, to_slot)
+            self.scheduler.get_request(request_id).cache_slot = to_slot
 
     # --- Async seam ---
     def prepare_step(self) -> list[ExecutionPlan]:
@@ -129,6 +136,7 @@ class Engine:
                 if slot is not None:
                     self.runner.clear_slot(slot)
                     freed.append(slot)
+                self.scheduler.release(r.request_id)
                 continue
             req.append_output_token(r.token)
             new_tokens.setdefault(r.request_id, []).append(r.token)
@@ -174,6 +182,7 @@ class Engine:
         )
 
     def step(self) -> EngineStepResult:
+        self._apply_compaction()
         return self.commit_step(self.execute_step(self.prepare_step()))
 
     # --- Execution helpers ---

@@ -157,6 +157,75 @@ class TestSchedulerChunkedPrefill(unittest.TestCase):
         self.assertEqual(chunked_tokens, list(range(1500)))
 
 
+class TestSchedulerSlotManagement(unittest.TestCase):
+  """Phase 4A: persistent slot state — lowest-slot admission, compaction, and
+  decode-plan slot ordering."""
+
+  def test_admission_assigns_lowest_free_slot(self):
+    s = Scheduler(num_slots=3)
+    s.add_request(_req("r1"))
+    s.add_request(_req("r2"))
+    s.add_request(_req("r3"))
+    self.assertEqual([s._requests[r].cache_slot for r in ("r1", "r2", "r3")], [0, 1, 2])
+    s.schedule()  # r1 prefilling
+    s.mark_prefill_chunk_done("r1", 0)  # r1 decoding
+    s.mark_finished("r1")  # frees slot 0
+    s.add_request(_req("r4"))
+    self.assertEqual(s._requests["r4"].cache_slot, 0)
+
+  def _set_decoding(self, s: Scheduler, rid: str):
+    """Force a waiting request into an active DECODING state for compaction
+    tests (serial admission keeps one request active via ``schedule``)."""
+    req = s._requests[rid]
+    req.state = RequestState.DECODING
+    s._active[rid] = req
+
+  def test_compact_single_hole(self):
+    s = Scheduler(num_slots=2)
+    s.add_request(_req("r1"))
+    s.add_request(_req("r2"))
+    self._set_decoding(s, "r1")  # r1@0
+    self._set_decoding(s, "r2")  # r2@1
+    s.mark_finished("r1")  # frees slot 0; r2 still active at slot 1
+    self.assertEqual(s.compact(), [("r2", 1, 0)])
+
+  def test_compact_no_moves_when_already_prefix(self):
+    s = Scheduler(num_slots=2)
+    s.add_request(_req("r1"))
+    s.add_request(_req("r2"))
+    self._set_decoding(s, "r1")
+    self._set_decoding(s, "r2")
+    self.assertEqual(s.compact(), [])
+
+  def test_compact_multiple_holes(self):
+    s = Scheduler(num_slots=4)
+    for rid in ("r1", "r2", "r3", "r4"):
+      s.add_request(_req(rid))
+    for rid in ("r1", "r2", "r3", "r4"):
+      self._set_decoding(s, rid)
+    s.mark_finished("r1")
+    s.mark_finished("r2")  # holes at 0 and 1
+    self.assertEqual(s.compact(), [("r4", 3, 0), ("r3", 2, 1)])
+
+  def test_compact_ignores_terminal_requests(self):
+    s = Scheduler(num_slots=2)
+    s.add_request(_req("r1"))
+    s.add_request(_req("r2"))
+    self._set_decoding(s, "r1")
+    self._set_decoding(s, "r2")
+    s.mark_finished("r1")
+    s.mark_finished("r2")  # nothing active
+    self.assertEqual(s.compact(), [])
+
+  def test_decode_plan_slots_sorted_by_slot(self):
+    s = Scheduler(num_slots=2)
+    r1, r2 = _req("r1"), _req("r2")
+    r1.cache_slot, r2.cache_slot = 1, 0
+    dp = s._make_decode_plan([r1, r2])
+    self.assertEqual(dp.slots, (0, 1))
+    self.assertEqual(dp.request_ids, ("r2", "r1"))
+
+
 class TestSchedulerCancellation(unittest.TestCase):
     def test_cancel_waiting_not_scheduled(self):
         s = Scheduler(num_slots=2)
