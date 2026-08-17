@@ -404,13 +404,15 @@ ownership invariants.
 **Subphase gate:** Indexed stores match dense reference updates across page and
 dtype boundaries without inactive or aliased dummy writes.
 
-**Planned approach:** decode stores use a per-row bound `Variable` over the pool
-write position via the existing SSA `uop.store` / `uop.after` mechanism (masked
-with `active_mask`; padded rows write unique reserved dummy pages at constant
-positions), extending the Phase 2C precedent. Prefill stores are eager per-page
-contiguous `assign` calls. A measurement checkpoint records memory traffic and
-time versus the dense `assign` reference; the persistent-buffer optimization is
-tracked but not gated.
+**Status:** Implemented. `PagedKVCache` (`buffers.py`) defines the pool contract
+`[layer, 2, page, page_size, kv_head, head_dim]` with reserved dummy pages and
+`flat_slot(page, offset) = page * page_size + offset`. `kernels/kv_store.py`
+provides the eager indexed `store_kv` (per-row `assign` at decomposed
+`(page, offset)`; masked inactive rows write unique auto-derived dummy positions
+via a running dummy index, so no aliasing by construction; K/V cast to fp16).
+Tests compare scattered per-token writes against a dense per-page block
+reference across page and dtype boundaries. The SSA bound-`Variable` decode
+store wraps this kernel in 5C alongside attention.
 
 ### Phase 5C: Paged Decode Attention
 

@@ -43,12 +43,15 @@ decode traces). The HTTP adapter (Phase 3F) is deferred. The documents define
 phase gates rather than claiming support for features that have not passed their
 correctness tests.
 
-The active work is Phase 5 (paged decode KV). Phase 5A is complete: the logical
-page allocator (`src/infurnace/cache/block_pool.py`) with reference-counted
-active/in-flight ownership and atomic allocation is gated by randomized
-CPU-only tests, and the page size was benchmarked and defaults to 16 tokens.
-Phases 5B-5D remain: the indexed KV-store and paged-attention kernels are empty
-stubs, and engine integration replaces contiguous slots with page ownership.
+The active work is Phase 5 (paged decode KV). Phases 5A and 5B are complete: the
+logical page allocator (`src/infurnace/cache/block_pool.py`) with
+reference-counted active/in-flight ownership and atomic allocation is gated by
+randomized CPU-only tests, the page size was benchmarked and defaults to 16
+tokens, and the `PagedKVCache` pool contract plus the eager indexed `store_kv`
+kernel (`src/infurnace/kernels/kv_store.py`) match dense reference updates
+across page and dtype boundaries without inactive or aliased dummy writes.
+Phases 5C-5D remain: the paged-attention kernel is an empty stub, and engine
+integration replaces contiguous slots with page ownership.
 
 ## Development
 
