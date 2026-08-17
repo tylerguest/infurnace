@@ -29,7 +29,7 @@ only after the simpler path is correct and measured.
 
 ## Current State
 
-Phases 0-4C are complete. The repository implements verified checkpoint
+Phases 0-4D are complete. The repository implements verified checkpoint
 acquisition, GGUF inspection, focused tinygrad execution contracts, recorded
 upstream functional and performance baselines, the exact immutable Qwen3-0.6B
 model and tensor contract, a stateless eager forward pass, external contiguous KV
@@ -37,9 +37,11 @@ storage, TinyJit-captured single-request decode, an offline engine with request
 lifecycle, scheduler, tokenizer, streaming detokenization, real runner
 integration, and a CLI driver, plus fixed-shape batched decode (shapes 1/2/4)
 with persistent slot compaction, lazy per-contract JIT capture, and
-engine-integrated batched greedy sampling. The HTTP adapter (Phase 3F) is
-deferred. The documents define phase gates rather than claiming support for
-features that have not passed their correctness tests.
+engine-integrated batched greedy sampling, with verified steady-state stability
+(no re-capture or persistent device-buffer growth across long and ragged batched
+decode traces). The HTTP adapter (Phase 3F) is deferred. The documents define
+phase gates rather than claiming support for features that have not passed their
+correctness tests.
 
 ## Development
 

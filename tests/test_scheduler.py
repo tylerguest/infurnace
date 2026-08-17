@@ -225,6 +225,20 @@ class TestSchedulerSlotManagement(unittest.TestCase):
     self.assertEqual(dp.slots, (0, 1))
     self.assertEqual(dp.request_ids, ("r2", "r1"))
 
+  def test_free_slot_reclaims_vacated_slot(self):
+    s = Scheduler(num_slots=4)
+    for rid in ("r1", "r2", "r3", "r4"):
+      s.add_request(_req(rid))
+    # All four slots reserved at admission; a compaction move vacates a slot
+    # that the engine returns to the free set (Phase 4D regression).
+    self.assertEqual(s.num_free_slots, 0)
+    s.free_slot(3)
+    self.assertEqual(s.num_free_slots, 1)
+    s.free_slot(3)  # idempotent
+    self.assertEqual(s.num_free_slots, 1)
+    with self.assertRaises(SchedulerError):
+      s.free_slot(4)
+
 
 class TestSchedulerCancellation(unittest.TestCase):
     def test_cancel_waiting_not_scheduled(self):

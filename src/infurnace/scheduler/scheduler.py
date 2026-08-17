@@ -190,6 +190,16 @@ class Scheduler:
     def num_free_slots(self) -> int:
         return len(self._free_slots)
 
+    def free_slot(self, slot: int) -> None:
+        """Return a vacated cache slot to the free set (after a compaction move).
+
+        Compaction relocates an active request into a lower slot; the slot it
+        vacated is no longer owned by any request and must be reclaimable.
+        """
+        if slot < 0 or slot >= self._num_slots:
+            raise SchedulerError(f"slot {slot} out of range [0, {self._num_slots})")
+        self._free_slots.add(slot)
+
     # --- Plan construction ---
     def _make_prefill_plan(self, req: Request) -> PrefillPlan:
         bounds = tuple(chunk_prompt(list(req.prompt_token_ids), self._policy.max_chunk_tokens))

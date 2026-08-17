@@ -175,6 +175,23 @@ class TestEngineBatchedDecode(unittest.TestCase):
         shared = [c for c in runner.calls if c[0] == "decode_batch" and len(c[1]) == 2]
         self.assertTrue(shared)
 
+    def test_ragged_batch_shrinks_to_one(self):
+        # Four requests share a decode batch of 4 that shrinks ragged to 1 as
+        # each request finishes at its own max_tokens.
+        runner = FakeRunner(vocab_size=200, seed=0, num_slots=4)
+        eng = Engine(runner, Scheduler(num_slots=4))
+        for rid in ("r1", "r2", "r3", "r4"):
+            eng.add_request(_req(rid, prompt_len=3, sp=SamplingParams(max_tokens=5)))
+        _run_to_done(eng)
+        for rid in ("r1", "r2", "r3", "r4"):
+            self.assertEqual(eng.scheduler.get_request(rid).state, RequestState.FINISHED)
+            self.assertEqual(len(eng.output_tokens(rid)), 5)
+        rows = [len(c[1]) for c in runner.calls if c[0] == "decode_batch"]
+        self.assertIn(4, rows)  # full batch reached
+        self.assertIn(3, rows)  # ragged shrink 4 -> 3
+        self.assertIn(1, rows)  # tail
+        self.assertEqual(eng.scheduler.num_free_slots, 4)
+
 
 class TestEngineCancellation(unittest.TestCase):
     def test_cancel_waiting_is_cancelled_no_runner_calls(self):

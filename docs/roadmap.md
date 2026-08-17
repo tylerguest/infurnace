@@ -319,9 +319,20 @@ remains single-request and serial.
 **Subphase gate:** Long decode traces preserve allocation and capture counts after
 warmup for every supported batch contract.
 
+**Status:** Implemented. `tests/test_stability.py` asserts, per supported batch
+shape and across a ragged 4 -> 3 -> 2 -> 1 shrink, that steady `decode_batch`
+replays keep `GlobalCounters.mem_used` at its post-warmup value, never re-capture
+a contract (`TinyJit.captured` identity stable, `cnt` grows by exactly one per
+step), and still match independent single-request decode.
+
 **Gate:** Fixed ragged decode batches match independent single-request execution
 without cache corruption, inactive-row mutation, recapture, or cross-request output
 changes.
+
+**Status:** PASS. 4B/4C tests cover fixed shapes, dummy-row isolation, independent
+finish, mid-batch cancellation, slot reuse, and batch-membership invariance; 4D
+stability tests cover recapture-free and allocation-flat long/ragged traces on
+CPU and NV.
 
 **Release:** `v0.2`, fixed batched tinygrad inference server.
 

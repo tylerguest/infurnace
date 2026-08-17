@@ -107,6 +107,8 @@ class Engine:
         for request_id, from_slot, to_slot in self.scheduler.compact():
             self.runner.move_slot(from_slot, to_slot)
             self.scheduler.get_request(request_id).cache_slot = to_slot
+            # The source slot is vacated by the move and becomes free again.
+            self.scheduler.free_slot(from_slot)
 
     # --- Async seam ---
     def prepare_step(self) -> list[ExecutionPlan]:
