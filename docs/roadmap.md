@@ -387,6 +387,16 @@ physical_page, page_offset, kv_head, head_dim]`.
 **Subphase gate:** CPU-only randomized traces preserve allocator and ownership
 invariants, including atomic failure and delayed in-flight reclamation.
 
+**Status:** Implemented. `src/infurnace/cache/block_pool.py` provides the
+logical page allocator (free set, per-request block tables, reference counts,
+separate active and in-flight ownership, reserved dummy pages, atomic
+`alloc`/`extend` with rollback, idempotent `mark_in_flight`, delayed
+reclamation on `complete_in_flight`). Page size was benchmarked first
+([report](baselines/phase5a-page-size.md)) and defaults to 16 tokens; the
+measurement is re-verified at 5B/5C. `tests/test_block_pool.py` covers
+deterministic and seeded randomized traces preserving the allocator and
+ownership invariants.
+
 ### Phase 5B: Indexed KV Store
 
 - Implement a custom UOp indexed KV-store operation with masked inactive writes.

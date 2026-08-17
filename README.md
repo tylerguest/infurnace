@@ -43,12 +43,12 @@ decode traces). The HTTP adapter (Phase 3F) is deferred. The documents define
 phase gates rather than claiming support for features that have not passed their
 correctness tests.
 
-The active work is Phase 5 (paged decode KV): the `kernels/` modules and their
-test stubs exist but are unimplemented. Before Phase 5 begins, one CLI polish fix
-lands first -- the `--device` flag currently sets `DEV` after tinygrad is
-imported and has no effect. Two deferred items are recorded in the roadmap
-(StreamingDetokenizer window decode, post-Phase 5; persistent decode input
-buffers, folded into Phase 5D) and are not Phase 5 blockers.
+The active work is Phase 5 (paged decode KV). Phase 5A is complete: the logical
+page allocator (`src/infurnace/cache/block_pool.py`) with reference-counted
+active/in-flight ownership and atomic allocation is gated by randomized
+CPU-only tests, and the page size was benchmarked and defaults to 16 tokens.
+Phases 5B-5D remain: the indexed KV-store and paged-attention kernels are empty
+stubs, and engine integration replaces contiguous slots with page ownership.
 
 ## Development
 
