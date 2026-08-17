@@ -26,11 +26,10 @@ class Qwen3Runner:
     self.model = model
     self.kv_cache = kv_cache
     self.model.kv_cache = kv_cache
+    # Single-decode and batched-decode contracts are captured lazily on first
+    # use so a runner that never decodes through a given path does not pay the
+    # compile/workspace cost (keeps NV engine memory within budget).
     self._decode_jit: dict[int, TinyJit] = {}
-    for slot in range(kv_cache.num_slots):
-      self._decode_jit[slot] = self._capture_decode(slot)
-    # Batched decode contracts are captured lazily on first decode_batch call so
-    # a runner that never batch-decodes does not pay the compile/workspace cost.
     self._decode_batch_jit: dict[tuple[int, ...], TinyJit] = {}
 
   @property
@@ -87,8 +86,12 @@ class Qwen3Runner:
       raise RunnerError(f"position {position} out of range [0, {self.kv_cache.max_context})")
 
     ids = input_ids if input_ids.uop.is_realized else input_ids.contiguous().realize()
+    jit = self._decode_jit.get(slot)
+    if jit is None:
+      jit = self._capture_decode(slot)
+      self._decode_jit[slot] = jit
     pos_var = Variable("position", 0, self.kv_cache.max_context - 1).bind(position)
-    logits = self._decode_jit[slot](ids, pos_var)
+    logits = jit(ids, pos_var)
     return logits
 
   def decode_batch(self, input_ids: Tensor, positions: Sequence[int], slots: Sequence[int]) -> Tensor:

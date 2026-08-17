@@ -1,5 +1,6 @@
 from __future__ import annotations
 from abc import ABC, abstractmethod
+from typing import Sequence
 from tinygrad import Tensor
 
 class Runner(ABC):
@@ -33,6 +34,16 @@ class Runner(ABC):
         """Single-token decode. ``input_ids`` has shape ``[1, 1]``.
         ``position`` is the absolute position of the decoded token. Returns
         logits of shape ``[1, vocab_size]``.
+        """
+        ...
+
+    @abstractmethod
+    def decode_batch(self, input_ids: Tensor, positions: Sequence[int], slots: Sequence[int]) -> Tensor:
+        """Fixed-shape batched decode for ``B`` active rows.
+
+        ``input_ids`` has shape ``[B, 1]`` (one token per row). ``positions``
+        and ``slots`` have ``B`` entries. The runner pads inactive rows to the
+        next supported shape and returns logits of shape ``[B, vocab_size]``.
         """
         ...
 

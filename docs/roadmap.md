@@ -306,6 +306,11 @@ single-request execution, including inactive rows and position boundaries.
 **Subphase gate:** Requests finish independently and greedy output is unchanged by
 batch membership, row movement, inactive padding, or slot reuse.
 
+**Status:** Implemented. The engine executes one `decode_batch` per decode plan
+with batched greedy sampling; the scheduler admits one waiting request to
+prefill while decoders stay active so real decode batches build up. Prefill
+remains single-request and serial.
+
 ### Phase 4D: Steady-State Stability
 
 - Verify that steady decode creates no new persistent device buffers and does not

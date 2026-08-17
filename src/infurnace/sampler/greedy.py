@@ -15,8 +15,20 @@ class Sampler(ABC):
         """Return a single next-token id for ``logits`` of shape ``[1, V]``."""
         ...
 
+    @abstractmethod
+    def sample_batch(self, logits: Tensor, params) -> tuple[int, ...]:
+        """Return next-token ids for ``logits`` of shape ``[B, V]``.
+
+        Greedy ignores ``params``; per-request sampling parameters arrive in
+        Phase 7.
+        """
+        ...
+
 class GreedySampler(Sampler):
     """Deterministic argmax sampler. Used to validate the server end-to-end."""
 
     def sample(self, logits: Tensor, params) -> int:
         return int(logits.argmax().item())
+
+    def sample_batch(self, logits: Tensor, params) -> tuple[int, ...]:
+        return tuple(int(t) for t in logits.argmax(axis=1).tolist())

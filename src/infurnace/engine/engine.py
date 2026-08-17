@@ -209,18 +209,19 @@ class Engine:
         return [_PlanResult(plan, plan.request_id, token=token, is_prefill=True)]
 
     def _execute_decode(self, plan: DecodePlan) -> list[_PlanResult]:
-        results: list[_PlanResult] = []
-        for i, rid in enumerate(plan.request_ids):
-            try:
-                logits = self.runner.decode(
-                    Tensor([[plan.input_ids[i]]], dtype=dtypes.int32),
-                    position=plan.positions[i],
-                    slot=plan.slots[i],
-                )
-                req = self.scheduler.get_request(rid)
-                token = self.sampler.sample(logits, plan.sampling_params[i])
-                results.append(_PlanResult(plan, rid, token=token, is_prefill=False))
-            except Exception as e:
-                traceback.print_exc()
-                results.append(_PlanResult(plan, rid, error=str(e), is_prefill=False))
-        return results
+        if not plan.request_ids:
+            return []
+        try:
+            logits = self.runner.decode_batch(
+                Tensor([[tid] for tid in plan.input_ids], dtype=dtypes.int32),
+                plan.positions,
+                plan.slots,
+            )
+            tokens = self.sampler.sample_batch(logits, plan.sampling_params)
+        except Exception as e:  # a batched decode failure is terminal for every row
+            traceback.print_exc()
+            return [_PlanResult(plan, rid, error=str(e), is_prefill=False) for rid in plan.request_ids]
+        return [
+            _PlanResult(plan, rid, token=token, is_prefill=False)
+            for rid, token in zip(plan.request_ids, tokens)
+        ]

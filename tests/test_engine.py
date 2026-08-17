@@ -59,10 +59,10 @@ class TestEngineSingleRequest(unittest.TestCase):
         eng = Engine(runner, Scheduler(num_slots=1))
         eng.add_request(_req("r1", prompt_len=3, sp=SamplingParams(max_tokens=4)))
         _run_to_done(eng)
-        decode_calls = [c for c in runner.calls if c[0] == "decode"]
+        decode_calls = [c for c in runner.calls if c[0] == "decode_batch"]
         # First token comes from prefill; 3 decode steps follow.
         self.assertEqual(len(decode_calls), 3)
-        self.assertEqual([c[2]["position"] for c in decode_calls], [3, 4, 5])
+        self.assertEqual([c[2]["positions"][0] for c in decode_calls], [3, 4, 5])
         self.assertEqual([c[1][0] for c in decode_calls], [0, 1, 2])  # fed-back tokens
 
     def test_metrics_recorded(self):
@@ -80,9 +80,9 @@ class TestEngineSingleRequest(unittest.TestCase):
 
 
 class TestEngineFIFOAndConcurrency(unittest.TestCase):
-    def test_two_requests_fifo_serial(self):
-        # num_slots=2 so both are admitted (queued); prefill stays serial, so
-        # r2's prefill runs only after r1 fully completes.
+    def test_two_requests_batch_concurrently(self):
+        # num_slots=2 admits both; r2's prefill overlaps r1's decode so the
+        # engine produces a real decode batch containing both requests.
         runner = FakeRunner(vocab_size=50, seed=0, num_slots=2)
         eng = Engine(runner, Scheduler(num_slots=2))
         eng.add_request(_req("r1", prompt_len=3, sp=SamplingParams(max_tokens=3)))
@@ -90,11 +90,11 @@ class TestEngineFIFOAndConcurrency(unittest.TestCase):
         _run_to_done(eng)
         self.assertEqual(eng.scheduler.get_request("r1").state, RequestState.FINISHED)
         self.assertEqual(eng.scheduler.get_request("r2").state, RequestState.FINISHED)
-        # Serial: r2's prefill occurs only after r1's last decode.
-        roles = [c[0] for c in runner.calls]
-        r1_prefill = roles.index("prefill")
-        r2_prefill = roles.index("prefill", r1_prefill + 1)
-        self.assertTrue(all(r == "decode" for r in roles[r1_prefill + 1:r2_prefill]))
+        # A shared decode batch carries one row per active request, in slot order.
+        shared = [c for c in runner.calls if c[0] == "decode_batch" and len(c[1]) == 2]
+        self.assertTrue(shared)
+        self.assertEqual(shared[0][1], (1, 2))       # row tokens for r1, r2
+        self.assertEqual(shared[0][2]["slots"], (0, 1))
 
     def test_rejection_on_capacity(self):
         runner = FakeRunner(vocab_size=50, num_slots=1)
@@ -124,6 +124,56 @@ class TestEngineFIFOAndConcurrency(unittest.TestCase):
         # r1 finishes first and frees slot 0; a new request reuses the lowest slot.
         eng.add_request(_req("r3", sp=SamplingParams(max_tokens=1)))
         self.assertEqual(eng.scheduler.get_request("r3").cache_slot, 0)
+
+
+class TestEngineBatchedDecode(unittest.TestCase):
+    """Phase 4C: decode plans execute through decode_batch and requests in one
+    batch finish independently."""
+
+    def test_batch_requests_finish_independently(self):
+        runner = FakeRunner(vocab_size=50, seed=0, num_slots=2)
+        eng = Engine(runner, Scheduler(num_slots=2))
+        eng.add_request(_req("r1", prompt_len=3, sp=SamplingParams(max_tokens=2)))
+        eng.add_request(_req("r2", prompt_len=3, sp=SamplingParams(max_tokens=5)))
+        _run_to_done(eng)
+        self.assertEqual(eng.scheduler.get_request("r1").state, RequestState.FINISHED)
+        self.assertEqual(eng.scheduler.get_request("r2").state, RequestState.FINISHED)
+        self.assertEqual(len(eng.output_tokens("r1")), 2)
+        self.assertEqual(len(eng.output_tokens("r2")), 5)
+
+    def test_cancel_one_of_batched_requests(self):
+        runner = FakeRunner(vocab_size=50, seed=0, num_slots=2)
+        eng = Engine(runner, Scheduler(num_slots=2))
+        eng.add_request(_req("r1", prompt_len=3, sp=SamplingParams(max_tokens=10)))
+        eng.add_request(_req("r2", prompt_len=3, sp=SamplingParams(max_tokens=10)))
+        eng.step()  # r1 prefill
+        eng.step()  # r1 decode + r2 prefill
+        eng.step()  # r1+r2 batched decode
+        self.assertEqual(eng.scheduler.get_request("r1").state, RequestState.DECODING)
+        self.assertEqual(eng.scheduler.get_request("r2").state, RequestState.DECODING)
+        calls_before = len(runner.calls)
+        eng.cancel("r1")
+        _run_to_done(eng)
+        self.assertEqual(eng.scheduler.get_request("r1").state, RequestState.CANCELLED)
+        self.assertEqual(eng.scheduler.get_request("r2").state, RequestState.FINISHED)
+        self.assertIn(0, runner.cleared_slots)  # r1's slot cleared on cancel
+        after = [c for c in runner.calls[calls_before:] if c[0] == "decode_batch"]
+        self.assertTrue(all(len(c[1]) == 1 for c in after))  # r2 continues alone
+
+    def test_new_request_joins_active_batch(self):
+        runner = FakeRunner(vocab_size=50, seed=0, num_slots=2)
+        eng = Engine(runner, Scheduler(num_slots=2))
+        eng.add_request(_req("r1", prompt_len=3, sp=SamplingParams(max_tokens=1)))
+        eng.add_request(_req("r2", prompt_len=3, sp=SamplingParams(max_tokens=8)))
+        eng.step()  # r1 prefill
+        eng.step()  # r1 decode + r2 prefill; r1 finishes and frees slot 0
+        eng.add_request(_req("r3", prompt_len=3, sp=SamplingParams(max_tokens=4)))
+        self.assertEqual(eng.scheduler.get_request("r3").cache_slot, 0)  # reuses slot 0
+        _run_to_done(eng)
+        self.assertEqual(eng.scheduler.get_request("r3").state, RequestState.FINISHED)
+        # r2 and r3 decode together after r3's prefill overlaps r2's decode.
+        shared = [c for c in runner.calls if c[0] == "decode_batch" and len(c[1]) == 2]
+        self.assertTrue(shared)
 
 
 class TestEngineCancellation(unittest.TestCase):

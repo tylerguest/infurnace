@@ -10,9 +10,10 @@ class SchedulerError(ValueError):
 
 class Scheduler:
     """Admission and execution-plan generator.
-    Single-request serial prefill in this phase: ``schedule()`` returns at most
-    one plan per step (a prefill chunk, a decode batch, or nothing). The return
-    type is a list so Phase 4 batched decode fits without a signature change.
+    Single-request serial prefill: ``schedule()`` returns the decode batch and,
+    when a waiting request holds a reserved slot, one new prefill (Phase 4C).
+    Prefill stays one request at a time so concurrent requests build a real
+    decode batch.
 
     The scheduler owns logical cache-slot assignment and prefill progress. The
     engine transitions ``PREFILLING -> DECODING -> FINISHED`` and frees slots on
@@ -100,19 +101,23 @@ class Scheduler:
         if self._prefill_chunk:
             rid = next(iter(self._prefill_chunk))
             return [self._make_prefill_plan(self._requests[rid])]
+        plans: list[ExecutionPlan] = []
         # 2) Decode all active decoding requests
         decoding = [r for r in self._active.values() if r.state == RequestState.DECODING]
         if decoding:
-            return [self._make_decode_plan(decoding)]
-        # 3) Admit head of waiting queue to prefill (slot already reserved)
+            plans.append(self._make_decode_plan(decoding))
+        # 3) Admit head of waiting queue to prefill even while decode runs, so
+        #    concurrent requests build a real decode batch (Phase 4C). The
+        #    waiting request already holds a reserved slot; prefill stays
+        #    single-request and serial.
         if self._waiting:
             rid = self._waiting.popleft()
             req = self._requests[rid]
             req.transition(RequestState.PREFILLING)
             self._active[rid] = req
             self._prefill_chunk[rid] = 0
-            return [self._make_prefill_plan(req)]
-        return []  # idle
+            plans.append(self._make_prefill_plan(req))
+        return plans  # [decode, prefill], [decode], [prefill], or [] when idle
 
     def mark_prefill_chunk_done(self, request_id: str, chunk_idx: int) -> None:
         """Advance prefill progress after a chunk executes.

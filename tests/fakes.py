@@ -37,6 +37,17 @@ class FakeRunner(Runner):
         self.calls.append(("decode", (tok,), {"position": position, "slot": slot}))
         return self._fake_logits()
 
+    def decode_batch(self, input_ids: Tensor, positions, slots) -> Tensor:
+        rows = input_ids.tolist()
+        toks = tuple(r[0] for r in rows)
+        self.calls.append(("decode_batch", toks, {"positions": tuple(positions), "slots": tuple(slots)}))
+        data = [[0.0] * self.vocab_size for _ in rows]
+        for i in range(len(rows)):
+            t = self._counter % self.vocab_size
+            self._counter += 1
+            data[i][t] = 1.0
+        return Tensor(data, dtype=dtypes.float32)
+
     def clear_slot(self, slot: int) -> None:
         self.cleared_slots.append(slot)
 

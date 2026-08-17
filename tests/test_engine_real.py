@@ -109,3 +109,30 @@ def test_real_runner_context_limit_rejection():
     eng = _build(num_slots=1, max_context=4)
     eng.add_text_request("The capital of France is", SamplingParams(max_tokens=4), request_id="r1")
     assert eng.scheduler.get_request("r1").state is RequestState.REJECTED
+
+
+@pytest.mark.model
+@pytest.mark.slow
+@_NEEDS
+def test_real_runner_batched_decode_matches_serial():
+    # Phase 4C gate: greedy output is unchanged by batch membership. The same
+    # two prompts produce identical per-request tokens whether they share a
+    # decode batch (num_slots=2) or run alone (num_slots=1).
+    def run_concurrent():
+        eng = _build(num_slots=2, max_context=256)
+        eng.add_text_request("The capital of France is", SamplingParams(max_tokens=4), request_id="r1")
+        eng.add_text_request("The capital of Germany is", SamplingParams(max_tokens=4), request_id="r2")
+        while not eng.is_done():
+            eng.step()
+        return eng.output_tokens("r1"), eng.output_tokens("r2")
+
+    def run_alone(prompt):
+        eng = _build(num_slots=1, max_context=256)
+        eng.add_text_request(prompt, SamplingParams(max_tokens=4), request_id="r1")
+        while not eng.is_done():
+            eng.step()
+        return eng.output_tokens("r1")
+
+    batched_r1, batched_r2 = run_concurrent()
+    assert batched_r1 == run_alone("The capital of France is")
+    assert batched_r2 == run_alone("The capital of Germany is")
