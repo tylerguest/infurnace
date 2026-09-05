@@ -37,7 +37,12 @@ gap with custom NV kernels:
   quantified gap list and the target decode tok/s. First pass complete
   ([comparison](baselines/qwen3-4b-q4-k-m-comparison.md)): llama.cpp sustains
   124 tok/s (~69% of the bandwidth ceiling) versus Infurnace's naive 7.9 tok/s
-  (~4.4%), a 15.6x gap that is kernel efficiency, not architecture.
+  (~4.4%), a 15.6x gap that is kernel efficiency, not architecture. Decode-step
+  profile ([profile](baselines/qwen3-4b-profile-decode.md)) confirms the
+  serving path is **device-bound** at ~110 ms/token (~23 GB/s): the small
+  per-layer Q4_K/Q6_K GEMVs (3-32 GB/s isolated) are the inefficiency while
+  the large output GEMV runs near the ceiling; only ~15 ms/token is host
+  overhead (the `.tolist()` roundtrip and sampler).
 - **Model contract.** The pinned single-checkpoint contract is now Qwen3-4B
   Q4_K_M: 398 exact tensors (F32 norms, Q4_K matmuls, Q6_K embedding/value/FFN-
   down with an imatrix layer split). Lazy quantized execution is the only
