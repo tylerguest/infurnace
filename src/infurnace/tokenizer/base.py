@@ -4,8 +4,8 @@ from typing import Callable, Optional
 
 class Tokenizer(ABC):
     """Text<->token interface for the engine.
-    Implemented by ``GGUFTokenizer`` (tinygrad ``SimpleTokenizer``) and by
-    test fakes. The engine depends only on this contract.
+    Implemented by ``GGUFTokenizer`` (tinygrad ``SimpleTokenizer``). The engine
+    depends only on this contract.
     """
 
     @abstractmethod

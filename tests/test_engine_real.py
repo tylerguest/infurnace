@@ -11,15 +11,15 @@ from infurnace.executor.tinygrad.weights import load_qwen3_checkpoint, WeightPol
 from infurnace.executor.tinygrad.runner import Qwen3Runner
 from infurnace.tokenizer import GGUFTokenizer
 
-_ARTIFACT = "artifacts/models/Qwen3-0.6B-Q8_0.gguf"
-_MANIFEST = "models/qwen3-0.6b-q8_0.json"
+_ARTIFACT = "artifacts/models/Qwen3-4B-Q4_K_M.gguf"
+_MANIFEST = "models/qwen3-4b-q4_k_m.json"
 _NEEDS = pytest.mark.skipif(
     not (os.path.exists(_ARTIFACT) and os.path.exists(_MANIFEST)),
     reason="Qwen3 GGUF artifact/manifest not present",
 )
 
 
-def _build(num_slots: int = 1, max_context: int = 512, policy: WeightPolicy = WeightPolicy.REALIZED_FP16):
+def _build(num_slots: int = 1, max_context: int = 512, policy: WeightPolicy = WeightPolicy.LAZY_FP16):
     cp = load_qwen3_checkpoint(_ARTIFACT, load_manifest(_MANIFEST), policy=policy)
     tok = GGUFTokenizer.from_gguf_metadata(cp.metadata)
     runner = Qwen3Runner.from_weights(cp.weights, num_slots=num_slots, max_context=max_context)
@@ -125,14 +125,20 @@ def test_real_runner_batched_decode_matches_serial():
         eng.add_text_request("The capital of Germany is", SamplingParams(max_tokens=4), request_id="r2")
         while not eng.is_done():
             eng.step()
-        return eng.output_tokens("r1"), eng.output_tokens("r2")
+        tokens = eng.output_tokens("r1"), eng.output_tokens("r2")
+        del eng
+        gc.collect()
+        return tokens
 
     def run_alone(prompt):
         eng = _build(num_slots=1, max_context=256)
         eng.add_text_request(prompt, SamplingParams(max_tokens=4), request_id="r1")
         while not eng.is_done():
             eng.step()
-        return eng.output_tokens("r1")
+        tokens = eng.output_tokens("r1")
+        del eng
+        gc.collect()
+        return tokens
 
     batched_r1, batched_r2 = run_concurrent()
     assert batched_r1 == run_alone("The capital of France is")
@@ -183,3 +189,35 @@ def test_real_runner_ragged_batch_stable():
     # Greedy output is unchanged by batch membership through the ragged shrink.
     for rid in prompts:
         assert eng.output_tokens(rid) == baseline[rid]
+
+
+@pytest.mark.model
+@pytest.mark.slow
+@_NEEDS
+def test_real_runner_metrics_recorded():
+    eng = _build(num_slots=1, max_context=256)
+    eng.add_text_request("The capital of France is", SamplingParams(max_tokens=4), request_id="r1")
+    while not eng.is_done():
+        eng.step()
+    m = eng.metrics_of("r1")
+    assert m.arrival_time is not None
+    assert m.first_token_time is not None
+    assert m.completion_time is not None
+    assert m.first_token_time <= m.completion_time
+    assert eng.scheduler.get_request("r1").state is RequestState.FINISHED
+
+
+@pytest.mark.model
+@pytest.mark.slow
+@_NEEDS
+def test_real_runner_step_api_matches_composed_step():
+    eng = _build(num_slots=1, max_context=256)
+    eng.add_text_request("The capital of France is", SamplingParams(max_tokens=2), request_id="r1")
+    composed = eng.step()
+
+    eng2 = _build(num_slots=1, max_context=256)
+    eng2.add_text_request("The capital of France is", SamplingParams(max_tokens=2), request_id="r1")
+    raw = eng2.execute_step(eng2.prepare_step())
+    split = eng2.commit_step(raw)
+    assert composed.new_tokens == split.new_tokens
+    assert composed.completed_requests == split.completed_requests

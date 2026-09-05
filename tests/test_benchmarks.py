@@ -104,6 +104,26 @@ def valid_decode_result() -> dict:
   )
   return result
 
+def valid_infurnace_decode_result() -> dict:
+  result = copy.deepcopy(valid_result())
+  measured = [10, 20]
+  result["benchmark"] = "infurnace_decode"
+  result["workload"] = {
+    "prompt_tokens": 16, "ttft_tokens": 1, "contract_setup_tokens": 2,
+    "timed_decode_tokens": 2, "total_generated_tokens": 5, "measured_samples": 2, "sampling": "greedy",
+  }
+  result["timings"] = {
+    "artifact_verification_ns": 1, "model_load_ns": 2, "cold_prefill_ttft_ns": 3,
+    "decode_capture_ns": 4, "contract_setup_ns": [4, 5], "decode_ns": measured,
+    "decode_summary": timing_summary(measured),
+    "generated_tokens_per_second": [100_000_000.0, 50_000_000.0],
+    "weights_bytes": 1000, "achieved_bytes_per_second": 50_000_000_000,
+  }
+  result["outputs"] = {
+    "prefill_token_id": 1, "contract_setup_token_ids": [2, 3], "measured_token_ids": [4, 5],
+  }
+  return result
+
 def valid_end_to_end_result() -> dict:
   result = copy.deepcopy(valid_result())
   result["benchmark"] = "upstream_end_to_end"
@@ -217,6 +237,23 @@ class TestBenchmarkResultContract(unittest.TestCase):
       write_result(result, output)
       self.assertEqual(json.loads(output.read_text(encoding="utf-8")), result)
       self.assertEqual(list(output.parent.iterdir()), [output])
+
+  def test_accepts_valid_infurnace_decode_result(self):
+    validate_result(valid_infurnace_decode_result())
+
+  def test_rejects_infurnace_decode_mismatches(self):
+    mutations = [
+      lambda result: result["timings"].update(decode_capture_ns=0),
+      lambda result: result["timings"].update(weights_bytes=0),
+      lambda result: result["timings"].update(achieved_bytes_per_second=-1),
+      lambda result: result["workload"].update(contract_setup_tokens=3),
+      lambda result: result["outputs"].update(prefill_token_id=-1),
+    ]
+    for mutate in mutations:
+      with self.subTest(mutate=mutate):
+        result = copy.deepcopy(valid_infurnace_decode_result())
+        mutate(result)
+        with self.assertRaises(ValueError): validate_result(result)
 
   def test_rejects_policy_timing_and_peak_mismatches(self):
     mutations = [

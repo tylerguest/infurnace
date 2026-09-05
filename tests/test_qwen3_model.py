@@ -11,12 +11,12 @@ from infurnace.models.config import Qwen3Config, TensorSpec
 from infurnace.models.manifest import load_manifest
 
 REPOSITORY_ROOT = Path(__file__).parents[1]
-PINNED_MANIFEST = REPOSITORY_ROOT / "models" / "qwen3-0.6b-q8_0.json"
+PINNED_MANIFEST = REPOSITORY_ROOT / "models" / "qwen3-4b-q4_k_m.json"
 
 def _tensor_specs(config: Qwen3Config) -> tuple[TensorSpec, ...]:
   specs = [
     TensorSpec("output_norm.weight", (config.embedding_length,), "F32", "float"),
-    TensorSpec("token_embd.weight", (config.vocab_size, config.embedding_length), "Q8_0", "float"),
+    TensorSpec("token_embd.weight", (config.vocab_size, config.embedding_length), "Q6_K", "float"),
   ]
   qw = config.attention_head_count * config.key_length
   kw = config.attention_head_count_kv * config.key_length
@@ -25,17 +25,17 @@ def _tensor_specs(config: Qwen3Config) -> tuple[TensorSpec, ...]:
   for i in range(config.block_count):
     p = f"blk.{i}"
     specs.extend((
-      TensorSpec(f"{p}.attn_k.weight", (kw, config.embedding_length), "Q8_0", "float"),
+      TensorSpec(f"{p}.attn_k.weight", (kw, config.embedding_length), "Q4_K", "float"),
       TensorSpec(f"{p}.attn_k_norm.weight", (config.key_length,), "F32", "float"),
       TensorSpec(f"{p}.attn_norm.weight", (config.embedding_length,), "F32", "float"),
-      TensorSpec(f"{p}.attn_output.weight", (config.embedding_length, ow), "Q8_0", "float"),
-      TensorSpec(f"{p}.attn_q.weight", (qw, config.embedding_length), "Q8_0", "float"),
+      TensorSpec(f"{p}.attn_output.weight", (config.embedding_length, ow), "Q4_K", "float"),
+      TensorSpec(f"{p}.attn_q.weight", (qw, config.embedding_length), "Q4_K", "float"),
       TensorSpec(f"{p}.attn_q_norm.weight", (config.key_length,), "F32", "float"),
-      TensorSpec(f"{p}.attn_v.weight", (vw, config.embedding_length), "Q8_0", "float"),
-      TensorSpec(f"{p}.ffn_down.weight", (config.embedding_length, config.feed_forward_length), "Q8_0", "float"),
-      TensorSpec(f"{p}.ffn_gate.weight", (config.feed_forward_length, config.embedding_length), "Q8_0", "float"),
+      TensorSpec(f"{p}.attn_v.weight", (vw, config.embedding_length), "Q6_K", "float"),
+      TensorSpec(f"{p}.ffn_down.weight", (config.embedding_length, config.feed_forward_length), "Q6_K", "float"),
+      TensorSpec(f"{p}.ffn_gate.weight", (config.feed_forward_length, config.embedding_length), "Q4_K", "float"),
       TensorSpec(f"{p}.ffn_norm.weight", (config.embedding_length,), "F32", "float"),
-      TensorSpec(f"{p}.ffn_up.weight", (config.feed_forward_length, config.embedding_length), "Q8_0", "float"),
+      TensorSpec(f"{p}.ffn_up.weight", (config.feed_forward_length, config.embedding_length), "Q4_K", "float"),
     ))
   return tuple(specs)
 
@@ -45,7 +45,7 @@ def _make_config(**overrides) -> Qwen3Config:
     feed_forward_length=16, attention_head_count=2, attention_head_count_kv=1,
     key_length=4, value_length=4, rope_dimension_count=4, rope_freq_base=10000.0,
     rms_norm_epsilon=1e-6, vocab_size=16, quantization_version=2, file_type=7,
-    quantization="Q8_0", qk_norm=True, attention_bias=False, mlp_bias=False,
+    quantization="Q4_K_M", qk_norm=True, attention_bias=False, mlp_bias=False,
     tied_embeddings=True, mlp_type="swiglu", tensors=(),
   )
   config = Qwen3Config(**{**defaults, **overrides})
@@ -217,18 +217,4 @@ class TestPinnedQwen3Model(unittest.TestCase):
     from tinygrad import Device
     Device["NV"].synchronize()
     self.assertEqual(logits.shape, (1, 151936))
-    self.assertEqual(logits.argmax().item(), 657)
-
-  @pytest.mark.nv
-  def test_nv_forward_realized(self):
-    if os.environ.get("DEV") != "NV": self.skipTest("requires DEV=NV")
-    artifact = os.environ.get("INFURNACE_MODEL_ARTIFACT")
-    if artifact is None: self.skipTest("set INFURNACE_MODEL_ARTIFACT")
-    weights = load_qwen3_weights(artifact, load_manifest(PINNED_MANIFEST), WeightPolicy.REALIZED_FP16)
-    model = Qwen3Model(weights)
-    ids = Tensor([[257] + [1000 + i for i in range(15)]], dtype=dtypes.int32)
-    logits = model(ids).realize()
-    from tinygrad import Device
-    Device["NV"].synchronize()
-    self.assertEqual(logits.shape, (1, 151936))
-    self.assertEqual(logits.argmax().item(), 657)
+    self.assertEqual(logits.argmax().item(), 198)

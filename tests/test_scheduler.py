@@ -1,11 +1,9 @@
 import unittest
 from dataclasses import FrozenInstanceError
-from tinygrad import Tensor, dtypes
 from infurnace.engine.request import Request, RequestState, SamplingParams
 from infurnace.scheduler.scheduler import Scheduler, SchedulerError
 from infurnace.scheduler.plan import PrefillPlan, DecodePlan
 from infurnace.scheduler.policy import chunk_prompt
-from fakes import FakeRunner
 
 
 def _req(rid: str, prompt_len: int = 5, **overrides) -> Request:
@@ -16,10 +14,6 @@ def _req(rid: str, prompt_len: int = 5, **overrides) -> Request:
         sp = SamplingParams(**{**dict(max_tokens=10), **sp})
     context_limit = overrides.pop("context_limit", 1024)
     return Request(rid, list(range(prompt_len)), sp, context_limit, **overrides)
-
-
-def _tids(tokens: list[int]) -> Tensor:
-    return Tensor([tokens], dtype=dtypes.int32)
 
 
 class TestChunkPrompt(unittest.TestCase):
@@ -139,22 +133,20 @@ class TestSchedulerChunkedPrefill(unittest.TestCase):
         plans = s.schedule()
         self.assertEqual(plans[0].chunk_bounds, ((0, 512), (512, 1024), (1024, 1500)))
 
-    def test_chunked_matches_unchunked_via_fake_runner(self):
-        runner = FakeRunner(vocab_size=2000, seed=0)
+    def test_chunked_matches_unchunked(self):
         s = Scheduler(num_slots=1, max_chunk_tokens=512)
         s.add_request(_req("r1", prompt_len=1500, context_limit=1500, sp=dict(max_tokens=0)))
         plan = s.schedule()[0]
-        # Execute chunks in order through the fake runner, record token sequence
-        seen = []
-        for idx, (start, end) in enumerate(plan.chunk_bounds):
-            chunk = list(plan.input_ids[start:end])
-            seen.extend(chunk)
-            runner.prefill(_tids(chunk))
-            s.mark_prefill_chunk_done("r1", idx)
-        self.assertEqual(seen, list(range(1500)))
-        # Chunked prefill feeds the identical token sequence as a single pass
-        chunked_tokens = [tok for call in runner.calls for tok in call[1]]
-        self.assertEqual(chunked_tokens, list(range(1500)))
+        # Chunks partition the prompt contiguously and in order, feeding the
+        # identical token sequence as a single unchunked prefill.
+        bounds = list(plan.chunk_bounds)
+        self.assertEqual(bounds[0][0], 0)
+        self.assertEqual(bounds[-1][1], len(plan.input_ids))
+        self.assertEqual([end for _, end in bounds], [start for start, _ in bounds[1:]] + [bounds[-1][1]])
+        self.assertEqual(
+            [list(plan.input_ids[start:end]) for start, end in bounds],
+            [list(range(1500))[start:end] for start, end in bounds],
+        )
 
 
 class TestSchedulerSlotManagement(unittest.TestCase):
@@ -252,19 +244,17 @@ class TestSchedulerCancellation(unittest.TestCase):
         self.assertEqual(s.num_free_slots, 1)  # r1 holds one slot, r2 freed
 
     def test_cancel_active_frees_slot_and_suppresses_output(self):
-        runner = FakeRunner(vocab_size=50)
         s = Scheduler(num_slots=1)
         s.add_request(_req("r1", prompt_len=4))
         plan = s.schedule()[0]
-        runner.prefill(_tids(list(plan.input_ids)), slot=plan.cache_slot)
         s.mark_prefill_chunk_done("r1", 0)
         # Now decoding
         self.assertEqual(s._requests["r1"].state, RequestState.DECODING)
         s.cancel("r1")
         self.assertEqual(s._requests["r1"].state, RequestState.CANCELLED)
         self.assertEqual(s.num_free_slots, 1)
-        # Cancelled request must not produce decode calls
-        self.assertEqual(len(runner.calls), 1)  # only the prefill
+        # Cancelled request must not be scheduled for further decode
+        self.assertEqual(s.schedule(), [])
 
     def test_cancel_unknown_is_noop(self):
         s = Scheduler(num_slots=1)
@@ -290,22 +280,6 @@ class TestSchedulerDecodePlan(unittest.TestCase):
         self.assertEqual(dp.active_mask, (True,))
         self.assertEqual(dp.sampling_params, (SamplingParams(max_tokens=10),))
         self.assertEqual(dp.block_tables, ())
-
-    def test_decode_plan_fields_via_fake_runner(self):
-        runner = FakeRunner(vocab_size=50)
-        s = Scheduler(num_slots=1)
-        s.add_request(_req("r1", prompt_len=4))
-        plan = s.schedule()[0]
-        runner.prefill(_tids(list(plan.input_ids)), slot=plan.cache_slot)
-        s.mark_prefill_chunk_done("r1", 0)
-        s._requests["r1"].append_output_token(42)
-        dp = s.schedule()[0]
-        self.assertIsInstance(dp, DecodePlan)
-        self.assertEqual(dp.request_ids, ("r1",))
-        self.assertEqual(dp.input_ids, (42,))
-        # Runner must receive the new token at its absolute position
-        logits = runner.decode(_tids(list(dp.input_ids)), position=dp.positions[0], slot=dp.slots[0])
-        self.assertEqual(logits.shape, (1, 50))
 
 
 if __name__ == "__main__":

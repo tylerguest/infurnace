@@ -97,11 +97,11 @@ while numerical differences or state invariants remain unexplained.
 
 ## Phase 1D Tolerances
 
-- Checkpoint: pinned Qwen3-0.6B Q8_0 GGUF
+- Checkpoint: pinned Qwen3-4B Q4_K_M GGUF
 - Backend: `DEV=NV`
-- Weight policies: `lazy-fp16` and `realized-fp16`
+- Weight policies: `lazy-fp16` (realized FP16 does not fit the 8 GiB card for 4B)
 - Workload: fixed 16-token prompt `[257] + [1000 + i for i in range(15)]`
 - Gate: greedy token matches the `tinygrad.llm.Transformer.from_gguf` baseline
-  exactly for both weight policies.
+  exactly.
 - Logit numerical tolerances: deferred until a logits-exposing independent
   reference (PyTorch or upstream hook) is added.

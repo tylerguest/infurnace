@@ -21,7 +21,7 @@ class TestUpstreamModelRunner(unittest.TestCase):
     command = [
       sys.executable,
       str(REPOSITORY_ROOT / "tools" / "run_upstream_model.py"),
-      "--manifest", str(REPOSITORY_ROOT / "models" / "qwen3-0.6b-q8_0.json"),
+      "--manifest", str(REPOSITORY_ROOT / "models" / "qwen3-4b-q4_k_m.json"),
       "--artifact", artifact_value,
       "--weight-policy", weight_policy,
       "--workload", workload,
@@ -29,31 +29,27 @@ class TestUpstreamModelRunner(unittest.TestCase):
       "--fixed-output-tokens", "4",
       "--text-output-tokens", "16",
     ]
-    result = subprocess.run(command, cwd=REPOSITORY_ROOT, env=environment, capture_output=True, text=True, timeout=300)
+    result = subprocess.run(command, cwd=REPOSITORY_ROOT, env=environment, capture_output=True, text=True, timeout=600)
     self.assertEqual(result.returncode, 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}")
     output = json.loads(result.stdout)
     self.assertEqual(output["execution"]["device"], "NV")
     self.assertEqual(output["execution"]["weight_policy"], weight_policy)
-    self.assertEqual(output["execution"]["upstream_realize"], weight_policy == "realized-fp16")
+    self.assertFalse(output["execution"]["upstream_realize"])
     self.assertEqual(output["workload"]["name"], workload)
     return output
 
-  def test_fixed_generation_for_each_weight_policy(self):
-    policy_outputs = {}
-    for policy in ("lazy", "realized-fp16"):
-      outputs = [self.run_workload(policy, "fixed") for _ in range(2)]
-      self.assertEqual(outputs[0]["workload"], outputs[1]["workload"])
-      self.assertEqual(outputs[0]["workload"]["generated_token_ids"], [657, 198, 9, 0])
-      policy_outputs[policy] = outputs[0]["workload"]["generated_token_ids"]
-    self.assertEqual(policy_outputs["lazy"], policy_outputs["realized-fp16"])
+  def test_fixed_generation_for_lazy_policy(self):
+    policy_outputs = [self.run_workload("lazy", "fixed") for _ in range(2)]
+    self.assertEqual(policy_outputs[0]["workload"], policy_outputs[1]["workload"])
+    self.assertEqual(policy_outputs[0]["workload"]["generated_token_ids"], [198, 785, 1196, 702])
 
   def test_text_generation_from_fresh_process(self):
     outputs = [self.run_workload("lazy", "text") for _ in range(2)]
     expected_tokens = [
-      151667, 198, 151668, 271, 31382, 124941, 124794, 124613,
-      37524, 126860, 124325, 128286, 37524, 83827, 125327, 16157,
+      151667, 198, 32313, 11, 279, 1196, 6801, 752,
+      311, 9851, 448, 6896, 330, 14990, 3263, 6771,
     ]
     self.assertEqual(outputs[0]["workload"]["generated_token_ids"], expected_tokens)
-    self.assertEqual(outputs[0]["workload"]["generated_text"], "<think>\n</think>\n\nالسلام عليكم ورحمة الله وبركاته")
+    self.assertEqual(outputs[0]["workload"]["generated_text"], ' thinking\nOkay, the user wants me to reply with exactly "hello". Let')
     self.assertNotIn("\ufffd", outputs[0]["workload"]["generated_text"])
     self.assertEqual(outputs[0]["workload"], outputs[1]["workload"])

@@ -4,7 +4,38 @@ Benchmark entry points are development tools, not serving APIs. Raw results belo
 under the ignored `results/` directory; committed baseline documents summarize the
 commands, results, and limitations.
 
+## Infurnace Engine Decode
+
+The Infurnace entry point drives the offline engine (request lifecycle,
+scheduler, runner, greedy sampler) on the pinned checkpoint. One generation
+records a cold prefill/TTFT token, two one-token decode calls that capture the
+TinyJit contract, and then individually timed steady replay tokens. The
+headline metrics (decode tok/s, TTFT) match the llama.cpp `llama-bench` bar;
+achieved memory bandwidth and phase memory snapshots are recorded alongside.
+
+```sh
+DEV=NV JIT=1 .venv/bin/python benchmarks/benchmark_infurnace.py \
+  --manifest models/qwen3-4b-q4_k_m.json \
+  --artifact artifacts/models/Qwen3-4B-Q4_K_M.gguf \
+  --max-context 512 \
+  --prompt-tokens 16 \
+  --decode-tokens 200 \
+  --memory-sample-ms 50 \
+  --output results/infurnace-4b-q4-k-m-decode.json
+```
+
+The cold TTFT includes first-execution compile of the eager prefill graph and
+is not comparable to a warm precompiled measurement; warm TTFT is a separate
+follow-up. Decode throughput is one generated token divided by each
+synchronized replay latency. The comparison is recorded in
+[`qwen3-4b-q4-k-m-comparison.md`](../docs/baselines/qwen3-4b-q4-k-m-comparison.md).
+
 ## Upstream Prefill
+
+The upstream sections below predate the Infurnace engine benchmark and measure
+the `tinygrad.llm.Transformer.generate()` path. On the pinned 4B checkpoint,
+`realized-fp16` is not runnable (full FP16 weights are ~8 GB and exceed the
+8 GiB card), so only the `lazy` policy is exercised.
 
 The first Phase 0E benchmark measures checkpoint verification, model loading, and
 steady prefill time to first token through tinygrad's upstream model-owned-cache
@@ -12,8 +43,8 @@ path. Run each weight policy in a separate clean process:
 
 ```sh
 DEV=NV JIT=1 .venv/bin/python benchmarks/benchmark_prefill.py \
-  --manifest models/qwen3-0.6b-q8_0.json \
-  --artifact artifacts/models/Qwen3-0.6B-Q8_0.gguf \
+  --manifest models/qwen3-4b-q4_k_m.json \
+  --artifact artifacts/models/Qwen3-4B-Q4_K_M.gguf \
   --weight-policy lazy \
   --max-context 1024 \
   --chunk-size 32 \
@@ -23,8 +54,8 @@ DEV=NV JIT=1 .venv/bin/python benchmarks/benchmark_prefill.py \
   --output results/phase0e-prefill-lazy.json
 
 DEV=NV JIT=1 .venv/bin/python benchmarks/benchmark_prefill.py \
-  --manifest models/qwen3-0.6b-q8_0.json \
-  --artifact artifacts/models/Qwen3-0.6B-Q8_0.gguf \
+  --manifest models/qwen3-4b-q4_k_m.json \
+  --artifact artifacts/models/Qwen3-4B-Q4_K_M.gguf \
   --weight-policy realized-fp16 \
   --max-context 1024 \
   --chunk-size 32 \
@@ -73,8 +104,8 @@ capture, and then individually times steady replay tokens:
 
 ```sh
 DEV=NV JIT=1 .venv/bin/python benchmarks/benchmark_decode.py \
-  --manifest models/qwen3-0.6b-q8_0.json \
-  --artifact artifacts/models/Qwen3-0.6B-Q8_0.gguf \
+  --manifest models/qwen3-4b-q4_k_m.json \
+  --artifact artifacts/models/Qwen3-4B-Q4_K_M.gguf \
   --weight-policy lazy \
   --max-context 1024 \
   --chunk-size 32 \
@@ -84,8 +115,8 @@ DEV=NV JIT=1 .venv/bin/python benchmarks/benchmark_decode.py \
   --output results/phase0e-decode-lazy.json
 
 DEV=NV JIT=1 .venv/bin/python benchmarks/benchmark_decode.py \
-  --manifest models/qwen3-0.6b-q8_0.json \
-  --artifact artifacts/models/Qwen3-0.6B-Q8_0.gguf \
+  --manifest models/qwen3-4b-q4_k_m.json \
+  --artifact artifacts/models/Qwen3-4B-Q4_K_M.gguf \
   --weight-policy realized-fp16 \
   --max-context 1024 \
   --chunk-size 32 \
@@ -113,8 +144,8 @@ Run two setup generations followed by five closed-loop measured generations:
 
 ```sh
 DEV=NV JIT=1 .venv/bin/python benchmarks/benchmark_serving.py \
-  --manifest models/qwen3-0.6b-q8_0.json \
-  --artifact artifacts/models/Qwen3-0.6B-Q8_0.gguf \
+  --manifest models/qwen3-4b-q4_k_m.json \
+  --artifact artifacts/models/Qwen3-4B-Q4_K_M.gguf \
   --weight-policy lazy \
   --max-context 1024 \
   --chunk-size 32 \
@@ -126,8 +157,8 @@ DEV=NV JIT=1 .venv/bin/python benchmarks/benchmark_serving.py \
   --output results/phase0e-end-to-end-lazy.json
 
 DEV=NV JIT=1 .venv/bin/python benchmarks/benchmark_serving.py \
-  --manifest models/qwen3-0.6b-q8_0.json \
-  --artifact artifacts/models/Qwen3-0.6B-Q8_0.gguf \
+  --manifest models/qwen3-4b-q4_k_m.json \
+  --artifact artifacts/models/Qwen3-4B-Q4_K_M.gguf \
   --weight-policy realized-fp16 \
   --max-context 1024 \
   --chunk-size 32 \

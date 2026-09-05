@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Benchmark paged-KV page sizes for Phase 5A.
 
-Computes the exact KV bytes-per-page arithmetic for Qwen3-0.6B, measures the
+Computes the exact KV bytes-per-page arithmetic for Qwen3-4B, measures the
 per-page store/read dispatch cost for candidate page sizes on a small CPU pool
 (the prefill-store pattern Phase 5B mirrors), and optionally allocates the
 target physical pool on DEV=NV against the device budget. Output is a small
@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 SCHEMA_VERSION = 1
-LAYERS, KV_HEADS, HEAD_DIM, DTYPE_BYTES = 28, 8, 128, 2
+LAYERS, KV_HEADS, HEAD_DIM, DTYPE_BYTES = 36, 8, 128, 2
 BYTES_PER_TOKEN = LAYERS * 2 * KV_HEADS * HEAD_DIM * DTYPE_BYTES
 MIB = 1024 * 1024
 
@@ -99,7 +99,7 @@ def main() -> int:
     "schema_version": SCHEMA_VERSION,
     "benchmark": "page_size_scan",
     "created_at_utc": datetime.now(timezone.utc).isoformat(),
-    "checkpoint": {"id": "qwen3-0.6b-q8_0"},
+    "checkpoint": {"id": "qwen3-4b-q4_k_m"},
     "system": {"python": platform.python_version(), "platform": platform.platform(),
                "device": os.environ.get("DEV", "CPU")},
     "model": {"layers": LAYERS, "kv_heads": KV_HEADS, "head_dim": HEAD_DIM,

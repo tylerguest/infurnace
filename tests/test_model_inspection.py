@@ -7,13 +7,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 import pytest
+from tinygrad import Tensor
 from infurnace.models.manifest import load_manifest, verify_artifact
 from tools.gguf_inspection import (GGUFInspectionError, build_report, crosscheck_tinygrad, scan_gguf, serialize_report, stable_artifact_path,)
 from tools.inspect_artifact import _write_atomic
 
 REPOSITORY_ROOT = Path(__file__).parents[1]
-PINNED_MANIFEST = REPOSITORY_ROOT / "models" / "qwen3-0.6b-q8_0.json"
-PINNED_INSPECTION = REPOSITORY_ROOT / "models" / "qwen3-0.6b-q8_0.inspection.json"
+PINNED_MANIFEST = REPOSITORY_ROOT / "models" / "qwen3-4b-q4_k_m.json"
+PINNED_INSPECTION = REPOSITORY_ROOT / "models" / "qwen3-4b-q4_k_m.inspection.json"
 
 def gguf_string(value: str) -> bytes:
   encoded = value.encode("utf-8")
@@ -43,13 +44,6 @@ def build_gguf(metadata, tensors, data: bytes | None = None) -> bytes:
     data = b"\x00" * final_size
   return prefix + padding + data
 
-class FakeDType:
-  name = "float"
-
-class FakeTensor:
-  def __init__(self, shape):
-    self.shape, self.dtype = shape, FakeDType()
-
 class TestGGUFInspection(unittest.TestCase):
   def write_gguf(self, directory: str, content: bytes) -> Path:
     path = Path(directory) / "model.gguf"
@@ -77,7 +71,7 @@ class TestGGUFInspection(unittest.TestCase):
     self.assertEqual(info.tensors[1].serialized_nbytes, 34)
 
     tinygrad_metadata = {item.key: item.value for item in info.metadata}
-    tinygrad_tensors = {item.name: FakeTensor(item.logical_shape) for item in info.tensors}
+    tinygrad_tensors = {item.name: Tensor.empty(item.logical_shape) for item in info.tensors}
     logical_dtypes = crosscheck_tinygrad(info, tinygrad_metadata, tinygrad_tensors)
     report = build_report(info, "test", info.file_size, "a" * 64, logical_dtypes)
     token_record = next(item for item in report["gguf"]["metadata"] if item["key"] == "tokenizer.ggml.tokens")
@@ -117,9 +111,9 @@ class TestGGUFInspection(unittest.TestCase):
     with tempfile.TemporaryDirectory() as directory:
       info = scan_gguf(self.write_gguf(directory, content))
     with self.assertRaisesRegex(GGUFInspectionError, "metadata mismatch"):
-      crosscheck_tinygrad(info, {}, {"matrix": FakeTensor((3, 2))})
+      crosscheck_tinygrad(info, {}, {"matrix": Tensor.empty((3, 2))})
     with self.assertRaisesRegex(GGUFInspectionError, "shape mismatch"):
-      crosscheck_tinygrad(info, {"general.name": "test"}, {"matrix": FakeTensor((2, 3))})
+      crosscheck_tinygrad(info, {"general.name": "test"}, {"matrix": Tensor.empty((2, 3))})
 
   def test_rejects_descriptor_counts_beyond_file_bounds(self):
     cases = [

@@ -13,8 +13,8 @@ Acquire the pinned development checkpoint with:
 
 ```sh
 .venv/bin/python tools/fetch_model.py \
-  --manifest models/qwen3-0.6b-q8_0.json \
-  --output artifacts/models/Qwen3-0.6B-Q8_0.gguf
+  --manifest models/qwen3-4b-q4_k_m.json \
+  --output artifacts/models/Qwen3-4B-Q4_K_M.gguf
 ```
 
 Both paths are explicit so invoking the tool cannot silently choose a location for a
@@ -29,9 +29,9 @@ Verify the committed inspection report with current tinygrad on CPU:
 
 ```sh
 DEV=CPU .venv/bin/python tools/inspect_artifact.py \
-  --manifest models/qwen3-0.6b-q8_0.json \
-  --artifact artifacts/models/Qwen3-0.6B-Q8_0.gguf \
-  --check models/qwen3-0.6b-q8_0.inspection.json
+  --manifest models/qwen3-4b-q4_k_m.json \
+  --artifact artifacts/models/Qwen3-4B-Q4_K_M.gguf \
+  --check models/qwen3-4b-q4_k_m.inspection.json
 ```
 
 Use `--output PATH` to atomically generate a report or omit both `--check` and
@@ -49,8 +49,8 @@ path with bounded fixed-token and text workloads:
 
 ```sh
 DEV=NV JIT=1 .venv/bin/python tools/run_upstream_model.py \
-  --manifest models/qwen3-0.6b-q8_0.json \
-  --artifact artifacts/models/Qwen3-0.6B-Q8_0.gguf \
+  --manifest models/qwen3-4b-q4_k_m.json \
+  --artifact artifacts/models/Qwen3-4B-Q4_K_M.gguf \
   --weight-policy lazy \
   --workload fixed \
   --max-context 1024 \

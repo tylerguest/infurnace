@@ -3,37 +3,15 @@ import argparse
 import os
 import sys
 
-def _build_fake() -> Engine:
-    from infurnace.tokenizer import Tokenizer
-    from infurnace.engine import Engine
-    from infurnace.scheduler.scheduler import Scheduler
-    from infurnace.sampler import GreedySampler
-
-    class FakeTokenizer(Tokenizer):
-        """Trivial char<->token mapping for CPU-only offline runs."""
-
-        def encode(self, text: str) -> list[int]:
-            return [ord(c) for c in text]
-
-        def decode(self, ids: list[int]) -> str:
-            return "".join(chr(i) for i in ids)
-
-        def is_end(self, token_id: int) -> bool:
-            return False
-
-    try:
-        from tests.fakes import FakeRunner
-    except Exception:
-        from fakes import FakeRunner
-    runner = FakeRunner(vocab_size=300, num_slots=1)
-    return Engine(runner, Scheduler(num_slots=1), GreedySampler(), FakeTokenizer())
-
-def _build_real(artifact: str, manifest: str, *, num_slots: int,
+def _build_engine(artifact: str, manifest: str, *, num_slots: int,
                 max_context: int | None, device: str | None) -> Engine:
     from infurnace.models.manifest import load_manifest
     from infurnace.executor.tinygrad.weights import load_qwen3_checkpoint
     from infurnace.executor.tinygrad.runner import Qwen3Runner
     from infurnace.tokenizer import GGUFTokenizer
+    from infurnace.engine import Engine
+    from infurnace.scheduler.scheduler import Scheduler
+    from infurnace.sampler import GreedySampler
 
     if not os.path.exists(artifact):
         print(f"artifact not found: {artifact} (download/place the GGUF locally)", file=sys.stderr)
@@ -54,9 +32,8 @@ def main() -> int:
     ap.add_argument("--prompt", required=True)
     ap.add_argument("--max-tokens", type=int, default=32)
     ap.add_argument("--stop-strings", nargs="*", default=[])
-    ap.add_argument("--fake", action="store_true", help="CPU-only fake runner + tokenizer")
-    ap.add_argument("--artifact", default="artifacts/models/Qwen3-0.6B-Q8_0.gguf")
-    ap.add_argument("--manifest", default="models/qwen3-0.6b-q8_0.json")
+    ap.add_argument("--artifact", default="artifacts/models/Qwen3-4B-Q4_K_M.gguf")
+    ap.add_argument("--manifest", default="models/qwen3-4b-q4_k_m.json")
     ap.add_argument("--num-slots", type=int, default=1)
     ap.add_argument("--max-context", type=int, default=2048,
                     help="KV cache context length (default 2048; lower saves GPU memory)")
@@ -69,7 +46,7 @@ def main() -> int:
 
     from infurnace.engine.request import SamplingParams
 
-    eng = _build_fake() if args.fake else _build_real(
+    eng = _build_engine(
         args.artifact, args.manifest, num_slots=args.num_slots,
         max_context=args.max_context, device=args.device,
     )

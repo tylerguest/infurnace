@@ -154,7 +154,7 @@ def validate_result(result: dict[str, Any]) -> None:
   if set(result) != required_root: raise ValueError("benchmark result fields are incomplete or unknown")
   if result.get("schema_version") != SCHEMA_VERSION: raise ValueError(f"schema_version must be {SCHEMA_VERSION}")
   benchmark = result.get("benchmark")
-  if benchmark not in ("upstream_prefill", "upstream_decode", "upstream_end_to_end"):
+  if benchmark not in ("upstream_prefill", "upstream_decode", "upstream_end_to_end", "infurnace_decode"):
     raise ValueError("benchmark type is invalid")
   if not isinstance(result.get("created_at_utc"), str) or not result["created_at_utc"].endswith("+00:00"):
     raise ValueError("created_at_utc must be an explicit UTC timestamp")
@@ -255,6 +255,38 @@ def validate_result(result: dict[str, Any]) -> None:
     host_boundaries = {"before_artifact_verification", "after_artifact_verification", "after_model_load", "after_prefill", "after_contract_setup", "after_measurement"}
     tinygrad_boundaries = {"before_model_load", "after_model_load", "after_prefill", "after_contract_setup", "after_measurement"}
     phases = ("model_load", "prefill", "contract_setup", "measurement")
+  elif benchmark == "infurnace_decode":
+    required_workload = {"prompt_tokens", "ttft_tokens", "contract_setup_tokens", "timed_decode_tokens", "total_generated_tokens", "measured_samples", "sampling"}
+    required_timings = {"artifact_verification_ns", "model_load_ns", "cold_prefill_ttft_ns", "decode_capture_ns", "contract_setup_ns", "decode_ns", "decode_summary", "generated_tokens_per_second", "weights_bytes", "achieved_bytes_per_second"}
+    if set(workload) != required_workload or set(timings) != required_timings: raise ValueError("Infurnace decode result fields are incomplete")
+    for field in ("prompt_tokens", "ttft_tokens", "contract_setup_tokens", "timed_decode_tokens", "total_generated_tokens", "measured_samples"):
+      if type(workload[field]) is not int or workload[field] <= 0: raise ValueError(f"{field} must be positive")
+    if workload["ttft_tokens"] != 1 or workload["contract_setup_tokens"] != 2 \
+        or workload["timed_decode_tokens"] != workload["measured_samples"] \
+        or workload["total_generated_tokens"] != workload["ttft_tokens"] + workload["contract_setup_tokens"] + workload["timed_decode_tokens"] \
+        or workload["sampling"] != "greedy":
+      raise ValueError("Infurnace decode token accounting is invalid")
+    if workload["prompt_tokens"] < 2 or workload["prompt_tokens"] > execution["chunk_size"] \
+        or workload["prompt_tokens"] + workload["total_generated_tokens"] > execution["max_context"]:
+      raise ValueError("Infurnace decode workload exceeds its execution contract")
+    if type(timings["cold_prefill_ttft_ns"]) is not int or timings["cold_prefill_ttft_ns"] <= 0:
+      raise ValueError("Infurnace decode cold prefill timing is invalid")
+    if type(timings["decode_capture_ns"]) is not int or timings["decode_capture_ns"] <= 0:
+      raise ValueError("Infurnace decode capture timing is invalid")
+    if type(timings["weights_bytes"]) is not int or timings["weights_bytes"] <= 0:
+      raise ValueError("Infurnace decode weights size is invalid")
+    if type(timings["achieved_bytes_per_second"]) is not int or timings["achieved_bytes_per_second"] <= 0:
+      raise ValueError("Infurnace decode achieved bandwidth is invalid")
+    if type(outputs["prefill_token_id"]) is not int or outputs["prefill_token_id"] < 0:
+      raise ValueError("Infurnace decode prefill token is invalid")
+    setup, measured = timings["contract_setup_ns"], timings["decode_ns"]
+    summary, rates = timings["decode_summary"], timings["generated_tokens_per_second"]
+    rate_numerator = 1e9
+    required_outputs = {"prefill_token_id", "contract_setup_token_ids", "measured_token_ids"}
+    expected_output_lengths = (workload["contract_setup_tokens"], workload["measured_samples"])
+    host_boundaries = {"before_artifact_verification", "after_artifact_verification", "after_model_load", "after_contract_setup", "after_measurement"}
+    tinygrad_boundaries = {"before_model_load", "after_model_load", "after_contract_setup", "after_measurement"}
+    phases = ("model_load", "contract_setup", "measurement")
   else:
     required_workload = {
       "prompt_tokens", "setup_generations", "setup_output_tokens_per_generation", "measured_generations",

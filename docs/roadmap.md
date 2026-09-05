@@ -17,15 +17,43 @@ require the checkpoint or execution hardware.
 
 ## Current Work
 
-Phase 4 is complete (v0.2 gates PASS). The active work is Phase 5 (Paged Decode
-KV). One CLI polish fix lands before Phase 5 implementation begins:
+Phase 4 is complete (v0.2 gates PASS). Phase 5 (Paged Decode KV) is active:
+Phase 5A (logical page allocator) and Phase 5B (indexed KV store) are
+implemented; Phase 5C (paged decode attention) and Phase 5D (engine
+integration) remain.
 
-- **CLI `--device` flag** (`src/infurnace/cli.py`): the flag sets
-  `os.environ["DEV"]` after tinygrad has already been imported by the module's
-  top-level imports, so it has no effect. Fix by removing the top-level
-  `infurnace` imports and setting `DEV` before the lazy imports inside
-  `main()`; strengthen `test_device_env_set` to assert `Device.DEFAULT == "CPU"`
-  instead of only checking the environment variable.
+The strategic direction for this hardware is a throughput engine on the RTX 5060,
+targeting the pinned Qwen3-4B Q4_K_M checkpoint (the original 0.6B Q8_0 was
+removed). The Phase 0E upstream baseline measured ~48-60 tok/s, only ~7-16% of
+the card's ~448 GB/s memory-bandwidth ceiling, and an 8 GiB card underuses a
+0.6B model. The next work therefore measures first, then closes the bandwidth
+gap with custom NV kernels:
+
+- **Ceiling, bar, and bottleneck (gates everything).** Microbenchmark decode
+  GEMV on the 5060 across Qwen3-4B Q4_K_M weight shapes (achieved GB/s vs the
+  448 GB/s ceiling); record the external bar on the same card with llama.cpp
+  (primary) and vLLM (optional) for identical prompts and models; profile the
+  NV decode step to quantify kernel, launch, and host-sync gaps. Produces a
+  quantified gap list and the target decode tok/s. First pass complete
+  ([comparison](baselines/qwen3-4b-q4-k-m-comparison.md)): llama.cpp sustains
+  124 tok/s (~69% of the bandwidth ceiling) versus Infurnace's naive 7.9 tok/s
+  (~4.4%), a 15.6x gap that is kernel efficiency, not architecture.
+- **Model contract.** The pinned single-checkpoint contract is now Qwen3-4B
+  Q4_K_M: 398 exact tensors (F32 norms, Q4_K matmuls, Q6_K embedding/value/FFN-
+  down with an imatrix layer split). Lazy quantized execution is the only
+  feasible resident policy: realized FP16 is ~8 GB and does not fit the 8 GiB
+  card.
+- **Throughput kernels.** Write fused Q4_K/Q6_K dequant-GEMV and fused
+  single-token paged attention as custom UOp/PTX kernels on tinygrad's NV
+  renderer; add persistent device input buffers to remove the per-step host
+  roundtrip.
+- **Fold into the roadmap.** Land Phase 5C with the fused attention kernel and
+  5D with page ownership and persistent buffers, then continuous batching
+  (Phase 6), where KV capacity for the 4B model with real context finally binds.
+  Re-evaluate Phases 7-12 against the chosen metric: keep 7 (sampling) and
+  8 (prefix cache); Phases 9-12 (worker isolation, replication, sharding,
+  artifacts) are deprioritized for a single-card engine unless they serve a
+  measured goal.
 
 Two items are explicitly deferred and are not Phase 5 blockers:
 
@@ -58,7 +86,7 @@ selected explicitly.
 
 ### Phase 0B: Checkpoint Identity and Acquisition
 
-- Pin the official Qwen3-0.6B Q8_0 GGUF by URL, revision, byte size, and SHA-256.
+- Pin the official Qwen3-4B Q4_K_M GGUF by URL, revision, byte size, and SHA-256.
 - Download to a temporary path, verify identity while streaming, and publish the
   local artifact atomically only after its size and hash match.
 
@@ -102,6 +130,13 @@ measurements on execution devices without competing workloads.
 
 **Gate:** The current environment produces a documented baseline with recorded
 output, latency, generated-token throughput, startup time, and memory measurements.
+
+**Optimization discipline:** performance work is a measured experiment, not an
+assumption: profile the bottleneck, state one hypothesis, make one focused
+change, revalidate numerical and state correctness, then keep or revert on the
+result. Report prefill, decode, sampling, and end-to-end serving results
+separately, always recording checkpoint identity, weight and cache policies,
+device, context, chunk/page/batch settings, and capture/replay state.
 
 ## Phase 1: Stateless Qwen3 Model Runner
 
@@ -188,6 +223,12 @@ prefill matches unchunked execution, and cached decode matches full recomputatio
 **Subphase gate:** JIT capture completes on NV, decode replays across positions
 without recompilation, and greedy output matches Phase 2B eager decode.
 
+**Status:** Implemented. The SSA `uop.store`/`uop.after` + bound-`Variable`
+contract described above replaced an earlier fixed-shape mask variant: decode is
+now O(position) per token and measures ~3 ms/token (280x faster than the mask's
+~900 ms/token at max_context=1024), with capture completing in ~13 s under
+`BEAM=0`.
+
 ### Phase 2D: Stateful Stress Validation
 
 - Compare cached decode logits with full-sequence recomputation at every position,
@@ -197,6 +238,11 @@ without recompilation, and greedy output matches Phase 2B eager decode.
 
 **Subphase gate:** Repeated and boundary-heavy traces preserve logits and caller-owned
 cache contents without state leaking between conversations.
+
+**Status:** PASS. `tests/test_runner.py` covers per-position recompute match,
+context boundaries, chunked-prefill-then-JIT, repeated conversations, cache
+replacement, and multi-slot isolation; NV full-model stress matches the greedy
+reference across clear/reuse, cancellation, and replacement.
 
 **Gate:** Single-request cached generation remains correct through eager execution,
 warmup, capture, replay, cache replacement, and repeated conversations. The model
@@ -230,10 +276,11 @@ Metrics collection verified at each transition.
 - **Priority/fairness metadata** in plans (FIFO for v0.1, extensible).
 - **Prefix cache lookup integration point** in scheduler admission.
 
-**Subphase gate:** A fake runner produces deterministic queue order and plans that do
-not change after submission; cancellation suppresses in-flight output safely.
-Chunked prefill plans match unchunked execution. Plan structure supports future
-paged KV and prefix cache without modification.
+**Subphase gate:** The scheduler produces stable queue order and immutable plans
+that do not change after submission; cancellation suppresses in-flight output
+safely. Chunked prefill plans partition the input contiguously and match
+unchunked execution. Plan structure supports future paged KV and prefix cache
+without modification.
 
 ### Phase 3C: Offline Engine
 
@@ -243,8 +290,8 @@ paged KV and prefix cache without modification.
 - **Cache slot manager:** allocate on prefill start, clear on finish/cancel, track ownership (active + in-flight).
 - **Metrics collection** at engine level per step.
 
-**Subphase gate:** The complete request and scheduler path works with a deterministic
-fake runner, including queueing, completion, failure, rejection, and cancellation.
+**Subphase gate:** The complete request and scheduler path works with the real
+Qwen3 runner, including queueing, completion, rejection, and cancellation.
 Cache slots allocated/cleared correctly on all terminal paths. Metrics recorded
 for each request.
 
@@ -347,7 +394,10 @@ warmup for every supported batch contract.
 shape and across a ragged 4 -> 3 -> 2 -> 1 shrink, that steady `decode_batch`
 replays keep `GlobalCounters.mem_used` at its post-warmup value, never re-capture
 a contract (`TinyJit.captured` identity stable, `cnt` grows by exactly one per
-step), and still match independent single-request decode.
+step), and still match independent single-request decode. Measured capture cost
+(realized FP16): model+load 1.19 GB, +runner build 1.34 GB, +all four captures
+1.35 GB; lazy FP16: 0.64 GB -> 0.79 GB -> 0.80 GB. Captures add under 20 MB;
+replay adds nothing.
 
 **Gate:** Fixed ragged decode batches match independent single-request execution
 without cache corruption, inactive-row mutation, recapture, or cross-request output
@@ -362,12 +412,11 @@ CPU and NV.
 
 ## Phase 5: Paged Decode KV
 
-**Status:** Active. Implementation is scaffolded but not yet started: the
-`kernels/` modules (`kv_store.py`, `paged_attention.py`) and their test files
-(`test_block_pool.py`, `test_kv_store.py`, `test_paged_attention.py`) are empty
-stubs, and `DecodePlan.block_tables` is already present for Phase 5 prep. The
-physical page layout follows `architecture.md`: `kv_pool[layer, K_or_V,
-physical_page, page_offset, kv_head, head_dim]`.
+**Status:** Active. Phase 5A (logical page allocator) and Phase 5B (indexed KV
+store) are implemented; Phase 5C (paged decode attention) and Phase 5D (engine
+integration) remain. The physical page layout follows `architecture.md`:
+`kv_pool[layer, K_or_V, physical_page, page_offset, kv_head, head_dim]`, and
+`DecodePlan.block_tables` is already present for paged decode prep.
 
 ### Phase 5A: Logical Page Allocator
 
@@ -424,11 +473,12 @@ store wraps this kernel in 5C alongside attention.
 **Subphase gate:** Paged attention and contiguous attention agree independently of
 physical page assignment, partial tails, and GQA head mapping.
 
-**Planned approach:** first implementation gathers per-request K/V from the pool
-via `block_tables`/`seq_len` device inputs into dense `[S, seq_len, head, dim]`
-tensors and uses `scaled_dot_product_attention`, preserving the explicit
-store-before-attention dependency. A fused custom UOp attention kernel is
-evaluation-only and retained only if it beats the gather path.
+**Planned approach:** the decode path targets a fused single-token paged
+attention kernel (Q·K over the pool via `block_tables`/`seq_len`, online
+softmax, no materialized full softmax) as custom UOp/PTX on tinygrad's NV
+renderer, preserving the explicit store-before-attention dependency. The
+gather-to-dense + `scaled_dot_product_attention` path remains as the numerical
+reference for the fusion.
 
 ### Phase 5D: Engine Integration
 
@@ -446,7 +496,9 @@ page reclaim replaces `clear_slot`/`move_slot`/compaction (each request carries
 its own block table, so slot compaction disappears). Paged decode contracts are
 captured per supported batch shape with the Phase 4D stability invariants
 (no recapture, flat memory), and the persistent fixed-shape input buffers from
-the Phase 4D note land here.
+the Phase 4D note land here. The Phase 5A `--nv-pool-check` (real pool
+allocation against the measured device budget) is performed here; the page-size
+measurement itself was CPU-only.
 
 **Gate:** Paged and contiguous decode agree numerically, allocator invariants hold
 under stress, and pages are reclaimed only after active and in-flight ownership ends.

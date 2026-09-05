@@ -22,7 +22,7 @@ class TestModelComparison(unittest.TestCase):
     command = [
       sys.executable,
       str(REPOSITORY_ROOT / "tools" / "compare_outputs.py"),
-      "--manifest", str(REPOSITORY_ROOT / "models" / "qwen3-0.6b-q8_0.json"),
+      "--manifest", str(REPOSITORY_ROOT / "models" / "qwen3-4b-q4_k_m.json"),
       "--artifact", artifact_value,
       "--weight-policy", weight_policy,
       "--max-context", "1024",
@@ -34,14 +34,12 @@ class TestModelComparison(unittest.TestCase):
     self.assertEqual(result.returncode, 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}")
     return json.loads(result.stdout)
 
-  def test_greedy_token_agreement_for_each_weight_policy(self):
-    for policy in ("lazy-fp16", "realized-fp16"):
-      with self.subTest(policy=policy):
-        output = self._run_comparison(policy)
-        self.assertTrue(
-          output["agreement"]["greedy_tokens_match"],
-          f"token mismatch for {policy}: "
-          f"infurnace={output['infurnace']['token']}, "
-          f"upstream={output['upstream']['token']}",
-        )
-        self.assertEqual(output["infurnace"]["logits_shape"], [1, 151936])
+  def test_greedy_token_agreement_for_lazy_policy(self):
+    output = self._run_comparison("lazy-fp16")
+    self.assertTrue(
+      output["agreement"]["greedy_tokens_match"],
+      f"token mismatch for lazy-fp16: "
+      f"infurnace={output['infurnace']['token']}, "
+      f"upstream={output['upstream']['token']}",
+    )
+    self.assertEqual(output["infurnace"]["logits_shape"], [1, 151936])

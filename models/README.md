@@ -16,27 +16,27 @@ supported only after its manifest records:
 Checkpoint identity is exact even though Infurnace follows current tinygrad rather
 than pinning tinygrad itself.
 
-## First Target
+## Target
 
-The first development target is the official Qwen3-0.6B Q8_0 GGUF:
+The serving target is the official Qwen3-4B Q4_K_M GGUF:
 
 ```text
-https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/23749fefcc72300e3a2ad315e1317431b06b590a/Qwen3-0.6B-Q8_0.gguf
+https://huggingface.co/Qwen/Qwen3-4B-GGUF/resolve/bc640142c66e1fdd12af0bd68f40445458f3869b/Qwen3-4B-Q4_K_M.gguf
 ```
 
 Its identity is pinned in
-[`qwen3-0.6b-q8_0.json`](qwen3-0.6b-q8_0.json):
+[`qwen3-4b-q4_k_m.json`](qwen3-4b-q4_k_m.json):
 
 ```text
-revision:  23749fefcc72300e3a2ad315e1317431b06b590a
-size:      639446688 bytes
-SHA-256:   9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031
+revision:  bc640142c66e1fdd12af0bd68f40445458f3869b
+size:      2497280256 bytes
+SHA-256:   7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5
 license:   Apache-2.0
 ```
 
-The manifest currently establishes artifact identity and acquisition. GGUF metadata,
-tokenizer data, and the complete tensor inventory are recorded in
-[`qwen3-0.6b-q8_0.inspection.json`](qwen3-0.6b-q8_0.inspection.json), generated only
+The manifest establishes artifact identity and acquisition. GGUF metadata, tokenizer
+data, and the complete tensor inventory are recorded in
+[`qwen3-4b-q4_k_m.inspection.json`](qwen3-4b-q4_k_m.inspection.json), generated only
 after Phase 0C inspection validates them from this exact artifact through current
 tinygrad.
 
@@ -44,8 +44,8 @@ Acquire the model into ignored local artifact storage with:
 
 ```sh
 .venv/bin/python tools/fetch_model.py \
-  --manifest models/qwen3-0.6b-q8_0.json \
-  --output artifacts/models/Qwen3-0.6B-Q8_0.gguf
+  --manifest models/qwen3-4b-q4_k_m.json \
+  --output artifacts/models/Qwen3-4B-Q4_K_M.gguf
 ```
 
 The tool streams into a temporary file, verifies the exact byte count and SHA-256,
@@ -56,23 +56,25 @@ Generate or verify the canonical inspection report on CPU with:
 
 ```sh
 DEV=CPU .venv/bin/python tools/inspect_artifact.py \
-  --manifest models/qwen3-0.6b-q8_0.json \
-  --artifact artifacts/models/Qwen3-0.6B-Q8_0.gguf \
-  --check models/qwen3-0.6b-q8_0.inspection.json
+  --manifest models/qwen3-4b-q4_k_m.json \
+  --artifact artifacts/models/Qwen3-4B-Q4_K_M.gguf \
+  --check models/qwen3-4b-q4_k_m.inspection.json
 ```
 
-The report records GGUF version 3, 28 metadata entries, and all 310 tensor
-descriptors. It records 197 Q8_0 tensors and 113 F32 tensors. Large tokenizer arrays
-are represented by their element count and a canonical SHA-256 rather than copied
-verbatim into the repository.
+The report records all 398 tensor descriptors: 145 F32 normalization tensors,
+216 Q4_K matrix tensors, and 37 Q6_K tensors (token embedding, value projections,
+and feed-forward-down projections, with the value/FFN-down layers split by the
+file's imatrix between Q4_K and Q6_K). Large tokenizer arrays are represented by
+their element count and a canonical SHA-256 rather than copied verbatim into the
+repository.
 
-Expected Qwen3-0.6B values used to validate the GGUF metadata are:
+Expected Qwen3-4B values used to validate the GGUF metadata are:
 
 ```text
-layers:                 28
-hidden size:            1024
-intermediate size:      3072
-attention heads:        16
+layers:                 36
+hidden size:            2560
+intermediate size:      9728
+attention heads:        32
 KV heads:               8
 head dimension:         128
 vocabulary size:        151936
@@ -80,15 +82,14 @@ RoPE theta:             1000000
 RMS normalization eps:  1e-6
 attention bias:         false
 tied token embeddings:  true
-source model dtype:     bfloat16
+GGUF file type:         15 (Q4_K_M)
 ```
 
 Phase 1A implements this as a frozen, tinygrad-independent `Qwen3Config` derived
 from live GGUF metadata. The exact contract requires full 128-dimensional RoPE,
 per-head Q/K RMS normalization, bias-free attention and MLP projections, a dense
-SwiGLU MLP, and an output projection tied to `token_embd.weight`. It generates all
-310 required tensor names, logical shapes, and storage dtypes: 113 normalization
-tensors stored as F32 and 197 matrix or embedding tensors stored as Q8_0.
+SwiGlu MLP, and an output projection tied to `token_embd.weight`. It generates all
+398 required tensor names, logical shapes, and storage dtypes.
 
 The committed inspection report is audit and test evidence, not a production
 configuration input. Phase 1B loads the verified artifact through tinygrad and
@@ -102,44 +103,45 @@ verifying its identity, then keeps that snapshot open through tinygrad parsing. 
 prevents pathname replacement or in-place source mutation from changing the parsed
 contents. The loader accepts only the pinned identity, whose hash connects those
 contents to Phase 0's unique tensor descriptors and storage dtypes. It additionally
-requires the exact 310 live tensor names, logical shapes, and tinygrad dtypes before
-Infurnace's policy cast or weight realization, then adds `output.weight` as the same
-object as `token_embd.weight`.
+requires the exact 398 live tensor names, logical shapes, and tinygrad dtypes before
+Infurnace's policy cast, then adds `output.weight` as the same object as
+`token_embd.weight`.
 
-Both supported policies cast weights to FP16. `lazy-fp16` retains the Q8_0
-dequantization and cast expressions, while `realized-fp16` makes each weight
-contiguous and realized. Realized FP16 remains the provisional default based on the
-Phase 0 latency measurements. Phase 1C must remeasure both policies with Infurnace's
-stateless forward pass before the choice becomes a permanent serving default.
+Weights are cast to FP16 lazily: the Q4_K/Q6_K dequantization and cast expressions
+are fused into execution kernels, so the resident artifact stays at its packed size.
+Realized FP16 is not a feasible resident policy for a 4B checkpoint on the 8 GiB
+RTX 5060 (FP16 weights alone are ~8 GB), so lazy quantized execution is the serving
+policy.
 
 The pinned GGUF metadata reports 40,960 maximum positions, resolving the artifact
-contract even though the GGUF model card describes a 32,768 context length. The
-server may expose a lower limit based on measured memory budgets for its configured
-execution topology.
+contract even though the Qwen3-4B model card describes a 32,768 native context
+length. The server may expose a lower limit based on measured memory budgets for
+its configured execution topology.
 
-Qwen3-0.6B exercises RMSNorm, Q/K normalization, RoPE, grouped-query attention,
-SwiGLU, and tied embeddings while remaining small enough for rapid iteration.
+Qwen3-4B exercises RMSNorm, Q/K normalization, RoPE, grouped-query attention,
+SwiGLU, and tied embeddings while fitting the 8 GiB device at Q4_K_M.
 
 ## KV Capacity
 
-For 28 layers, 8 KV heads, head dimension 128, and a two-byte cache dtype, KV storage
-costs:
+For 36 layers, 8 KV heads, head dimension 128, and a two-byte cache dtype, KV
+storage costs:
 
 ```text
-28 * 2 * 8 * 128 * 2 = 114,688 bytes per token
+36 * 2 * 8 * 128 * 2 = 294,912 bytes per token
 ```
 
 Approximate per-request capacity is therefore:
 
 ```text
-4,096 tokens:   448 MiB
-32,768 tokens:  3.5 GiB
-40,960 tokens:  4.375 GiB
+4,096 tokens:   1.125 GiB
+16,384 tokens:  4.5 GiB
+32,768 tokens:  9.0 GiB
 ```
 
-These values exclude model weights, TinyJit workspaces, input and output buffers,
-sampling buffers, and backend reserve. The first server context and concurrency
-limits must come from measured total memory, not only the model's advertised maximum.
+A full 32,768-token cache exceeds the device alone; the 8 GiB card cannot hold the
+model, a large contiguous KV pool, and workspaces at the same time. This is why
+paged KV (Phase 5) with a bounded total token budget, not the model's advertised
+maximum, governs the served context and concurrency limits.
 
 ## Integration Rule
 

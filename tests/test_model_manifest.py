@@ -13,7 +13,7 @@ from urllib.error import URLError
 from infurnace.models.manifest import (ArtifactError, CheckpointManifest, ManifestError, acquire_artifact, load_manifest, verify_artifact,)
 
 REPOSITORY_ROOT = Path(__file__).parents[1]
-PINNED_MANIFEST = REPOSITORY_ROOT / "models" / "qwen3-0.6b-q8_0.json"
+PINNED_MANIFEST = REPOSITORY_ROOT / "models" / "qwen3-4b-q4_k_m.json"
 
 def valid_manifest_data():
   return {
@@ -48,9 +48,9 @@ class TestCheckpointManifest(unittest.TestCase):
 
   def test_pinned_manifest_identity(self):
     manifest = load_manifest(PINNED_MANIFEST)
-    self.assertEqual(manifest.revision, "23749fefcc72300e3a2ad315e1317431b06b590a")
-    self.assertEqual(manifest.size_bytes, 639446688)
-    self.assertEqual(manifest.sha256, "9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031")
+    self.assertEqual(manifest.revision, "bc640142c66e1fdd12af0bd68f40445458f3869b")
+    self.assertEqual(manifest.size_bytes, 2497280256)
+    self.assertEqual(manifest.sha256, "7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5")
 
   def test_valid_manifest(self):
     with tempfile.TemporaryDirectory() as directory:

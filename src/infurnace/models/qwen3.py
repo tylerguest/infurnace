@@ -12,19 +12,23 @@ _MODEL_KEYS = {
 _EXPECTED = {
   "general.architecture": (str, "qwen3"),
   "general.type": (str, "model"),
-  "qwen3.block_count": (int, 28),
+  "qwen3.block_count": (int, 36),
   "qwen3.context_length": (int, 40960),
-  "qwen3.embedding_length": (int, 1024),
-  "qwen3.feed_forward_length": (int, 3072),
-  "qwen3.attention.head_count": (int, 16),
+  "qwen3.embedding_length": (int, 2560),
+  "qwen3.feed_forward_length": (int, 9728),
+  "qwen3.attention.head_count": (int, 32),
   "qwen3.attention.head_count_kv": (int, 8),
   "qwen3.rope.freq_base": (float, 1000000.0),
   "qwen3.attention.layer_norm_rms_epsilon": (float, 9.999999974752427e-07),
   "qwen3.attention.key_length": (int, 128),
   "qwen3.attention.value_length": (int, 128),
   "general.quantization_version": (int, 2),
-  "general.file_type": (int, 7),
+  "general.file_type": (int, 15),
 }
+
+# The official Qwen3-4B Q4_K_M file keeps an imatrix: the value-projection and
+# feed-forward-down weights are Q6_K on these layers and Q4_K elsewhere.
+_Q6_K_LAYERS = (0, 1, 2, 3, 6, 9, 12, 15, 18, 21, 24, 27, 30, 31, 32, 33, 34, 35)
 
 def _expected(metadata: Mapping[str, Any], key: str) -> Any:
   if key not in metadata: raise ModelConfigError(f"missing GGUF metadata: {key}")
@@ -40,27 +44,28 @@ def _tensor_specs(blocks: int, hidden: int, intermediate: int, heads: int, kv_he
   value_width, output_width = kv_heads * value_length, heads * value_length
   specs = [
     TensorSpec("output_norm.weight", (hidden,), "F32", "float"),
-    TensorSpec("token_embd.weight", (vocab_size, hidden), "Q8_0", "float"),
+    TensorSpec("token_embd.weight", (vocab_size, hidden), "Q6_K", "float"),
   ]
   for block in range(blocks):
     prefix = f"blk.{block}"
+    mixed = "Q6_K" if block in _Q6_K_LAYERS else "Q4_K"
     specs.extend((
-      TensorSpec(f"{prefix}.attn_k.weight", (key_width, hidden), "Q8_0", "float"),
+      TensorSpec(f"{prefix}.attn_k.weight", (key_width, hidden), "Q4_K", "float"),
       TensorSpec(f"{prefix}.attn_k_norm.weight", (key_length,), "F32", "float"),
       TensorSpec(f"{prefix}.attn_norm.weight", (hidden,), "F32", "float"),
-      TensorSpec(f"{prefix}.attn_output.weight", (hidden, output_width), "Q8_0", "float"),
-      TensorSpec(f"{prefix}.attn_q.weight", (query_width, hidden), "Q8_0", "float"),
+      TensorSpec(f"{prefix}.attn_output.weight", (hidden, output_width), "Q4_K", "float"),
+      TensorSpec(f"{prefix}.attn_q.weight", (query_width, hidden), "Q4_K", "float"),
       TensorSpec(f"{prefix}.attn_q_norm.weight", (key_length,), "F32", "float"),
-      TensorSpec(f"{prefix}.attn_v.weight", (value_width, hidden), "Q8_0", "float"),
-      TensorSpec(f"{prefix}.ffn_down.weight", (hidden, intermediate), "Q8_0", "float"),
-      TensorSpec(f"{prefix}.ffn_gate.weight", (intermediate, hidden), "Q8_0", "float"),
+      TensorSpec(f"{prefix}.attn_v.weight", (value_width, hidden), mixed, "float"),
+      TensorSpec(f"{prefix}.ffn_down.weight", (hidden, intermediate), mixed, "float"),
+      TensorSpec(f"{prefix}.ffn_gate.weight", (intermediate, hidden), "Q4_K", "float"),
       TensorSpec(f"{prefix}.ffn_norm.weight", (hidden,), "F32", "float"),
-      TensorSpec(f"{prefix}.ffn_up.weight", (intermediate, hidden), "Q8_0", "float"),
+      TensorSpec(f"{prefix}.ffn_up.weight", (intermediate, hidden), "Q4_K", "float"),
     ))
   return tuple(specs)
 
 def qwen3_config_from_gguf(metadata: Mapping[str, Any]) -> Qwen3Config:
-  """Derive the pinned Qwen3-0.6B contract from tinygrad GGUF metadata."""
+  """Derive the pinned Qwen3-4B Q4_K_M contract from tinygrad GGUF metadata."""
   if not isinstance(metadata, Mapping): raise ModelConfigError("GGUF metadata must be a mapping")
   if any(type(key) is not str for key in metadata): raise ModelConfigError("GGUF metadata keys must be strings")
   unknown_model_keys = {key for key in metadata if isinstance(key, str) and key.startswith("qwen3.")} - _MODEL_KEYS
@@ -91,6 +96,6 @@ def qwen3_config_from_gguf(metadata: Mapping[str, Any]) -> Qwen3Config:
     rope_freq_base=values["qwen3.rope.freq_base"],
     rms_norm_epsilon=values["qwen3.attention.layer_norm_rms_epsilon"], vocab_size=vocab_size,
     quantization_version=values["general.quantization_version"], file_type=values["general.file_type"],
-    quantization="Q8_0", qk_norm=True, attention_bias=False, mlp_bias=False, tied_embeddings=True,
+    quantization="Q4_K_M", qk_norm=True, attention_bias=False, mlp_bias=False, tied_embeddings=True,
     mlp_type="swiglu", tensors=tensors,
   )

@@ -10,20 +10,20 @@ from infurnace.models import ModelConfigError, qwen3_config_from_gguf
 from infurnace.models.manifest import load_manifest, verified_artifact
 
 REPOSITORY_ROOT = Path(__file__).parents[1]
-PINNED_MANIFEST = REPOSITORY_ROOT / "models" / "qwen3-0.6b-q8_0.json"
-PINNED_INSPECTION = REPOSITORY_ROOT / "models" / "qwen3-0.6b-q8_0.inspection.json"
+PINNED_MANIFEST = REPOSITORY_ROOT / "models" / "qwen3-4b-q4_k_m.json"
+PINNED_INSPECTION = REPOSITORY_ROOT / "models" / "qwen3-4b-q4_k_m.inspection.json"
 
 def valid_metadata():
   return {
     "general.architecture": "qwen3",
     "general.type": "model",
     "general.quantization_version": 2,
-    "general.file_type": 7,
-    "qwen3.block_count": 28,
+    "general.file_type": 15,
+    "qwen3.block_count": 36,
     "qwen3.context_length": 40960,
-    "qwen3.embedding_length": 1024,
-    "qwen3.feed_forward_length": 3072,
-    "qwen3.attention.head_count": 16,
+    "qwen3.embedding_length": 2560,
+    "qwen3.feed_forward_length": 9728,
+    "qwen3.attention.head_count": 32,
     "qwen3.attention.head_count_kv": 8,
     "qwen3.rope.freq_base": 1000000.0,
     "qwen3.attention.layer_norm_rms_epsilon": 9.999999974752427e-07,
@@ -38,12 +38,12 @@ class TestQwen3Config(unittest.TestCase):
     self.assertEqual(
       (config.architecture, config.block_count, config.context_length, config.embedding_length,
        config.feed_forward_length, config.attention_head_count, config.attention_head_count_kv),
-      ("qwen3", 28, 40960, 1024, 3072, 16, 8),
+      ("qwen3", 36, 40960, 2560, 9728, 32, 8),
     )
     self.assertEqual((config.key_length, config.value_length, config.rope_dimension_count), (128, 128, 128))
     self.assertEqual((config.rope_freq_base, config.rms_norm_epsilon), (1000000.0, 9.999999974752427e-07))
-    self.assertEqual((config.vocab_size, config.quantization_version, config.file_type), (151936, 2, 7))
-    self.assertEqual(config.quantization, "Q8_0")
+    self.assertEqual((config.vocab_size, config.quantization_version, config.file_type), (151936, 2, 15))
+    self.assertEqual(config.quantization, "Q4_K_M")
     self.assertTrue(config.qk_norm)
     self.assertFalse(config.attention_bias)
     self.assertFalse(config.mlp_bias)
@@ -60,15 +60,16 @@ class TestQwen3Config(unittest.TestCase):
   def test_generates_exact_tensor_inventory(self):
     config = qwen3_config_from_gguf(valid_metadata())
     specs = {spec.name: spec for spec in config.tensors}
-    self.assertEqual(len(specs), 310)
+    self.assertEqual(len(specs), 398)
     self.assertNotIn("output.weight", specs)
     self.assertFalse(any(name.endswith(".bias") for name in specs))
-    self.assertEqual(specs["token_embd.weight"].shape, (151936, 1024))
-    self.assertEqual(specs["blk.0.attn_q.weight"].shape, (2048, 1024))
-    self.assertEqual(specs["blk.27.attn_output.weight"].shape, (1024, 2048))
-    self.assertEqual(specs["blk.27.ffn_down.weight"].shape, (1024, 3072))
-    self.assertEqual(sum(spec.storage_dtype == "F32" for spec in specs.values()), 113)
-    self.assertEqual(sum(spec.storage_dtype == "Q8_0" for spec in specs.values()), 197)
+    self.assertEqual(specs["token_embd.weight"].shape, (151936, 2560))
+    self.assertEqual(specs["blk.0.attn_q.weight"].shape, (4096, 2560))
+    self.assertEqual(specs["blk.35.attn_output.weight"].shape, (2560, 4096))
+    self.assertEqual(specs["blk.35.ffn_down.weight"].shape, (2560, 9728))
+    self.assertEqual(sum(spec.storage_dtype == "F32" for spec in specs.values()), 145)
+    self.assertEqual(sum(spec.storage_dtype == "Q4_K" for spec in specs.values()), 216)
+    self.assertEqual(sum(spec.storage_dtype == "Q6_K" for spec in specs.values()), 37)
 
   def test_tensor_specs_match_pinned_inspection(self):
     config = qwen3_config_from_gguf(valid_metadata())
@@ -136,9 +137,9 @@ class TestPinnedQwen3Config(unittest.TestCase):
       metadata, tensors = gguf_load(gguf_tensor)
       config = qwen3_config_from_gguf(metadata)
 
-    self.assertEqual(config.block_count, 28)
+    self.assertEqual(config.block_count, 36)
     self.assertEqual(config.vocab_size, 151936)
-    self.assertEqual(len(config.tensors), 310)
+    self.assertEqual(len(config.tensors), 398)
     specs = {spec.name: spec for spec in config.tensors}
     self.assertEqual(tensors.keys(), specs.keys())
     for name, tensor in tensors.items():

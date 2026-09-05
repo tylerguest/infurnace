@@ -5,8 +5,8 @@ as its only production tensor compiler and device runtime. It does not define a
 tensor framework, render device code independently, or wrap
 `tinygrad.llm.Transformer.generate()` as a multi-request serving interface.
 
-The first validated model and backend are deliberately narrow: Qwen3-0.6B and
-`DEV=NV`, with external KV state and a constrained network API. The execution
+The first validated model and backend are deliberately narrow: Qwen3-4B (Q4_K_M)
+and `DEV=NV`, with external KV state and a constrained network API. The execution
 topology is explicit configuration. Request, scheduler, cache-ownership, and protocol
 contracts do not assume a device count or bind a request to a specific placement
 strategy.
@@ -196,13 +196,13 @@ kv_storage[
 ]
 ```
 
-For Qwen3-0.6B the concrete Phase 2A contract is:
+For Qwen3-4B the concrete Phase 2A contract is:
 
 - dtype: `float16`
-- max_context: `1024` (conservative initial limit; model max is 32768)
+- max_context: `1024` (conservative initial limit; model max is 40960)
 - num_slots: `1` (single-request prefill/decode for Phase 2B)
-- shape: `[28, 2, 1, 1024, 4, 128]`
-- size: `28 * 2 * 1 * 1024 * 4 * 128 * 2 = 58,982,400` bytes (~56.25 MiB)
+- shape: `[36, 2, 1, 1024, 8, 128]`
+- size: `36 * 2 * 1 * 1024 * 8 * 128 * 2 = 150,994,944` bytes (~144 MiB)
 
 The tensor is allocated with `Tensor.zeros`, made contiguous, and realized
 before use. `Tensor.empty(...).realize()` is not used because an initialized
@@ -392,7 +392,7 @@ the active sequence tail.
 
 ## Model Support
 
-Qwen3-0.6B is the first exact model contract. Qwen-specific metadata, weight
+Qwen3-4B (Q4_K_M) is the exact model contract. Qwen-specific metadata, weight
 mapping, RoPE, Q/K normalization, tied embeddings, and tensor layouts stay in the
 model layer. Scheduling, protocol handling, request state, and logical cache
 allocation do not depend on Qwen weight names.

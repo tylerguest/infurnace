@@ -4,7 +4,7 @@ from typing import Sequence
 from tinygrad import Tensor
 
 class Runner(ABC):
-    """Execution contract shared by all model runners (tinygrad, fake, future).
+    """Execution contract shared by all model runners (tinygrad and future).
     A runner owns model execution but not request lifecycle, scheduling, or
     cache ownership. The engine drives it through prefill and decode steps.
     """
