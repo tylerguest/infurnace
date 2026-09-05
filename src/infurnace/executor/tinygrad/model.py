@@ -1,7 +1,9 @@
 from __future__ import annotations
 import math
+import os
 from typing import Sequence
 from tinygrad import Tensor, UOp, dtypes
+from infurnace.kernels.quant_gemv import QuantGemvError, packed_weight, quant_gemv
 from infurnace.models.config import Qwen3Config
 from .buffers import ContiguousKVCache
 from .weights import Qwen3Weights
@@ -45,9 +47,34 @@ class Qwen3Model:
 
     self.config = config
     self._w = tensors
+    self._packed: dict[str, tuple[Tensor, int] | None] = {}
     self.kv_cache: ContiguousKVCache | None = None
     device = tensors["token_embd.weight"].device
     self._rope = _precompute_rope(config.rope_dimension_count, config.context_length, config.rope_freq_base, device)
+
+  def _decode_linear(self, x: Tensor, name: str) -> Tensor:
+    """Decode matmul for a weight name, using the fused Q4_K/Q6_K GEMV when possible.
+
+    The custom kernel (C1) targets the single-token decode shape: quantized
+    weights stay packed and the warp-per-output-row GEMV fixes the small-N
+    tiling gap. Non-quantized weights and unsupported shapes fall back to the
+    generic fp16 matmul. ``name`` (not the weight object) keys the cache so
+    tied weights are resolved once per weight name. The env knob is read at
+    call time (not import) so an A/B comparison can toggle the path in-process.
+    """
+    if os.environ.get("INFURNACE_DISABLE_QUANT_GEMV", "") not in ("", "0"):
+      return _linear(x, self._w[name])
+    if name not in self._packed:
+      self._packed[name] = packed_weight(self._w[name])
+    entry = self._packed[name]
+    if entry is not None:
+      packed, ggml_type = entry
+      out_features, in_features = self._w[name].shape
+      try:
+        return quant_gemv(x, packed, out_features=out_features, in_features=in_features, ggml_type=ggml_type)
+      except QuantGemvError:
+        return _linear(x, self._w[name])
+    return _linear(x, self._w[name])
 
   def _validate_forward_inputs(self, input_ids: Tensor, start_position: int, kv: Tensor | None, slot: int) -> tuple[int, int]:
     config = self.config
@@ -173,9 +200,9 @@ class Qwen3Model:
       p = f"blk.{i}"
 
       h = _rms_norm(x, w[f"{p}.attn_norm.weight"], config.rms_norm_epsilon)
-      q = _linear(h, w[f"{p}.attn_q.weight"])
-      k = _linear(h, w[f"{p}.attn_k.weight"])
-      v = _linear(h, w[f"{p}.attn_v.weight"])
+      q = self._decode_linear(h, f"{p}.attn_q.weight")
+      k = self._decode_linear(h, f"{p}.attn_k.weight")
+      v = self._decode_linear(h, f"{p}.attn_v.weight")
 
       q = q.reshape(1, 1, config.attention_head_count, config.key_length).transpose(1, 2)
       k = k.reshape(1, 1, config.attention_head_count_kv, config.key_length).transpose(1, 2)
@@ -200,15 +227,15 @@ class Qwen3Model:
 
       attn = q.scaled_dot_product_attention(cached_k, cached_v, is_causal=False, enable_gqa=True)
       attn = attn.transpose(1, 2).reshape(1, 1, -1)
-      x = x + _linear(attn, w[f"{p}.attn_output.weight"])
+      x = x + self._decode_linear(attn, f"{p}.attn_output.weight")
 
       h = _rms_norm(x, w[f"{p}.ffn_norm.weight"], config.rms_norm_epsilon)
-      gate = _linear(h, w[f"{p}.ffn_gate.weight"])
-      up = _linear(h, w[f"{p}.ffn_up.weight"])
-      x = (x + _linear(gate.silu().contiguous() * up, w[f"{p}.ffn_down.weight"])).contiguous()
+      gate = self._decode_linear(h, f"{p}.ffn_gate.weight")
+      up = self._decode_linear(h, f"{p}.ffn_up.weight")
+      x = (x + self._decode_linear(gate.silu().contiguous() * up, f"{p}.ffn_down.weight")).contiguous()
 
     x = _rms_norm(x[:, -1:], w["output_norm.weight"], config.rms_norm_epsilon)
-    return _linear(x, w["output.weight"])[:, -1, :]
+    return self._decode_linear(x, "output.weight")[:, -1, :]
 
   def _decode_batch_step(self, input_ids: Tensor, positions: Sequence[int | UOp], slots: Sequence[int]) -> Tensor:
     """Batched single-token decode for a fixed shape ``[S, 1]``.
@@ -244,9 +271,9 @@ class Qwen3Model:
       p = f"blk.{l}"
 
       h = _rms_norm(x, w[f"{p}.attn_norm.weight"], config.rms_norm_epsilon)
-      q = _linear(h, w[f"{p}.attn_q.weight"])
-      k = _linear(h, w[f"{p}.attn_k.weight"])
-      v = _linear(h, w[f"{p}.attn_v.weight"])
+      q = self._decode_linear(h, f"{p}.attn_q.weight")
+      k = self._decode_linear(h, f"{p}.attn_k.weight")
+      v = self._decode_linear(h, f"{p}.attn_v.weight")
 
       q = q.reshape(S, 1, config.attention_head_count, config.key_length).transpose(1, 2)
       k = k.reshape(S, 1, config.attention_head_count_kv, config.key_length).transpose(1, 2)
@@ -279,15 +306,15 @@ class Qwen3Model:
         row_attn.append(attn.transpose(1, 2).reshape(1, 1, -1))
 
       attn = row_attn[0].stack(*row_attn[1:], dim=0).reshape(S, 1, -1)  # [S, 1, out_dim]
-      x = x + _linear(attn, w[f"{p}.attn_output.weight"])
+      x = x + self._decode_linear(attn, f"{p}.attn_output.weight")
 
       h = _rms_norm(x, w[f"{p}.ffn_norm.weight"], config.rms_norm_epsilon)
-      gate = _linear(h, w[f"{p}.ffn_gate.weight"])
-      up = _linear(h, w[f"{p}.ffn_up.weight"])
-      x = (x + _linear(gate.silu().contiguous() * up, w[f"{p}.ffn_down.weight"])).contiguous()
+      gate = self._decode_linear(h, f"{p}.ffn_gate.weight")
+      up = self._decode_linear(h, f"{p}.ffn_up.weight")
+      x = (x + self._decode_linear(gate.silu().contiguous() * up, f"{p}.ffn_down.weight")).contiguous()
 
     x = _rms_norm(x[:, -1:], w["output_norm.weight"], config.rms_norm_epsilon)
-    return _linear(x, w["output.weight"])[:, -1, :]  # [S, V]
+    return self._decode_linear(x, "output.weight")[:, -1, :]  # [S, V]
 
   def prefill(self, input_ids: Tensor, kv_cache: ContiguousKVCache, slot: int = 0, start_position: int = 0) -> Tensor:
     if not isinstance(kv_cache, ContiguousKVCache): raise Qwen3ModelError("kv_cache must be a ContiguousKVCache")

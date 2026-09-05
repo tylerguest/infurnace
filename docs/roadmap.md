@@ -51,7 +51,13 @@ gap with custom NV kernels:
 - **Throughput kernels.** Write fused Q4_K/Q6_K dequant-GEMV and fused
   single-token paged attention as custom UOp/PTX kernels on tinygrad's NV
   renderer; add persistent device input buffers to remove the per-step host
-  roundtrip.
+  roundtrip. C1 (fused decode GEMV) is implemented
+  ([report](baselines/qwen3-4b-c1-gemv.md)): the decode graph dropped from
+  109.8 ms/token (~22.7 GB/s) to 24.8 ms/token (~100 GB/s, ~40 tok/s), a 4.4x
+  kernel-side gain with identical greedy tokens; per-shape gains are 2-4.5x.
+  The remaining attention fusion (C2) and persistent buffers (5D) still land
+  here; the smallest-N shapes (attn_k/v at 12-15 GB/s) and the ~24 ms/token
+  host roundtrip are the next levers.
 - **Fold into the roadmap.** Land Phase 5C with the fused attention kernel and
   5D with page ownership and persistent buffers, then continuous batching
   (Phase 6), where KV capacity for the 4B model with real context finally binds.
