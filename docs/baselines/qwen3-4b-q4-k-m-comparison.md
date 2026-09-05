@@ -4,6 +4,15 @@ Head-to-head steady decode on the same checkpoint, same card, same greedy
 sampling, 16-token prompt. This is the "measure first" bar that gates the
 throughput-kernel work in the roadmap's Current Work section.
 
+A single command reproduces the comparison table and writes a validated JSON:
+
+```sh
+DEV=NV JIT=1 .venv/bin/python benchmarks/benchmark_comparison.py \
+  --manifest models/qwen3-4b-q4_k_m.json \
+  --artifact artifacts/models/Qwen3-4B-Q4_K_M.gguf \
+  --output results/infurnace-llama-cpp-comparison.json
+```
+
 ## Reference
 
 - Checkpoint: `Qwen/Qwen3-4B-GGUF` revision `bc640142c66e1fdd12af0bd68f40445458f3869b`,

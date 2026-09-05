@@ -30,6 +30,24 @@ follow-up. Decode throughput is one generated token divided by each
 synchronized replay latency. The comparison is recorded in
 [`qwen3-4b-q4-k-m-comparison.md`](../docs/baselines/qwen3-4b-q4-k-m-comparison.md).
 
+## Infurnace vs llama.cpp
+
+One command runs both engines on the same card and checkpoint and prints the
+head-to-head table (decode tok/s, achieved GB/s vs the ~448 GB/s ceiling,
+TTFT). `benchmark_comparison.py` subprocesses `benchmark_infurnace.py` and
+`llama-bench -o json`, so both sides run in separate clean processes:
+
+```sh
+DEV=NV JIT=1 .venv/bin/python benchmarks/benchmark_comparison.py \
+  --manifest models/qwen3-4b-q4_k_m.json \
+  --artifact artifacts/models/Qwen3-4B-Q4_K_M.gguf \
+  --output results/infurnace-llama-cpp-comparison.json
+```
+
+`--llama-bench` defaults to `../llama.cpp/build/bin/llama-bench` and is
+overridable. The validated combined result embeds both engine sub-results plus
+derived ratios; the llama.cpp side is the bar for the decode tok/s metric.
+
 ## Upstream Prefill
 
 The upstream sections below predate the Infurnace engine benchmark and measure

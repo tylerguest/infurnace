@@ -124,6 +124,48 @@ def valid_infurnace_decode_result() -> dict:
   }
   return result
 
+def valid_comparison_result() -> dict:
+  inf_decode = 100.0
+  llm_decode = 1000.0
+  ceiling = 448.0
+  return {
+    "schema_version": 1,
+    "benchmark": "comparison",
+    "created_at_utc": "2026-08-15T00:00:00+00:00",
+    "checkpoint": {"id": "model", "sha256": "a" * 64, "size_bytes": 10},
+    "system": {
+      "python": "3.14.4", "platform": "Linux",
+      "device": {
+        "index": 0, "uuid": "GPU-a", "name": "GPU", "driver_version": "1",
+        "total_memory_bytes": 100, "baseline_used_memory_bytes": 10, "baseline_free_memory_bytes": 90,
+      },
+    },
+    "engines": {
+      "infurnace": {
+        "decode_tokens_per_second": inf_decode,
+        "ttft_ms": 30_000.0, "capture_ms": 20_000.0,
+        "achieved_gb_per_second": 20.0,
+        "peak_device_memory_bytes": 10,
+        "model_load_ms": 1000.0, "weights_bytes": 1000,
+      },
+      "llamacpp": {
+        "decode_tokens_per_second": llm_decode,
+        "decode_ms_per_token": 1.0,
+        "prefill_tokens_per_second": 2000.0,
+        "achieved_gb_per_second": 300.0,
+        "model_size_bytes": 1000,
+        "build_commit": "abc", "repetitions": 5, "n_gpu_layers": 99,
+      },
+    },
+    "derived": {
+      "decode_ratio_infurnace_over_llamacpp": inf_decode / llm_decode,
+      "ceiling_gb_per_second": ceiling,
+      "infurnace_pct_of_ceiling": 20.0 / ceiling * 100.0,
+      "llamacpp_pct_of_ceiling": 300.0 / ceiling * 100.0,
+      "notes": "test comparison",
+    },
+  }
+
 def valid_end_to_end_result() -> dict:
   result = copy.deepcopy(valid_result())
   result["benchmark"] = "upstream_end_to_end"
@@ -240,6 +282,24 @@ class TestBenchmarkResultContract(unittest.TestCase):
 
   def test_accepts_valid_infurnace_decode_result(self):
     validate_result(valid_infurnace_decode_result())
+
+  def test_accepts_valid_comparison_result(self):
+    validate_result(valid_comparison_result())
+
+  def test_rejects_comparison_mismatches(self):
+    mutations = [
+      lambda result: result["derived"].update(decode_ratio_infurnace_over_llamacpp=1.0),
+      lambda result: result["derived"].update(infurnace_pct_of_ceiling=0.0),
+      lambda result: result["engines"]["infurnace"].pop("weights_bytes"),
+      lambda result: result["engines"]["llamacpp"].update(repetitions=0),
+      lambda result: result["engines"]["infurnace"].update(achieved_gb_per_second=-1),
+      lambda result: result["engines"].pop("infurnace"),
+    ]
+    for mutate in mutations:
+      with self.subTest(mutate=mutate):
+        result = copy.deepcopy(valid_comparison_result())
+        mutate(result)
+        with self.assertRaises(ValueError): validate_result(result)
 
   def test_rejects_infurnace_decode_mismatches(self):
     mutations = [

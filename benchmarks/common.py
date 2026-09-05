@@ -149,7 +149,75 @@ class NvidiaMemorySampler:
       self.sample_once()
       self._stop.wait(max(0.0, interval_seconds - (time.monotonic() - started)))
 
+def _validate_comparison(result: dict[str, Any]) -> None:
+  checkpoint = result.get("checkpoint")
+  if not isinstance(checkpoint, dict) or set(checkpoint) != {"id", "sha256", "size_bytes"}:
+    raise ValueError("comparison checkpoint identity is incomplete")
+  if not isinstance(checkpoint["id"], str) or not checkpoint["id"]: raise ValueError("comparison checkpoint id is invalid")
+  if not isinstance(checkpoint["sha256"], str) or len(checkpoint["sha256"]) != 64: raise ValueError("comparison checkpoint sha256 is invalid")
+  try: int(checkpoint["sha256"], 16)
+  except ValueError as error: raise ValueError("comparison checkpoint sha256 is invalid") from error
+  if type(checkpoint["size_bytes"]) is not int or checkpoint["size_bytes"] <= 0: raise ValueError("comparison checkpoint size is invalid")
+
+  system = result.get("system")
+  if not isinstance(system, dict) or set(system) != {"python", "platform", "device"}:
+    raise ValueError("comparison system metadata is incomplete")
+  if any(not isinstance(system[field], str) or not system[field] for field in ("python", "platform")):
+    raise ValueError("comparison system software metadata is invalid")
+  device = system["device"]
+  required_device = {"index", "uuid", "name", "driver_version", "total_memory_bytes", "baseline_used_memory_bytes", "baseline_free_memory_bytes"}
+  if not isinstance(device, dict) or set(device) != required_device:
+    raise ValueError("comparison device metadata is incomplete")
+
+  engines = result.get("engines")
+  if not isinstance(engines, dict) or set(engines) != {"infurnace", "llamacpp"}:
+    raise ValueError("comparison engines are incomplete")
+  inf, llm = engines["infurnace"], engines["llamacpp"]
+  required_inf = {"decode_tokens_per_second", "ttft_ms", "capture_ms", "achieved_gb_per_second", "peak_device_memory_bytes", "model_load_ms", "weights_bytes"}
+  required_llm = {"decode_tokens_per_second", "decode_ms_per_token", "prefill_tokens_per_second", "achieved_gb_per_second", "model_size_bytes", "build_commit", "repetitions", "n_gpu_layers"}
+  if not isinstance(inf, dict) or set(inf) != required_inf: raise ValueError("Infurnace comparison result is incomplete")
+  if not isinstance(llm, dict) or set(llm) != required_llm: raise ValueError("llama.cpp comparison result is incomplete")
+  for field in ("decode_tokens_per_second", "achieved_gb_per_second"):
+    if type(inf[field]) not in (int, float) or inf[field] <= 0: raise ValueError(f"Infurnace {field} is invalid")
+  for field in ("ttft_ms", "capture_ms", "model_load_ms"):
+    if type(inf[field]) not in (int, float) or inf[field] <= 0: raise ValueError(f"Infurnace {field} is invalid")
+  if type(inf["peak_device_memory_bytes"]) is not int or inf["peak_device_memory_bytes"] <= 0:
+    raise ValueError("Infurnace peak memory is invalid")
+  if type(inf["weights_bytes"]) is not int or inf["weights_bytes"] <= 0: raise ValueError("Infurnace weights size is invalid")
+  for field in ("decode_tokens_per_second", "decode_ms_per_token", "prefill_tokens_per_second", "achieved_gb_per_second"):
+    if type(llm[field]) not in (int, float) or llm[field] <= 0: raise ValueError(f"llama.cpp {field} is invalid")
+  if type(llm["model_size_bytes"]) is not int or llm["model_size_bytes"] <= 0: raise ValueError("llama.cpp model size is invalid")
+  for field in ("repetitions", "n_gpu_layers"):
+    if type(llm[field]) is not int or llm[field] <= 0: raise ValueError(f"llama.cpp {field} is invalid")
+  if not isinstance(llm["build_commit"], str) or not llm["build_commit"]:
+    raise ValueError("llama.cpp build commit is invalid")
+
+  derived = result.get("derived")
+  required_derived = {"decode_ratio_infurnace_over_llamacpp", "ceiling_gb_per_second", "infurnace_pct_of_ceiling", "llamacpp_pct_of_ceiling", "notes"}
+  if not isinstance(derived, dict) or set(derived) != required_derived:
+    raise ValueError("comparison derived metrics are incomplete")
+  ceiling = derived["ceiling_gb_per_second"]
+  if type(ceiling) not in (int, float) or ceiling <= 0: raise ValueError("comparison bandwidth ceiling is invalid")
+  expected_ratio = inf["decode_tokens_per_second"] / llm["decode_tokens_per_second"]
+  if not math.isclose(derived["decode_ratio_infurnace_over_llamacpp"], expected_ratio, rel_tol=1e-12):
+    raise ValueError("comparison decode ratio is invalid")
+  for engine_key, achieved in (("infurnace", inf["achieved_gb_per_second"]), ("llamacpp", llm["achieved_gb_per_second"])):
+    expected_pct = achieved / ceiling * 100.0
+    key = f"{engine_key}_pct_of_ceiling"
+    if not math.isclose(derived[key], expected_pct, rel_tol=1e-12):
+      raise ValueError(f"comparison {key} is invalid")
+  if not isinstance(derived["notes"], str) or not derived["notes"]:
+    raise ValueError("comparison notes are invalid")
+
 def validate_result(result: dict[str, Any]) -> None:
+  if not isinstance(result, dict): raise ValueError("benchmark result must be an object")
+  benchmark = result.get("benchmark")
+  if benchmark == "comparison":
+    if result.get("schema_version") != SCHEMA_VERSION: raise ValueError(f"schema_version must be {SCHEMA_VERSION}")
+    if not isinstance(result.get("created_at_utc"), str) or not result["created_at_utc"].endswith("+00:00"):
+      raise ValueError("created_at_utc must be an explicit UTC timestamp")
+    _validate_comparison(result)
+    return
   required_root = {"schema_version", "benchmark", "created_at_utc", "checkpoint", "system", "execution", "workload", "timings", "outputs", "memory"}
   if set(result) != required_root: raise ValueError("benchmark result fields are incomplete or unknown")
   if result.get("schema_version") != SCHEMA_VERSION: raise ValueError(f"schema_version must be {SCHEMA_VERSION}")
