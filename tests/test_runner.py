@@ -308,10 +308,12 @@ class TestQwen3RunnerStress(unittest.TestCase):
     runner.initialize_fused_decode(tokens[1])
     for i in range(1, len(tokens)):
       runner.decode_fused(i, 0)
-    jit = runner._decode_fused_jit[0]
-    # warmup (1) + capture (1) + 7 replays = 9 calls, one captured program
-    self.assertLessEqual(jit.cnt, 9)
-    self.assertTrue(jit.captured is not None)
+    jit_a, jit_b = runner._decode_fused_jit[0]
+    # Each contract: warmup (2) + capture (2) + replays; one captured program.
+    self.assertLessEqual(jit_a.cnt, 2 + 2 + len(tokens) // 2 + 1)
+    self.assertLessEqual(jit_b.cnt, 2 + 2 + len(tokens) // 2 + 1)
+    self.assertTrue(jit_a.captured is not None)
+    self.assertTrue(jit_b.captured is not None)
 
   # ------------------------------------------------------------------
   # Cache replacement

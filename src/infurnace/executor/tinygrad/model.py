@@ -316,23 +316,24 @@ class Qwen3Model:
     x = _rms_norm(x[:, -1:], w["output_norm.weight"], config.rms_norm_epsilon)
     return self._decode_linear(x, "output.weight")[:, -1, :]  # [S, V]
 
-  def _decode_step_fused(self, input_pair: Tensor, position: UOp, feedback_idx: UOp, slot: int = 0) -> Tensor:
+  def _decode_step_fused(self, input_token: Tensor, position: UOp, write_slot: Tensor, slot: int = 0) -> Tensor:
     """Single-token decode with in-graph greedy argmax and device-side token feedback.
 
-    ``input_pair`` is a persistent ``[2, 1]`` int32 buffer owned by the runner.
-    The graph reads the row at the bound ``feedback_idx`` (the previous replay's
-    sampled token), runs the decode layers, argmaxes the logits, and stores the
-    sampled token into the row at ``1 - feedback_idx`` via an SSA ``uop.store``.
-    It returns the written row so the store stays in the graph. The host toggles
-    the bound index each replay, so every per-token input write and the greedy
-    sampler run as captured kernels — no eager ops and no host roundtrip in the
-    steady decode path (Phase 5D).
+    ``input_token`` is a persistent ``[1, 1]`` int32 buffer holding the token to
+    decode and ``write_slot`` the ``[1, 1]`` int32 buffer the sampled token is
+    stored into via an SSA ``uop.store``. Both targets are Python constants
+    (closure buffers), so no variable-indexed feedback slice exists in the
+    captured graph — the NV HCQ replay path applies new var_vals to every other
+    slice correctly (the KV stores use the bound ``position``), but a
+    ``feedback_idx``-indexed store/read on a closure buffer lags by one replay
+    on first use. The runner owns two buffers and alternates the read/write
+    role between two captures. Returns the written row (post-store view).
     """
     if self.kv_cache is None: raise Qwen3ModelError("kv_cache must be attached to the model before decode")
     kv = self.kv_cache.kv
     config, w = self.config, self._w
     rope = self._rope[position:position+1]
-    x = w["token_embd.weight"][input_pair[feedback_idx:feedback_idx+1]].float()
+    x = w["token_embd.weight"][input_token].float()
 
     for i in range(config.block_count):
       p = f"blk.{i}"
@@ -373,10 +374,8 @@ class Qwen3Model:
     x = _rms_norm(x[:, -1:], w["output_norm.weight"], config.rms_norm_epsilon)
     logits = self._decode_linear(x, "output.weight")[:, -1, :]  # [1, V]
     token = logits.argmax(axis=1)
-    write_idx = 1 - feedback_idx
-    feedback_store = input_pair[write_idx:write_idx+1].uop.store(token.uop)
-    feedback = Tensor(input_pair.uop.after(feedback_store))
-    return feedback[write_idx:write_idx+1]  # [1, 1] int32
+    feedback_store = write_slot.uop.store(token.uop)
+    return Tensor(write_slot.uop.after(feedback_store))  # [1, 1] int32, post-store
 
   def prefill(self, input_ids: Tensor, kv_cache: ContiguousKVCache, slot: int = 0, start_position: int = 0) -> Tensor:
     if not isinstance(kv_cache, ContiguousKVCache): raise Qwen3ModelError("kv_cache must be a ContiguousKVCache")

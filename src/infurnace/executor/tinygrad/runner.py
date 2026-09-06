@@ -31,11 +31,17 @@ class Qwen3Runner:
     # compile/workspace cost (keeps NV engine memory within budget).
     self._decode_jit: dict[int, TinyJit] = {}
     self._decode_batch_jit: dict[tuple[int, ...], TinyJit] = {}
-    # Phase 5D fused decode state: persistent [2, 1] token buffer the decode
-    # graph reads and writes on device (ping-pong), plus the alternating index.
-    self._fused_feedback = Tensor.zeros(2, 1, dtype=dtypes.int32, device=kv_cache.kv.device).contiguous().realize()
+    # Phase 5D fused decode state: two persistent [1, 1] token buffers the
+    # decode graph reads from and writes to on device (closure constants), plus
+    # the alternating read/write role between two captures. Variable-indexed
+    # feedback slices on a closure buffer lag by one replay on the NV HCQ path,
+    # so the buffers are swapped by selecting which capture runs, not by a
+    # bound index.
+    self._feedback_read = Tensor.zeros(1, 1, dtype=dtypes.int32, device=kv_cache.kv.device).contiguous().realize()
+    self._feedback_write = Tensor.zeros(1, 1, dtype=dtypes.int32, device=kv_cache.kv.device).contiguous().realize()
     self._fused_toggle = 0
-    self._decode_fused_jit: dict[int, TinyJit] = {}
+    self._fused_seed = 0
+    self._decode_fused_jit: dict[int, tuple[TinyJit, TinyJit]] = {}
 
   @property
   def num_slots(self) -> int:
@@ -139,14 +145,22 @@ class Qwen3Runner:
     return logits[:B]
 
   def initialize_fused_decode(self, seed_token: int) -> None:
-    """Seed the fused-decode feedback buffer before a request's first decode.
+    """Seed the fused-decode feedback buffers before a request's first decode.
 
-    The prefill token is sampled on the host, so it is written into both
-    feedback rows once per request; the toggled rows then alternate on device.
+    The prefill token is sampled on the host, so both buffers are written with
+    it once per request. If the fused contracts are already captured, the
+    buffers are written immediately; otherwise the first ``decode_fused`` call
+    captures first and re-seeds after the capture warmups consumed the seed.
     """
     if type(seed_token) is not int or seed_token < 0:
       raise RunnerError(f"seed_token must be a non-negative int, got {seed_token!r}")
-    self._fused_feedback.assign(Tensor([[seed_token], [seed_token]], dtype=dtypes.int32)).realize()
+    self._fused_seed = seed_token
+    if self._decode_fused_jit:
+      self._seed_feedback()
+
+  def _seed_feedback(self) -> None:
+    self._feedback_read.assign(Tensor([[self._fused_seed]], dtype=dtypes.int32)).realize()
+    self._feedback_write.assign(Tensor([[self._fused_seed]], dtype=dtypes.int32)).realize()
     self._fused_toggle = 0
 
   def decode_fused(self, position: int, slot: int = 0) -> int:
@@ -154,21 +168,22 @@ class Qwen3Runner:
 
     The captured graph reads the previous sampled token from a persistent
     on-device buffer, decodes, argmaxes on device, and writes the next token
-    back to the other buffer row — no per-step host roundtrip or eager ops.
+    back to the paired buffer — no per-step host roundtrip or eager ops.
     Returns the sampled token id as a host int.
     """
     if slot < 0 or slot >= self.kv_cache.num_slots:
       raise RunnerError(f"slot {slot} out of range [0, {self.kv_cache.num_slots})")
     if position < 0 or position >= self.kv_cache.max_context:
       raise RunnerError(f"position {position} out of range [0, {self.kv_cache.max_context})")
-    jit = self._decode_fused_jit.get(slot)
-    if jit is None:
-      jit = self._capture_decode_fused(slot)
-      self._decode_fused_jit[slot] = jit
+    pair = self._decode_fused_jit.get(slot)
+    if pair is None:
+      pair = self._capture_decode_fused(slot)
+      self._decode_fused_jit[slot] = pair
+      self._seed_feedback()  # capture warmups consumed the seed; restore it
     self._fused_toggle = 1 - self._fused_toggle
+    jit = pair[self._fused_toggle]
     pos_var = Variable("position", 0, self.kv_cache.max_context - 1).bind(position)
-    idx_var = Variable("feedback_idx", 0, 1).bind(self._fused_toggle)
-    token = jit(pos_var, idx_var)
+    token = jit(pos_var)
     return int(token.tolist()[0][0])
 
   def _capture_decode(self, slot: int) -> TinyJit:
@@ -204,17 +219,25 @@ class Qwen3Runner:
 
     return _jit_decode_batch
 
-  def _capture_decode_fused(self, slot: int) -> TinyJit:
+  def _capture_decode_fused(self, slot: int) -> tuple[TinyJit, TinyJit]:
+    """Capture the two paired decode contracts: read A -> write B and read B -> write A."""
     @TinyJit
-    def _jit_decode_fused(position: UOp, feedback_idx: UOp) -> Tensor:
-      return self.model._decode_step_fused(self._fused_feedback, position, feedback_idx, slot)
+    def _jit_read_a(position: UOp) -> Tensor:
+      return self.model._decode_step_fused(self._feedback_read, position, self._feedback_write, slot)
+
+    @TinyJit
+    def _jit_read_b(position: UOp) -> Tensor:
+      return self.model._decode_step_fused(self._feedback_write, position, self._feedback_read, slot)
 
     max_context = self.kv_cache.max_context
-    warmup_pos = Variable("position", 0, max_context - 1).bind(0)
-    warmup_idx = Variable("feedback_idx", 0, 1).bind(0)
+    # Warmup at the last cache position so the capture's KV stores and reads
+    # never touch the request's real prefix (positions 0..max_context-2).
+    warmup_pos = Variable("position", 0, max_context - 1).bind(max_context - 1)
 
     with Context(BEAM=0):
-      _jit_decode_fused(warmup_pos, warmup_idx)
-      _jit_decode_fused(warmup_pos, warmup_idx)
+      _jit_read_a(warmup_pos)
+      _jit_read_a(warmup_pos)
+      _jit_read_b(warmup_pos)
+      _jit_read_b(warmup_pos)
 
-    return _jit_decode_fused
+    return _jit_read_a, _jit_read_b

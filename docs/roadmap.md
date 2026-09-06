@@ -56,13 +56,13 @@ gap with custom NV kernels:
   109.8 ms/token (~22.7 GB/s) to 24.8 ms/token (~100 GB/s, ~40 tok/s), a 4.4x
   kernel-side gain with identical greedy tokens; per-shape gains are 2-4.5x.
   The persistent-buffer half of 5D landed with the fused decode contract
-  ([report](baselines/qwen3-4b-fused-decode.md)): in-graph argmax plus a
-  persistent on-device token feedback buffer moved the engine step from 48.8
-  to 15.2 ms/token (63.1 tok/s, 51.3% of the llama.cpp bar, 1.9x gap), because
-  every eager op costs ~13-16 ms with the model resident while captured kernels
-  cost ~2 ms. The remaining attention fusion (C2) and the small-N GEMV shapes
-  (attn_k/v) are the next kernel levers; the ~4 ms/token readback and host work
-  closes the last engine-side gap.
+  ([report](baselines/qwen3-4b-fused-decode.md)): in-graph argmax plus paired
+  on-device token feedback buffers moved the engine step from 48.8 to 11.3
+  ms/token (88.5 tok/s, 68.4% of the llama.cpp bar, 1.5x gap), because every
+  eager op costs ~13-16 ms with the model resident while captured kernels cost
+  ~2 ms. The remaining attention fusion (C2) and the small-N GEMV shapes
+  (attn_k/v) are the next kernel levers; the ~1-2 ms/token readback and host
+  work closes the last engine-side gap.
 - **Fold into the roadmap.** Land Phase 5C with the fused attention kernel and
   5D with page ownership and persistent buffers, then continuous batching
   (Phase 6), where KV capacity for the 4B model with real context finally binds.
@@ -507,8 +507,8 @@ pages at the correct time under end-to-end request traces.
 **Status (partial):** the persistent fixed-shape input buffers from the Phase 4D
 note landed as the fused decode contract ([report](baselines/qwen3-4b-fused-decode.md)):
 single-request engine decode runs as one TinyJit replay with in-graph argmax and
-device-side token feedback (no per-step host roundtrip), measured 63.1 tok/s
-(51.3% of the llama.cpp bar). Page ownership and the paged decode contracts
+device-side token feedback (no per-step host roundtrip), measured 88.5 tok/s
+(68.4% of the llama.cpp bar). Page ownership and the paged decode contracts
 remain.
 
 **Planned approach:** contiguous-slot ownership is replaced by page ownership
