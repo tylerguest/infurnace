@@ -79,12 +79,9 @@ def _https_url(value: Any, name: str) -> str:
 
 def load_manifest(path: str | Path) -> CheckpointManifest:
   manifest_path = Path(path)
-  try:
-    data = json.loads(manifest_path.read_text(encoding="utf-8"), object_pairs_hook=_unique_object)
-  except ManifestError:
-    raise
-  except (OSError, UnicodeError, json.JSONDecodeError) as error:
-    raise ManifestError(f"cannot read manifest {manifest_path}: {error}") from error
+  try: data = json.loads(manifest_path.read_text(encoding="utf-8"), object_pairs_hook=_unique_object)
+  except ManifestError: raise
+  except (OSError, UnicodeError, json.JSONDecodeError) as error: raise ManifestError(f"cannot read manifest {manifest_path}: {error}") from error
 
   root = _object(data, "manifest", {"schema_version", "id", "source", "artifact", "license"})
   source = _object(root["source"], "source", {"repository", "revision", "url"})
@@ -92,8 +89,7 @@ def load_manifest(path: str | Path) -> CheckpointManifest:
   license_data = _object(root["license"], "license", {"spdx", "url"})
 
   schema_version = root["schema_version"]
-  if type(schema_version) is not int or schema_version != _EXPECTED_SCHEMA_VERSION:
-    raise ManifestError(f"schema_version must be {_EXPECTED_SCHEMA_VERSION}")
+  if type(schema_version) is not int or schema_version != _EXPECTED_SCHEMA_VERSION: raise ManifestError(f"schema_version must be {_EXPECTED_SCHEMA_VERSION}")
 
   checkpoint_id = _string(root["id"], "id")
   if _ID_PATTERN.fullmatch(checkpoint_id) is None: raise ManifestError("id contains unsupported characters")
@@ -104,8 +100,7 @@ def load_manifest(path: str | Path) -> CheckpointManifest:
   if _REVISION_PATTERN.fullmatch(revision) is None: raise ManifestError("source.revision must be a full lowercase Git revision")
 
   filename = _string(artifact["filename"], "artifact.filename")
-  if Path(filename).name != filename or "/" in filename or "\\" in filename:
-    raise ManifestError("artifact.filename must be a basename")
+  if Path(filename).name != filename or "/" in filename or "\\" in filename: raise ManifestError("artifact.filename must be a basename")
   if not filename.endswith(".gguf"): raise ManifestError("artifact.filename must end with .gguf")
 
   url = _https_url(source["url"], "source.url")
@@ -129,10 +124,8 @@ def load_manifest(path: str | Path) -> CheckpointManifest:
                             quantization, size_bytes, sha256, license_spdx, license_url)
 
 def _check_identity(size_bytes: int, sha256: str, manifest: CheckpointManifest) -> None:
-  if size_bytes != manifest.size_bytes:
-    raise ArtifactError(f"artifact size mismatch: expected {manifest.size_bytes}, got {size_bytes}")
-  if sha256 != manifest.sha256:
-    raise ArtifactError(f"artifact SHA-256 mismatch: expected {manifest.sha256}, got {sha256}")
+  if size_bytes != manifest.size_bytes: raise ArtifactError(f"artifact size mismatch: expected {manifest.size_bytes}, got {size_bytes}")
+  if sha256 != manifest.sha256: raise ArtifactError(f"artifact SHA-256 mismatch: expected {manifest.sha256}, got {sha256}")
 
 def verify_artifact(path: str | Path, manifest: CheckpointManifest) -> None:
   artifact_path = Path(path)
@@ -141,8 +134,7 @@ def verify_artifact(path: str | Path, manifest: CheckpointManifest) -> None:
     with artifact_path.open("rb") as artifact:
       while chunk := artifact.read(_CHUNK_SIZE):
         size_bytes += len(chunk)
-        if size_bytes > manifest.size_bytes:
-          raise ArtifactError(f"artifact size exceeds expected {manifest.size_bytes} bytes")
+        if size_bytes > manifest.size_bytes: raise ArtifactError(f"artifact size exceeds expected {manifest.size_bytes} bytes")
         digest.update(chunk)
   except ArtifactError:
     raise
@@ -158,8 +150,7 @@ def verified_artifact(path: str | Path, manifest: CheckpointManifest) -> Iterato
       digest, size_bytes = hashlib.sha256(), 0
       while chunk := artifact.read(_CHUNK_SIZE):
         size_bytes += len(chunk)
-        if size_bytes > manifest.size_bytes:
-          raise ArtifactError(f"artifact size exceeds expected {manifest.size_bytes} bytes")
+        if size_bytes > manifest.size_bytes: raise ArtifactError(f"artifact size exceeds expected {manifest.size_bytes} bytes")
         snapshot.write(chunk)
         digest.update(chunk)
       _check_identity(size_bytes, digest.hexdigest(), manifest)
@@ -183,15 +174,13 @@ def acquire_artifact(manifest: CheckpointManifest, destination: str | Path, time
   try:
     destination_path.parent.mkdir(parents=True, exist_ok=True)
     request = Request(manifest.url, headers={"Accept-Encoding": "identity", "User-Agent": "infurnace/0.0.0"})
-    with tempfile.NamedTemporaryFile(mode="wb", dir=destination_path.parent, prefix=f".{destination_path.name}.",
-                                     suffix=".part", delete=False) as temporary:
+    with tempfile.NamedTemporaryFile(mode="wb", dir=destination_path.parent, prefix=f".{destination_path.name}.", suffix=".part", delete=False) as temporary:
       temporary_path = Path(temporary.name)
       digest, size_bytes = hashlib.sha256(), 0
       with urlopen(request, timeout=timeout) as response:
         while chunk := response.read(_CHUNK_SIZE):
           size_bytes += len(chunk)
-          if size_bytes > manifest.size_bytes:
-            raise ArtifactError(f"download exceeds expected {manifest.size_bytes} bytes")
+          if size_bytes > manifest.size_bytes: raise ArtifactError(f"download exceeds expected {manifest.size_bytes} bytes")
           temporary.write(chunk)
           digest.update(chunk)
       _check_identity(size_bytes, digest.hexdigest(), manifest)
@@ -199,13 +188,10 @@ def acquire_artifact(manifest: CheckpointManifest, destination: str | Path, time
       os.fsync(temporary.fileno())
 
     try: os.link(temporary_path, destination_path)
-    except FileExistsError:
-      verify_artifact(destination_path, manifest)
+    except FileExistsError: verify_artifact(destination_path, manifest)
     return destination_path
-  except ArtifactError:
-    raise
-  except (OSError, URLError, HTTPException) as error:
-    raise ArtifactError(f"cannot acquire artifact: {error}") from error
+  except ArtifactError: raise
+  except (OSError, URLError, HTTPException) as error: raise ArtifactError(f"cannot acquire artifact: {error}") from error
   finally:
     if temporary_path is not None:
       try: temporary_path.unlink(missing_ok=True)

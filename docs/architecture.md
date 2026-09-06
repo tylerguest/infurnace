@@ -96,6 +96,30 @@ token result, request update, and streamed output
 Protocol adapters cannot bypass the engine or call model generation directly. This
 keeps offline tests representative of network-serving behavior.
 
+## Source Layout (Top to Bottom)
+
+The package (`src/infurnace/`, ~2,700 lines) has two stacks: the serving stack
+(requests, scheduler, engine, cache ownership) is device-agnostic Python; the
+execution stack (weights, model, kernels) is the tinygrad boundary. Files marked
+*stub* are reserved placeholders.
+
+1. `cli.py` — entry point. Builds the engine, steps it, streams output. (`api/` `protocol.py`, `server.py` are stubs for the deferred HTTP adapter.)
+2. `models/` — pinned Qwen3-4B Q4_K_M contract: `manifest.py` (verify/download checkpoint), `qwen3.py` (config from GGUF), `config.py` (tensor specs).
+3. `executor/tinygrad/weights.py` — loads the GGUF via tinygrad, validates every tensor, casts fp16, ties `output.weight`.
+4. `tokenizer/` — `base.py` (ABC), `gguf.py` (GGUF-backed tokenizer), `detokenizer.py` (streaming + stop strings).
+5. `engine/request.py` — `Request` state machine, sampling params, metrics.
+6. `scheduler/` — admission, slot reservation, FIFO, chunked prefill, decode batching, compaction; `plan.py` defines the immutable execution plans.
+7. `cache/block_pool.py` — logical page allocator (Phase 5A). `kv_manager.py`, `prefix_cache.py` are stubs.
+8. `engine/engine.py` — the `prepare/execute/commit` step loop tying it together.
+9. `executor/` — `runner.py` (ABC); `tinygrad/runner.py` captures TinyJit decode contracts; `tinygrad/model.py` builds the graph (SSA cache writes);
+   `tinygrad/buffers.py` holds the contiguous and paged KV caches.
+10. `kernels/` — `quant_gemv.py` (fused Q4_K/Q6_K decode GEMV), `kv_store.py` (paged KV store). `paged_attention.py` is a stub.
+11. `sampler/greedy.py` — argmax sampling.
+
+Flow: `cli.py` loads the checkpoint and tokenizer, then drives `Engine`, which
+asks `Scheduler` for plans, runs them on the tinygrad runner (prefill eager,
+decode TinyJit), samples, detokenizes, and frees slots.
+
 ## Request Lifecycle
 
 A request has one nonterminal state and one terminal outcome:
