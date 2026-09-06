@@ -43,6 +43,16 @@ class SamplingParams:
   min_tokens: int = 0
   include_stop_str_in_output: bool = False
 
+  @property
+  def is_greedy(self) -> bool:
+    """True when the parameter set reduces to deterministic argmax sampling.
+
+    The fused decode contract performs in-graph argmax and therefore honors
+    only this default; any other parameter combination must use the engine
+    sampler path.
+    """
+    return self.temperature == 0.0 and self.top_k == 1 and self.top_p == 1.0
+
 @dataclass(slots=True)
 class RequestMetrics:
   arrival_time: float = field(default_factory=monotonic)

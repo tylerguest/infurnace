@@ -69,9 +69,11 @@ class Runner(ABC):
   # override these. The engine discovers support by calling ``decode_fused``
   # and falling back to ``decode_batch`` on ``NotImplementedError``.
 
-  def initialize_fused_decode(self, seed_token: int) -> None:
-    """Seed the fused-decode feedback buffers with the sampled prefill token.
-    Optional: the default is a no-op for runners without fused decode.
+  def initialize_fused_decode(self, seed_token: int, slot: int = 0) -> None:
+    """Seed the fused-decode feedback buffers for ``slot`` with the sampled
+    prefill token. Feedback state is per slot, so one request's seeding can
+    never corrupt another request's decode stream. Optional: the default is a
+    no-op for runners without fused decode.
     """
     ...
 

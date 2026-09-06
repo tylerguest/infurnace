@@ -219,15 +219,21 @@ class TestSchedulerSlotManagement(unittest.TestCase):
 
   def test_free_slot_reclaims_vacated_slot(self):
     s = Scheduler(num_slots=4)
-    for rid in ("r1", "r2", "r3", "r4"):
-      s.add_request(_req(rid))
-    # All four slots reserved at admission; a compaction move vacates a slot
-    # that the engine returns to the free set (Phase 4D regression).
-    self.assertEqual(s.num_free_slots, 0)
-    s.free_slot(3)
-    self.assertEqual(s.num_free_slots, 1)
-    s.free_slot(3)  # idempotent
-    self.assertEqual(s.num_free_slots, 1)
+    s.add_request(_req("r1"))
+    s.add_request(_req("r4"))
+    self._set_decoding(s, "r1")
+    self._set_decoding(s, "r4")
+    s.mark_finished("r1")  # frees slot 0; r4 still active at slot 1
+    # No waiting request holds slot 1, so the vacated source is reclaimable.
+    self.assertEqual(s.compact(), [("r4", 1, 0)])
+    s.reserve_slot(0)  # engine: the moved request owns the destination
+    s._requests["r4"].cache_slot = 0  # engine updates the moved request
+    self.assertNotIn(0, s._free_slots)
+    s.free_slot(1)  # engine: vacated source returns to the free set
+    self.assertIn(1, s._free_slots)
+    self.assertEqual(s.num_free_slots, 3)
+    s.free_slot(1)  # idempotent
+    self.assertEqual(s.num_free_slots, 3)
     with self.assertRaises(SchedulerError):
       s.free_slot(4)
 
@@ -259,6 +265,68 @@ class TestSchedulerCancellation(unittest.TestCase):
     def test_cancel_unknown_is_noop(self):
         s = Scheduler(num_slots=1)
         s.cancel("nope")  # should not raise
+
+    def test_cancel_nulls_cache_slot(self):
+        # A cancelled request's cache_slot must be nulled (like mark_finished
+        # and release), so a repeated engine cancel can never clear_slot a
+        # slot re-owned by a live request.
+        s = Scheduler(num_slots=2)
+        s.add_request(_req("r1"))
+        s.add_request(_req("r2"))
+        s.cancel("r1")
+        self.assertIsNone(s._requests["r1"].cache_slot)
+        self.assertEqual(s.num_free_slots, 1)  # r1 freed, r2 still holds one
+        # The freed slot is immediately reusable by a new request.
+        s.add_request(_req("r3"))
+        self.assertEqual(s._requests["r3"].cache_slot, 0)
+
+
+class TestSchedulerCompactionReservations(unittest.TestCase):
+    def _set_decoding(self, s: Scheduler, rid: str):
+        req = s._requests[rid]
+        req.state = RequestState.DECODING
+        s._active[rid] = req
+
+    def test_compact_reassigns_waiting_reservation_to_vacated_slot(self):
+        # r1 finished and freed slot 0; r3 was then admitted into the hole.
+        # Compacting active r2 (slot 1) into slot 0 must move r3's reservation
+        # onto the vacated slot 1 so prefill and decode can never collide.
+        s = Scheduler(num_slots=2)
+        s.add_request(_req("r1"))
+        s.add_request(_req("r2"))
+        self._set_decoding(s, "r1")
+        self._set_decoding(s, "r2")
+        s.mark_finished("r1")  # frees slot 0
+        s.add_request(_req("r3"))  # reservation on slot 0 (min free)
+        self.assertEqual(s._requests["r3"].cache_slot, 0)
+        self.assertEqual(s.compact(), [("r2", 1, 0)])
+        self.assertEqual(s._requests["r2"].cache_slot, 1)  # unchanged by compact
+        self.assertEqual(s._requests["r3"].cache_slot, 1)  # reassigned
+
+    def test_free_slot_skips_reservation_reassigned_by_compaction(self):
+        s = Scheduler(num_slots=2)
+        s.add_request(_req("r1"))
+        s.add_request(_req("r2"))
+        self._set_decoding(s, "r1")
+        self._set_decoding(s, "r2")
+        s.mark_finished("r1")
+        s.add_request(_req("r3"))  # holds 0
+        s.compact()  # moves r2 1->0, reassigns r3 0->1
+        s.free_slot(1)  # engine returns the vacated source
+        self.assertEqual(s.num_free_slots, 0)  # r3's reservation owns slot 1
+
+    def test_free_slot_no_reservation_still_reclaims(self):
+        s = Scheduler(num_slots=2)
+        s.add_request(_req("r1"))
+        s.add_request(_req("r2"))
+        self._set_decoding(s, "r1")
+        self._set_decoding(s, "r2")
+        s.mark_finished("r1")
+        self.assertEqual(s.compact(), [("r2", 1, 0)])  # no waiting reservation
+        s.reserve_slot(0)
+        s._requests["r2"].cache_slot = 0  # engine updates the moved request
+        s.free_slot(1)
+        self.assertEqual(s.num_free_slots, 1)  # only the vacated source
 
 
 class TestSchedulerDecodePlan(unittest.TestCase):

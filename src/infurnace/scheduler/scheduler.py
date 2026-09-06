@@ -72,12 +72,15 @@ class Scheduler:
     if req is None or req.is_terminal():
         return
     # Suppress in-flight output, free slot if assigned. Repeated or queued
-    # references are dropped so the request cannot be scheduled again.
+    # references are dropped so the request cannot be scheduled again. The
+    # request's cache_slot is nulled so a repeated engine cancel cannot
+    # clear_slot a slot re-owned by a live request.
     if req.cache_slot is not None and req.cache_slot not in self._free_slots:
         self._free_slots.add(req.cache_slot)
     self._waiting = deque(r for r in self._waiting if r != request_id)
     self._active.pop(request_id, None)
     self._prefill_chunk.pop(request_id, None)
+    req.cache_slot = None
     req.transition(RequestState.CANCELLED)
 
   def get_request(self, request_id: str) -> Request:
@@ -156,6 +159,11 @@ class Scheduler:
     The engine applies the moves with ``runner.move_slot`` and updates each
     request's ``cache_slot``. Fixed-shape batched decode relies on this
     prefix (row ``i`` is bound to physical slot ``i``).
+
+    A waiting request may hold a reservation on a move destination (it was
+    admitted into the hole before the move). The reservation is reassigned to
+    the vacated source slot, which ``free_slot`` then refuses to free, so
+    admission and the compacted decode can never collide on one slot.
     """
     active = [r for r in self._active.values() if r.cache_slot is not None]
     if not active: return []
@@ -166,6 +174,10 @@ class Scheduler:
         mover = max(occupied)  # move the highest-slot request into the hole
         req = next(r for r in active if r.cache_slot == mover)
         moves.append((req.request_id, mover, target))
+        for w in self._waiting:
+            wreq = self._requests.get(w)
+            if wreq is not None and wreq.cache_slot == target:
+                wreq.cache_slot = mover
         occupied.remove(mover)
         occupied.append(target)
     return moves
@@ -177,9 +189,25 @@ class Scheduler:
     """Return a vacated cache slot to the free set (after a compaction move).
     Compaction relocates an active request into a lower slot; the slot it
     vacated is no longer owned by any request and must be reclaimable.
+    A slot is NOT freed when a waiting request's reservation was reassigned
+    onto it by the compaction move — that request owns it now, and admitting
+    another request into it would collide with the compacted decode.
     """
     if slot < 0 or slot >= self._num_slots: raise SchedulerError(f"slot {slot} out of range [0, {self._num_slots})")
+    for w in self._waiting:
+        wreq = self._requests.get(w)
+        if wreq is not None and wreq.cache_slot == slot:
+            return
     self._free_slots.add(slot)
+
+  def reserve_slot(self, slot: int) -> None:
+    """Remove a compaction-move destination from the free set.
+    The moved active request now owns ``slot``; if it was freed by a terminal
+    request moments ago (cancel or finish) and immediately re-occupied by the
+    move, admitting another request into it would collide with the decode.
+    """
+    if slot < 0 or slot >= self._num_slots: raise SchedulerError(f"slot {slot} out of range [0, {self._num_slots})")
+    self._free_slots.discard(slot)
 
   # --- Plan construction ---
   def _make_prefill_plan(self, req: Request) -> PrefillPlan:

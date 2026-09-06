@@ -44,6 +44,8 @@ class Engine:
     self.sampler = sampler or GreedySampler()
     self.tokenizer = tokenizer
     self._detoks: dict[str, StreamingDetokenizer] = {}
+    # Requests currently on the fused-decode path (transition-seed tracking).
+    self._fused_active: dict[str, bool] = {}
 
     # --- Offline request API ---
   def add_request(self, req: Request) -> None:
@@ -66,6 +68,7 @@ class Engine:
     slot = req.cache_slot if req is not None else None
     self.scheduler.cancel(request_id)
     if slot is not None: self.runner.clear_slot(slot)
+    self._fused_active.pop(request_id, None)
     self._apply_compaction()
 
   def output_tokens(self, request_id: str) -> tuple[int, ...]: return self.scheduler.get_request(request_id).output_token_ids
@@ -83,11 +86,19 @@ class Engine:
     for request_id, from_slot, to_slot in self.scheduler.compact():
       self.runner.move_slot(from_slot, to_slot)
       self.scheduler.get_request(request_id).cache_slot = to_slot
-      # The source slot is vacated by the move and becomes free again.
+      # The moved request now owns the destination (it may have been freed by
+      # a terminal request moments ago) and the source slot is vacated; the
+      # free set must reflect both.
+      self.scheduler.reserve_slot(to_slot)
       self.scheduler.free_slot(from_slot)
 
   # --- Async seam ---
-  def prepare_step(self) -> list[ExecutionPlan]: return self.scheduler.schedule()
+  def prepare_step(self) -> list[ExecutionPlan]:
+    # Compaction is part of plan preparation so callers driving the seam
+    # directly cannot build non-prefix decode plans (batched decode binds
+    # row ``i`` to physical slot ``i``).
+    self._apply_compaction()
+    return self.scheduler.schedule()
 
   def execute_step(self, plans: list[ExecutionPlan]) -> RawStep:
     raw = RawStep()
@@ -108,6 +119,7 @@ class Engine:
         slot = req.cache_slot
         req.error = r.error
         req.transition(RequestState.FAILED)
+        self._fused_active.pop(r.request_id, None)
         if slot is not None:
           self.runner.clear_slot(slot)
           freed.append(slot)
@@ -142,6 +154,7 @@ class Engine:
               new_text[r.request_id][-1] = detok.text[before:]
       if reason is not None:
         slot = req.cache_slot
+        self._fused_active.pop(r.request_id, None)
         self.scheduler.mark_finished(r.request_id)
         metrics[r.request_id] = req.metrics
         completed.append(r.request_id)
@@ -157,7 +170,6 @@ class Engine:
     )
 
   def step(self) -> EngineStepResult:
-    self._apply_compaction()
     return self.commit_step(self.execute_step(self.prepare_step()))
 
   # --- Execution helpers ---
@@ -179,28 +191,42 @@ class Engine:
       return [_PlanResult(plan, plan.request_id, error=str(e), is_prefill=True)]
     req = self.scheduler.get_request(plan.request_id)
     token = self.sampler.sample(logits, req.sampling_params)
-    # Seed the fused-decode feedback buffer so the request's first decode
-    # reads the sampled prefill token on device (Phase 5D).
-    seed = getattr(self.runner, "initialize_fused_decode", None)
-    if seed is not None: seed(token)
     return [_PlanResult(plan, plan.request_id, token=token, is_prefill=True)]
 
   def _execute_decode(self, plan: DecodePlan) -> list[_PlanResult]:
     if not plan.request_ids: return []
-    # Single-request decode uses the fused contract: the token fed to the
-    # model lives in a persistent on-device buffer, argmax runs in-graph,
-    # and the next token is written back on device. Multi-request plans
-    # keep the batched decode contract.
-    if len(plan.request_ids) == 1 and getattr(self.runner, "decode_fused", None) is not None:
+    # Single-request greedy decode uses the fused contract: the token fed to
+    # the model lives in a persistent on-device buffer, argmax runs in-graph,
+    # and the next token is written back on device. The fused path is
+    # restricted to the greedy default because it bypasses the engine sampler
+    # (in-graph argmax); multi-request plans and non-greedy parameters keep
+    # the batched decode contract.
+    use_fused = (len(plan.request_ids) == 1 and plan.sampling_params[0].is_greedy
+                 and getattr(self.runner, "decode_fused", None) is not None)
+    if use_fused:
+      rid = plan.request_ids[0]
       try:
+        # The feedback buffers are slot-local execution state, but the request
+        # token stream is host state: seed them with the request's own last
+        # token whenever the request (re)enters the fused path, so a stream
+        # interrupted by batched decode, prefill seeding, or slot moves can
+        # never resume on another request's token.
+        if not self._fused_active.get(rid):
+          self._fused_active[rid] = True
+          req = self.scheduler.get_request(rid)
+          self.runner.initialize_fused_decode(req.all_token_ids[-1], plan.slots[0])
         token = self.runner.decode_fused(plan.positions[0], plan.slots[0])
       except NotImplementedError:
         pass  # optional capability absent; fall back to batched decode below
       except Exception as e:  # a fused decode failure is terminal for the row
         traceback.print_exc()
-        return [_PlanResult(plan, plan.request_ids[0], error=str(e), is_prefill=False)]
+        return [_PlanResult(plan, rid, error=str(e), is_prefill=False)]
       else:
-        return [_PlanResult(plan, plan.request_ids[0], token=token, is_prefill=False)]
+        return [_PlanResult(plan, rid, token=token, is_prefill=False)]
+    # Batched decode: every row leaves the fused path, so a later single-row
+    # plan must re-seed its feedback buffers.
+    for rid in plan.request_ids:
+      self._fused_active.pop(rid, None)
     try:
       logits = self.runner.decode_batch(
         Tensor([[tid] for tid in plan.input_ids], dtype=dtypes.int32),
