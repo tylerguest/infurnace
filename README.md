@@ -5,34 +5,29 @@ tinygrad, which handles all tensor compilation and device execution, while
 Infurnace owns the serving side: scheduling, batching, KV-cache management,
 sampling, streaming, and metrics.
 
-The current target is Qwen3-4B (Q4_K_M) on NVIDIA GPUs. The product goal is a
-production single-tenant appliance serving dozens of concurrent requests on one
-GPU. Development tracks current tinygrad; production releases pin a recorded-good
-tinygrad commit.
-
 ## Install
 
 Requires Python 3.11+. Clone tinygrad into an adjacent directory, then:
 
 ```sh
 python3 -m venv .venv
-.venv/bin/python -m pip install -e ../tinygrad
-.venv/bin/python -m pip install -e ".[test]"
+.venv/bin/python -m pip install -e ../tinygrad -e ".[test]"
 ```
 
 ## Quick example
 
-Acquire the pinned Qwen3-4B GGUF, then run:
+Fetch the pinned Qwen3-4B GGUF, then run the CLI:
 
 ```sh
 .venv/bin/python tools/fetch_model.py \
   --manifest models/qwen3-4b-q4_k_m.json \
   --output artifacts/models/Qwen3-4B-Q4_K_M.gguf
 
-.venv/bin/python -m infurnace.cli \
-  --artifact artifacts/models/Qwen3-4B-Q4_K_M.gguf \
-  --prompt "Hello, world" --max-tokens 32
+.venv/bin/infurnace --prompt "Hello, world"
 ```
+
+Add `--chat` for interactive multi-turn chat. The CLI defaults to the fetched
+artifact and manifest; see `--help` for all options.
 
 ## Tests
 
