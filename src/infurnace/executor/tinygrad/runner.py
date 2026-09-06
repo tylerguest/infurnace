@@ -31,6 +31,11 @@ class Qwen3Runner:
     # compile/workspace cost (keeps NV engine memory within budget).
     self._decode_jit: dict[int, TinyJit] = {}
     self._decode_batch_jit: dict[tuple[int, ...], TinyJit] = {}
+    # Phase 5D fused decode state: persistent [2, 1] token buffer the decode
+    # graph reads and writes on device (ping-pong), plus the alternating index.
+    self._fused_feedback = Tensor.zeros(2, 1, dtype=dtypes.int32, device=kv_cache.kv.device).contiguous().realize()
+    self._fused_toggle = 0
+    self._decode_fused_jit: dict[int, TinyJit] = {}
 
   @property
   def num_slots(self) -> int:
@@ -133,6 +138,39 @@ class Qwen3Runner:
     logits = jit(padded_ids, *bound)
     return logits[:B]
 
+  def initialize_fused_decode(self, seed_token: int) -> None:
+    """Seed the fused-decode feedback buffer before a request's first decode.
+
+    The prefill token is sampled on the host, so it is written into both
+    feedback rows once per request; the toggled rows then alternate on device.
+    """
+    if type(seed_token) is not int or seed_token < 0:
+      raise RunnerError(f"seed_token must be a non-negative int, got {seed_token!r}")
+    self._fused_feedback.assign(Tensor([[seed_token], [seed_token]], dtype=dtypes.int32)).realize()
+    self._fused_toggle = 0
+
+  def decode_fused(self, position: int, slot: int = 0) -> int:
+    """Single-token decode with in-graph greedy argmax and device feedback.
+
+    The captured graph reads the previous sampled token from a persistent
+    on-device buffer, decodes, argmaxes on device, and writes the next token
+    back to the other buffer row — no per-step host roundtrip or eager ops.
+    Returns the sampled token id as a host int.
+    """
+    if slot < 0 or slot >= self.kv_cache.num_slots:
+      raise RunnerError(f"slot {slot} out of range [0, {self.kv_cache.num_slots})")
+    if position < 0 or position >= self.kv_cache.max_context:
+      raise RunnerError(f"position {position} out of range [0, {self.kv_cache.max_context})")
+    jit = self._decode_fused_jit.get(slot)
+    if jit is None:
+      jit = self._capture_decode_fused(slot)
+      self._decode_fused_jit[slot] = jit
+    self._fused_toggle = 1 - self._fused_toggle
+    pos_var = Variable("position", 0, self.kv_cache.max_context - 1).bind(position)
+    idx_var = Variable("feedback_idx", 0, 1).bind(self._fused_toggle)
+    token = jit(pos_var, idx_var)
+    return int(token.tolist()[0][0])
+
   def _capture_decode(self, slot: int) -> TinyJit:
     @TinyJit
     def _jit_decode(input_ids: Tensor, position: UOp) -> Tensor:
@@ -165,3 +203,18 @@ class Qwen3Runner:
       _jit_decode_batch(warmup_ids, *warmup_positions)
 
     return _jit_decode_batch
+
+  def _capture_decode_fused(self, slot: int) -> TinyJit:
+    @TinyJit
+    def _jit_decode_fused(position: UOp, feedback_idx: UOp) -> Tensor:
+      return self.model._decode_step_fused(self._fused_feedback, position, feedback_idx, slot)
+
+    max_context = self.kv_cache.max_context
+    warmup_pos = Variable("position", 0, max_context - 1).bind(0)
+    warmup_idx = Variable("feedback_idx", 0, 1).bind(0)
+
+    with Context(BEAM=0):
+      _jit_decode_fused(warmup_pos, warmup_idx)
+      _jit_decode_fused(warmup_pos, warmup_idx)
+
+    return _jit_decode_fused

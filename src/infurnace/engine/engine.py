@@ -208,11 +208,27 @@ class Engine:
             return [_PlanResult(plan, plan.request_id, error=str(e), is_prefill=True)]
         req = self.scheduler.get_request(plan.request_id)
         token = self.sampler.sample(logits, req.sampling_params)
+        # Seed the fused-decode feedback buffer so the request's first decode
+        # reads the sampled prefill token on device (Phase 5D).
+        seed = getattr(self.runner, "initialize_fused_decode", None)
+        if seed is not None:
+            seed(token)
         return [_PlanResult(plan, plan.request_id, token=token, is_prefill=True)]
 
     def _execute_decode(self, plan: DecodePlan) -> list[_PlanResult]:
         if not plan.request_ids:
             return []
+        # Single-request decode uses the fused contract: the token fed to the
+        # model lives in a persistent on-device buffer, argmax runs in-graph,
+        # and the next token is written back on device. Multi-request plans
+        # keep the batched decode contract.
+        if len(plan.request_ids) == 1 and getattr(self.runner, "decode_fused", None) is not None:
+            try:
+                token = self.runner.decode_fused(plan.positions[0], plan.slots[0])
+            except Exception as e:  # a fused decode failure is terminal for the row
+                traceback.print_exc()
+                return [_PlanResult(plan, plan.request_ids[0], error=str(e), is_prefill=False)]
+            return [_PlanResult(plan, plan.request_ids[0], token=token, is_prefill=False)]
         try:
             logits = self.runner.decode_batch(
                 Tensor([[tid] for tid in plan.input_ids], dtype=dtypes.int32),

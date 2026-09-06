@@ -274,6 +274,46 @@ class TestQwen3RunnerStress(unittest.TestCase):
       cache.clear_slot(-1)
 
   # ------------------------------------------------------------------
+  # Fused decode (Phase 5D): in-graph argmax + device token feedback
+  # ------------------------------------------------------------------
+
+  def test_fused_decode_matches_batch_greedy(self):
+    tokens = list(range(1, 9))  # positions 1..7
+
+    cache_b = ContiguousKVCache(self.config, max_context=16, num_slots=1)
+    runner_b = Qwen3Runner(self.model, cache_b)
+    runner_b.prefill(Tensor([tokens[:1]], dtype=dtypes.int32)).realize()
+    token = tokens[1]
+    batch_tokens = []
+    for i in range(1, len(tokens)):
+      logits = runner_b.decode_batch(Tensor([[token]], dtype=dtypes.int32), [i], [0])
+      token = int(logits.argmax(axis=1).tolist()[0])
+      batch_tokens.append(token)
+
+    cache_f = ContiguousKVCache(self.config, max_context=16, num_slots=1)
+    runner_f = Qwen3Runner(self.model, cache_f)
+    runner_f.prefill(Tensor([tokens[:1]], dtype=dtypes.int32)).realize()
+    runner_f.initialize_fused_decode(tokens[1])
+    fused_tokens = []
+    for i in range(1, len(tokens)):
+      fused_tokens.append(runner_f.decode_fused(i, 0))
+
+    self.assertEqual(batch_tokens, fused_tokens)
+
+  def test_fused_decode_reuses_one_capture(self):
+    tokens = list(range(1, 9))
+    cache = ContiguousKVCache(self.config, max_context=16, num_slots=1)
+    runner = Qwen3Runner(self.model, cache)
+    runner.prefill(Tensor([tokens[:1]], dtype=dtypes.int32)).realize()
+    runner.initialize_fused_decode(tokens[1])
+    for i in range(1, len(tokens)):
+      runner.decode_fused(i, 0)
+    jit = runner._decode_fused_jit[0]
+    # warmup (1) + capture (1) + 7 replays = 9 calls, one captured program
+    self.assertLessEqual(jit.cnt, 9)
+    self.assertTrue(jit.captured is not None)
+
+  # ------------------------------------------------------------------
   # Cache replacement
   # ------------------------------------------------------------------
 

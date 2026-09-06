@@ -316,6 +316,68 @@ class Qwen3Model:
     x = _rms_norm(x[:, -1:], w["output_norm.weight"], config.rms_norm_epsilon)
     return self._decode_linear(x, "output.weight")[:, -1, :]  # [S, V]
 
+  def _decode_step_fused(self, input_pair: Tensor, position: UOp, feedback_idx: UOp, slot: int = 0) -> Tensor:
+    """Single-token decode with in-graph greedy argmax and device-side token feedback.
+
+    ``input_pair`` is a persistent ``[2, 1]`` int32 buffer owned by the runner.
+    The graph reads the row at the bound ``feedback_idx`` (the previous replay's
+    sampled token), runs the decode layers, argmaxes the logits, and stores the
+    sampled token into the row at ``1 - feedback_idx`` via an SSA ``uop.store``.
+    It returns the written row so the store stays in the graph. The host toggles
+    the bound index each replay, so every per-token input write and the greedy
+    sampler run as captured kernels — no eager ops and no host roundtrip in the
+    steady decode path (Phase 5D).
+    """
+    if self.kv_cache is None: raise Qwen3ModelError("kv_cache must be attached to the model before decode")
+    kv = self.kv_cache.kv
+    config, w = self.config, self._w
+    rope = self._rope[position:position+1]
+    x = w["token_embd.weight"][input_pair[feedback_idx:feedback_idx+1]].float()
+
+    for i in range(config.block_count):
+      p = f"blk.{i}"
+
+      h = _rms_norm(x, w[f"{p}.attn_norm.weight"], config.rms_norm_epsilon)
+      q = self._decode_linear(h, f"{p}.attn_q.weight")
+      k = self._decode_linear(h, f"{p}.attn_k.weight")
+      v = self._decode_linear(h, f"{p}.attn_v.weight")
+
+      q = q.reshape(1, 1, config.attention_head_count, config.key_length).transpose(1, 2)
+      k = k.reshape(1, 1, config.attention_head_count_kv, config.key_length).transpose(1, 2)
+      v = v.reshape(1, 1, config.attention_head_count_kv, config.value_length).transpose(1, 2)
+
+      q = _rms_norm(q, w[f"{p}.attn_q_norm.weight"], config.rms_norm_epsilon)
+      k = _rms_norm(k, w[f"{p}.attn_k_norm.weight"], config.rms_norm_epsilon)
+
+      q = _apply_rope(q, rope)
+      k = _apply_rope(k, rope)
+
+      k_for_store = k[0].permute(1, 0, 2).contiguous().cast(kv.dtype)
+      v_for_store = v[0].permute(1, 0, 2).contiguous().cast(kv.dtype)
+      store_uop = kv[i, :, slot, position:position+1, :, :].uop.store(
+        Tensor.stack(k_for_store, v_for_store).uop
+      )
+      assigned = Tensor(kv[i, :, slot].uop.after(store_uop))
+      cached_k = assigned[0, 0:position+1, :, :].permute(1, 0, 2).unsqueeze(0).float()
+      cached_v = assigned[1, 0:position+1, :, :].permute(1, 0, 2).unsqueeze(0).float()
+
+      attn = q.scaled_dot_product_attention(cached_k, cached_v, is_causal=False, enable_gqa=True)
+      attn = attn.transpose(1, 2).reshape(1, 1, -1)
+      x = x + self._decode_linear(attn, f"{p}.attn_output.weight")
+
+      h = _rms_norm(x, w[f"{p}.ffn_norm.weight"], config.rms_norm_epsilon)
+      gate = self._decode_linear(h, f"{p}.ffn_gate.weight")
+      up = self._decode_linear(h, f"{p}.ffn_up.weight")
+      x = (x + self._decode_linear(gate.silu().contiguous() * up, f"{p}.ffn_down.weight")).contiguous()
+
+    x = _rms_norm(x[:, -1:], w["output_norm.weight"], config.rms_norm_epsilon)
+    logits = self._decode_linear(x, "output.weight")[:, -1, :]  # [1, V]
+    token = logits.argmax(axis=1)
+    write_idx = 1 - feedback_idx
+    feedback_store = input_pair[write_idx:write_idx+1].uop.store(token.uop)
+    feedback = Tensor(input_pair.uop.after(feedback_store))
+    return feedback[write_idx:write_idx+1]  # [1, 1] int32
+
   def prefill(self, input_ids: Tensor, kv_cache: ContiguousKVCache, slot: int = 0, start_position: int = 0) -> Tensor:
     if not isinstance(kv_cache, ContiguousKVCache): raise Qwen3ModelError("kv_cache must be a ContiguousKVCache")
     return self.forward(input_ids, start_position=start_position, kv=kv_cache.kv, slot=slot)
