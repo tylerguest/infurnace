@@ -5,6 +5,10 @@ tinygrad, which handles all tensor compilation and device execution, while
 Infurnace owns the serving side: scheduling, batching, KV-cache management,
 sampling, streaming, and metrics.
 
+**Status:** Development target is v0.3 — a paged continuous-batching
+inference server on one GPU with a minimal HTTP surface. See the
+[roadmap](docs/roadmap.md) for the end-state gates.
+
 ## Install
 
 Requires Python 3.11+. Clone tinygrad into an adjacent directory, then:

@@ -51,6 +51,18 @@ device-runtime implementation.
 PyTorch may be used only as an independent test reference. It is not a production
 dependency or fallback execution path.
 
+## End State
+
+The project finish line is v0.3: a paged continuous-batching inference server
+for the pinned Qwen3-4B Q4_K_M checkpoint on one NVIDIA GPU (RTX 5060),
+serving dozens of concurrent requests with a minimal HTTP surface. The
+serving-specific kernels (indexed KV store, paged attention, fused decode
+GEMV) are the durable artifacts and are submitted to tinygrad upstream.
+Prefix caching, production sampling, process isolation, batched prefill,
+compiled artifacts, and multi-device topologies are outside the end state.
+The release gates, scope, and milestones are recorded in
+[`roadmap.md`](roadmap.md).
+
 ## Tinygrad Tracking
 
 Infurnace develops against the current tinygrad codebase. Development does not pin

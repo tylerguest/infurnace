@@ -41,6 +41,60 @@ Explicit v1 exclusions: prefix caching (Phase 8 lands after paged decode is
 stable), guided/structured decoding, logprobs streaming, multi-model support,
 adapters, and multi-GPU topologies (Phases 11-12).
 
+## Project End State
+
+The project finish line is **v0.3, a paged continuous-batching inference
+server**: one node, one GPU (RTX 5060), the pinned Qwen3-4B Q4_K_M
+checkpoint, and dozens of concurrent requests served well, with a minimal
+HTTP surface for demonstration. The end state is the Phase 6 gate — the
+point where the Production Target statement above is true and measured.
+Phases 7-12 are deliberately outside the end state: they are future work
+beyond this project's finish line, not planned releases.
+
+**Done criteria (all must hold):**
+
+- **Correctness.** Phase 5 gate: paged decode attention matches contiguous
+  attention numerically (page boundaries, partial tails, GQA mapping);
+  allocator invariants hold under randomized stress; pages are reclaimed only
+  after active and in-flight ownership ends. Phase 6 gate: admission,
+  decode-priority, bounded-waiting, and fairness invariants pass CPU
+  simulation and real execution; decode batch shapes extend to the measured
+  concurrency target (32).
+- **Performance.** Decode at or above 85% of the llama.cpp bar and prefill at
+  or above 60% of the llama.cpp prompt bar on the RTX 5060, recorded in
+  committed benchmark reports with checkpoint, device, and settings identity.
+  The Phase 6D JIT-prefill spike decides the prefill path; if it fails, the
+  fallback is a custom token-batched quant kernel (port of tinygrad's AMD
+  WMMA path), not a substrate change.
+- **HTTP adapter.** A minimal OpenAI-compatible chat-completions subset with
+  SSE streaming, driven through the `prepare_step`/`execute_step`/`commit_step`
+  seam (no engine bypass), with disconnect-driven cancellation and
+  deterministic capacity errors. Demoable with `curl`.
+- **Upstream submission.** The paged decode attention kernel (Phase 5C) is
+  packaged for tinygrad review; a submitted or pending review is the finish
+  line, not merge.
+- **Narrative.** A project license is selected, the README is rewritten
+  around measured results, and a results page an interviewer can absorb in
+  about thirty minutes exists.
+
+**Explicitly out of scope for the end state (roadmap-deferred):** prefix
+cache (Phase 8), non-greedy sampling (Phase 7), process isolation and
+deployment policy (Phases 9A, 9C), batched prefill (Phase 10), compiled
+function artifacts (Phase 11), and scalable execution topologies (Phase 12).
+Window-based incremental detokenization remains deferred.
+
+**Milestones:**
+
+- **M1 — Finish Phase 5 (5C + 5D).** Fused single-token paged attention
+  kernel; page ownership replaces slots in the engine (slot compaction
+  disappears); `--nv-pool-check` against the measured device budget. Exit:
+  the Phase 5 gate.
+- **M2 — Phase 6 continuous batching.** Policy simulation (6A), engine
+  integration and replay (6B), the JIT-prefill spike (6D), decode shapes to
+  32. Exit: the Phase 6 gate and both recorded performance bars.
+- **M3 — Ship.** HTTP adapter, paged-attention upstream submission, license,
+  README/results rewrite, and a final full validation run.
+
 ## Current Work
 
 Phase 4 is complete (v0.2 gates PASS). Phase 5 (Paged Decode KV) is active:
@@ -139,6 +193,40 @@ Regression coverage requirement: multi-request interleaving tests must assert
 **token equality** across fused and batched paths; "finished with non-empty
 text" assertions cannot catch corruption (the existing multi-slot engine test
 passes even when the fused path feeds the wrong token).
+
+**Status: fixed** (`tests/test_engine_blockers.py`). Decision recorded per
+blocker:
+
+- **Fused-decode feedback is per-slot state** (`Qwen3Runner._fused_state`,
+  lazy per-slot buffers/toggle/seed), and the engine seeds it at **every
+  transition into the fused path** with the request's own last token
+  (`all_token_ids[-1]`) rather than at prefill: the token stream is host
+  state, the buffers are slot-local transport, and a stream interrupted by
+  batched decode, prefill seeding, or slot moves can never resume on another
+  request's token. Prefill-time seeding was removed; the first fused decode
+  seeds itself. The fused path is **restricted to the greedy default**
+  (`SamplingParams.is_greedy`); non-greedy parameters use the batched path.
+- **`Scheduler.cancel` nulls `cache_slot`** (like `mark_finished`/`release`),
+  and `Engine.cancel` is idempotent: a repeated cancel is a no-op and can no
+  longer `clear_slot` a slot re-owned by a live request.
+- **`SamplingParams` import** was already present; no change needed.
+- **Compaction moved into `prepare_step`** so the async seam cannot build
+  non-prefix decode plans; `step()` no longer double-compacts.
+- **Slot-ownership accounting during compaction** (found while fixing the
+  above): a freed slot immediately re-occupied by a compaction move stayed in
+  the free set, and a waiting request's reservation on a move destination
+  collided with the compacted decode. Compaction now reassigns waiting
+  reservations to the vacated source slot, `reserve_slot` removes a move
+  destination from the free set, and `free_slot` refuses to free a slot a
+  waiting request was reassigned onto.
+- **Capture-warmup KV pollution** (found the same way): single and batched
+  decode captures warmed up at position 0, overwriting the real prefill KV
+  with garbage (invisible under constant-argmax synthetic weights). All three
+  captures now warm up at the last cache position like the fused capture.
+- Regression coverage: `tests/test_engine_blockers.py` uses seeded random
+  weights whose argmax varies with input/KV, and asserts **token equality**
+  across fused/batched interleaving, slot moves, double cancel, and the async
+  seam against solo-run baselines; all fail on the pre-fix code.
 
 ## Phase 0: Current NV Baseline
 
@@ -419,11 +507,10 @@ HTTP adapter deferred to post-v0.1.
 disconnect, backpressure, health, and capacity errors preserve engine invariants.
 
 **Status:** Committed (production track). CLI-first development targeted v0.1 via
-the offline engine (Phase 3E). The production appliance requires this adapter:
-it lands after Phase 6 paged continuous batching as the OpenAI-compatible
-chat-completions subset of Phase 9B, with SSE streaming and disconnect-driven
-cancellation, driving the engine through the
-`prepare_step`/`execute_step`/`commit_step` seam.
+the offline engine (Phase 3E). The v0.3 end state includes this adapter as a
+minimal OpenAI-compatible chat-completions subset with SSE streaming and
+disconnect-driven cancellation, driving the engine through the
+`prepare_step`/`execute_step`/`commit_step` seam (M3, Project End State).
 
 ## Phase 4: Fixed Batched Decode
 
@@ -714,6 +801,10 @@ tokens, and all references remain valid under cancellation, eviction, and concur
 execution.
 
 ## Phase 9: Server Hardening and Isolation
+
+Only the 9B chat-completions protocol subset is in the v0.3 end state
+(M3); process isolation, observability, and deployment policy are
+post-v0.3 future work.
 
 ### Phase 9A: Execution Isolation
 
