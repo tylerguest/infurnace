@@ -1,10 +1,8 @@
 from __future__ import annotations
-import math
 import os
 from typing import Sequence
 from tinygrad import Tensor, UOp, dtypes
 from infurnace.kernels.quant_gemv import QuantGemvError, packed_weight, quant_gemv
-from infurnace.models.config import Qwen3Config
 from .buffers import ContiguousKVCache
 from .weights import Qwen3Weights
 

@@ -89,7 +89,8 @@ def load_manifest(path: str | Path) -> CheckpointManifest:
   license_data = _object(root["license"], "license", {"spdx", "url"})
 
   schema_version = root["schema_version"]
-  if type(schema_version) is not int or schema_version != _EXPECTED_SCHEMA_VERSION: raise ManifestError(f"schema_version must be {_EXPECTED_SCHEMA_VERSION}")
+  if type(schema_version) is not int or schema_version != _EXPECTED_SCHEMA_VERSION:
+    raise ManifestError(f"schema_version must be {_EXPECTED_SCHEMA_VERSION}")
 
   checkpoint_id = _string(root["id"], "id")
   if _ID_PATTERN.fullmatch(checkpoint_id) is None: raise ManifestError("id contains unsupported characters")
@@ -174,7 +175,8 @@ def acquire_artifact(manifest: CheckpointManifest, destination: str | Path, time
   try:
     destination_path.parent.mkdir(parents=True, exist_ok=True)
     request = Request(manifest.url, headers={"Accept-Encoding": "identity", "User-Agent": "infurnace/0.0.0"})
-    with tempfile.NamedTemporaryFile(mode="wb", dir=destination_path.parent, prefix=f".{destination_path.name}.", suffix=".part", delete=False) as temporary:
+    with tempfile.NamedTemporaryFile(mode="wb", dir=destination_path.parent,
+                                   prefix=f".{destination_path.name}.", suffix=".part", delete=False) as temporary:
       temporary_path = Path(temporary.name)
       digest, size_bytes = hashlib.sha256(), 0
       with urlopen(request, timeout=timeout) as response:

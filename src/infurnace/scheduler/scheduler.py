@@ -1,6 +1,5 @@
 from __future__ import annotations
 from collections import deque
-from typing import Optional
 from infurnace.engine.request import Request, RequestState
 from infurnace.scheduler.plan import PrefillPlan, DecodePlan, ExecutionPlan
 from infurnace.scheduler.policy import FIFOPolicy, chunk_prompt
@@ -114,7 +113,7 @@ class Scheduler:
     return plans  # [decode, prefill], [decode], [prefill], or [] when idle
 
   def mark_prefill_chunk_done(self, request_id: str, chunk_idx: int) -> None:
-    """Advance prefill progress after a chunk executes.  
+    """Advance prefill progress after a chunk executes.
     Called by the engine. When the last chunk completes, the request moves
     to DECODING.
     """
@@ -153,7 +152,7 @@ class Scheduler:
 
   def compact(self) -> list[tuple[str, int, int]]:
     """Return ``(request_id, from_slot, to_slot)`` moves that restore active
-    requests to a contiguous prefix of slots ``0..B-1``.  
+    requests to a contiguous prefix of slots ``0..B-1``.
     The engine applies the moves with ``runner.move_slot`` and updates each
     request's ``cache_slot``. Fixed-shape batched decode relies on this
     prefix (row ``i`` is bound to physical slot ``i``).
@@ -175,7 +174,7 @@ class Scheduler:
   def num_free_slots(self) -> int: return len(self._free_slots)
 
   def free_slot(self, slot: int) -> None:
-    """Return a vacated cache slot to the free set (after a compaction move).  
+    """Return a vacated cache slot to the free set (after a compaction move).
     Compaction relocates an active request into a lower slot; the slot it
     vacated is no longer owned by any request and must be reclaimable.
     """

@@ -73,13 +73,11 @@ def main() -> int:
     from infurnace.executor.tinygrad.weights import WeightPolicy, load_qwen3_checkpoint
     from infurnace.executor.tinygrad.model import Qwen3Model
     from infurnace.kernels.quant_gemv import packed_weight, quant_gemv
-    from infurnace.models.config import Qwen3Config
 
     manifest = load_manifest(args.manifest)
     with stable_artifact_path(args.artifact) as stable_path:
       verify_artifact(stable_path, manifest)
       checkpoint = load_qwen3_checkpoint(stable_path, manifest, WeightPolicy.LAZY_FP16)
-    config: Qwen3Config = checkpoint.weights.config
     model = Qwen3Model(checkpoint.weights)
     device = Device["NV"]
 
@@ -127,7 +125,8 @@ def main() -> int:
       packed = entry[0] if entry is not None else None
       custom = (lambda x, p=packed, o=out_features, i=in_features, g=ggml_type:
                 quant_gemv(x, p, out_features=o, in_features=i, ggml_type=g)) if packed is not None else None
-      generic = (lambda x, w=weight: x.linear(w.transpose()))
+      def generic(x, w=weight):
+        return x.linear(w.transpose())
       measure(role, out_features, in_features, ggml_type, custom, generic)
 
     weight = model._w["token_embd.weight"]
@@ -159,12 +158,16 @@ def main() -> int:
     ids = Tensor([[1234]], dtype=dtypes.int32)
     engine_request = Request("eng", prompt, SamplingParams(max_tokens=128), 512)
     engine.add_request(engine_request)
-    engine.step(); engine.step(); engine.step(); device.synchronize()
+    engine.step()
+    engine.step()
+    engine.step()
+    device.synchronize()
     chain = 16
     engine_ms = median_ms(bracketed_replay(device, lambda: [engine.step() for _ in range(chain)], reps=3)) / chain
     samples = []
     for _ in range(3):
-      device.synchronize(); started = time.perf_counter()
+      device.synchronize()
+      started = time.perf_counter()
       for _ in range(chain): runner.decode_batch(ids, [position], [0])
       device.synchronize()
       samples.append((time.perf_counter() - started) / chain)

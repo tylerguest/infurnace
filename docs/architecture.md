@@ -11,6 +11,12 @@ topology is explicit configuration. Request, scheduler, cache-ownership, and pro
 contracts do not assume a device count or bind a request to a specific placement
 strategy.
 
+The product goal is a production single-tenant inference appliance: one node, one
+GPU, the pinned checkpoint, and dozens of concurrent requests served well.
+tinygrad as the compute substrate is a product requirement, not a negotiable
+implementation detail. The placement-agnostic contracts below are retained, but
+replicated and sharded topologies are out of scope for the appliance.
+
 ## Product Boundary
 
 Infurnace owns the inference server:
@@ -47,9 +53,9 @@ dependency or fallback execution path.
 
 ## Tinygrad Tracking
 
-Infurnace develops against the current tinygrad codebase. It does not pin tinygrad,
-maintain a supported-version matrix, or add compatibility branches for older
-tinygrad APIs. A narrow executor boundary and focused contract tests cover the
+Infurnace develops against the current tinygrad codebase. Development does not pin
+tinygrad, maintain a supported-version matrix, or add compatibility branches for
+older tinygrad APIs. A narrow executor boundary and focused contract tests cover the
 tinygrad behavior Infurnace relies on: GGUF loading, buffer realization, assignment
 dependencies, TinyJit input replacement, replay, output reuse, random primitives,
 and custom UOps.
@@ -57,6 +63,12 @@ and custom UOps.
 When upstream behavior changes, Infurnace updates to the current contract rather
 than retaining the old one. Focused contract tests expose behavior changes directly;
 source-checkout identity is not part of an Infurnace result or compatibility claim.
+
+Production releases are the exception to tracking: each release pins one
+recorded-good tinygrad commit (recorded with the release artifacts) and upgrades
+deliberately, re-running the applicable phase gates and benchmark bars before a
+bump is accepted. Tracking current upstream is a development mode; a pinned commit
+is the only supported production configuration.
 
 ## End-to-End Path
 
@@ -98,22 +110,21 @@ keeps offline tests representative of network-serving behavior.
 
 ## Source Layout (Top to Bottom)
 
-The package (`src/infurnace/`, ~2,700 lines) has two stacks: the serving stack
+The package (`src/infurnace/`, ~1,770 lines) has two stacks: the serving stack
 (requests, scheduler, engine, cache ownership) is device-agnostic Python; the
-execution stack (weights, model, kernels) is the tinygrad boundary. Files marked
-*stub* are reserved placeholders.
+execution stack (weights, model, kernels) is the tinygrad boundary.
 
-1. `cli.py` — entry point. Builds the engine, steps it, streams output. (`api/` `protocol.py`, `server.py` are stubs for the deferred HTTP adapter.)
+1. `cli.py` — entry point. Builds the engine, steps it, streams output. (A deferred HTTP adapter will add `api/` `protocol.py` and `server.py`.)
 2. `models/` — pinned Qwen3-4B Q4_K_M contract: `manifest.py` (verify/download checkpoint), `qwen3.py` (config from GGUF), `config.py` (tensor specs).
 3. `executor/tinygrad/weights.py` — loads the GGUF via tinygrad, validates every tensor, casts fp16, ties `output.weight`.
 4. `tokenizer/` — `base.py` (ABC), `gguf.py` (GGUF-backed tokenizer), `detokenizer.py` (streaming + stop strings).
 5. `engine/request.py` — `Request` state machine, sampling params, metrics.
 6. `scheduler/` — admission, slot reservation, FIFO, chunked prefill, decode batching, compaction; `plan.py` defines the immutable execution plans.
-7. `cache/block_pool.py` — logical page allocator (Phase 5A). `kv_manager.py`, `prefix_cache.py` are stubs.
+7. `cache/block_pool.py` — logical page allocator (Phase 5A).
 8. `engine/engine.py` — the `prepare/execute/commit` step loop tying it together.
 9. `executor/` — `runner.py` (ABC); `tinygrad/runner.py` captures TinyJit decode contracts; `tinygrad/model.py` builds the graph (SSA cache writes);
    `tinygrad/buffers.py` holds the contiguous and paged KV caches.
-10. `kernels/` — `quant_gemv.py` (fused Q4_K/Q6_K decode GEMV), `kv_store.py` (paged KV store). `paged_attention.py` is a stub.
+10. `kernels/` — `quant_gemv.py` (fused Q4_K/Q6_K decode GEMV), `kv_store.py` (paged KV store).
 11. `sampler/greedy.py` — argmax sampling.
 
 Flow: `cli.py` loads the checkpoint and tokenizer, then drives `Engine`, which

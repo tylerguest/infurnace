@@ -4,61 +4,80 @@ from typing import Sequence
 from tinygrad import Tensor
 
 class Runner(ABC):
-    """Execution contract shared by all model runners (tinygrad and future).
-    A runner owns model execution but not request lifecycle, scheduling, or
-    cache ownership. The engine drives it through prefill and decode steps.
+  """Execution contract shared by all model runners (tinygrad and future).
+  A runner owns model execution but not request lifecycle, scheduling, or
+  cache ownership. The engine drives it through prefill and decode steps.
+  """
+
+  @property
+  @abstractmethod
+  def num_slots(self) -> int:
+    """Number of independent cache slots the runner can execute concurrently."""
+    ...
+
+  @property
+  @abstractmethod
+  def max_context(self) -> int:
+    """Maximum token context length the runner can store in its KV cache."""
+    ...
+
+  @abstractmethod
+  def prefill(self, input_ids: Tensor, slot: int = 0, start_position: int = 0) -> Tensor:
+    """Eager prefill. ``input_ids`` has shape ``[1, T]``.
+    ``start_position`` is the absolute KV position where the chunk's first
+    token is written (0 for the first chunk; advanced for chunked prefill).
+    Returns logits of shape ``[1, vocab_size]`` for the last token.
     """
-    @property
-    @abstractmethod
-    def num_slots(self) -> int:
-        """Number of independent cache slots the runner can execute concurrently."""
-        ...
+    ...
 
-    @property
-    @abstractmethod
-    def max_context(self) -> int:
-        """Maximum token context length the runner can store in its KV cache."""
-        ...
+  @abstractmethod
+  def decode(self, input_ids: Tensor, position: int, slot: int = 0) -> Tensor:
+    """Single-token decode. ``input_ids`` has shape ``[1, 1]``.
+    ``position`` is the absolute position of the decoded token. Returns
+    logits of shape ``[1, vocab_size]``.
+    """
+    ...
 
-    @abstractmethod
-    def prefill(self, input_ids: Tensor, slot: int = 0, start_position: int = 0) -> Tensor:
-        """Eager prefill. ``input_ids`` has shape ``[1, T]``.
-        ``start_position`` is the absolute KV position where the chunk's first
-        token is written (0 for the first chunk; advanced for chunked prefill).
-        Returns logits of shape ``[1, vocab_size]`` for the last token.
-        """
-        ...
+  @abstractmethod
+  def decode_batch(self, input_ids: Tensor, positions: Sequence[int], slots: Sequence[int]) -> Tensor:
+    """Fixed-shape batched decode for ``B`` active rows.
 
-    @abstractmethod
-    def decode(self, input_ids: Tensor, position: int, slot: int = 0) -> Tensor:
-        """Single-token decode. ``input_ids`` has shape ``[1, 1]``.
-        ``position`` is the absolute position of the decoded token. Returns
-        logits of shape ``[1, vocab_size]``.
-        """
-        ...
+    ``input_ids`` has shape ``[B, 1]`` (one token per row). ``positions``
+    and ``slots`` have ``B`` entries. The runner pads inactive rows to the
+    next supported shape and returns logits of shape ``[B, vocab_size]``.
+    """
+    ...
 
-    @abstractmethod
-    def decode_batch(self, input_ids: Tensor, positions: Sequence[int], slots: Sequence[int]) -> Tensor:
-        """Fixed-shape batched decode for ``B`` active rows.
+  @abstractmethod
+  def clear_slot(self, slot: int) -> None:
+    """Reset the KV cache contents of ``slot`` so it can be reused.
+    Called by the engine on every terminal transition (finished, cancelled,
+    failed) after the request's cache slot is reclaimed.
+    """
+    ...
 
-        ``input_ids`` has shape ``[B, 1]`` (one token per row). ``positions``
-        and ``slots`` have ``B`` entries. The runner pads inactive rows to the
-        next supported shape and returns logits of shape ``[B, vocab_size]``.
-        """
-        ...
+  @abstractmethod
+  def move_slot(self, from_slot: int, to_slot: int) -> None:
+    """Copy the KV contents of ``from_slot`` into ``to_slot`` and zero the
+    source. The engine uses this to compact active requests into a prefix of
+    slots so fixed-shape batched decode can bind row ``i`` to slot ``i``.
+    """
+    ...
 
-    @abstractmethod
-    def clear_slot(self, slot: int) -> None:
-        """Reset the KV cache contents of ``slot`` so it can be reused.
-        Called by the engine on every terminal transition (finished, cancelled,
-        failed) after the request's cache slot is reclaimed.
-        """
-        ...
+  # --- Optional fused decode capability (Phase 5D) ---
+  # Runners that support in-graph greedy argmax with on-device token feedback
+  # override these. The engine discovers support by calling ``decode_fused``
+  # and falling back to ``decode_batch`` on ``NotImplementedError``.
 
-    @abstractmethod
-    def move_slot(self, from_slot: int, to_slot: int) -> None:
-        """Copy the KV contents of ``from_slot`` into ``to_slot`` and zero the
-        source. The engine uses this to compact active requests into a prefix of
-        slots so fixed-shape batched decode can bind row ``i`` to slot ``i``.
-        """
-        ...
+  def initialize_fused_decode(self, seed_token: int) -> None:
+    """Seed the fused-decode feedback buffers with the sampled prefill token.
+    Optional: the default is a no-op for runners without fused decode.
+    """
+    ...
+
+  def decode_fused(self, position: int, slot: int = 0) -> int:
+    """Single-token decode with in-graph argmax and device token feedback.
+    Returns the sampled token id. Optional: the default raises
+    ``NotImplementedError`` so the engine can fall back to ``decode_batch``.
+    """
+    raise NotImplementedError("fused decode is an optional runner capability")

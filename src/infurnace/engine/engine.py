@@ -3,7 +3,7 @@ import traceback
 from dataclasses import dataclass, field
 from typing import Mapping
 from tinygrad import Tensor, dtypes
-from infurnace.engine.request import Request, RequestState, RequestMetrics
+from infurnace.engine.request import Request, RequestState, RequestMetrics, SamplingParams
 from infurnace.scheduler.plan import ExecutionPlan, PrefillPlan, DecodePlan
 from infurnace.scheduler.scheduler import Scheduler
 from infurnace.executor.runner import Runner
@@ -51,7 +51,7 @@ class Engine:
     # observable via get_request). Duplicate IDs still raise.
     self.scheduler.add_request(req)
 
-  def add_text_request(self, prompt: str, sampling_params=None, stop_strings: list[str]|None = None, request_id: str|None = None, 
+  def add_text_request(self, prompt: str, sampling_params=None, stop_strings: list[str]|None = None, request_id: str|None = None,
                        context_limit: int = 1024, **kw,) -> Request:
     if self.tokenizer is None: raise RuntimeError("engine has no tokenizer; cannot add a text request")
     token_ids = self.tokenizer.encode(prompt)
@@ -192,11 +192,15 @@ class Engine:
     # and the next token is written back on device. Multi-request plans
     # keep the batched decode contract.
     if len(plan.request_ids) == 1 and getattr(self.runner, "decode_fused", None) is not None:
-      try: token = self.runner.decode_fused(plan.positions[0], plan.slots[0])
+      try:
+        token = self.runner.decode_fused(plan.positions[0], plan.slots[0])
+      except NotImplementedError:
+        pass  # optional capability absent; fall back to batched decode below
       except Exception as e:  # a fused decode failure is terminal for the row
         traceback.print_exc()
         return [_PlanResult(plan, plan.request_ids[0], error=str(e), is_prefill=False)]
-      return [_PlanResult(plan, plan.request_ids[0], token=token, is_prefill=False)]
+      else:
+        return [_PlanResult(plan, plan.request_ids[0], token=token, is_prefill=False)]
     try:
       logits = self.runner.decode_batch(
         Tensor([[tid] for tid in plan.input_ids], dtype=dtypes.int32),

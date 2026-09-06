@@ -2,12 +2,15 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+  from infurnace.engine import Engine
 
 _IM_START = "<|im_start|>"
 _IM_END = "<|im_end|>"
 _SINGLE_SHOT_MAX_TOKENS = 32
 _CHAT_MAX_TOKENS = 256
-_SYSTEM_PROMPT = "You are a helpful assistant. Answer directly and concisely; do not use thinking or reasoning mode."
 
 def _build_engine(artifact: str, manifest: str, *, num_slots: int, max_context: int | None, device: str | None) -> Engine:
   from infurnace.models.manifest import load_manifest
@@ -40,7 +43,7 @@ def _chat_template(messages: list[tuple[str, str]]) -> str:
 def _run_chat(eng: Engine, max_tokens: int, max_context: int) -> int:
   from infurnace.engine.request import RequestState, SamplingParams
   print(f"infurnace chat (max-context {max_context} tokens; type 'exit' or Ctrl-D to quit)", flush=True)
-  messages: list[tuple[str, str]] = [("system", _SYSTEM_PROMPT)]
+  messages: list[tuple[str, str]] = []
   while True:
     try:
       prompt = input("You: ")

@@ -111,7 +111,8 @@ class TestQuantGemvRealModel(unittest.TestCase):
       engine.add_request(request)
       guard = 0
       while not engine.is_done():
-        engine.step(); guard += 1
+        engine.step()
+        guard += 1
         self.assertLess(guard, 72, "decode did not terminate")
       Device["NV"].synchronize()
       return list(request.output_token_ids)

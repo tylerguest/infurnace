@@ -1,16 +1,20 @@
 from __future__ import annotations
-from typing import Sequence
+from typing import TYPE_CHECKING, Sequence
 from tinygrad import Tensor, TinyJit, UOp, Variable, dtypes
 from tinygrad.helpers import Context
 from .buffers import ContiguousKVCache
 from .model import Qwen3Model
+from ..runner import Runner
+
+if TYPE_CHECKING:
+  from .weights import Qwen3Weights
 
 SUPPORTED_DECODE_SHAPES: tuple[int, ...] = (1, 2, 4)
 
 class RunnerError(ValueError):
   """Runner inputs or configuration do not satisfy the execution contract."""
 
-class Qwen3Runner:
+class Qwen3Runner(Runner):
   """Serving runner with TinyJit-captured decode contracts.
 
   Prefill currently uses the eager stateless forward (Phase 2B). Single-request
@@ -132,7 +136,7 @@ class Qwen3Runner:
     padded_ids = Tensor(
       input_ids.tolist() + [[0]] * (S - B), dtype=dtypes.int32
     ).contiguous().realize()
-    padded_positions = list(positions) + [i for i in range(S - B)]
+    padded_positions = list(positions) + list(range(S - B))
     bound = [
       Variable(f"position_{i}", 0, self.kv_cache.max_context - 1).bind(p)
       for i, p in enumerate(padded_positions)

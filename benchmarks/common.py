@@ -59,7 +59,8 @@ def sampled_peak_bytes(samples: list[dict[str, Any]], start_ns: int | None = Non
             and (end_ns is None or sample["query_start_ns"] <= end_ns)]
   return max(values) if values else None
 
-def validate_generation_timings(group: dict[str, Any], generations: int, output_tokens: int, label: str) -> tuple[list[int], list[list[int]], list[int]]:
+def validate_generation_timings(group: dict[str, Any], generations: int, output_tokens: int, label: str
+                                ) -> tuple[list[int], list[list[int]], list[int]]:
   if not isinstance(group, dict) or set(group) != {"ttft_ns", "inter_token_ns", "end_to_end_ns"}:
     raise ValueError(f"{label} generation timings are incomplete")
   ttft, inter_token, end_to_end = group["ttft_ns"], group["inter_token_ns"], group["end_to_end_ns"]
@@ -173,8 +174,10 @@ def _validate_comparison(result: dict[str, Any]) -> None:
   if not isinstance(engines, dict) or set(engines) != {"infurnace", "llamacpp"}:
     raise ValueError("comparison engines are incomplete")
   inf, llm = engines["infurnace"], engines["llamacpp"]
-  required_inf = {"decode_tokens_per_second", "ttft_ms", "capture_ms", "achieved_gb_per_second", "peak_device_memory_bytes", "model_load_ms", "weights_bytes"}
-  required_llm = {"decode_tokens_per_second", "decode_ms_per_token", "prefill_tokens_per_second", "achieved_gb_per_second", "model_size_bytes", "build_commit", "repetitions", "n_gpu_layers"}
+  required_inf = {"decode_tokens_per_second", "ttft_ms", "capture_ms", "achieved_gb_per_second",
+                  "peak_device_memory_bytes", "model_load_ms", "weights_bytes"}
+  required_llm = {"decode_tokens_per_second", "decode_ms_per_token", "prefill_tokens_per_second",
+                  "achieved_gb_per_second", "model_size_bytes", "build_commit", "repetitions", "n_gpu_layers"}
   if not isinstance(inf, dict) or set(inf) != required_inf: raise ValueError("Infurnace comparison result is incomplete")
   if not isinstance(llm, dict) or set(llm) != required_llm: raise ValueError("llama.cpp comparison result is incomplete")
   for field in ("decode_tokens_per_second", "achieved_gb_per_second"):
@@ -279,8 +282,10 @@ def validate_result(result: dict[str, Any]) -> None:
     raise ValueError("benchmark-specific result fields are invalid")
 
   if benchmark == "upstream_prefill":
-    required_workload = {"prompt_tokens", "ttft_tokens_per_sample", "timed_decode_tokens_per_sample", "total_generated_tokens", "contract_setup_calls", "measured_samples", "sampling"}
-    required_timings = {"artifact_verification_ns", "model_load_ns", "contract_setup_ns", "prefill_ttft_ns", "prefill_ttft_summary", "prompt_tokens_per_second"}
+    required_workload = {"prompt_tokens", "ttft_tokens_per_sample", "timed_decode_tokens_per_sample",
+                       "total_generated_tokens", "contract_setup_calls", "measured_samples", "sampling"}
+    required_timings = {"artifact_verification_ns", "model_load_ns", "contract_setup_ns", "prefill_ttft_ns",
+                        "prefill_ttft_summary", "prompt_tokens_per_second"}
     if set(workload) != required_workload or set(timings) != required_timings: raise ValueError("prefill result fields are incomplete")
     for field in ("prompt_tokens", "contract_setup_calls", "measured_samples"):
       if type(workload[field]) is not int or workload[field] <= 0: raise ValueError(f"{field} must be positive")
@@ -300,8 +305,10 @@ def validate_result(result: dict[str, Any]) -> None:
     tinygrad_boundaries = {"before_model_load", "after_model_load", "after_contract_setup", "after_measurement"}
     phases = ("model_load", "contract_setup", "measurement")
   elif benchmark == "upstream_decode":
-    required_workload = {"prompt_tokens", "ttft_tokens", "contract_setup_tokens", "timed_decode_tokens", "total_generated_tokens", "measured_samples", "sampling"}
-    required_timings = {"artifact_verification_ns", "model_load_ns", "cold_prefill_ttft_ns", "contract_setup_ns", "decode_ns", "decode_summary", "generated_tokens_per_second"}
+    required_workload = {"prompt_tokens", "ttft_tokens", "contract_setup_tokens", "timed_decode_tokens",
+                       "total_generated_tokens", "measured_samples", "sampling"}
+    required_timings = {"artifact_verification_ns", "model_load_ns", "cold_prefill_ttft_ns", "contract_setup_ns",
+                        "decode_ns", "decode_summary", "generated_tokens_per_second"}
     if set(workload) != required_workload or set(timings) != required_timings: raise ValueError("decode result fields are incomplete")
     for field in ("prompt_tokens", "ttft_tokens", "contract_setup_tokens", "timed_decode_tokens", "total_generated_tokens", "measured_samples"):
       if type(workload[field]) is not int or workload[field] <= 0: raise ValueError(f"{field} must be positive")
@@ -320,12 +327,16 @@ def validate_result(result: dict[str, Any]) -> None:
     rate_numerator = 1e9
     required_outputs = {"prefill_token_id", "contract_setup_token_ids", "measured_token_ids"}
     expected_output_lengths = (workload["contract_setup_tokens"], workload["measured_samples"])
-    host_boundaries = {"before_artifact_verification", "after_artifact_verification", "after_model_load", "after_prefill", "after_contract_setup", "after_measurement"}
+    host_boundaries = {"before_artifact_verification", "after_artifact_verification", "after_model_load",
+                     "after_prefill", "after_contract_setup", "after_measurement"}
     tinygrad_boundaries = {"before_model_load", "after_model_load", "after_prefill", "after_contract_setup", "after_measurement"}
     phases = ("model_load", "prefill", "contract_setup", "measurement")
   elif benchmark == "infurnace_decode":
-    required_workload = {"prompt_tokens", "ttft_tokens", "contract_setup_tokens", "timed_decode_tokens", "total_generated_tokens", "measured_samples", "sampling"}
-    required_timings = {"artifact_verification_ns", "model_load_ns", "cold_prefill_ttft_ns", "decode_capture_ns", "contract_setup_ns", "decode_ns", "decode_summary", "generated_tokens_per_second", "weights_bytes", "achieved_bytes_per_second"}
+    required_workload = {"prompt_tokens", "ttft_tokens", "contract_setup_tokens", "timed_decode_tokens",
+                       "total_generated_tokens", "measured_samples", "sampling"}
+    required_timings = {"artifact_verification_ns", "model_load_ns", "cold_prefill_ttft_ns", "decode_capture_ns",
+                        "contract_setup_ns", "decode_ns", "decode_summary", "generated_tokens_per_second",
+                        "weights_bytes", "achieved_bytes_per_second"}
     if set(workload) != required_workload or set(timings) != required_timings: raise ValueError("Infurnace decode result fields are incomplete")
     for field in ("prompt_tokens", "ttft_tokens", "contract_setup_tokens", "timed_decode_tokens", "total_generated_tokens", "measured_samples"):
       if type(workload[field]) is not int or workload[field] <= 0: raise ValueError(f"{field} must be positive")
@@ -383,7 +394,8 @@ def validate_result(result: dict[str, Any]) -> None:
         or workload["sampling"] != "greedy" or workload["arrival_pattern"] != "closed_loop_sequential":
       raise ValueError("end-to-end workload contract is invalid")
     if workload["prompt_tokens"] < 2 or workload["prompt_tokens"] > execution["chunk_size"] \
-        or workload["prompt_tokens"] + max(workload["setup_output_tokens_per_generation"], workload["measured_output_tokens_per_generation"]) > execution["max_context"]:
+        or workload["prompt_tokens"] + max(workload["setup_output_tokens_per_generation"],
+                                       workload["measured_output_tokens_per_generation"]) > execution["max_context"]:
       raise ValueError("end-to-end workload exceeds its execution contract")
 
     setup_group = timings["contract_setup"]
@@ -481,7 +493,8 @@ def validate_result(result: dict[str, Any]) -> None:
     if snapshot["peak_rss_bytes"] < snapshot["current_rss_bytes"]: raise ValueError(f"host memory snapshot {boundary} has an invalid peak")
 
   tinygrad = memory["tinygrad"]
-  if not isinstance(tinygrad, dict) or set(tinygrad) != tinygrad_boundaries | {"source", "unit"}: raise ValueError("tinygrad memory measurements are incomplete")
+  if not isinstance(tinygrad, dict) or set(tinygrad) != tinygrad_boundaries | {"source", "unit"}:
+    raise ValueError("tinygrad memory measurements are incomplete")
   if tinygrad.get("source") != "tinygrad.GlobalCounters.mem_used_per_device":
     raise ValueError("tinygrad memory source is invalid")
   if tinygrad.get("unit") != "live_requested_bytes_not_peak": raise ValueError("tinygrad memory unit is invalid")
@@ -489,7 +502,8 @@ def validate_result(result: dict[str, Any]) -> None:
     raise ValueError("tinygrad memory snapshot is invalid")
 
   device_memory = memory["device"]
-  required_device_memory = {"source", "sample_interval_ms", "sampled_peak_bytes", "phase_windows_ns", "phase_sampled_peak_bytes", "samples", "limitations"}
+  required_device_memory = {"source", "sample_interval_ms", "sampled_peak_bytes", "phase_windows_ns",
+                            "phase_sampled_peak_bytes", "samples", "limitations"}
   if not isinstance(device_memory, dict) or set(device_memory) != required_device_memory:
     raise ValueError("device memory measurements are incomplete")
   if device_memory.get("source") != "nvidia-smi.compute-apps.sampled": raise ValueError("device memory source is invalid")

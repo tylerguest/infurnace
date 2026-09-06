@@ -246,7 +246,7 @@ class TestSchedulerCancellation(unittest.TestCase):
     def test_cancel_active_frees_slot_and_suppresses_output(self):
         s = Scheduler(num_slots=1)
         s.add_request(_req("r1", prompt_len=4))
-        plan = s.schedule()[0]
+        s.schedule()
         s.mark_prefill_chunk_done("r1", 0)
         # Now decoding
         self.assertEqual(s._requests["r1"].state, RequestState.DECODING)

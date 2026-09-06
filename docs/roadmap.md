@@ -15,12 +15,39 @@ the parent phase gate has passed. CPU-only contract and state tests should remai
 separate from model-dependent and accelerator tests so normal development does not
 require the checkpoint or execution hardware.
 
+## Production Target
+
+The product goal is a production **single-tenant inference appliance**: one node,
+one GPU (RTX 5060), the pinned Qwen3-4B Q4_K_M checkpoint, and **dozens of
+concurrent requests** served well. tinygrad as the compute substrate is a hard
+product requirement, not a negotiable implementation detail. Two consequences
+shape the whole roadmap:
+
+- **Concurrency is the product.** The paged-KV and continuous-batching phases
+  (5-6) are the critical path. Fixed-slot contiguous KV is scaffolding and is
+  retired when page ownership lands; decode batch shapes scale to the measured
+  concurrency target (32). KV cost is fixed (36 layers x 2 x 8 kv-heads x 128
+  dim x 2 B = 144 KiB/token), so 32 requests x 2k tokens is ~9.2 GiB of KV:
+  paged allocation sized from measured device memory is the only way dozens of
+  requests fit beside the ~2.5 GB weights on this card.
+- **Prefill performance is the top technical risk.** Prefill is eager today;
+  a timeboxed JIT-prefill spike (Phase 6D) gates the production plan. Target:
+  >=60% of the llama.cpp prompt tok/s bar and >=85% of its decode bar on the
+  RTX 5060, measured by the existing harness. If the spike fails, the fallback
+  is a custom token-batched quant kernel (port of tinygrad's AMD WMMA path),
+  not a substrate change.
+
+Explicit v1 exclusions: prefix caching (Phase 8 lands after paged decode is
+stable), guided/structured decoding, logprobs streaming, multi-model support,
+adapters, and multi-GPU topologies (Phases 11-12).
+
 ## Current Work
 
 Phase 4 is complete (v0.2 gates PASS). Phase 5 (Paged Decode KV) is active:
 Phase 5A (logical page allocator) and Phase 5B (indexed KV store) are
 implemented; Phase 5C (paged decode attention) and Phase 5D (engine
-integration) remain.
+integration) remain. A pre-Phase-5C code review surfaced correctness blockers
+(listed at the end of this section) that land before new kernel work.
 
 The strategic direction for this hardware is a throughput engine on the RTX 5060,
 targeting the pinned Qwen3-4B Q4_K_M checkpoint (the original 0.6B Q8_0 was
@@ -83,15 +110,48 @@ Two items are explicitly deferred and are not Phase 5 blockers:
   with paged store/gather and persistent `block_tables`/`seq_len` device
   inputs.
 
+### Correctness Blockers (fix first, pre-Phase-5C)
+
+A full code review before the paged-attention kernel work found defects that a
+production appliance forbids. These land before any new kernel work:
+
+- **Fused-decode feedback buffers are per-runner, not per-slot.** A second
+  request's prefill re-seeds the shared buffers mid-stream, so a request that
+  resumes single-request fused decode consumes another request's token: silent
+  cross-request KV/record divergence. Fix direction: per-slot feedback state,
+  or retire fused decode as a separate contract and keep it only as the
+  batch==1 case of the batched path (the decision is recorded with the fix).
+- **`Scheduler.cancel` leaves a stale `cache_slot`** on the cancelled request
+  (unlike `mark_finished`/`release`); a repeated engine cancel can then
+  `clear_slot` a slot re-owned by a live request. Null the slot on cancel and
+  make engine cancel idempotent.
+- **`Engine.add_text_request` references `SamplingParams` without importing
+  it**: the default-params path raises `NameError` (masked today because the
+  CLI and tests always pass params).
+- **The async seam skips compaction**: `prepare_step()` does not apply slot
+  compaction, so callers driving the seam directly can build non-prefix decode
+  plans that fail the whole batch. Move compaction into `prepare_step`.
+- **Fused decode bypasses the engine sampler** and per-request sampling params
+  (in-graph argmax). Restrict the fused path to the greedy default, or plumb
+  params explicitly.
+
+Regression coverage requirement: multi-request interleaving tests must assert
+**token equality** across fused and batched paths; "finished with non-empty
+text" assertions cannot catch corruption (the existing multi-slot engine test
+passes even when the fused path feeds the wrong token).
+
 ## Phase 0: Current NV Baseline
 
 ### Phase 0A: Repository Foundation
 
 - Define the Python package, dependency installation, and test configuration.
-- Develop against current tinygrad rather than pinning a commit or maintaining a
-  supported-version matrix.
+- Develop against current tinygrad rather than maintaining a supported-version
+  matrix; development does not pin a commit.
 - Treat Infurnace's tinygrad contract tests as the compatibility boundary and adapt
   them when upstream APIs or semantics change.
+- Pin one recorded-good tinygrad commit per production release and upgrade it
+  deliberately behind the phase gates; tracking current upstream is a development
+  mode, not a release policy.
 - Make backend and execution topology explicit test and benchmark inputs. Use the
   available NVIDIA GeForce RTX 5060 with tinygrad `DEV=NV` for the first recorded
   baseline without making it a product boundary.
@@ -358,8 +418,12 @@ HTTP adapter deferred to post-v0.1.
 **Subphase gate:** Protocol tests prove that HTTP cannot bypass the engine and that
 disconnect, backpressure, health, and capacity errors preserve engine invariants.
 
-**Status:** Deferred. CLI-first development targets v0.1 via offline engine (Phase 3E).
-HTTP adapter will be added in a subsequent release after CLI path is validated.
+**Status:** Committed (production track). CLI-first development targeted v0.1 via
+the offline engine (Phase 3E). The production appliance requires this adapter:
+it lands after Phase 6 paged continuous batching as the OpenAI-compatible
+chat-completions subset of Phase 9B, with SSE streaming and disconnect-driven
+cancellation, driving the engine through the
+`prepare_step`/`execute_step`/`commit_step` seam.
 
 ## Phase 4: Fixed Batched Decode
 
@@ -535,6 +599,9 @@ under stress, and pages are reclaimed only after active and in-flight ownership 
 - Schedule one single-request prefill chunk under a bounded token budget when decode
   policy permits it.
 - Keep prefill and decode as separate execution plans.
+- Extend supported decode shapes from {1, 2, 4} to powers of two up to the
+  measured concurrency target (32 for the single-card appliance), padding to
+  the next supported shape.
 - Add cache-aware admission, bounded waiting, and explicit fairness metrics.
 
 **Subphase gate:** Deterministic CPU-only workload simulations satisfy documented
@@ -555,6 +622,21 @@ and page ownership across the workload suite.
 
 **Subphase gate:** Any retained overlap or unified policy improves a named metric
 without changing output, page lifetime, fairness, or latency bounds.
+
+### Phase 6D: JIT Prefill Contracts
+
+- Capture chunked prefill under TinyJit with fixed chunk shapes and validated
+  symbolic valid-length ranges, replacing the eager per-layer realize loop.
+- Timeboxed spike first (see Production Target): if the generic NV matmul path
+  cannot reach the documented fraction of the llama.cpp prompt bar, the fallback
+  is a custom token-batched quant kernel (port of tinygrad's AMD WMMA path), not
+  a substrate change.
+- Keep the eager prefill path as the numerical reference; JIT output matches it
+  chunk for chunk, including at chunk and context boundaries.
+
+**Subphase gate:** JIT prefill matches eager prefill numerically across chunk
+boundaries, reaches the documented prompt-throughput bar, and TTFT is recorded
+in the benchmark suite.
 
 **Gate:** Continuous batching improves measured throughput over fixed batching
 without output changes, leaked pages, unbounded starvation, or latency outside the
@@ -653,7 +735,15 @@ subset, while unsupported fields fail deterministically at the protocol boundary
 
 - Add structured metrics for queueing, time to first token, inter-token latency,
   throughput, cache occupancy, rejection, cancellation, and compilation.
-- Add authentication and deployment policy only at the protocol boundary.
+- Add authentication and deployment policy only at the protocol boundary (an API
+  key suffices for the single-tenant appliance).
+- Package the appliance as a container image built on the pinned tinygrad commit
+  and the verified checkpoint manifest; select a project license (`LICENSE` is
+  currently empty).
+- Derive KV pool capacity from measured free device memory at startup and fail
+  fast with a clear error when weights, workspaces, and pool do not fit.
+- Support graceful drain on shutdown: stop admission, then finish or fail
+  in-flight requests deterministically.
 
 **Subphase gate:** Metrics reconcile with request outcomes under load, and deployment
 policy cannot alter or bypass engine semantics.
@@ -782,6 +872,7 @@ capacity or performance gains.
 - MoE and multimodal models
 - Speculative decoding
 - LoRA
+- Guided/structured decoding
 - Broad compatibility with unrelated decoder architectures
 - Remote or tiered KV storage
 - A tensor framework or independent device compiler

@@ -154,7 +154,6 @@ def main() -> int:
     setup_start, setup_end = generation["phase_windows"]["contract_setup"]
     measurement_start, measurement_end = generation["phase_windows"]["measurement"]
     setup_timings, measured_timings = generation["setup_timings"], generation["measured_timings"]
-    after_prefill = generation["snapshots"]["after_prefill"]
     after_contract_setup = generation["snapshots"]["after_contract_setup"]
     after_measurement = generation["snapshots"]["after_measurement"]
     if len(setup_timings) != 2 or len(measured_timings) != args.decode_tokens:

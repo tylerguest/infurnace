@@ -5,8 +5,10 @@ tinygrad, which handles all tensor compilation and device execution, while
 Infurnace owns the serving side: scheduling, batching, KV-cache management,
 sampling, streaming, and metrics.
 
-The current target is Qwen3-4B (Q4_K_M) on NVIDIA GPUs. Infurnace tracks current
-tinygrad rather than pinning a version.
+The current target is Qwen3-4B (Q4_K_M) on NVIDIA GPUs. The product goal is a
+production single-tenant appliance serving dozens of concurrent requests on one
+GPU. Development tracks current tinygrad; production releases pin a recorded-good
+tinygrad commit.
 
 ## Install
 

@@ -90,8 +90,8 @@ def main() -> int:
     from tinygrad import GlobalCounters, Tensor, dtypes
     total_pages = max(pool["pages"] + 4 for pool in per_size.values())
     target = max(sizes)
-    pool = Tensor.zeros(LAYERS, 2, total_pages, target, KV_HEADS, HEAD_DIM,
-                        dtype=dtypes.float16).contiguous().realize()
+    _pool = Tensor.zeros(LAYERS, 2, total_pages, target, KV_HEADS, HEAD_DIM,
+                         dtype=dtypes.float16).contiguous().realize()
     nv = {"checked": True, "page_size": target, "pages": total_pages,
           "live_requested_bytes": int(GlobalCounters.mem_used_per_device["NV"])}
 

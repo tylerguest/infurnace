@@ -110,15 +110,17 @@ def main() -> int:
       ids = Tensor([[1234]], dtype=dtypes.int32)
 
       # --- engine decode steps on one request (sampler, .tolist(), JIT) ---
-      engine_request = Request(f"eng", prompt, SamplingParams(max_tokens=args.chain + 256), args.max_context)
+      engine_request = Request("eng", prompt, SamplingParams(max_tokens=args.chain + 256), args.max_context)
       engine.add_request(engine_request)
       engine.step()  # prefill + first token
       engine.step()  # one warm decode (JIT captured)
-      engine.step(); device.synchronize()
+      engine.step()
+      device.synchronize()
       engine_decode_ms = median_ms(bracketed(device, lambda: [engine.step() for _ in range(args.chain)], reps=args.reps)) / args.chain
 
       # --- JIT replay: one call, bracketed ---
-      runner.decode_batch(ids, [position], [0]); device.synchronize()
+      runner.decode_batch(ids, [position], [0])
+      device.synchronize()
       jit_single_ms = median_ms(bracketed(device, lambda: runner.decode_batch(ids, [position], [0]), reps=args.reps))
 
       # --- JIT replay amortized: N calls queued back-to-back, one trailing sync ---
@@ -254,7 +256,7 @@ def main() -> int:
             f"{kernel_count} top-level CALL nodes in the captured graph")
       print(f"  jit amortized bandwidth: {result['decode_path']['jit_amortized_gb_per_s']:.1f} GB/s "
             f"(ceiling ~448 GB/s)")
-      print(f"\nisolated GEMV microbench (relative; inflated absolute ms, see notes):")
+      print("\nisolated GEMV microbench (relative; inflated absolute ms, see notes):")
       for row in gemv_rows:
         print(f"  {row['role']:12s} {str(row['shape']):>22s} "
               f"{row['ms_per_call']:6.3f} ms/call  {row['achieved_gb_per_s']:6.1f} GB/s")
