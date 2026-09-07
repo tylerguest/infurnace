@@ -5,35 +5,19 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "infurnace"
 version = "0.0.0"
-description = "Language-model inference serving with tinygrad"
+description = "Run a single LLM fast on your GPU with tinygrad"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["tinygrad"]
+dependencies = ["tinygrad @ git+https://github.com/tinygrad/tinygrad@07268b724fe63e45ba33be193ee679dbf02b163f",]
 
 [project.optional-dependencies]
-test = ["pytest>=8"]
-dev = ["pytest>=8", "ruff==0.14.10"]
+dev = ["ruff==0.14.10"]
 
 [project.scripts]
 infurnace = "infurnace.cli:main"
 
-[tool.setuptools.packages.find]
-where = ["src"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-addopts = [
-  "-ra",
-  "--strict-config",
-  "--strict-markers",
-  "-m",
-  "not nv and not model and not slow",
-]
-markers = [
-  "nv: requires the tinygrad NV backend and NVIDIA execution hardware",
-  "model: requires the verified model artifact",
-  "slow: excluded from the normal development suite",
-]
+[tool.setuptools]
+packages = ["infurnace", "infurnace.kernels"]
 
 [tool.ruff]
 preview = true
@@ -43,9 +27,8 @@ indent-width = 2
 exclude = [
   ".git/",
   "docs/",
-  "artifacts/",
-  "results/",
-  "src/infurnace.egg-info/",
+  "models/",
+  "infurnace.egg-info/",
 ]
 
 [tool.ruff.lint]

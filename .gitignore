@@ -43,7 +43,7 @@ Thumbs.db
 
 # Local runtime, profiling, and benchmark output
 .cache/
-/artifacts/
+/models/
 /profiles/
 /results/
 /benchmark-results/

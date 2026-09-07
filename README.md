@@ -1,53 +1,44 @@
-# Infurnace
+# infurnace
 
-Infurnace is an inference server for decoder-only language models. It runs on
-tinygrad, which handles all tensor compilation and device execution, while
-Infurnace owns the serving side: scheduling, batching, KV-cache management,
-sampling, streaming, and metrics.
-
-**Status:** Development target is v0.3 — a paged continuous-batching
-inference server on one GPU with a minimal HTTP surface. See the
-[roadmap](docs/roadmap.md) for the end-state gates.
+Run LLMs on your GPU with tinygrad. No server, no batching, no scheduler —
+load a GGUF, generate tokens, stream them out. A few files, one dependency.
 
 ## Install
 
-Requires Python 3.11+. Clone tinygrad into an adjacent directory, then:
-
 ```sh
 python3 -m venv .venv
-.venv/bin/python -m pip install -e ../tinygrad -e ".[test]"
+.venv/bin/pip install -e .
 ```
 
-## Quick example
+## Run
 
-Fetch the pinned Qwen3-4B GGUF, then run the CLI:
+Drop a GGUF in `models/`, then:
 
 ```sh
-.venv/bin/python tools/fetch_model.py \
-  --manifest models/qwen3-4b-q4_k_m.json \
-  --output artifacts/models/Qwen3-4B-Q4_K_M.gguf
-
-.venv/bin/infurnace --prompt "Hello, world"
+.venv/bin/infurnace --prompt "Hello"      # single-shot
+.venv/bin/infurnace --chat                # chat
+.venv/bin/infurnace --benchmark 20        # tokens/sec
 ```
 
-Add `--chat` for interactive multi-turn chat. The CLI defaults to the fetched
-artifact and manifest; see `--help` for all options.
+`--model` overrides the default `models/Qwen3-4B-Q4_K_M.gguf`.
 
-## Tests
+## Status
 
-```sh
-.venv/bin/python -m pytest
+Scaffold. It installs and imports; the parser, tokenizer, and model aren't
+written yet — order of work is in `docs/roadmap.md`.
+
+## Layout
+
 ```
+infurnace/
+├── gguf.py            # GGUF parser + quantized dequant
+├── tokenizer.py       # BPE tokenizer + chat template
+├── model.py           # forward / decode / generate + KV cache
+├── kernels/
+│   └── quant_gemv.py  # NV Q4_K/Q6_K decode kernel
+└── cli.py             # the CLI above
 
-Hardware and model suites are opt-in and require a GPU and model artifact:
-
-```sh
-DEV=NV .venv/bin/python -m pytest -m nv
-DEV=NV .venv/bin/python -m pytest -m "nv and model and slow"
+docs/
+├── architecture.md
+└── roadmap.md
 ```
-
-## Learn more
-
-See the [architecture](docs/architecture.md) and [roadmap](docs/roadmap.md)
-for design and implementation gates, and [benchmarks](benchmarks/README.md)
-for measurement methodology.
