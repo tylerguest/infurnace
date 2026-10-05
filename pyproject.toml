@@ -8,10 +8,10 @@ version = "0.0.0"
 description = "Run a single LLM fast on your GPU with tinygrad"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["tinygrad @ git+https://github.com/tinygrad/tinygrad@07268b724fe63e45ba33be193ee679dbf02b163f",]
+dependencies = ["tinygrad @ git+https://github.com/tinygrad/tinygrad@ce9c84605e94de9667fb578c1ff3fa8678725a87",]
 
 [project.optional-dependencies]
-dev = ["ruff==0.14.10", "pytest"]
+dev = ["ruff==0.14.10", "pytest", "jinja2"]
 
 [project.scripts]
 infurnace = "infurnace.cli:main"

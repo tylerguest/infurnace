@@ -10,19 +10,20 @@ fallback. No server, scheduler, batching, multi-GPU, or additional model familie
 |---|---|
 | 1. Small module layout / removal of serving infrastructure | Done |
 | 2. GGUF loading | CPU quantized loading works; remaining fixture coverage and GPU/storage integration tracked below |
-| 3. Qwen3 configuration and tokenizer | Stubs |
+| 3. Qwen3 configuration and tokenizer | Config/weights, tokenizer adapter, and bundled text-only chat rendering implemented |
 | 4. Correct eager inference | Stubs |
-| 5. Validated NV kernels and JIT decode | Kernel retained, not integrated or validated by the current suite |
+| 5. Validated NV kernels and JIT decode | Q4_K/Q6_K eager/JIT kernel tests pass on NV; model integration pending |
 | 6. Usable CLI and measured local performance | Argument parsing only |
 
-Current verification: **95 CPU tests pass; 1 local-model test is opt-in; Ruff
+Current verification: **162 CPU tests pass; model/reference and NV tests are opt-in; Ruff
 passes.** All 398 bundled tensors load as lazy FP32 views on CPU, with sampled
 Q4_K/Q6_K parity. The opt-in test took 8.46 s wall time with ~4.8 GiB peak RSS
 (including file-backed storage and resident packed bytes); this is not an
 isolated load benchmark. Model execution is still unimplemented.
-A small NV GEMV smoke attempt also failed (`NV_ERR_INVALID_ARGUMENT`, then a
-runtime timeout); basic NV tensor arithmetic passed. Diagnose this before
-claiming the retained kernel works. No end-to-end inference is working yet.
+After upgrading tinygrad and fixing custom-UOp syntax, typed operands, and
+NV offset-buffer handling, all four NV eager/JIT parity tests pass on the
+RTX 5060. Run `DEV=NV INFURNACE_TEST_NV=1 .venv/bin/python -m pytest -q
+ tests/test_tinygrad_compat.py` on one line. No end-to-end inference works yet.
 
 ## 2 — Finish GGUF loading (next)
 
@@ -46,23 +47,36 @@ materialization. Implementation details: [GGUF roadmap](gguf-roadmap.md).
 
 ## 3 — Lock down the Qwen3 contract
 
-- [ ] Implement `config_from_gguf()`; reject unsupported architectures/features
+- [x] Implement `config_from_gguf()`; reject unsupported architectures/features
   and inconsistent dimensions before allocation.
-- [ ] Use explicit key/value lengths, not `embedding_length / head_count`.
+- [x] Use explicit key/value lengths, not `embedding_length / head_count`.
   This file has embedding 2560, 32 query heads, 8 KV heads, **head size 128**;
   query projection width is 4096. Default missing RoPE dimension to head size.
-- [ ] Validate required tensor names/shapes, including per-head Q/K norms.
+- [x] Validate required tensor names/shapes, including per-head Q/K norms.
   When `output.weight` is absent, share `token_embd.weight` (this file is tied).
-- [ ] Honor `max_context`: positive, capped by model context; estimate KV bytes
+- [x] Honor `max_context`: positive, capped by model context; estimate KV bytes
   before allocation. At 2048 tokens this model's FP16 KV cache is 288 MiB;
   the advertised 40960-token context alone needs 5.625 GiB.
-- [ ] Implement Qwen2 byte-level BPE using GGUF merge ranks and the correct
-  Unicode/punctuation/digit splitting; token IDs are not a general merge-rank
-  contract. Validate vocab, special tokens, BOS policy, EOS/EOT, and preset.
-- [ ] Implement encode/decode and independent incremental UTF-8 decoders.
-- [ ] Implement the bundled Qwen3 text-only chat format: system/user/assistant,
-  turn delimiters, generation prefix, and an explicit thinking policy. Match
-  its template's multi-turn handling; no generic Jinja/tool-calling engine yet.
+- [x] Reuse tinygrad `SimpleTokenizer` behind a thin adapter. Packaging is fixed;
+  all 14 sampled bundled-Qwen3 prompts match llama.cpp exactly (including digits,
+  Unicode, code, whitespace, and special tokens). This is sampled parity, not
+  proof of compatibility with every Qwen2 vocabulary or input.
+- [x] Adapter: metadata/vocab validation, encode/decode, independent incremental
+  UTF-8 decoders, special tokens, BOS policy, EOS/EOT, and preset. `encode()`
+  returns raw IDs without automatically prepending BOS; callers use `bos_id`.
+  Run tokenizer opt-in fixtures with `INFURNACE_TEST_MODEL`; additionally set
+  `INFURNACE_LLAMA_TOKENIZE` to a llama-tokenize binary for live reference checks.
+- [x] Implement the bundled Qwen3 text-only chat format: system/user/assistant,
+  turn delimiters and optional generation prefix. Thinking defaults on;
+  `enable_thinking=False` appends the template's empty think block. Historical
+  assistant reasoning is omitted before the latest user turn. Seven histories
+  across both thinking/prefix settings match actual GGUF Jinja output (28 cases).
+  Tools/non-text messages are rejected; Jinja is a development oracle only.
+
+Config gate passed: synthetic invalid-input tests and the opt-in bundled-model
+shape check run before weight staging; factory preserves tied storage. Model
+construction/cache allocation remain stubs. Tokenization reuses tinygrad at
+runtime; own GGUF parsing and model execution remain independent.
 
 **Gate:** config/shape tests cover this file and invalid inputs; tokenizer IDs
 match an authoritative Qwen/llama.cpp reference on ASCII, Unicode, whitespace,
@@ -95,8 +109,9 @@ CPU tests must work without a GPU or downloading a large checkpoint.
 
 ## 5 — Validate and integrate fast NV decode
 
-- [ ] Diagnose the current NV GEMV smoke failure against the pinned tinygrad
-  runtime; add isolated Q8 quantization and Q4_K/Q6_K GEMV GPU tests.
+- [x] Fix NV GEMV runtime/API failures; add Q4_K/Q6_K GPU parity tests with
+  Q8-rounded activations, partial final warps, offset views, and TinyJit replay.
+- [ ] Add isolated Q8 quantization tests and broader kernel contract checks.
 - [ ] Guard dispatch by backend/renderer and kernel contract: one-token decode,
   matching input shape, 256-value weight blocks, packed dtype/length/alignment,
   and same-device resident buffers. Unsupported cases use the generic path.
@@ -143,16 +158,20 @@ reliability**, not more server infrastructure.
 
 ## Reference and scope rules
 
-- Runtime dependency stays tinygrad only. Use its LLM code as a development
-  oracle, not a runtime import: `llm/gguf.py`, `llm/model.py`, `llm/cli.py`,
-  `llm/kernels/amd.py`, and their tests.
-- Current pin: `07268b724fe63e45ba33be193ee679dbf02b163f`. The reviewed sibling
-  checkout (`bec565d15786`) is newer: it separates packed parsing/loading and
-  hardens quantized dispatch. Borrow ideas, not incompatible UOp calls.
-  Update the dependency pin and rerun kernel/JIT tests together when upgrading.
-- The current installed tinygrad package lacks `tinygrad.llm.kernels`, so its
-  `Transformer`/`SimpleTokenizer` imports fail. Run those reference checks from
-  a complete checkout at the pinned revision in a separate development setup.
+- Runtime dependency stays tinygrad only. Reuse `llm/cli.SimpleTokenizer` for
+  tokenization. GGUF/model/kernel code is a development oracle, not a runtime
+  implementation dependency (the upstream tokenizer module transitively imports
+  its model and server). Keep pinned-import regression tests.
+- Current pin: `ce9c84605e94de9667fb578c1ff3fa8678725a87`, including the wheel
+  packaging fix for `tinygrad.llm.kernels`. `Transformer`/`SimpleTokenizer`
+  imports are now covered by a regression test. Tokenizer correctness is still
+  pending; successful import does not establish Qwen3 parity.
+- When upgrading an existing environment, pip may retain tinygrad's same-version
+  wheel. Force reinstall the exact VCS dependency from `pyproject.toml`, then
+  rerun CPU and opt-in NV/JIT tests. Fresh installs use the declared pin.
+- Packed extraction copies compressed bytes to aligned storage once (cache the
+  result outside JIT). Direct offset Buffer views hung on the tested NV runtime;
+  no decoded floating-point weights are copied.
 - **Server deferred until Phase 6 passes.** If needed later, add a thin local
   adapter over the same generation path, with request validation, cancellation,
   context limits, and correct streaming. No return to the old serving stack.

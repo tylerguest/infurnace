@@ -26,8 +26,10 @@ Inference is not implemented yet. Once ready, put a GGUF in `models/`, then:
 
 Phase 2: F32/Q4_K/Q6_K GGUF loading works on CPU with lazy dequantization
 and explicit packed-byte staging. GPU integration still needs verification.
-Tokenizer, model execution, and CLI modes are stubs. The retained NV decode
-kernel still needs validation and integration. See the [roadmap](docs/roadmap.md)
+Qwen3 config/weight validation, a tinygrad tokenizer adapter, and text-only
+Qwen3 chat rendering are implemented. Sampled tokenizer IDs match llama.cpp;
+chat output matches the bundled template. Model execution and CLI modes remain stubs. NV decode kernel eager/JIT tests
+pass; model integration is pending. See the [roadmap](docs/roadmap.md)
 for ordered tasks and verification gates.
 
 ## Layout
@@ -35,7 +37,7 @@ for ordered tasks and verification gates.
 ```
 infurnace/
 ├── gguf.py            # GGUF parser + quantized dequant
-├── tokenizer.py       # BPE tokenizer + chat template
+├── tokenizer.py       # tinygrad tokenizer adapter + Qwen3 chat rendering
 ├── model.py           # forward / decode / generate + KV cache
 ├── kernels/
 │   └── quant_gemv.py  # NV Q4_K/Q6_K decode kernel

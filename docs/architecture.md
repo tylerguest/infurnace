@@ -12,16 +12,16 @@ This is the target design, not the current implementation status. See the
 - **Single user, single GPU.** No server, no batching, no scheduling.
 - **Few files.** Every file has one job.
 - **Fast decode.** The quantized GEMV kernel stays; serving infrastructure does not.
-- **Standalone on tinygrad.** Only `tinygrad.Tensor` (and friends) are imported;
-  tinygrad's own LLM helpers (`tinygrad.llm.gguf`, `tinygrad.llm.cli.SimpleTokenizer`)
-  are *not* used — infurnace owns its parser and tokenizer.
+- **Built on tinygrad.** Infurnace owns GGUF parsing and model execution;
+  tokenization reuses `tinygrad.llm.cli.SimpleTokenizer` through a thin validated
+  Qwen2 adapter. No duplicate BPE engine.
 
 ## Module responsibilities
 
 | File | Job |
 |---|---|
 | `gguf.py` | Validate GGUF, stage packed bytes on the selected device, return metadata and lazy dequant views |
-| `tokenizer.py` | BPE encode/decode + streaming decode + chat template, built from GGUF vocab metadata |
+| `tokenizer.py` | Tinygrad tokenizer adapter + metadata validation; bundled Qwen3 text-only chat rendering |
 | `model.py` | `Qwen3Config` + `Qwen3Model`: prefill (`forward`), decode, and the `generate` loop; owns the KV cache |
 | `kernels/quant_gemv.py` | NV decode GEMV over packed Q4_K/Q6_K weights (self-contained, device-specific) |
 | `cli.py` | Single-shot / chat / benchmark driver |

@@ -23,10 +23,9 @@ control flow inside the captured graph.
 """
 import functools
 import math
-from typing import Callable, cast
+from typing import Callable
 
 from tinygrad import Tensor, UOp, dtypes
-from tinygrad.device import Buffer
 from tinygrad.dtype import AddrSpace
 from tinygrad.helpers import prod
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops
@@ -43,19 +42,19 @@ def warp_reduce(val: UOp, maximum: bool = False, full_wave: bool = False) -> UOp
   for offset in ((16, 8, 4, 2, 1) if full_wave else (8, 4, 2, 1)):
     if val.op is Ops.INDEX and val.addrspace == AddrSpace.REG:
       val = val.load()
-    other = UOp(Ops.CUSTOM, dtypes.float, (val,), arg=f"__shfl_xor_sync(0xffffffff, {{0}}, {offset})")
+    other = UOp(Ops.CUSTOM, src=(val,), arg=(f"__shfl_xor_sync(0xffffffff, {{0}}, {offset})", dtypes.float))
     val = val.maximum(other) if maximum else val + other
   return val
 
 def _dp4a(a: UOp, b: UOp, c: UOp) -> UOp:
-  return UOp(Ops.CUSTOMI, dtypes.int32, (a.int(), b.int(), c), arg="__dp4a({}, {}, {})")
+  return UOp(Ops.CUSTOMI, src=(a.int(), b.int(), c), arg=("__dp4a({}, {}, {})", dtypes.int32))
 
 def _load_lanes(ptr: UOp, lanes: int) -> UOp:
   """Load ``lanes`` consecutive elements at a buffer index as a vector value."""
   assert ptr.op is Ops.INDEX
   buf, coords = ptr.src[0], ptr.src[1:]
   idx = sum((coord * math.prod(buf.shape[i + 1:]) for i, coord in enumerate(coords)), UOp.const(0))
-  return UOp(Ops.SHRINK, src=(buf.flatten(), idx, UOp.const(lanes))).load(dtype=ptr.dtype)
+  return UOp(Ops.SHRINK, src=(buf.flatten(), idx, UOp.const(lanes))).load()
 
 def _load_byte(raw: UOp, base: UOp, offset: UOp) -> UOp:
   return (raw[base + offset // 4] >> ((offset & 3) * 8).cast(dtypes.uint32)) & 255
@@ -146,7 +145,7 @@ def quant_gemv(x: Tensor, packed: Tensor, *, out_features: int, in_features: int
   if in_features % Q8_GROUP_SIZE != 0: raise QuantGemvError(f"in_features {in_features} not a multiple of 32")
   if out_features % 16 != 0: raise QuantGemvError(f"out_features {out_features} not a multiple of 16")
   tokens = int(x.numel()) // in_features
-  raw = packed.uop.buf_uop
+  raw = packed.uop
   xq, xd = q8_quantize(x, tokens, in_features)
   decode = functools.partial(_quant_decode_kernel, ggml_type=ggml_type)
   chunks = (in_features + 1023) // 1024
@@ -160,10 +159,11 @@ def quant_gemv(x: Tensor, packed: Tensor, *, out_features: int, in_features: int
 def packed_weight(decoded: Tensor) -> tuple[Tensor, int] | None:
   """Extract the packed GGML weight view from a lazy fp16-cast quantized tensor.
 
-  Mirrors ``tinygrad.llm.kernels.amd.Linear.set_quantized``: finds the uint8
-  packed-block SHRINK inside the dequant expression and views the resident
-  buffer as packed words. Returns ``None`` for non-quantized weights so callers
-  fall back to the generic matmul path.
+  Finds the uint8 packed-block SHRINK and copies compressed bytes once into
+  aligned packed storage (direct offset Buffer views hang on the tested NV
+  runtime). Callers must cache this result outside JIT capture. Returns None
+  for unrecognized weights; explicit GGUF descriptors are preferred for model
+  integration because size-only graph matching cannot reject transformed weights.
   """
   if decoded.dtype != dtypes.float16: return None
   packed_sizes = {decoded.numel() // GGML_BLOCK_SIZE * type_size: typ for typ, type_size in QUANT_SIZES.items()}
@@ -174,6 +174,7 @@ def packed_weight(decoded: Tensor) -> tuple[Tensor, int] | None:
   if raw_offset is None or raw_offset % 4 != 0 or raw.buf_uop.dtype != dtypes.uint8: return None
   ggml_type = packed_sizes[prod(raw.shape)]
   packed_dtype = dtypes.uint8 if ggml_type == Q6_K else dtypes.uint32
-  packed = Tensor(UOp.from_buffer(cast(Buffer, raw.buf_uop.buffer)
-    .view(raw.max_numel() * raw.dtype.itemsize // packed_dtype.itemsize, packed_dtype, raw_offset)))
+  # Direct offset Buffer views hang on the tested NV runtime. Copy packed bytes
+  # into aligned storage once, outside JIT capture; never copy decoded weights.
+  packed = Tensor(raw).contiguous().bitcast(packed_dtype).clone().flatten().realize()
   return packed, ggml_type
