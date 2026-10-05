@@ -1,25 +1,8 @@
-"""Qwen3 model on tinygrad: forward (prefill) + decode + generate.
-
-The model owns its weights (lazy fp16 views over packed GGUF bytes from
-``infurnace.gguf``), a contiguous KV cache, and the two execution paths:
-
-  * ``forward``  — eager prefill, writes K/V into the internal cache
-  * ``decode``   — single-token decode, TinyJit-captured with a symbolic
-                   position and the ``quant_gemv`` packed fast path
-
-``generate`` drives both: prefill the prompt, then sample+decode in a loop,
-yielding one token id at a time. There is no slot / batch / server concept —
-this is the single-user path, mirroring ``tinygrad.llm.model.Transformer``.
-"""
-
 from __future__ import annotations
-
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Mapping
-
 from tinygrad import Tensor, dtypes  # noqa: F401  # used by forward / KV cache (TODO)
-
 from infurnace.gguf import load_gguf
 from infurnace.kernels.quant_gemv import quant_gemv, packed_weight  # noqa: F401  # used by _decode_linear (TODO)
 
@@ -49,7 +32,6 @@ def config_from_gguf(metadata: Mapping) -> Qwen3Config:
 class Qwen3Model:
   def __init__(self, config: Qwen3Config, weights: Mapping[str, Tensor]):
     """``weights``: lazy fp16 views keyed by GGUF tensor name.
-
     Sanity checks the required tensor names/shapes, precomputes RoPE freqs,
     and allocates the contiguous fp16 KV cache ``[layers, 2, context, kv_heads, head_dim]``.
     """

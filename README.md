@@ -10,9 +10,9 @@ python3 -m venv .venv
 .venv/bin/pip install -e .
 ```
 
-## Run
+## Planned CLI
 
-Drop a GGUF in `models/`, then:
+Inference is not implemented yet. Once ready, put a GGUF in `models/`, then:
 
 ```sh
 .venv/bin/infurnace --prompt "Hello"      # single-shot
@@ -24,8 +24,11 @@ Drop a GGUF in `models/`, then:
 
 ## Status
 
-Scaffold. It installs and imports; the parser, tokenizer, and model aren't
-written yet — order of work is in `docs/roadmap.md`.
+Phase 2: F32/Q4_K/Q6_K GGUF loading works on CPU with lazy dequantization
+and explicit packed-byte staging. GPU integration still needs verification.
+Tokenizer, model execution, and CLI modes are stubs. The retained NV decode
+kernel still needs validation and integration. See the [roadmap](docs/roadmap.md)
+for ordered tasks and verification gates.
 
 ## Layout
 
@@ -40,5 +43,6 @@ infurnace/
 
 docs/
 ├── architecture.md
-└── roadmap.md
+├── roadmap.md
+└── gguf-roadmap.md
 ```

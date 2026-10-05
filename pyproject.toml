@@ -11,7 +11,7 @@ requires-python = ">=3.11"
 dependencies = ["tinygrad @ git+https://github.com/tinygrad/tinygrad@07268b724fe63e45ba33be193ee679dbf02b163f",]
 
 [project.optional-dependencies]
-dev = ["ruff==0.14.10"]
+dev = ["ruff==0.14.10", "pytest"]
 
 [project.scripts]
 infurnace = "infurnace.cli:main"

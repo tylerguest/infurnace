@@ -1,60 +1,221 @@
-"""Own GGUF parser. No ``tinygrad.llm.gguf`` dependency.
-
-Reads the GGUF binary container (header, typed KV metadata, tensor info, data)
-and returns ``(metadata, state_dict)`` where quantized weights stay as *lazy
-packed views* over the raw bytes. The dequant expression is fused into the
-consuming kernel (matmul / embedding lookup) instead of materializing fp16, and
-``kernels.quant_gemv.packed_weight`` digs the same packed view out for the
-decode fast path — no dequant -> fp16 -> re-extract round trip.
-
-Only the quant types this model needs are supported: F32 (native) and Q4_K /
-Q6_K (block dequant in tinygrad ops). See ``docs/architecture.md``.
-"""
-
-from __future__ import annotations
-
+import struct, functools, math
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-
 from tinygrad import Tensor, dtypes
 
-# ggml quant block geometry: number of weights and packed bytes per block.
 Q4_K, Q6_K = 12, 14
 GGML_BLOCK_SIZE = 256
 QUANT_BLOCK_BYTES = {Q4_K: 144, Q6_K: 210}
-
+Q4_K_BLOCK_VALUES = 256
+Q4_K_BLOCK_BYTES = 144
 _NATIVE_DTYPES = {0: dtypes.float32}
 
+def _read_exact(handle, n: int) -> bytes:
+  offset = handle.tell()
+  data = handle.read(n)
+  if len(data) != n: raise ValueError(f"truncated GGUF at byte {offset}: expected {n} bytes, got {len(data)}")
+  return data
 
-def _round_up(value: int, alignment: int) -> int:
-  """Round ``value`` up to a multiple of ``alignment`` (GGUF data alignment)."""
-  return (value + alignment - 1) // alignment * alignment
-
+def _read_unpack(fmt: str, n: int, handle):
+  return struct.unpack(fmt, _read_exact(handle, n))[0]
 
 def _read_str(handle) -> str:
-  """Read a GGUF string: uint64 length prefix + utf-8 bytes."""
-  raise NotImplementedError  # TODO: struct.unpack length, read bytes, decode
+  length = _read_unpack("<Q", 8, handle)
+  try: return _read_exact(handle, length).decode("utf-8")
+  except UnicodeDecodeError as exc: raise ValueError("invalid GGUF UTF-8 string") from exc
 
+def _read_arr(handle) -> list[Any]:
+  value_type = _read_unpack("<i", 4, handle)
+  reader = _value_reader(value_type)
+  return [reader(handle) for _ in range(_read_unpack("<Q", 8, handle))]
+
+_READERS = {
+  0: functools.partial(_read_unpack, "<B", 1),  # uint8
+  1: functools.partial(_read_unpack, "<b", 1),  # int8
+  2: functools.partial(_read_unpack, "<H", 2),  # uint16
+  3: functools.partial(_read_unpack, "<h", 2),  # int16
+  4: functools.partial(_read_unpack, "<I", 4),  # uint32
+  5: functools.partial(_read_unpack, "<i", 4),  # int32
+  6: functools.partial(_read_unpack, "<f", 4),  # float32
+  7: functools.partial(_read_unpack, "<?", 1),  # bool
+  8: _read_str,                                 # string
+  9: _read_arr,                                 # array
+  10: functools.partial(_read_unpack, "<Q", 8), # uint64
+  11: functools.partial(_read_unpack, "<q", 8), # int64
+  12: functools.partial(_read_unpack, "<d", 8), # float64
+}
+
+def _round_up(value: int, alignment: int) -> int:
+  return (value + alignment - 1) // alignment * alignment
+
+def _value_reader(value_type: int):
+  if value_type not in _READERS: raise ValueError(f"unsupported GGUF metadata type: {value_type}")
+  return _READERS[value_type]
 
 def _read_value(handle, value_type: int) -> Any:
-  """Read one typed GGUF value (uint8..float64, string, or array)."""
-  raise NotImplementedError  # TODO: value type table + recursive arrays
+  return _value_reader(value_type)(handle)
 
+def _read_header(handle) -> tuple[int, int, int]:
+  magic = _read_exact(handle, 4)
+  if magic != b"GGUF": raise ValueError(f"invalid GGUF magic: {magic!r}")
+  version = _read_unpack("<I", 4, handle)
+  if version not in (2, 3): raise ValueError(f"unsupported GGUF version: {version}")
+  tensor_count = _read_unpack("<Q", 8, handle)
+  metadata_count = _read_unpack("<Q", 8, handle)
+  return version, tensor_count, metadata_count
+
+def _read_metadata(handle, count: int) -> dict[str, Any]:
+  metadata = {}
+  for _ in range(count):
+    key = _read_str(handle)
+    value_type = _read_unpack("<i", 4, handle)
+    if key in metadata: raise ValueError(f"duplicate GGUF metadata key: {key!r}")
+    metadata[key] = _read_value(handle, value_type)
+  return metadata
+
+def _read_tensor_info(handle) -> tuple[str, tuple[int, ...], int, int]:
+  name = _read_str(handle)
+  dim_count = _read_unpack("<I", 4, handle)
+  if not 1 <= dim_count <= 4: raise ValueError(f"tensor {name!r} has invalid rank: {dim_count}")
+  dims = tuple(_read_unpack("<Q", 8, handle) for _ in range(dim_count))
+  ggml_type = _read_unpack("<i", 4, handle)
+  offset = _read_unpack("<Q", 8, handle)
+  return name, dims, ggml_type, offset
+
+def _read_multi_tensor_info(handle, count: int) -> list[tuple[str, tuple[int, ...], int, int]]:
+  return [_read_tensor_info(handle) for _ in range(count)]
+
+def _alignment(metadata: dict[str, Any]) -> int:
+  alignment = metadata.get("general.alignment", 32)
+  if type(alignment) is not int or alignment <= 0 or alignment & (alignment - 1):
+    raise ValueError(f"invalid GGUF alignment: {alignment!r}; expected a positive power of two")
+  return alignment
+
+def _data_start(handle, metadata: dict[str, Any]) -> int:
+  return _round_up(handle.tell(), _alignment(metadata))
+
+def _tensor_nbytes(n: int, ggml_type: int) -> int:
+  if ggml_type in _NATIVE_DTYPES: return n * _NATIVE_DTYPES[ggml_type].itemsize
+  if ggml_type in QUANT_BLOCK_BYTES:
+    if n % GGML_BLOCK_SIZE != 0:
+      raise ValueError(f"tensor has {n} values, not a whole number of quant blocks")
+    return n // GGML_BLOCK_SIZE * QUANT_BLOCK_BYTES[ggml_type]
+  raise ValueError(f"unsupported GGML type: {ggml_type}")
+
+def _tensor_range(info: tuple[str, tuple[int, ...], int, int], data_start: int, file_size: int,) -> tuple[int, int]:
+  name, dims, ggml_type, offset = info
+  if not 1 <= len(dims) <= 4 or any(type(d) is not int or d <= 0 for d in dims):
+    raise ValueError(f"tensor {name!r} has invalid dimensions: {dims}")
+  if offset < 0: raise ValueError(f"tensor {name!r} has negative offset")
+  if ggml_type in QUANT_BLOCK_BYTES and dims[0] % GGML_BLOCK_SIZE:
+    raise ValueError(f"tensor {name!r} row width {dims[0]} is not a multiple of {GGML_BLOCK_SIZE}")
+  n = math.prod(dims)
+  nbytes = _tensor_nbytes(n, ggml_type)
+  start = data_start+offset
+  end = start+nbytes
+  if end > file_size: raise ValueError(f"tensor {name!r} extends beyond the GGUF file")
+  return start, end
+
+def _q_to_uint8(data: Tensor, bits: int) -> Tensor:
+  shifts = Tensor.const(tuple(2**(i*bits) for i in range(8//bits)), dtype=data.dtype)
+  bitmask = 0xFF >> (8-bits)
+  return (data.unsqueeze(-1).div(shifts, rounding_mode="trunc").bitwise_and(bitmask).transpose(-1, -2).flatten(-2))
+
+def _q4_scales(blocks:Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+  d = blocks[:, 0:2].bitcast(dtypes.float16).cast(dtypes.float32)
+  dmin = blocks[:, 2:4].bitcast(dtypes.float16).cast(dtypes.float32)
+  packed = blocks[:, 4:16]
+  scales = packed[:, 0:4].bitwise_and(63).cat(packed[:, 8:12].bitwise_and(15).bitwise_or(packed[:, 0:4].rshift(6).lshift(4),), dim = -1)
+  minimums = packed[:, 4:8].bitwise_and(63).cat(packed[:, 8:12].rshift(4).bitwise_or(packed[:, 4:8].rshift(6).lshift(4),), dim = -1)
+  return d, dmin, scales, minimums
+
+def _dequant_q4_k(data: Tensor) -> Tensor:
+  blocks = data.reshape(-1, QUANT_BLOCK_BYTES[Q4_K]).contiguous()
+  d, dmin, scales, minimums = _q4_scales(blocks)
+  # Each 32-byte chunk encodes a low-nibble group followed by a high-nibble group.
+  qs = blocks[:, 16:144].reshape(-1, 4, 32)
+  q = Tensor.stack(qs.bitwise_and(15), qs.rshift(4), dim=2).reshape(-1, 8, 32)
+  return (d.unsqueeze(-1) * scales.unsqueeze(-1) * q - dmin.unsqueeze(-1) * minimums.unsqueeze(-1)).flatten()
+
+def _dequant_q6_k(data: Tensor) -> Tensor:
+  blocks = data.reshape(-1, QUANT_BLOCK_BYTES[Q6_K]).contiguous()
+  low = _q_to_uint8(blocks[:, :128].reshape(-1, 2, 64), 4)
+  high = _q_to_uint8(blocks[:, 128:192].reshape(-1, 2, 32), 2).lshift(4)
+  q = (low.bitwise_or(high).bitcast(dtypes.int8) - 32).reshape(-1, 256)
+  scales = blocks[:, 192:208].bitcast(dtypes.int8).unsqueeze(-1).expand(-1, 16, 16).reshape(-1, 256)
+  d = blocks[:, 208:210].bitcast(dtypes.float16).cast(dtypes.float32)
+  return (d * q * scales).flatten()
 
 def _dequant(data: Tensor, n: int, ggml_type: int) -> Tensor:
-  """Return a lazy tensor of ``n`` values for a raw GGUF byte slice ``data``.
+  """Build decoding math over exact resident packed bytes; do not realize weights."""
+  expected = _tensor_nbytes(n, ggml_type)
+  if data.dtype != dtypes.uint8: raise ValueError("packed GGUF data must have uint8 dtype")
+  if data.numel() != expected: raise ValueError(f"expected {expected} packed bytes, got {data.numel()}")
+  if data.device.split(":")[0].upper() == "DISK": raise ValueError("transfer packed GGUF bytes to a compute device before decoding")
+  if ggml_type in _NATIVE_DTYPES: return data.contiguous().bitcast(_NATIVE_DTYPES[ggml_type])
+  if ggml_type == Q4_K: return _dequant_q4_k(data)
+  if ggml_type == Q6_K: return _dequant_q6_k(data)
+  raise ValueError(f"unsupported GGML type: {ggml_type}")
 
-  Native types bitcast directly; quantized types build the block dequant as a
-  lazy expression over the packed bytes (never realized on its own).
+@dataclass(frozen=True)
+class PackedTensor:
+  """Bounded storage plus explicit GGML identity; shape is in logical tensor order."""
+  data: Tensor
+  shape: tuple[int, ...]
+  ggml_type: int
+
+  def to(self, device: str | None = None) -> "PackedTensor":
+    return PackedTensor(self.data.to(device).realize(), self.shape, self.ggml_type)
+
+  def decode(self) -> Tensor:
+    return _dequant(self.data, math.prod(self.shape), self.ggml_type).reshape(self.shape)
+
+def _tensor_from_info(raw: Tensor, info: tuple[str, tuple[int, ...], int, int], data_start: int,
+                      device: str | None = None) -> Tensor:
+  _, dims, ggml_type, _ = info
+  start, end = _tensor_range(info, data_start, raw.numel())
+  return PackedTensor(raw[start:end], tuple(reversed(dims)), ggml_type).to(device).decode()
+
+def _validate_tensor_infos(infos, metadata: dict[str, Any], data_start: int, file_size: int) -> None:
+  if metadata.get("split.count", 1) != 1 or metadata.get("split.no", 0) != 0:
+    raise ValueError("split GGUF files are not supported")
+  alignment = _alignment(metadata)
+  names, ranges = set(), []
+  for info in infos:
+    name, _, _, offset = info
+    if name in names: raise ValueError(f"duplicate tensor name: {name!r}")
+    names.add(name)
+    if offset % alignment: raise ValueError(f"tensor {name!r} offset {offset} is not aligned to {alignment}")
+    start, end = _tensor_range(info, data_start, file_size)
+    ranges.append((start, end, name))
+  ranges.sort()
+  for previous, current in zip(ranges, ranges[1:]):
+    if current[0] < previous[1]: raise ValueError(f"tensor ranges overlap: {previous[2]!r} and {current[2]!r}")
+
+def parse_gguf(path: str | Path) -> tuple[dict[str, Any], dict[str, PackedTensor]]:
+  """Validate a single GGUF and return bounded DISK views without transferring weights."""
+  path = Path(path).resolve()
+  file_size = path.stat().st_size
+  with path.open("rb") as handle:
+    _, tensor_count, metadata_count = _read_header(handle)
+    metadata = _read_metadata(handle, metadata_count)
+    infos = _read_multi_tensor_info(handle, tensor_count)
+    data_start = _data_start(handle, metadata)
+  _validate_tensor_infos(infos, metadata, data_start, file_size)
+  raw = Tensor.empty(file_size, dtype=dtypes.uint8, device=f"disk:{path}")
+  entries = {}
+  for info in infos:
+    name, dims, ggml_type, _ = info
+    start, end = _tensor_range(info, data_start, file_size)
+    entries[name] = PackedTensor(raw[start:end], tuple(reversed(dims)), ggml_type)
+  return metadata, entries
+
+def load_gguf(path: str | Path, device: str | None = None) -> tuple[dict[str, Any], dict[str, Tensor]]:
+  """Stage packed bytes once on the compute device and return lazy FP32 decoding views.
+
+  Native F32 remains F32. Only packed bytes are realized here, never decoded weights.
+  Use parse_gguf() when explicit packed descriptors are needed for custom kernels.
   """
-  raise NotImplementedError  # TODO: F32 bitcast, Q4_K + Q6_K dequant in tinygrad ops
-
-
-def load_gguf(path: str | Path) -> tuple[dict[str, Any], dict[str, Tensor]]:
-  """Parse a GGUF file and return ``(metadata, state_dict)``.
-
-  ``metadata`` carries the ``qwen3.*`` config keys and ``tokenizer.ggml.*``
-  vocab keys. ``state_dict`` maps tensor names to lazy fp16 views:
-  quantized weights are packed views (fused dequant), native weights bitcast.
-  """
-  raise NotImplementedError  # TODO: parse header/kv/infos, disk tensor slices, reshape+cast
+  metadata, entries = parse_gguf(path)
+  return metadata, {name: entry.to(device).decode() for name, entry in entries.items()}
