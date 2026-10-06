@@ -5,7 +5,7 @@ them out. The module layout mirrors tinygrad's own ``tinygrad/llm`` package:
 
   gguf.py      — own GGUF parser (packed quantized views, no fp16 round-trip)
   tokenizer.py — tinygrad tokenizer adapter + streaming decode + Qwen3 chat template
-  model.py     — Qwen3 forward/decode/generate with an internal KV cache
+  model.py     — validated tinygrad Transformer adapter + bounded generation
   kernels/     — custom decode kernels (Q4_K/Q6_K GEMV)
   cli.py       — single-shot, chat, and benchmark driver
 """

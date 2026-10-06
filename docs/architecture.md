@@ -1,94 +1,82 @@
 # Architecture
 
-Infurnace is a single-user local LLM runner on tinygrad. It exists to run one
-model on one GPU, for you, as fast as possible — deliberately in the shape of
-tinygrad's `tinygrad/llm` package and `examples/llama.py`.
+Infurnace is a single-user local Qwen3 application **on tinygrad**. It validates
+local GGUF input, adapts tinygrad's transformer/tokenizer, and provides a small
+CLI. It is not a second transformer implementation or a serving framework.
 
-This is the target design, not the current implementation status. See the
-[roadmap](roadmap.md) for completed work and verification gates.
+## Ownership
 
-## Goal
-
-- **Single user, single GPU.** No server, no batching, no scheduling.
-- **Few files.** Every file has one job.
-- **Fast decode.** The quantized GEMV kernel stays; serving infrastructure does not.
-- **Built on tinygrad.** Infurnace owns GGUF parsing and model execution;
-  tokenization reuses `tinygrad.llm.cli.SimpleTokenizer` through a thin validated
-  Qwen2 adapter. No duplicate BPE engine.
-
-## Module responsibilities
-
-| File | Job |
+| Module | Responsibility |
 |---|---|
-| `gguf.py` | Validate GGUF, stage packed bytes on the selected device, return metadata and lazy dequant views |
-| `tokenizer.py` | Tinygrad tokenizer adapter + metadata validation; bundled Qwen3 text-only chat rendering |
-| `model.py` | `Qwen3Config` + `Qwen3Model`: prefill (`forward`), decode, and the `generate` loop; owns the KV cache |
-| `kernels/quant_gemv.py` | NV decode GEMV over packed Q4_K/Q6_K weights (self-contained, device-specific) |
-| `cli.py` | Single-shot / chat / benchmark driver |
+| `gguf.py` | Preflight validation, bounded DISK descriptors, device staging and lazy decoding |
+| `model.py` | Qwen3 metadata/shape contract, tinygrad config/state loading, bounded generation |
+| `tokenizer.py` | SimpleTokenizer adapter and bundled text-only Qwen3 chat rendering |
+| `cli.py` | Single-shot/chat, UTF-8 streaming, interruption and baseline benchmark reporting |
+| `kernels/quant_gemv.py` | Opt-in NV single-token GEMV; generic fallback and shared packed storage |
 
-## Data flow
+Tinygrad owns transformer blocks, Q/K normalization, RoPE, attention, FFN,
+KV-cache writes, prefix reuse, chunked prefill, sampling and TinyJit. Infurnace
+uses the pinned `Transformer` and its state loader rather than reproducing math.
 
-```
-GGUF file
-  │  gguf.load_gguf()
-  ▼
-(metadata, state_dict)
-  │              │
-  │              ├─ model.config_from_gguf()  → Qwen3Config
-  │              └─ Qwen3Model (linear weights = lazy fp16 views over resident packed bytes)
-  │
-  ▼
-tokenizer.Tokenizer.from_gguf(metadata)
-  │
-  ▼
-cli: tokenizer.encode(prompt) → model.generate(ids) → tokenizer.stream_decoder() → stdout
+## Loading
+
+```text
+GGUF → parse/validate metadata and descriptors
+     → validate Qwen3 config and weight shapes
+     → transfer packed bytes once to explicit CPU/NV device
+     → lazy decoded views, FP16 casts (same cast for tied weights)
+     → tinygrad TransformerConfig + Transformer + load_state_dict(realize=False)
 ```
 
-## Key decisions
+No whole-model FP16 realization is requested. This does not promise that every
+consumer fuses decoding: measure schedules and memory. DISK is storage only.
+The custom loader remains while its stricter validation/storage control is
+useful; replacing it with preflight checks plus upstream loading is an option.
 
-### GGUF: packed views, not dequantized weights
+## Generation and state
 
-Parse bounded DISK byte views, then copy packed bytes to the selected compute
-device before constructing lazy dequant expressions. DISK is storage, not a
-dequant execution backend. Keep native F32 at the loader boundary; the model
-selects compute dtypes. Packed bytes may be realized once, decoded model-wide
-weights must not be.
+`Qwen3Model.generate()` validates inputs, copies the prompt list, bounds output
+by token/context limits, and delegates to upstream generation. Upstream samples
+and synchronizes each token before returning its Python integer. Temperature
+zero follows upstream sampling semantics (temperature is clamped internally).
 
-The NV decode path should read the same resident bytes through validated
-`quant_gemv.packed_weight` extraction or explicit packed descriptors. This
-avoids dequant → fp16 → re-extract. Laziness does **not** guarantee fusion:
-measure embedding/prefill schedules and peak memory, bounding per-layer/tiled
-dequantization if needed. Token chunking alone cannot fix retained full weights.
+The device Context is active only while advancing upstream generation, not
+while yielding to application code. Only one stream may be active per model;
+callers must close abandoned generators. Reset invalidates upstream's cached
+prefix, not the allocated KV tensors or captured programs. Prefix reuse is
+upstream token-based behavior; changed chat formatting may reduce reuse.
 
-Supported scope is F32, Q4_K, and Q6_K; implementation is tracked in the
-[GGUF roadmap](gguf-roadmap.md).
+The CLI checks EOS, closes streams and flushes incremental UTF-8 decoding at all
+exit paths. Chat reserves response space by dropping oldest complete turns
+with a notice; it rejects an individual oversized message without changing
+history. Default chat generation runs until EOS or remaining context rather
+than an artificial response cap. Explicit --max-tokens remains available. `--prompt` is raw text; `--chat` uses the
+bundled Qwen3 template. Thinking is on by default, configurable with
+`--no-thinking`. Tools and non-text content are unsupported.
 
-### KV cache lives inside the model
+## Baseline and optimization
 
-A contiguous fp16 tensor `[layers, 2, context, kv_heads, head_dim]`, allocated
-by the model. No slots, no paging, no pool, no `clear_slot`/`move_slot`.
-Cap context before allocation. Start with correct eager writes and reads;
-then capture decode with SSA `uop.store`/`uop.after` and a bound
-`UOp.variable("position", ...)`, so one graph replays across positions.
-Track only valid cache entries; exact-prefix reuse comes after reset-based
-generation is correct.
+The baseline disables custom quantized linears and uses generic tinygrad ops on
+NV. `--nv-quant` installs linear adapters using explicit GGUF descriptors:
+concrete single-token inputs use GEMV, multi-token inputs use the original
+linear. The final output projection may use GEMV during prefill because it
+projects only the last token. Packed typed storage is prepared once and shared
+with the generic dequant expression. Activation Q8 changes numerical behavior;
+this remains experimental pending full-model quality and longer-context evaluation.
+The CLI now selects a usable GPU by preference (NV, AMD, Metal, CUDA, CL), then
+CPU, respecting explicit --device/DEV overrides. Supported NV/CUDA-C devices
+use the fast path automatically; --no-nv-quant restores generic operations.
+This is not an exhaustive fastest-device benchmark or model-fit guarantee.
 
-### Sampling is inline
+Benchmarks report cold/warm first-token and decode timings, actual counts, host
+peak RSS and tinygrad current allocated memory. First-token time includes
+prefill/output work and cold compilation; the derived prefill rate is not a
+pure transformer-prefill measurement. GPU peak polling and comparisons with
+upstream/llama.cpp are separate measurements, not implied by the CLI counters.
 
-Greedy argmax at temperature 0, Gumbel-max otherwise — inside `generate`, not a
-`Sampler` abstraction.
+## Scope
 
-### What was removed
-
-The old serving layer is gone: `engine/`, `scheduler/`, `cache/block_pool.py`
-(paged KV), `executor/` (abstract Runner + tinygrad executor), `models/`
-(manifest/pinning), `sampler/`, and the tokenizer wrapper modules. Removing the
-manifest means no strict artifact pinning — `gguf.py` parses whatever the file
-says (tinygrad-style flexibility).
-
-## Dependencies
-
-`tinygrad` only at runtime. Parse header/offset bookkeeping in plain Python;
-stage packed tensor data from tinygrad `disk:` tensors to the compute device.
-Reference LLM implementations and tokenizer/template tooling are development
-oracles, not runtime dependencies.
+Runtime dependency: pinned tinygrad. Development tests use Jinja as the actual
+GGUF-template oracle and optionally llama.cpp for tokenizer parity. No server,
+scheduler, batching or multi-GPU. Evaluate the upstream server before adding a
+thin localhost adapter for Pi. See [roadmap](roadmap.md) for gates and status.

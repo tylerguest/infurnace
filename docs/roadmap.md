@@ -1,177 +1,258 @@
 # Roadmap
 
-## Focus and current state
+Build a small **local Qwen3 application on tinygrad**, not a second inference
+engine. Target: bundled Qwen3-4B Q4_K_M on the 8 GB RTX 5060, one user/model/GPU.
+Reuse upstream transformer/tokenizer/JIT; own narrow, measured improvements.
+No scheduler, request batching, multi-GPU or model-family expansion.
 
-Build a reliable **single-user, single-GPU local Qwen3 runner** first. Target:
-`models/Qwen3-4B-Q4_K_M.gguf` on the 8 GB RTX 5060; CPU is the correctness
-fallback. No server, scheduler, batching, multi-GPU, or additional model families.
+## Working foundations
 
-| Phase | Status |
+- [x] Validated GGUF descriptors, packed staging and lazy F32/Q4_K/Q6_K decoding;
+  Qwen3 config/shape validation, tied weights, context cap and KV estimate.
+- [x] Tinygrad Transformer integration and tokenizer adapter; sampled tokenizer
+  parity with llama.cpp and bundled chat-template parity with Jinja.
+- [x] Local CLI, automatic usable-device selection, default NV acceleration on
+  supported devices, thinking, startup warmup and `--no-nv-quant` fallback.
+- [x] Chat runs until EOS/remaining context unless explicitly capped; visible
+  oldest-turn rollover and token/context stop notices.
+- [x] CPU integration tests, isolated NV eager/JIT/Q8-reference tests, generic
+  multi-token fallback and bundled-model NV generation smoke tests.
+- [x] Short benchmark: ~93–94 accelerated vs ~10.75 generic decode tok/s.
+  Wrapper vs the same upstream Transformer adds no meaningful overhead.
+
+These are working foundations, **not full-model quality or long-session gates**.
+See [baseline](baseline.md) for settings and limitations: 8 prompt tokens,
+20 generated tokens, allocated context 2048. That is NOT decode at 2048 active
+cached tokens. Current tinygrad allocation is not process GPU peak.
+
+## What the code review establishes
+
+Reviewed installed tinygrad pin `ce9c84605e94de9667fb578c1ff3fa8678725a87`
+and sibling `tinygrad/` checkout `bec565d15786115279fe869e437f3b43b1e80010`.
+They are different runtimes; this review does not upgrade the dependency.
+
+| Code | Finding and implication |
 |---|---|
-| 1. Small module layout / removal of serving infrastructure | Done |
-| 2. GGUF loading | CPU quantized loading works; remaining fixture coverage and GPU/storage integration tracked below |
-| 3. Qwen3 configuration and tokenizer | Config/weights, tokenizer adapter, and bundled text-only chat rendering implemented |
-| 4. Correct eager inference | Stubs |
-| 5. Validated NV kernels and JIT decode | Q4_K/Q6_K eager/JIT kernel tests pass on NV; model integration pending |
-| 6. Usable CLI and measured local performance | Argument parsing only |
+| `infurnace/kernels/quant_gemv.py` | Separate activation quantization, packed GEMV and partial-sum reduction. Q4 recomputes activation sums for every output row; Q6 unpacks/repackages individual bytes. One 32-thread block per output/chunk. |
+| `infurnace/model.py::_NVLinear` | 253 eligible linears; explicit packed identity and generic/fast storage sharing. Only concrete single-token inputs accelerate; prefill remains generic except the last-token output head. |
+| `tinygrad/llm/kernels/amd.py` | Reusable designs: quantize each activation once, precompute activation sums, wordwise quant math, grouped output rows, tiled prefill and online-softmax attention. Some improvements already exist in our pin. Newer Q6 uses native 210-byte blocks via halfword storage instead of padded copies. These are AMD implementations, not drop-in NV kernels. |
+| `tinygrad/llm/model.py` | Separate prefill/decode JITs already exist. Every prefill chunk computes output logits and sampling even when its result is discarded. NV Qwen3 uses generic attention; the AMD flash dispatch is also restricted to hybrid models. |
+| `tinygrad/engine/jit.py`, NV runtime | The pin already batches supported captured work into graphs. Newer upstream has substantial HCQ2/runtime changes. Profile replay/dispatch before proposing another graph layer or assuming an upgrade is faster. |
+| `infurnace/cli.py`, `benchmarks/compare.py` | Existing timing is a smoke baseline; comparison script measures wrapper overhead, not independent engines. No per-kernel bottleneck attribution yet. |
 
-Current verification: **162 CPU tests pass; model/reference and NV tests are opt-in; Ruff
-passes.** All 398 bundled tensors load as lazy FP32 views on CPU, with sampled
-Q4_K/Q6_K parity. The opt-in test took 8.46 s wall time with ~4.8 GiB peak RSS
-(including file-backed storage and resident packed bytes); this is not an
-isolated load benchmark. Model execution is still unimplemented.
-After upgrading tinygrad and fixing custom-UOp syntax, typed operands, and
-NV offset-buffer handling, all four NV eager/JIT parity tests pass on the
-RTX 5060. Run `DEV=NV INFURNACE_TEST_NV=1 .venv/bin/python -m pytest -q
- tests/test_tinygrad_compat.py` on one line. No end-to-end inference works yet.
+These are source-level optimization candidates, not measured speedups.
 
-## 2 — Finish GGUF loading (next)
+## The bandwidth budget
 
-- [x] V2/v3 header, typed metadata/arrays, descriptors, aligned data start.
-- [x] F32 bitcast/views, reversed logical shapes, packed-size calculation.
-- [x] Duplicate tensor-name and end-of-file range checks.
-- [x] Exact reads and validation of metadata types, dimensions, row block
-  geometry, alignment, tensor ranges/overlaps, and unsupported split files.
-  All 398 bundled descriptors pass validation before tensor allocation.
-- [x] Q4_K/Q6_K lazy dequantization, scalar/reference parity, and packed-size tests.
-- [x] Explicit storage path: `parse_gguf()` returns bounded DISK `PackedTensor`
-  descriptors; `load_gguf(path, device=...)` realizes packed bytes, not weights.
-- [x] Explicit packed type/shape and bounded byte view for future decode wiring;
-  kernel integration remains Phase 5 (do not infer identity from byte count).
-- [ ] Complete scalar-metadata/custom-alignment/truncation fixture coverage and
-  separate load/transfer memory measurements; GPU staging is not verified yet.
+CPU-only inspection of the bundled GGUF descriptors gives **2,490,539,520 bytes**
+of packed linear weights per ordinary decode step, counting the tied output
+matrix once. This excludes metadata/file padding, tiny norms, embedding lookup,
+activations and scratch traffic. It is a useful minimum-work model, not a hardware
+DRAM counter: repeated loads and cache behavior must be profiled.
 
-**Gate:** load all 398 bundled tensors (145 F32, 216 Q4_K, 37 Q6_K), match
-reference metadata/shapes/decoded samples, and show no whole-model float
-materialization. Implementation details: [GGUF roadmap](gguf-roadmap.md).
+- Q4_K: **1.765 GB / 70.9%**; Q6_K: **0.725 GB / 29.1%**.
+- FFN gate/up/down: **65.4%** of linear weight bytes; output head: **12.8%**.
+  Prioritize those shapes, not just small attention projections.
+- FP16 KV storage is **147,456 bytes per cached token** across all 36 layers.
+  An efficient decode attention pass ideally reads K/V once per step, sharing
+  each KV head across its four query heads. Generic GQA may incur extra traffic.
 
-## 3 — Lock down the Qwen3 contract
+Assuming the advertised **448 GB/s**, weights plus one active-KV read imply:
 
-- [x] Implement `config_from_gguf()`; reject unsupported architectures/features
-  and inconsistent dimensions before allocation.
-- [x] Use explicit key/value lengths, not `embedding_length / head_count`.
-  This file has embedding 2560, 32 query heads, 8 KV heads, **head size 128**;
-  query projection width is 4096. Default missing RoPE dimension to head size.
-- [x] Validate required tensor names/shapes, including per-head Q/K norms.
-  When `output.weight` is absent, share `token_embd.weight` (this file is tied).
-- [x] Honor `max_context`: positive, capped by model context; estimate KV bytes
-  before allocation. At 2048 tokens this model's FP16 KV cache is 288 MiB;
-  the advertised 40960-token context alone needs 5.625 GiB.
-- [x] Reuse tinygrad `SimpleTokenizer` behind a thin adapter. Packaging is fixed;
-  all 14 sampled bundled-Qwen3 prompts match llama.cpp exactly (including digits,
-  Unicode, code, whitespace, and special tokens). This is sampled parity, not
-  proof of compatibility with every Qwen2 vocabulary or input.
-- [x] Adapter: metadata/vocab validation, encode/decode, independent incremental
-  UTF-8 decoders, special tokens, BOS policy, EOS/EOT, and preset. `encode()`
-  returns raw IDs without automatically prepending BOS; callers use `bos_id`.
-  Run tokenizer opt-in fixtures with `INFURNACE_TEST_MODEL`; additionally set
-  `INFURNACE_LLAMA_TOKENIZE` to a llama-tokenize binary for live reference checks.
-- [x] Implement the bundled Qwen3 text-only chat format: system/user/assistant,
-  turn delimiters and optional generation prefix. Thinking defaults on;
-  `enable_thinking=False` appends the template's empty think block. Historical
-  assistant reasoning is omitted before the latest user turn. Seven histories
-  across both thinking/prefix settings match actual GGUF Jinja output (28 cases).
-  Tools/non-text messages are rejected; Jinja is a development oracle only.
+| Active cached tokens | Idealized bytes/step | Bandwidth-only tok/s |
+|---:|---:|---:|
+| Near zero | 2.491 GB | 180 |
+| 512 | 2.566 GB | 175 |
+| 2048 | 2.793 GB | 160 |
+| 4096 | 3.095 GB | 145 |
+| 8192 | 3.698 GB | 121 |
 
-Config gate passed: synthetic invalid-input tests and the opt-in bundled-model
-shape check run before weight staging; factory preserves tied storage. Model
-construction/cache allocation remain stubs. Tokenization reuses tinygrad at
-runtime; own GGUF parsing and model execution remain independent.
+These optimistic estimates omit compute, launch/sync costs, extra memory passes
+and bandwidth inefficiency. Allocated context capacity and active length are
+separate variables. At ~93 tok/s, latency is ~10.75 ms and **weight-equivalent**
+throughput is ~232 GB/s; that is not measured DRAM throughput or proof that the
+remaining time is all memory stalls. The weight-only ideal is ~5.56 ms.
 
-**Gate:** config/shape tests cover this file and invalid inputs; tokenizer IDs
-match an authoritative Qwen/llama.cpp reference on ASCII, Unicode, whitespace,
-digits, and special tokens. Streaming plus final flush equals full decode;
-chat rendering has exact fixtures. Tinygrad's simplified tokenizer is a
-secondary reference, not the sole correctness oracle.
+Measure sustainable large-buffer bandwidth on this GPU. For illustration,
+312 GB/s would give only ~125 tok/s before other costs at short context; the
+kernel comment citing llama.cpp at that bandwidth is not a validated Infurnace
+measurement. Do not promise 180 tok/s, or 500 tok/s through kernel tuning.
 
-## 4 — Make eager inference correct before optimizing
+## 1 — Establish correctness and an attributable performance baseline
 
-- [ ] Implement embedding, attention/FFN RMSNorm, **per-head Q/K RMSNorm**,
-  half-split RoPE, grouped-query attention, residuals, and SwiGLU.
-  Do not apply Llama's GGUF Q/K weight permutation to Qwen3.
-- [ ] Make precision explicit: lazy FP16 linear weights, FP16 KV storage,
-  FP32-sensitive norm/softmax/reduction math. Expose logits for testing; apply
-  final norm/output projection only to the last prompt token.
-- [ ] Own one contiguous KV cache; writes must precede reads. For prefill at
-  nonzero positions use an offset-aware causal mask, not plain `is_causal=True`.
-- [ ] Implement eager single-token decode and bounded chunked prefill using
-  the same block math; never attend to unwritten cache entries.
-- [ ] Implement generation: exact greedy argmax at temperature 0, seeded
-  Gumbel-max otherwise. Validate tokens/temperature/limits, preserve the input
-  list, bound context writes, and stop cleanly on token/context limits.
-  Callers handle EOS and cancellation; start with cache reset per generation.
+Do these together, before changing arithmetic or launch geometry.
 
-**Gate:** on a small deterministic Qwen3-shaped fixture, compare logits and
-valid KV entries to the reference within documented tolerances. Full prefill,
-chunked prefill (including a one-token tail), and token-by-token execution
-agree; repeated requests and context boundaries do not leak stale state.
-CPU tests must work without a GPU or downloading a large checkpoint.
+- [ ] Full-model **teacher-forced logits** on identical token IDs/cache positions:
+  generic vs accelerated, eager vs JIT, chunk boundaries and one-token tails.
+  Obtain logits with a test hook rather than maintain a second transformer.
+  Run models sequentially/in separate processes to fit VRAM.
+- [ ] Separate kernel correctness against Q8-rounded activations from quality
+  changes against generic FP16 weights. The fast path also avoids generic
+  decoded-weight FP16 rounding. Record logit error, top-k agreement and held-out
+  loss/perplexity; document tolerances and test real prompts. Free-running text
+  can diverge after a small logit change; identical prose is not the sole oracle.
+- [ ] Extend benchmarks to 128–256 generated tokens, short/medium/long prompts,
+  and decode near active positions 128/512/2048/4096 (8192 only if memory fits).
+  Allocate room beyond the tested position for generation. Report actual ranges,
+  token IDs, chunk size, sampling, model hash, runtime/driver and GPU state.
+- [ ] Separate load/transfer/compile, pure prefill, TTFT and decode; compare cold
+  processes and repeated warm runs, median/tail inter-token latency and variance.
+  Measure process GPU peak, host peak and steady-state allocation separately;
+  label sampled peaks honestly. Keep EOS policy and prefix reuse explicit.
+- [ ] Use tinygrad profiling to break down Q4/Q6 GEMV, Q8 packing, reductions,
+  norms/FFN, embedding, attention, sampling, transfers and host/device gaps.
+  Inspect generated CUDA/PTX and replay coverage; confirm whether repeated packs,
+  expanded weights or large embedding intermediates survive compilation.
+  Timing runs must also run **without profiler overhead**.
+- [ ] Build shape microbenchmarks from actual descriptors: input widths
+  2560/4096/9728, output widths 1024/2560/4096/9728/151936, each applicable type.
+  Include full-sized FFN and Q6 output-head weights. Rotate enough buffers to
+  exceed L2; repeatedly timing a cache-resident tiny matrix is misleading.
+- [ ] Independently compare upstream loading/generation and llama.cpp with the
+  same GGUF, token IDs, active context and GPU placement. Record differences in
+  KV dtype, kernels and sampling instead of implying mathematically identical
+  engines. Measure sustained streaming bandwidth as a separate reference.
 
-## 5 — Validate and integrate fast NV decode
+**Gate:** reproducible latency breakdown, real-shape kernel baselines and a
+numerical/quality regression suite. Rank work by whole-model milliseconds, not
+isolated percentage wins. Fix correctness failures before enabling new paths.
 
-- [x] Fix NV GEMV runtime/API failures; add Q4_K/Q6_K GPU parity tests with
-  Q8-rounded activations, partial final warps, offset views, and TinyJit replay.
-- [ ] Add isolated Q8 quantization tests and broader kernel contract checks.
-- [ ] Guard dispatch by backend/renderer and kernel contract: one-token decode,
-  matching input shape, 256-value weight blocks, packed dtype/length/alignment,
-  and same-device resident buffers. Unsupported cases use the generic path.
-- [ ] Harden `packed_weight()` or pass explicit packed descriptors; reject
-  transformed/permuted weights. Test nonzero offsets, exact-sized buffers,
-  tied weights, negative scales, zero activations, and partial final warps.
-- [ ] Compare kernels against dequantized matmul with **Q8-rounded activations**;
-  separately measure error versus unrounded activations. This fast path adds
-  activation quantization, so bit-identical FP16 results are not the gate.
-- [ ] Capture single-token decode with TinyJit and a bound position UOp;
-  use SSA `store`/`after` for KV writes. Prepare packed buffers outside capture.
-- [ ] Inspect schedules and peak memory for embedding, prefill, and decode.
-  Laziness does not guarantee fusion; chunking tokens does not fix persistent
-  full-weight materialization. Use bounded per-layer/tiled dequantization if
-  needed before adding a custom prefill kernel.
+## 2 — Make the existing packed NV GEMV efficient
 
-**Gate:** eager/JIT and generic/fast-path comparisons pass; replay at changing
-positions and after cache reset needs no per-position compilation or repeated
-weight transfers. The bundled model runs within 8 GB without retaining a
-whole-model FP16 copy. GPU tests are explicitly marked/skipped on CPU-only hosts.
+Highest-value initial experiments, reordered if the profile disagrees:
 
-## 6 — Deliver useful local inference, then measure improvements
+1. **Remove redundant activation work.** Quantize one value per lane and pack
+   with shuffles rather than reloading/requantizing groups. Produce per-16 sums
+   once; Q4 can use their total instead of eight extra `dp4a` sums per group per
+   output row. Test zero inputs, extremes and rounding ties explicitly.
+2. **Improve packed loads and Q6 math.** Vectorize/coalesce Q4 loads and simplify
+   scale extraction. For Q6, operate on packed words and subtract `32*xsum`
+   after dot products rather than rebuilding signed bytes individually. Respect
+   210-byte block alignment: native halfword loads or a deliberately benchmarked
+   padded layout, never an unsafe aligned-u32 assumption. Preserve shared packed
+   storage and account for any repacking cost/extra bytes.
+3. **Tune scheduling by shape.** Compare 2/4/8 warps per block handling neighboring
+   rows, a separate row/chunk grid, and different reduction splits. Today widths
+   2560/4096/9728 produce 3/4/10 partials per row. Test fewer partials or in-block
+   completion against split-K parallelism; removing a reduction kernel is not
+   a win if occupancy collapses. Inspect register pressure/spills and tail lanes.
+4. **Test NV cache policy only with evidence.** Streaming weight loads may protect
+   activations/KV, but AMD's `nontemporal` renderer rule does not implement an NV
+   policy. Evaluate supported CUDA/PTX load policies; verify generated code and
+   both short-/long-context effects. Do not equate wider loads with fewer DRAM bytes.
 
-- [ ] Fix `_build()` to load once and share metadata/weights. Make `--device`
-  effective via tinygrad's device/context API: setting `os.environ['DEV']`
-  after tinygrad import does not update its already-initialized setting.
-- [ ] Implement single-shot streaming and multi-turn chat; flush UTF-8 on EOS,
-  token/context limit, and interruption. Validate conflicting/invalid flags,
-  handle EOF/Ctrl-C, and report context exhaustion without silent truncation.
-- [ ] After reset-based chat is correct, reuse only the exact cached token
-  prefix. Track tokens actually written to KV, not merely emitted tokens;
-  test changed prompts, thinking-template rewrites, and abandoned generation.
-- [ ] Implement reproducible benchmarks: load time, cold/warm time to first
-  token, prefill tokens/sec, steady decode tokens/sec, and peak host/GPU memory.
-  Separate JIT warmup, synchronize timings, and report actual token counts.
-- [ ] Compare against pinned tinygrad and llama.cpp on the same hardware,
-  GGUF, prompt IDs, context, and generation settings. Record versions and
-  repeated runs; optimize measured bottlenecks rather than claim a speedup.
+**Gate per experiment:** kernel and full-model tests pass, repeated end-to-end
+improvement exceeds noise, memory stays within budget. Retain simple per-shape
+choices only when justified; no large autotuning framework. Preserve generic
+fallback and make one change at a time so gains remain attributable.
 
-**Gate:** CLI integration tests and real-model single-shot/chat/benchmark runs
-pass. Publish the benchmark baseline and tradeoffs. "Better" means demonstrated
-local latency/throughput/memory improvements **without losing correctness or
-reliability**, not more server infrastructure.
+## 3 — Remove measured non-weight overhead
 
-## Reference and scope rules
+- [ ] Share activation packing across Q/K/V and across gate/up when inputs are
+  identical. They currently call separate adapters; first verify compiler reuse.
+  If all packs survive, sharing could remove **108 pack calls per step** across
+  36 layers, without reducing weight reads. Use bounded per-forward/capture
+  lifetimes, not an unbounded Python cache keyed by tensor identity.
+- [ ] Fuse proven hot boundaries: RMSNorm→Q8 packing, partial reduction→consumer,
+  or SiLU/gate multiply→down-projection packing. Consider grouped projections
+  only if launch costs justify them. Keep residual/norm rounding testable.
+- [ ] Audit sampling at temperature zero: upstream still constructs Gumbel noise.
+  Propose a true greedy fast path upstream if material, with explicit tie/numeric
+  semantics. Do not silently change the sampler while reporting a kernel speedup.
+- [ ] Confirm captured decode replay has no accidental weight copies, repeated
+  compilation or avoidable CPU synchronizations. `.item()` returns each token;
+  measure that cost before changing streaming/EOS/cancellation behavior.
+- [ ] Benchmark newer tinygrad in an isolated environment if profiling points
+  to runtime overhead or an upstream fix. Port custom UOp APIs and rerun all
+  gates before changing the pin; HCQ2 changes are not a free guaranteed speedup.
 
-- Runtime dependency stays tinygrad only. Reuse `llm/cli.SimpleTokenizer` for
-  tokenization. GGUF/model/kernel code is a development oracle, not a runtime
-  implementation dependency (the upstream tokenizer module transitively imports
-  its model and server). Keep pinned-import regression tests.
-- Current pin: `ce9c84605e94de9667fb578c1ff3fa8678725a87`, including the wheel
-  packaging fix for `tinygrad.llm.kernels`. `Transformer`/`SimpleTokenizer`
-  imports are now covered by a regression test. Tokenizer correctness is still
-  pending; successful import does not establish Qwen3 parity.
-- When upgrading an existing environment, pip may retain tinygrad's same-version
-  wheel. Force reinstall the exact VCS dependency from `pyproject.toml`, then
-  rerun CPU and opt-in NV/JIT tests. Fresh installs use the declared pin.
-- Packed extraction copies compressed bytes to aligned storage once (cache the
-  result outside JIT). Direct offset Buffer views hung on the tested NV runtime;
-  no decoded floating-point weights are copied.
-- **Server deferred until Phase 6 passes.** If needed later, add a thin local
-  adapter over the same generation path, with request validation, cancellation,
-  context limits, and correct streaming. No return to the old serving stack.
+**Ownership:** prefer small upstream hooks/patches or narrow adapters. Do not
+copy Transformer/attention/FFN wholesale just to share a pack or fuse an epilogue.
+
+## 4 — Keep decode fast as context grows
+
+Move this ahead of Phase 3 if attention dominates the target workload.
+
+- [ ] Profile attention vs **active** length and allocated capacity; inspect
+  generic GQA expansion, score/softmax intermediates and actual KV traffic.
+- [ ] If warranted, add a narrow NV decode-attention path using tinygrad UOps:
+  GQA KV reuse, tiled K/V reads, stable online softmax, and split-context combine
+  when needed for occupancy. Start with this model's head dimension 128 and
+  32 query / 8 KV heads. AMD flash kernels are an algorithm reference, not a
+  renderer-only port; NVIDIA scheduling/reduction layouts need separate tuning.
+- [ ] Preserve upstream KV layout, cache writes and prefix rules; validate
+  masking, partial tiles, start-position boundaries, reset and replay. Keep a
+  generic fallback. Avoid quantized KV until FP16 traffic is demonstrably limiting.
+
+**Gate:** correctness plus flatter long-context latency and bounded scratch
+memory. Report short-context regressions; dispatch by workload if justified.
+
+## 5 — Improve prefill and first-token latency separately
+
+Decode tok/s alone does not make chat responsive.
+
+- [ ] First try a small upstream prefill-only hook to skip output projection and
+  sampling for nonfinal chunks while still executing all KV writes. Each skipped
+  head avoids scanning ~319 MB of Q6 weights. Verify final logits/cache parity.
+- [ ] Sweep chunk sizes (e.g. 32/64/128), including partial/one-token tails, warmup
+  and symbolic replay. Measure TTFT, pure prefill, compilation and peak memory.
+- [ ] If generic linears dominate, prototype packed Q4_K/Q6_K **NV tiled GEMM**:
+  decode weight tiles for reuse across prompt tokens, use supported NVIDIA tensor
+  core layouts through tinygrad, and retain generic fallback. AMD WMMA layouts
+  cannot simply be relabeled CUDA. No persistent whole-model FP16 copy.
+- [ ] Optimize embedding lookup only if its scheduled work is material; audit
+  lazy packed-row access before adding another custom kernel.
+
+**Gate:** materially better realistic-prompt TTFT/prefill without decode, quality,
+storage-sharing or memory regressions. Prompt-token tiling is not request batching.
+
+## 6 — Reliability, startup and frontend work
+
+Run reliability checks throughout the performance work, not just at the end.
+
+- [ ] Hundreds of chat turns, rollover, abandoned/interrupted streams, repeated
+  resets and varying warmup/prompt lengths; bounded host/GPU/JIT growth.
+- [ ] Configurable answer-space reservation, reset/context-usage commands and
+  clear OOM/device-failure recovery. State when a fresh process is necessary.
+- [ ] Profile slower accelerated loading separately: parse, packed transfers,
+  typed-view preparation, tokenizer and compilation. Preserve no full FP16 copy,
+  no duplicate ties, and packed-byte lifetime tests. Startup savings are not
+  steady-state decode savings.
+- [ ] Complete GGUF metadata/alignment/truncation/unsupported-input fixtures;
+  retain numerical reference, packed-byte and preallocation validation tests.
+- [ ] After local reliability gates pass, evaluate tinygrad's server before a
+  thin localhost API for Pi. Test streaming, cancellation and errors; defer tools.
+  Optional history summarization is separate from simple visible rollover.
+
+## Execution and stopping rules
+
+1. Next work package: Phase 1 quality harness, benchmark matrix and profile.
+2. Next: the best measured Phase 2 experiment, one independently tested change.
+3. Re-profile; choose Phase 3 or 4 by remaining milliseconds. Treat Phase 5 as
+   a separate TTFT objective. Keep Phase 6 reliability checks running throughout.
+
+Use sustainable measured bandwidth and the best matched engine as reference,
+not advertised bandwidth alone. At short context, 120/140/150 tok/s would require
+~299/349/374 GB/s of weight-equivalent throughput **before** extra traffic.
+These are useful checkpoints, not forecasts. Consider the path near its practical
+ceiling when packed kernels approach measured streaming capability, remaining
+non-weight costs are explained, and successive changes no longer beat noise.
+Keep per-context results; there is no single context-independent ceiling.
+
+Do not chase improvements by rewriting the tokenizer/loader for decode speed,
+adding another scheduler/graph engine, or assuming tensor cores solve M=1 GEMV.
+Smaller/differently quantized models, speculative decoding and quantized KV change
+the assumptions and require separate quality/memory justification; they are not
+shortcuts to this model's ordinary-decode target.
+
+## Maintenance rules
+
+- Keep the exact tinygrad pin until a tested upgrade wins or fixes a needed bug.
+  Force reinstall the VCS dependency if pip retains a same-version older wheel.
+- Keep strict loading while its validation/storage control earns its maintenance
+  cost; revisit preflight validation plus upstream loading later.
+- Direct offset Buffer views previously hung on NV. Do not remove the safe packed
+  storage path without dedicated offset/JIT/lifetime regressions.
+- Preserve `--no-nv-quant`; revisit default enablement on quality/reliability
+  failures. Publish settings, timings and tradeoffs, not unsupported speed claims.
+- [Architecture](architecture.md) describes ownership; this roadmap tracks gates.

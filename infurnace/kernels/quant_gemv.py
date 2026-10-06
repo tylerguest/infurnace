@@ -142,8 +142,15 @@ def quant_gemv(x: Tensor, packed: Tensor, *, out_features: int, in_features: int
   warp-per-output decode kernel, and sums the per-chunk partials.
   """
   if x.dtype not in dtypes.floats: raise QuantGemvError(f"x must be float, got {x.dtype}")
-  if in_features % Q8_GROUP_SIZE != 0: raise QuantGemvError(f"in_features {in_features} not a multiple of 32")
-  if out_features % 16 != 0: raise QuantGemvError(f"out_features {out_features} not a multiple of 16")
+  if ggml_type not in QUANT_SIZES: raise QuantGemvError(f"unsupported quant type {ggml_type}")
+  if in_features <= 0 or in_features % GGML_BLOCK_SIZE: raise QuantGemvError("in_features must be a positive multiple of 256")
+  if out_features <= 0 or out_features % 16: raise QuantGemvError("out_features must be a positive multiple of 16")
+  if not x.shape or x.shape[-1] != in_features: raise QuantGemvError("activation shape does not match in_features")
+  if x.device != packed.device: raise QuantGemvError("activations and packed weights must share a device")
+  expected_dtype = dtypes.uint32 if ggml_type == Q4_K else dtypes.uint8
+  expected_bytes = out_features * in_features // GGML_BLOCK_SIZE * QUANT_SIZES[ggml_type]
+  if packed.dtype != expected_dtype or packed.numel() * packed.dtype.itemsize != expected_bytes:
+    raise QuantGemvError("packed weight dtype/size does not match the quantization contract")
   tokens = int(x.numel()) // in_features
   raw = packed.uop
   xq, xd = q8_quantize(x, tokens, in_features)

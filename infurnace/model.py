@@ -3,9 +3,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Mapping, TypeVar
 import math
-from tinygrad import Tensor, dtypes  # noqa: F401  # used by forward / KV cache (TODO)
-from infurnace.gguf import PackedTensor, parse_gguf
-from infurnace.kernels.quant_gemv import quant_gemv, packed_weight  # noqa: F401  # used by _decode_linear (TODO)
+from tinygrad import Tensor, Context, dtypes
+from tinygrad.llm.model import Transformer, TransformerConfig
+from tinygrad.nn.state import load_state_dict
+from infurnace.gguf import PackedTensor, parse_gguf, _dequant
+from infurnace.kernels.quant_gemv import quant_gemv, QUANT_SIZES
 
 
 @dataclass(frozen=True)
@@ -118,51 +120,148 @@ def prepare_weights(config: Qwen3Config, weights: Mapping[str, _Weight]) -> dict
   return prepared
 
 
+def transformer_config(config: Qwen3Config) -> TransformerConfig:
+  return TransformerConfig(
+    num_blocks=config.block_count, dim=config.embedding_length, hidden_dim=config.feed_forward_length,
+    n_heads=config.attention_head_count, n_kv_heads=config.attention_head_count_kv, norm_eps=config.rms_norm_epsilon,
+    vocab_size=config.vocab_size, head_dim=config.key_length, v_head_dim=config.value_length,
+    rope_theta=config.rope_freq_base, rope_dim=config.rope_dimension_count, qk_norm=config.key_length,
+    max_context=config.context_length,
+  )
+
+
+class _NVLinear:
+  """Single-token fast path using explicit GGUF identity, never graph-size guessing."""
+  def __init__(self, original, entry: PackedTensor):
+    self.original = original
+    self.in_features, self.out_features = entry.shape[1], entry.shape[0]
+    self.ggml_type = entry.ggml_type
+    dtype = dtypes.uint32 if entry.ggml_type == 12 else dtypes.uint8
+    # Loader entries are already independent aligned resident byte buffers;
+    # unlike offset graph extraction, they need no second packed-byte clone.
+    self.packed = entry.data.contiguous().bitcast(dtype).flatten().realize()
+    # Generic prefill decodes the same storage; don't retain a second Q4 byte copy.
+    original.weight = _dequant(self.packed.bitcast(dtypes.uint8), self.in_features * self.out_features,
+                              self.ggml_type).reshape(entry.shape).cast(dtypes.float16)
+    self.weight, self.bias = original.weight, original.bias
+
+  def __call__(self, x: Tensor) -> Tensor:
+    if isinstance(x.numel(), int) and x.numel() == self.in_features:
+      result = quant_gemv(x, self.packed, out_features=self.out_features, in_features=self.in_features, ggml_type=self.ggml_type)
+      return result if self.bias is None else result + self.bias
+    return self.original(x)
+
+
 class Qwen3Model:
+  """Thin local runner: tinygrad owns transformer math, cache, generation and JIT."""
   def __init__(self, config: Qwen3Config, weights: Mapping[str, Tensor]):
-    """``weights``: lazy fp16 views keyed by GGUF tensor name.
-    Sanity checks the required tensor names/shapes, precomputes RoPE freqs,
-    and allocates the contiguous fp16 KV cache ``[layers, 2, context, kv_heads, head_dim]``.
-    """
-    raise NotImplementedError  # TODO: validate tensors, rope, KV cache, per-weight packed cache
+    weights = prepare_weights(config, weights)
+    devices = {weight.device for weight in weights.values()}
+    if len(devices) != 1: raise ValueError("all model weights must be on the same compute device")
+    self.device = next(iter(devices))
+    if not isinstance(self.device, str) or self.device.startswith("DISK:"):
+      raise ValueError("model weights must be on a single compute device")
+    self.config, self.metadata = config, {}
+    self._generating = False
+    with Context(DEV=self.device):
+      self.transformer = Transformer(transformer_config(config))
+      # Cast each identity once: embedding/output stay tied even after dtype conversion.
+      casts = {}
+      state = {}
+      for name, weight in weights.items():
+        if name == "rope_freqs.weight": continue
+        if id(weight) not in casts: casts[id(weight)] = weight.cast(dtypes.float16)
+        state[name] = casts[id(weight)]
+      load_state_dict(self.transformer, state, verbose=False, realize=False)
+      # Baseline uses generic tinygrad linears; custom NV integration is a later phase.
+      self.transformer.output.use_custom_quant = False
+      for block in self.transformer.blk:
+        for name in ("attn_q", "attn_k", "attn_v", "attn_output", "ffn_gate", "ffn_up", "ffn_down"):
+          getattr(block, name).use_custom_quant = False
 
   @classmethod
-  def from_gguf(cls, path: str | Path, max_context: int | None = None) -> "Qwen3Model":
+  def from_gguf(cls, path: str | Path, max_context: int | None = None, device: str | None = None, *, nv_quant: bool = False) -> "Qwen3Model":
     """Load a GGUF, derive the config, and build the model. ``max_context`` caps
     the KV cache (defaults to the model's context length)."""
     metadata, entries = parse_gguf(path)
     config = config_from_gguf(metadata, max_context)
     entries = prepare_weights(config, entries)
-    tensors = {}
+    tensors, resident = {}, {}
     for name, entry in entries.items():
       # Preserve the alias rather than copying/decoding tied embedding bytes twice.
       if name == "output.weight" and entry is entries["token_embd.weight"]:
         tensors[name] = tensors["token_embd.weight"]
+        resident[name] = resident["token_embd.weight"]
       else:
-        tensors[name] = entry.to().decode()
-    return cls(config, tensors)
+        resident[name] = entry.to(device) if device is not None else entry.to()
+        tensors[name] = resident[name].decode()
+    result = cls(config, tensors)
+    result.metadata = metadata
+    if nv_quant: result._enable_nv_quant(resident)
+    return result
 
-  def _decode_linear(self, x: Tensor, name: str) -> Tensor:
-    """Decode matmul for weight ``name``: packed Q4_K/Q6_K GEMV when possible,
-    generic fp16 ``x.linear(w.transpose())`` fallback otherwise."""
-    raise NotImplementedError  # TODO: packed_weight + quant_gemv, fall back to _linear
+  def _enable_nv_quant(self, entries: Mapping[str, PackedTensor]) -> None:
+    from tinygrad import Device
+    from tinygrad.renderer.cstyle import CUDARenderer
+    if self.device.split(":")[0] != "NV" or not isinstance(Device[self.device].renderer, CUDARenderer):
+      raise ValueError("--nv-quant requires NV with the CUDA C renderer")
+    self.nv_quant_linears = 0
+    for name, entry in entries.items():
+      if entry.ggml_type not in QUANT_SIZES or len(entry.shape) != 2 or name == "token_embd.weight": continue
+      if entry.shape[1] % 256 or entry.shape[0] % 16: continue
+      if name == "output.weight": owner, attribute = self.transformer, "output"
+      elif name.startswith("blk."):
+        _, layer, attribute, _ = name.split(".")
+        owner = self.transformer.blk[int(layer)]
+      else: continue
+      setattr(owner, attribute, _NVLinear(getattr(owner, attribute), entry))
+      self.nv_quant_linears += 1
 
-  def forward(self, input_ids: Tensor, start_position: int = 0) -> Tensor:
-    """Eager prefill: embed -> blocks -> logits for the last token, writing
-    K/V into the internal cache at ``[start_position, start_position+seq_len)``."""
-    raise NotImplementedError  # TODO: rmsnorm, rope, scaled_dot_product_attention, KV writes
+  def warmup(self) -> None:
+    """Prime upstream prefill/decode JIT using the same chunk size as normal generation."""
+    if self.config.context_length < 2: return
+    prompt = [0] * min(2, self.config.context_length - 1)
+    count = min(4, self.config.context_length - len(prompt))
+    try:
+      # First calls execute, second calls capture, third calls verify replay.
+      for _ in range(3):
+        stream = self.generate(prompt, count, reuse_cache=False)
+        try:
+          for _ in stream: pass
+        finally: stream.close()
+    finally:
+      self.reset()  # No dummy tokens become conversation history or reusable prefix.
 
-  def decode(self, input_ids: Tensor, position: int) -> Tensor:
-    """Single-token decode at cache ``position``. TinyJit-captured with a
-    symbolic ``Variable("position")`` and SSA ``uop.store``/``uop.after`` KV
-    writes so one compiled program replays for every position."""
-    raise NotImplementedError  # TODO: _decode_step + TinyJit capture (port from old executor runner)
+  def reset(self) -> None:
+    """Invalidate prefix reuse without reallocating tinygrad's cache or JIT."""
+    if self._generating: raise RuntimeError("cannot reset during generation")
+    self.transformer._cached_tokens = []
 
-  def generate(self, tokens: list[int], max_new_tokens: int, temperature: float = 0.0) -> Iterator[int]:
-    """Prefill ``tokens`` then yield generated token ids until ``max_new_tokens``.
+  def generate(self, tokens: list[int], max_new_tokens: int, temperature: float = 0.0, *,
+               chunk_size: int = 32, reuse_cache: bool = True) -> Iterator[int]:
+    """Bound upstream generation; callers check EOS and must close abandoned streams.
 
-    Sampling: greedy argmax for ``temperature == 0``, otherwise Gumbel-max
-    (same as ``tinygrad.llm.model.Transformer.forward``). Callers check
-    ``tokenizer.is_end`` on yielded ids to stop at EOS.
+    Sampling and prefix reuse are upstream behavior. Context exhaustion bounds
+    output; an already-full prompt is rejected, never silently truncated.
     """
-    raise NotImplementedError  # TODO: prefill -> sample -> decode loop
+    if self._generating: raise RuntimeError("only one generation may run at a time")
+    if not isinstance(tokens, list) or not tokens: raise ValueError("prompt must contain at least one token")
+    if any(type(t) is not int or not 0 <= t < self.config.vocab_size for t in tokens): raise ValueError("invalid prompt token ID")
+    if type(max_new_tokens) is not int or max_new_tokens < 0: raise ValueError("max_new_tokens must be a nonnegative integer")
+    if type(chunk_size) is not int or chunk_size <= 0: raise ValueError("chunk_size must be a positive integer")
+    if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or not math.isfinite(temperature) or temperature < 0:
+      raise ValueError("temperature must be finite and nonnegative")
+    if len(tokens) >= self.config.context_length: raise ValueError("prompt exceeds available context; shorten history or increase --max-context")
+    if not reuse_cache: self.reset()
+    count = min(max_new_tokens, self.config.context_length - len(tokens))
+    if count == 0: return
+    self._generating = True
+    stream = self.transformer.generate(list(tokens), chunk_size=chunk_size, temperature=float(temperature))
+    try:
+      for _ in range(count):
+        # Do not leave a device context active while yielding control to a caller.
+        with Context(DEV=self.device): token = next(stream)
+        yield token
+    finally:
+      stream.close()
+      self._generating = False
