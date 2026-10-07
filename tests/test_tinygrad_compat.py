@@ -6,8 +6,8 @@ import pytest
 from tinygrad import Tensor, TinyJit, dtypes
 
 from infurnace.gguf import _dequant, PackedTensor
-from infurnace.model import _NVLinear
-from infurnace.kernels.quant_gemv import packed_weight, quant_gemv, QuantGemvError
+from infurnace.model import _NVLinear, Qwen3Model
+from infurnace.kernels.quant_gemv import quant_gemv, QuantGemvError
 
 
 def test_llm_imports():
@@ -25,6 +25,12 @@ def test_kernel_invalid_geometry(width, rows, typ):
                out_features=rows, in_features=width, ggml_type=typ)
 
 
+def test_q6_rejects_byte_storage():
+  with pytest.raises(QuantGemvError, match="dtype/size"):
+    quant_gemv(Tensor.ones(1, 256, device="CPU"), Tensor.empty(16*210, dtype=dtypes.uint8, device="CPU"),
+               out_features=16, in_features=256, ggml_type=14)
+
+
 def test_kernel_rejects_packed_size():
   with pytest.raises(QuantGemvError, match="dtype/size"):
     quant_gemv(Tensor.ones(1, 256, device="CPU"), Tensor.empty(1, dtype=dtypes.uint32, device="CPU"),
@@ -33,7 +39,37 @@ def test_kernel_rejects_packed_size():
 
 @pytest.mark.skipif(not os.environ.get("INFURNACE_TEST_NV"), reason="set INFURNACE_TEST_NV=1 on an NV GPU")
 @pytest.mark.parametrize("typ,size", [(12, 144), (14, 210)])
-@pytest.mark.parametrize("width", [256, 1280])
+@pytest.mark.parametrize("tied", [True, False])
+def test_nv_adapter_preserves_embedding_ties(typ, size, tied):
+  from types import SimpleNamespace
+  from tinygrad import nn
+  raw = Tensor(bytes(16*size), dtype=dtypes.uint8, device="NV").realize()
+  output_entry = PackedTensor(raw, (16, 256), typ)
+  embedding_entry = output_entry if tied else PackedTensor(
+    Tensor(bytes(16*size), dtype=dtypes.uint8, device="NV").realize(), (16, 256), typ)
+  embedding = SimpleNamespace(weight=embedding_entry.decode().half())
+  old_embedding = embedding.weight
+  output = nn.Linear(256, 16, bias=False)
+  output.weight = old_embedding if tied else output_entry.decode().half()
+  runner = object.__new__(Qwen3Model)
+  runner.device = "NV"
+  runner.transformer = SimpleNamespace(output=output, token_embd=embedding, blk=[])
+  runner._enable_nv_quant({"token_embd.weight": embedding_entry, "output.weight": output_entry})
+  adapter = runner.transformer.output
+  if tied:
+    assert embedding.weight.uop is adapter.weight.uop
+    # Every resident buffer reachable through the embedding is on adapter storage.
+    from tinygrad.uop.ops import Ops
+    bases = {u.buffer.base for u in embedding.weight.uop.toposort() if u.op is Ops.BUFFER}
+    assert bases == {adapter.packed.uop.buffer.base}
+  else:
+    assert embedding.weight is old_embedding
+    assert embedding.weight.uop is not adapter.weight.uop
+
+
+@pytest.mark.skipif(not os.environ.get("INFURNACE_TEST_NV"), reason="set INFURNACE_TEST_NV=1 on an NV GPU")
+@pytest.mark.parametrize("typ,size", [(12, 144), (14, 210)])
+@pytest.mark.parametrize("width", [256, 1280, 2560])
 def test_nv_quant_eager_and_jit(typ, size, width):
   rng = random.Random(7)
   rows = 16
@@ -42,12 +78,10 @@ def test_nv_quant_eager_and_jit(typ, size, width):
   for b in range(block_count):
     if typ == 12: data[b*size:b*size+4] = struct.pack("<ee", 0.001, 0.0002)
     else: data[(b+1)*size-2:(b+1)*size] = struct.pack("<e", 0.001)
-  # Exercise the nonzero-offset extraction path that previously hung on NV.
+  # Explicit packed storage; copy offset bytes safely rather than use graph extraction.
   raw = Tensor(bytes(4)+bytes(data), dtype=dtypes.uint8, device="NV").realize()[4:]
-  extracted = packed_weight(_dequant(raw, rows*width, typ).reshape(rows, width).half())
-  assert extracted is not None
-  packed, extracted_type = extracted
-  assert extracted_type == typ
+  packed_dtype = dtypes.uint32 if typ == 12 else dtypes.uint16
+  packed = raw.contiguous().bitcast(packed_dtype).clone().flatten().realize()
   weights = _dequant(Tensor(bytes(data), dtype=dtypes.uint8, device="CPU"), rows*width, typ).reshape(rows, width).tolist()
   def run(x): return quant_gemv(x, packed, out_features=rows, in_features=width, ggml_type=typ)
   jit = TinyJit(run)
@@ -69,6 +103,9 @@ def test_nv_quant_eager_and_jit(typ, size, width):
   original = nn.Linear(width, rows, bias=False)
   original.weight = _dequant(resident, rows*width, typ).reshape(rows, width).half()
   adapter = _NVLinear(original, PackedTensor(resident, (rows, width), typ))
+  assert adapter.packed.dtype == packed_dtype
+  assert adapter.packed.numel()*adapter.packed.dtype.itemsize == len(data)  # No Q6 padding/repacking.
+  assert adapter.packed.bitcast(dtypes.uint8).tolist() == list(data)
   assert adapter(Tensor.ones(1, width, device="NV")).tolist()[0] == pytest.approx(
     [sum(row) for row in weights], rel=3e-3, abs=2e-3)
   x = Tensor.ones(2, width, device="NV")

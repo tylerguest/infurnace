@@ -9,6 +9,8 @@ import sys
 import time
 from tinygrad.helpers import GlobalCounters
 from infurnace.device import select_device, supports_nv_quant
+from infurnace.kernels.quant_gemm import nv_prefill_supported
+from infurnace.benchmark import DEFAULT_PROMPT_TOKENS, benchmark_prompt_ids, validate_benchmark_context
 from infurnace.model import Qwen3Model
 from infurnace.tokenizer import Tokenizer
 
@@ -26,12 +28,23 @@ def _default_model() -> str:
 _SINGLE_SHOT_MAX_TOKENS = 64
 
 
-def _build(path: str, max_context: int, device: str | None, nv_quant: bool | None = None) -> tuple[Qwen3Model, Tokenizer]:
+def _build(path: str, max_context: int, device: str | None, nv_quant: bool | None = None, *,
+           nv_prefill: bool | None = None, nv_attention: bool = False,
+           nv_fused_attention: bool = False) -> tuple[Qwen3Model, Tokenizer]:
   device = select_device(device)
   enabled = supports_nv_quant(device) if nv_quant is None else nv_quant
   if enabled and not supports_nv_quant(device): raise ValueError("--nv-quant requires NV with the CUDA C renderer")
   kwargs = {"max_context": max_context, "device": device}
   if enabled: kwargs["nv_quant"] = True
+  prefill_enabled = enabled and nv_prefill_supported(device) if nv_prefill is None else nv_prefill
+  if prefill_enabled:
+    if not enabled: raise ValueError("--nv-prefill requires NV quantized acceleration")
+    if not nv_prefill_supported(device): raise ValueError("--nv-prefill requires CUDA-C FP16 tensor cores")
+    kwargs["nv_prefill"] = True
+  if nv_attention or nv_fused_attention:
+    if not enabled: raise ValueError("NV attention requires NV quantized acceleration")
+    if nv_attention: kwargs["nv_attention"] = True
+    if nv_fused_attention: kwargs["nv_fused_attention"] = True
   model = Qwen3Model.from_gguf(path, **kwargs)
   return model, Tokenizer.from_gguf(model.metadata)
 
@@ -133,8 +146,10 @@ def _measure(model: Qwen3Model, ids: list[int], count: int) -> dict:
   }
 
 
-def _run_benchmark(model: Qwen3Model, tokenizer: Tokenizer, count: int, load_seconds: float = 0.0) -> int:
-  ids = _prompt_ids(tokenizer, "Hello, explain what a GPU does.")
+def _run_benchmark(model: Qwen3Model, tokenizer: Tokenizer, count: int, load_seconds: float = 0.0, *,
+                   prompt_tokens: int = DEFAULT_PROMPT_TOKENS, prompt_text: str | None = None) -> int:
+  ids = benchmark_prompt_ids(tokenizer, prompt_tokens, prompt_text)
+  validate_benchmark_context(len(ids), count, model.config.context_length)
   cold = _measure(model, ids, count)
   # Two complete passes capture upstream prefill/decode JIT paths before warm timing.
   _measure(model, ids, count)
@@ -143,7 +158,13 @@ def _run_benchmark(model: Qwen3Model, tokenizer: Tokenizer, count: int, load_sec
   print(json.dumps({
     "model": model.metadata.get("general.name", "Qwen3"), "device": model.device,
     "context": model.config.context_length, "load_seconds": load_seconds,
+    "prompt_tokens": len(ids), "prompt_ids": ids,
+    "prompt_source": "raw text" if prompt_text is not None else "synthetic repeated prose",
+    "decode_input_positions": [len(ids), len(ids)+count-2] if count > 1 else None,
     "nv_quant_linears": getattr(model, "nv_quant_linears", 0),
+    "nv_prefill": getattr(model, "nv_prefill", False),
+    "nv_attention": getattr(model, "nv_attention", False),
+    "nv_fused_attention": getattr(model, "nv_fused_attention", False),
     "cold": cold, "warm_runs": warm,
     "host_peak_rss_bytes": rss if sys.platform == "darwin" else rss*1024,
     "tinygrad_current_allocated_bytes": GlobalCounters.mem_used,
@@ -159,6 +180,9 @@ def main() -> int:
   mode.add_argument("--prompt", help="raw single-shot prompt (not chat formatted)")
   mode.add_argument("--chat", action="store_true", help="interactive chat (default)")
   mode.add_argument("--benchmark", nargs="?", type=int, const=20, metavar="COUNT")
+  benchmark_prompt = ap.add_mutually_exclusive_group()
+  benchmark_prompt.add_argument("--benchmark-prompt-tokens", type=int, help="synthetic prompt length including BOS (default: 512)")
+  benchmark_prompt.add_argument("--benchmark-prompt-file", type=Path, help="UTF-8 raw prompt file; not truncated")
   ap.add_argument("--max-tokens", type=int, help="optional generation cap including thinking (chat: remaining context; raw prompt: 64)")
   ap.add_argument("--max-context", type=int, default=2048)
   ap.add_argument("--device", help="override automatic GPU/CPU selection, e.g. CPU or NV")
@@ -166,18 +190,34 @@ def main() -> int:
   acceleration.add_argument("--nv-quant", dest="nv_quant", action="store_true", help="require NV quantized acceleration")
   acceleration.add_argument("--no-nv-quant", dest="nv_quant", action="store_false", help="use generic tinygrad linears")
   ap.set_defaults(nv_quant=None)
+  prefill = ap.add_mutually_exclusive_group()
+  prefill.add_argument("--nv-prefill", dest="nv_prefill", action="store_true", help="require packed tensor-core prefill")
+  prefill.add_argument("--no-nv-prefill", dest="nv_prefill", action="store_false", help="use generic prefill, retaining NV decode")
+  ap.set_defaults(nv_prefill=None)
+  ap.add_argument("--nv-attention", action="store_true", help="experimental parallel-softmax single-token NV attention")
+  ap.add_argument("--nv-fused-attention", action="store_true", help="experimental fused GQA decode attention (supersedes --nv-attention)")
   ap.add_argument("--no-warmup", action="store_true", help="skip automatic startup warmup for interactive chat")
   ap.add_argument("--no-thinking", action="store_true", help="disable thinking in chat formatting")
   args = ap.parse_args()
-  for name in ("max_context", "max_tokens", "benchmark"):
+  for name in ("max_context", "max_tokens", "benchmark", "benchmark_prompt_tokens"):
     value = getattr(args, name)
     if value is not None and value <= 0: ap.error(f"--{name.replace('_', '-')} must be positive")
+  if args.nv_prefill and args.nv_quant is False: ap.error("--nv-prefill conflicts with --no-nv-quant")
+  if (args.nv_attention or args.nv_fused_attention) and args.nv_quant is False: ap.error("NV attention conflicts with --no-nv-quant")
+  if args.benchmark is None and (args.benchmark_prompt_tokens is not None or args.benchmark_prompt_file is not None):
+    ap.error("--benchmark-prompt-* options require --benchmark")
   if args.no_thinking and (args.prompt is not None or args.benchmark is not None): ap.error("--no-thinking applies only to chat")
   try:
     start = time.perf_counter()
-    model, tokenizer = _build(args.model, args.max_context, args.device, args.nv_quant)
+    kwargs = {"nv_prefill": args.nv_prefill} if args.nv_prefill is not None else {}
+    if args.nv_attention: kwargs["nv_attention"] = True
+    if args.nv_fused_attention: kwargs["nv_fused_attention"] = True
+    model, tokenizer = _build(args.model, args.max_context, args.device, args.nv_quant, **kwargs)
     load_seconds = time.perf_counter()-start
-    if args.benchmark is not None: return _run_benchmark(model, tokenizer, args.benchmark, load_seconds)
+    if args.benchmark is not None:
+      text = args.benchmark_prompt_file.read_text(encoding="utf-8") if args.benchmark_prompt_file is not None else None
+      return _run_benchmark(model, tokenizer, args.benchmark, load_seconds,
+                            prompt_tokens=args.benchmark_prompt_tokens or DEFAULT_PROMPT_TOKENS, prompt_text=text)
     if args.prompt is not None: return _run_single_shot(model, tokenizer, args.prompt, args.max_tokens or _SINGLE_SHOT_MAX_TOKENS)
     if not args.no_warmup: _warmup(model)
     return _run_chat(model, tokenizer, args.max_tokens, args.max_context, not args.no_thinking)

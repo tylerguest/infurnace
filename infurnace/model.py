@@ -4,11 +4,12 @@ from pathlib import Path
 from typing import Iterator, Mapping, TypeVar
 import math
 from tinygrad import Tensor, Context, dtypes
-from tinygrad.llm.model import Transformer, TransformerConfig
+from tinygrad.llm.model import Transformer, TransformerConfig, TransformerBlock, apply_rope
 from tinygrad.nn.state import load_state_dict
 from infurnace.gguf import PackedTensor, parse_gguf, _dequant
 from infurnace.kernels.quant_gemv import quant_gemv, QUANT_SIZES
-
+from infurnace.kernels.quant_gemm import quant_gemm, nv_prefill_supported
+from infurnace.kernels.attention import decode_attention, fused_decode_attention, nv_attention_supported
 
 @dataclass(frozen=True)
 class Qwen3Config:
@@ -30,7 +31,6 @@ class Qwen3Config:
   def kv_cache_bytes(self) -> int:
     """FP16 K and V storage; excludes weights, activations, and scratch buffers."""
     return self.block_count * self.context_length * self.attention_head_count_kv * (self.key_length + self.value_length) * 2
-
 
 def config_from_gguf(metadata: Mapping, max_context: int | None = None) -> Qwen3Config:
   """Validate the supported dense Qwen3 contract before allocating model state."""
@@ -79,7 +79,6 @@ def config_from_gguf(metadata: Mapping, max_context: int | None = None) -> Qwen3
     rms_norm_epsilon=positive_float("qwen3.attention.layer_norm_rms_epsilon"), vocab_size=len(tokens), context_length=context,
   )
 
-
 def expected_weight_shapes(config: Qwen3Config) -> dict[str, tuple[int, ...]]:
   """Linear weights are [out_features, in_features], independent of storage format."""
   dim, hidden = config.embedding_length, config.feed_forward_length
@@ -96,7 +95,6 @@ def expected_weight_shapes(config: Qwen3Config) -> dict[str, tuple[int, ...]]:
     }
     shapes.update({f"blk.{layer}.{name}": shape for name, shape in layer_shapes.items()})
   return shapes
-
 
 _Weight = TypeVar("_Weight", Tensor, PackedTensor)
 
@@ -119,7 +117,6 @@ def prepare_weights(config: Qwen3Config, weights: Mapping[str, _Weight]) -> dict
   if extra: raise ValueError(f"unsupported Qwen3 weights: {', '.join(sorted(extra))}")
   return prepared
 
-
 def transformer_config(config: Qwen3Config) -> TransformerConfig:
   return TransformerConfig(
     num_blocks=config.block_count, dim=config.embedding_length, hidden_dim=config.feed_forward_length,
@@ -129,16 +126,57 @@ def transformer_config(config: Qwen3Config) -> TransformerConfig:
     max_context=config.context_length,
   )
 
+class _NVAttentionBlock(TransformerBlock):
+  """Per-model decode-only adapter; upstream owns prefill and unsupported shapes.
+
+  The pin has no dispatch hook. Keep this small supported decode setup here
+  until an upstream hook exists; no dependency or global Tensor method is patched.
+  """
+  fused_attention = False
+
+  def _attention(self, x, start_pos):
+    if not all(isinstance(s, int) for s in x.shape[:2]) or x.shape[:2] != (1, 1):
+      return super()._attention(x, start_pos)
+    q, k, v = self.attn_q(x), self.attn_k(x), self.attn_v(x)
+    q = self.attn_q_norm(q.reshape(1, 1, self.config.n_heads, 128).transpose(1, 2))
+    k = self.attn_k_norm(k.reshape(1, 1, self.config.n_kv_heads, 128).transpose(1, 2))
+    v = v.reshape(1, 1, self.config.n_kv_heads, 128).transpose(1, 2)
+    frequencies = self.freqs_cis[start_pos:start_pos+1]
+    q, k = apply_rope(q, frequencies), apply_rope(k, frequencies)
+    store = self.cache_kv[:, :, :, start_pos:start_pos+1, :].uop.store(Tensor.stack(k, v).cast(self.cache_kv.dtype).uop)
+    assigned_kv = Tensor(self.cache_kv.uop.after(store))
+    attention = fused_decode_attention if self.fused_attention else decode_attention
+    attn = attention(q, assigned_kv, start_pos+1)
+    return self.attn_output(attn.transpose(1, 2).reshape(1, 1, -1))
+
+
+def enable_decode_attention(blocks, *, fused: bool = False) -> int:
+  """Adapt existing supported blocks in place, preserving weights/state identities."""
+  count = 0
+  for block in blocks:
+    config = block.config
+    if (type(block) not in (TransformerBlock, _NVAttentionBlock) or config.head_dim != 128 or config.rope_dim != 128
+        or config.qk_norm != 128 or config.attn_output_gate or config.n_heads%config.n_kv_heads
+        or (fused and config.n_heads != config.n_kv_heads*4)):
+      continue
+    block.__class__ = _NVAttentionBlock
+    block.fused_attention = fused
+    count += 1
+  return count
+
 
 class _NVLinear:
   """Single-token fast path using explicit GGUF identity, never graph-size guessing."""
-  def __init__(self, original, entry: PackedTensor):
+  def __init__(self, original, entry: PackedTensor, *, prefill: bool = False):
     self.original = original
+    self.prefill = prefill
+    if prefill and not nv_prefill_supported(entry.data.device):
+      raise ValueError("NV prefill requires CUDA-C FP16 tensor cores")
     self.in_features, self.out_features = entry.shape[1], entry.shape[0]
     self.ggml_type = entry.ggml_type
-    dtype = dtypes.uint32 if entry.ggml_type == 12 else dtypes.uint8
-    # Loader entries are already independent aligned resident byte buffers;
-    # unlike offset graph extraction, they need no second packed-byte clone.
+    dtype = dtypes.uint32 if entry.ggml_type == 12 else dtypes.uint16
+    # Typed preparation may allocate new storage on NV. Generic consumers must
+    # use this same storage; _enable_nv_quant also redirects any tied embedding.
     self.packed = entry.data.contiguous().bitcast(dtype).flatten().realize()
     # Generic prefill decodes the same storage; don't retain a second Q4 byte copy.
     original.weight = _dequant(self.packed.bitcast(dtypes.uint8), self.in_features * self.out_features,
@@ -149,8 +187,16 @@ class _NVLinear:
     if isinstance(x.numel(), int) and x.numel() == self.in_features:
       result = quant_gemv(x, self.packed, out_features=self.out_features, in_features=self.in_features, ggml_type=self.ggml_type)
       return result if self.bias is None else result + self.bias
+    if self.prefill:
+      # Upstream prefill uses a symbolic token count. Pad to its fixed maximum
+      # for capture, then slice valid rows; the kernel handles the final 16-row tile.
+      symbolic = not isinstance(x.numel(), int)
+      activation = x.pad_to(x.max_shape) if symbolic else x
+      result = quant_gemm(activation, self.packed, out_features=self.out_features,
+                          in_features=self.in_features, ggml_type=self.ggml_type)
+      if symbolic: result = result.shrink(tuple((0, size) for size in (*x.shape[:-1], self.out_features)))
+      return result if self.bias is None else result + self.bias
     return self.original(x)
-
 
 class Qwen3Model:
   """Thin local runner: tinygrad owns transformer math, cache, generation and JIT."""
@@ -180,9 +226,16 @@ class Qwen3Model:
           getattr(block, name).use_custom_quant = False
 
   @classmethod
-  def from_gguf(cls, path: str | Path, max_context: int | None = None, device: str | None = None, *, nv_quant: bool = False) -> "Qwen3Model":
+  def from_gguf(cls, path: str | Path, max_context: int | None = None, device: str | None = None, *,
+                nv_quant: bool = False, nv_prefill: bool = False, nv_attention: bool = False,
+                nv_fused_attention: bool = False) -> "Qwen3Model":
     """Load a GGUF, derive the config, and build the model. ``max_context`` caps
-    the KV cache (defaults to the model's context length)."""
+    the KV cache (defaults to the model's context length). ``nv_prefill`` opts
+    into FP16 tensor-core packed prefill and requires ``nv_quant``.
+    ``nv_attention`` opts into experimental parallel-softmax NV decode attention;
+    ``nv_fused_attention`` selects the fused four-query-head GQA path instead."""
+    if nv_prefill and not nv_quant: raise ValueError("NV prefill requires NV quantized integration")
+    if (nv_attention or nv_fused_attention) and not nv_quant: raise ValueError("NV attention requires NV quantized integration")
     metadata, entries = parse_gguf(path)
     config = config_from_gguf(metadata, max_context)
     entries = prepare_weights(config, entries)
@@ -197,14 +250,22 @@ class Qwen3Model:
         tensors[name] = resident[name].decode()
     result = cls(config, tensors)
     result.metadata = metadata
-    if nv_quant: result._enable_nv_quant(resident)
+    if nv_quant: result._enable_nv_quant(resident, nv_prefill=nv_prefill)
+    if nv_attention or nv_fused_attention:
+      if not nv_attention_supported(result.device): raise ValueError("NV attention requires NV with the CUDA C renderer")
+      result.nv_attention_blocks = enable_decode_attention(result.transformer.blk, fused=nv_fused_attention)
+      if not result.nv_attention_blocks: raise ValueError("no supported blocks for NV decode attention")
+      result.nv_attention = True
+      result.nv_fused_attention = nv_fused_attention
     return result
 
-  def _enable_nv_quant(self, entries: Mapping[str, PackedTensor]) -> None:
+  def _enable_nv_quant(self, entries: Mapping[str, PackedTensor], *, nv_prefill: bool = False) -> None:
     from tinygrad import Device
     from tinygrad.renderer.cstyle import CUDARenderer
     if self.device.split(":")[0] != "NV" or not isinstance(Device[self.device].renderer, CUDARenderer):
       raise ValueError("--nv-quant requires NV with the CUDA C renderer")
+    if nv_prefill and not nv_prefill_supported(self.device): raise ValueError("NV prefill requires CUDA-C FP16 tensor cores")
+    self.nv_prefill = nv_prefill
     self.nv_quant_linears = 0
     for name, entry in entries.items():
       if entry.ggml_type not in QUANT_SIZES or len(entry.shape) != 2 or name == "token_embd.weight": continue
@@ -214,7 +275,12 @@ class Qwen3Model:
         _, layer, attribute, _ = name.split(".")
         owner = self.transformer.blk[int(layer)]
       else: continue
-      setattr(owner, attribute, _NVLinear(getattr(owner, attribute), entry))
+      adapter = _NVLinear(getattr(owner, attribute), entry, prefill=nv_prefill)
+      setattr(owner, attribute, adapter)
+      if name == "output.weight" and entry is entries["token_embd.weight"]:
+        # Typed packed preparation can allocate new storage. Keep tied consumers
+        # on its same lazy decoded graph so the old embedding bytes can be freed.
+        self.transformer.token_embd.weight = adapter.weight
       self.nv_quant_linears += 1
 
   def warmup(self) -> None:

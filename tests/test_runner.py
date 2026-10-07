@@ -98,7 +98,10 @@ def test_local_generation():
   from infurnace.tokenizer import Tokenizer
   runner = Qwen3Model.from_gguf(os.environ["INFURNACE_TEST_MODEL"], max_context=2048,
                                device=os.environ.get("INFURNACE_GENERATION_DEVICE", "NV"),
-                               nv_quant=bool(os.environ.get("INFURNACE_TEST_NV_QUANT")))
+                               nv_quant=bool(os.environ.get("INFURNACE_TEST_NV_QUANT")),
+                               nv_prefill=bool(os.environ.get("INFURNACE_TEST_NV_PREFILL")),
+                               nv_attention=bool(os.environ.get("INFURNACE_TEST_NV_ATTENTION")),
+                               nv_fused_attention=bool(os.environ.get("INFURNACE_TEST_NV_FUSED_ATTENTION")))
   tokenizer = Tokenizer.from_gguf(runner.metadata)
   prompt = tokenizer.encode(tokenizer.render_chat([{"role": "user", "content": "Reply with just the word hello."}], enable_thinking=False))
   ids = []

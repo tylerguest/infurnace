@@ -32,6 +32,7 @@ def test_explicit_override(monkeypatch):
 def test_auto_acceleration(monkeypatch):
   monkeypatch.setattr(cli, "select_device", lambda requested: "NV")
   monkeypatch.setattr(cli, "supports_nv_quant", lambda device: True)
+  monkeypatch.setattr(cli, "nv_prefill_supported", lambda device: True)
   calls = []
   class Model:
     metadata = {}
@@ -41,6 +42,7 @@ def test_auto_acceleration(monkeypatch):
   monkeypatch.setattr(cli.Qwen3Model, "from_gguf", build)
   monkeypatch.setattr(cli.Tokenizer, "from_gguf", lambda metadata: None)
   cli._build("model", 16, None)
-  assert calls[-1] == {"max_context": 16, "device": "NV", "nv_quant": True}
+  assert calls[-1] == {"max_context": 16, "device": "NV", "nv_quant": True, "nv_prefill": True}
   cli._build("model", 16, None, False)
   assert "nv_quant" not in calls[-1]
+  assert "nv_prefill" not in calls[-1]
