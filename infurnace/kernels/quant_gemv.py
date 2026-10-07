@@ -35,11 +35,87 @@ def _load_lanes(ptr: UOp, lanes: int) -> UOp:
   idx = sum((coord * math.prod(buf.shape[i + 1:]) for i, coord in enumerate(coords)), UOp.const(0))
   return UOp(Ops.SHRINK, src=(buf.flatten(), idx, UOp.const(lanes))).load()
 
-def _load_byte(raw:UOp, base:UOp, offset:UOp) -> UOp:
-  return (raw[base + offset // 4] >> ((offset & 3) * 8).cast(dtypes.uint32)) & 255
+def _q4_word(raw: UOp, base: UOp, word: UOp | int, swizzle_width: int = 0) -> UOp:
+  index = _swizzled_index(base, word, swizzle_width, Q4_WORDS, 4) if swizzle_width else base+word
+  return raw[index].load()
+
+
+def _load_byte(raw:UOp, base:UOp, offset:UOp, swizzle_width: int = 0) -> UOp:
+  return (_q4_word(raw, base, offset//4, swizzle_width) >> ((offset & 3)*8).cast(dtypes.uint32)) & 255
 
 def _half(value:UOp) -> UOp:
   return value.cast(dtypes.uint16).bitcast(dtypes.float16).float()
+
+Q6_PREPARED_BYTES = 216
+
+
+def _swizzled_index(linear_block: UOp, word: UOp | int, blocks_per_row: int, block_words: int, group_words: int = 2) -> UOp:
+  """Row-local tiles of four blocks, [word-group, block, group-element]."""
+  row, block = linear_block//blocks_per_row, linear_block%blocks_per_row
+  tile, within = block//4, block%4
+  live = (blocks_per_row-tile*4).minimum(4)
+  return row*blocks_per_row*block_words+tile*4*block_words+(word//group_words)*live*group_words+within*group_words+word%group_words
+
+
+def _q6_swizzled_index(linear_block: UOp, word: UOp | int, blocks_per_row: int) -> UOp:
+  return _swizzled_index(linear_block, word, blocks_per_row, Q6_PREPARED_BYTES//4)
+
+
+def _prepare_q4_kernel(out: UOp, raw: UOp, *, blocks_per_row: int, gpu: bool = True) -> UOp:
+  block = UOp.range((out.shape[0]+127)//128, 0, axis_type=AxisType.GLOBAL if gpu else AxisType.LOOP)
+  lane = UOp.range(128, 1, axis_type=AxisType.LOCAL if gpu else AxisType.LOOP)
+  index = block*128+lane
+  row, offset = index//(blocks_per_row*36), index%(blocks_per_row*36)
+  tile, tile_offset = offset//144, offset%144
+  live = (blocks_per_row-tile*4).minimum(4)
+  word = (tile_offset//(live*4))*4+tile_offset%4
+  logical = row*blocks_per_row+tile*4+(tile_offset%(live*4))//4
+  start = logical*144+word*4
+  value = sum((raw[(start+i).valid(index < out.shape[0])].load().cast(dtypes.uint32) << (i*8)
+               for i in range(4)), UOp.const(0, dtypes.uint32))
+  return out[index.valid(index < out.shape[0])].store(value).end(block, lane).sink(
+    arg=KernelInfo(name="prepare_q4_swizzled", opts_to_apply=()))
+
+
+def prepare_q4(raw: Tensor, *, in_features: int) -> Tensor:
+  if (raw.dtype != dtypes.uint8 or raw.numel() <= 0 or in_features <= 0 or in_features%256
+      or raw.numel()%(in_features//256*144)):
+    raise QuantGemvError("swizzled Q4 preparation requires complete uint8 rows with width multiple of 256")
+  out = Tensor.empty(raw.numel()//4, dtype=dtypes.uint32, device=raw.device)
+  fxn = functools.partial(_prepare_q4_kernel, blocks_per_row=in_features//256, gpu=raw.device.split(':')[0] == 'NV')
+  return Tensor(UOp.custom_kernel(out.uop, raw.uop.flatten(), fxn=fxn)[0]).realize()
+
+
+def _prepare_q6_kernel(out: UOp, raw: UOp, *, gpu: bool = True, blocks_per_row: int = 0) -> UOp:
+  block = UOp.range((out.shape[0]+127)//128, 0, axis_type=AxisType.GLOBAL if gpu else AxisType.LOOP)
+  lane = UOp.range(128, 1, axis_type=AxisType.LOCAL if gpu else AxisType.LOOP)
+  index = block*128+lane
+  if blocks_per_row:
+    row, offset = index//(blocks_per_row*54), index%(blocks_per_row*54)
+    tile, tile_offset = offset//216, offset%216
+    live = (blocks_per_row-tile*4).minimum(4)
+    word = (tile_offset//(live*2))*2+tile_offset%2
+    logical_block = row*blocks_per_row+tile*4+(tile_offset%(live*2))//2
+  else:
+    logical_block, word = index//54, index%54
+  start = logical_block*Q6_BYTES
+  value = sum((raw[(start+word*4+i).valid((index < out.shape[0]) & (word*4+i < Q6_BYTES))].load().cast(dtypes.uint32)
+               << (i*8) for i in range(4)), UOp.const(0, dtypes.uint32))
+  return out[index.valid(index < out.shape[0])].store(value).end(block, lane).sink(
+    arg=KernelInfo(name="prepare_q6_aligned", opts_to_apply=()))
+
+
+def prepare_q6(raw: Tensor, *, in_features: int | None = None, swizzled: bool = False) -> Tensor:
+  """Value-preserving 210->216 byte blocks; UOp packing, one resident output."""
+  if raw.dtype != dtypes.uint8 or raw.numel() <= 0 or raw.numel()%Q6_BYTES:
+    raise QuantGemvError("Q6 preparation requires whole uint8 GGUF blocks")
+  if swizzled and (in_features is None or in_features <= 0 or in_features%256 or raw.numel()%(in_features//256*Q6_BYTES)):
+    raise QuantGemvError("swizzled Q6 preparation requires complete rows with width multiple of 256")
+  out = Tensor.empty(raw.numel()//Q6_BYTES*(Q6_PREPARED_BYTES//4), dtype=dtypes.uint32, device=raw.device)
+  fxn = functools.partial(_prepare_q6_kernel, gpu=raw.device.split(':')[0] == 'NV',
+                         blocks_per_row=in_features//256 if swizzled else 0)
+  return Tensor(UOp.custom_kernel(out.uop, raw.uop.flatten(), fxn=fxn)[0]).realize()
+
 
 def _q6_word(raw:UOp, base:UOp, byte_offset:UOp) -> UOp:
   # Q6 blocks are 210 bytes: every other block is only halfword-aligned.
@@ -47,11 +123,15 @@ def _q6_word(raw:UOp, base:UOp, byte_offset:UOp) -> UOp:
   index = base + byte_offset // 2
   return raw[index].load().cast(dtypes.uint32) | (raw[index + 1].load().cast(dtypes.uint32) << 16)
 
-def _q4_scales(raw:UOp, base:UOp, subgroup:UOp) -> tuple[UOp, UOp, UOp, UOp]:
+def _q4_scales(raw:UOp, base:UOp, subgroup:UOp, swizzle_width: int = 0) -> tuple[UOp, UOp, UOp, UOp]:
   """Q4_K/Q5_K shared scale layout: d, dmin, scale[4], minimum[4] in 12 bytes."""
-  scale = (subgroup < 4).where(_load_byte(raw, base, 4 + subgroup) & 63, (_load_byte(raw, base, 8 + subgroup) & 15) | ((_load_byte(raw, base, subgroup) >> 6) << 4))
-  minimum = (subgroup < 4).where(_load_byte(raw, base, 8 + subgroup) & 63, (_load_byte(raw, base, 8 + subgroup) >> 4) | ((_load_byte(raw, base, 4 + subgroup) >> 6) << 4))
-  d, dmin = (raw[base] & 0xffff).cast(dtypes.uint16), (raw[base] >> 16).cast(dtypes.uint16)
+  a = _load_byte(raw, base, 4+subgroup, swizzle_width)
+  b = _load_byte(raw, base, 8+subgroup, swizzle_width)
+  c = _load_byte(raw, base, subgroup, swizzle_width)
+  scale = (subgroup < 4).where(a & 63, (b & 15) | ((c >> 6) << 4))
+  minimum = (subgroup < 4).where(b & 63, (b >> 4) | ((a >> 6) << 4))
+  header = _q4_word(raw, base, 0, swizzle_width)
+  d, dmin = (header & 0xffff).cast(dtypes.uint16), (header >> 16).cast(dtypes.uint16)
   return _half(d), _half(dmin), scale.float(), minimum.float()
 
 def _q8_quantize_kernel(q:UOp, scale:UOp, xsum:UOp, x:UOp, tokens:int, in_features:int) -> UOp:
@@ -107,42 +187,65 @@ def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot:Callabl
   total = warp_reduce(value, full_wave=True)
   return out[token, output, chunk.valid(lane.eq(0))].store(total.cast(out.dtype)).end(block, warp, lane).sink(arg=KernelInfo(name=name, opts_to_apply=()))
 
-def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, out_features:int, in_features:int, ggml_type:int) -> UOp:
+def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, out_features:int, in_features:int, ggml_type:int,
+                         q6_aligned: bool = False, q6_swizzled: bool = False, q4_swizzled: bool = False) -> UOp:
   group_count = in_features // Q8_GROUP_SIZE
   def group_dot(token: UOp, output: UOp, group: UOp) -> UOp:
     block, subgroup = group // 8, group % 8
     xwords = _load_lanes(xq[token, group, 0], 8)
     if ggml_type == Q4_K:
-      base = (output * in_features // GGML_BLOCK_SIZE + block) * Q4_WORDS
-      qs_base, dot = base + 4 + (subgroup // 2) * 8, UOp.const(0, dtypes.int32)
+      logical = output*in_features//GGML_BLOCK_SIZE+block
+      base = logical if q4_swizzled else logical*Q4_WORDS
+      swizzle_width = in_features//256 if q4_swizzled else 0
+      payload_start = 4+(subgroup//2)*8
+      dot = UOp.const(0, dtypes.int32)
       for word_idx in range(8):
-        word = (raw[qs_base + word_idx] >> ((subgroup & 1) * 4).cast(dtypes.uint32)) & 0x0f0f0f0f
+        word = (_q4_word(raw, base, payload_start+word_idx, swizzle_width)
+                >> ((subgroup & 1)*4).cast(dtypes.uint32)) & 0x0f0f0f0f
         dot = _dp4a(word, xwords[word_idx], dot)
-      d, dmin, scale, minimum = _q4_scales(raw, base, subgroup)
+      d, dmin, scale, minimum = _q4_scales(raw, base, subgroup, swizzle_width)
       qsum = (xs[token, group, 0].load() + xs[token, group, 1].load()).float()
       return (dot.float() * d * scale - qsum * dmin * minimum) * xd[token, group]
     if ggml_type == Q6_K:
-      base = (output*in_features//GGML_BLOCK_SIZE+block) * (Q6_BYTES//2)
+      base = (output*in_features//GGML_BLOCK_SIZE+block) * (Q6_PREPARED_BYTES//4 if q6_aligned else Q6_BYTES//2)
       dots = [UOp.const(0, dtypes.int32)] * 2
+      if q6_aligned:
+        if q6_swizzled:
+          logical = output*(in_features//256)+block
+          def load_words(start):
+            pairs = [_load_lanes(raw[_q6_swizzled_index(logical, start+i, in_features//256)], 2) for i in (0, 2, 4, 6)]
+            return UOp.stack(*(pair[j] for pair in pairs for j in (0, 1)))
+          low_words = load_words((subgroup//4)*16+(subgroup%2)*8)
+          high_words = load_words(32+(subgroup//4)*8)
+        else:
+          # 216-byte rows prove 8-byte alignment to the pinned coalescer.
+          low_words = _load_lanes(raw[base+(subgroup//4)*16+(subgroup%2)*8], 8)
+          high_words = _load_lanes(raw[base+32+(subgroup//4)*8], 8)
       for word_idx in range(8):
         low_offset = (subgroup//4)*64 + (subgroup%2)*32 + word_idx*4
         high_offset = 128 + (subgroup//4)*32 + word_idx*4
-        low = _q6_word(raw, base, low_offset) >> ((subgroup%4//2)*4).cast(dtypes.uint32)
-        high = _q6_word(raw, base, high_offset) >> ((subgroup%4)*2).cast(dtypes.uint32)
+        low_word = low_words[word_idx] if q6_aligned else _q6_word(raw, base, low_offset)
+        high_word = high_words[word_idx] if q6_aligned else _q6_word(raw, base, high_offset)
+        low = low_word >> ((subgroup%4//2)*4).cast(dtypes.uint32)
+        high = high_word >> ((subgroup%4)*2).cast(dtypes.uint32)
         # Four independent values in [0, 63]; no byte unpack/repack or signed offset here.
         word = (low & 0x0f0f0f0f) | ((high & 0x03030303) << 4)
         dots[word_idx // 4] = _dp4a(word, xwords[word_idx], dots[word_idx // 4])
-      scale_word = raw[base + 96 + subgroup].load().cast(dtypes.uint32)
+      scale_index = (_q6_swizzled_index(logical, 48+subgroup//2, in_features//256) if q6_swizzled else base+48+subgroup//2)
+      d_index = _q6_swizzled_index(logical, 52, in_features//256) if q6_swizzled else base+(52 if q6_aligned else 104)
+      scale_word = ((raw[scale_index].load() >> ((subgroup%2)*16).cast(dtypes.uint32)) & 65535
+                    if q6_aligned else raw[base + 96 + subgroup].load().cast(dtypes.uint32))
       scales = [(scale_word >> (half*8)).cast(dtypes.uint8).bitcast(dtypes.int8).float() for half in range(2)]
       # dot((q-32), x) == dot(q, x) - 32*sum(x), independently for each 16-value scale group.
       corrected = [(dots[half] - 32*xs[token, group, half].load()).float() for half in range(2)]
-      return (corrected[0]*scales[0] + corrected[1]*scales[1]) * xd[token, group] * _half(raw[base + 104].load())
+      return (corrected[0]*scales[0] + corrected[1]*scales[1]) * xd[token, group] * _half(raw[d_index].load())
     raise QuantGemvError(f"unsupported quant type {ggml_type}")
   names = {Q4_K: "linear_q4_k", Q6_K: "linear_q6"}
   warps = _decode_warps(ggml_type, in_features, out_features)
   return _decode_linear(out, out_features, group_count, group_dot, names[ggml_type], warps_per_block=warps)
 
-def quant_gemv(x:Tensor, packed:Tensor, *, out_features:int, in_features:int, ggml_type:int) -> Tensor:
+def quant_gemv(x:Tensor, packed:Tensor, *, out_features:int, in_features:int, ggml_type:int, q6_aligned: bool = False,
+               q6_swizzled: bool = False, q4_swizzled: bool = False) -> Tensor:
   if x.dtype not in dtypes.floats: raise QuantGemvError(f"x must be float, got {x.dtype}")
   if ggml_type not in QUANT_SIZES: raise QuantGemvError(f"unsupported quant type {ggml_type}")
   if in_features <= 0 or in_features % GGML_BLOCK_SIZE: raise QuantGemvError("in_features must be a positive multiple of 256")
@@ -150,15 +253,18 @@ def quant_gemv(x:Tensor, packed:Tensor, *, out_features:int, in_features:int, gg
   if not x.shape or x.shape[-1] != in_features: raise QuantGemvError("activation shape does not match in_features")
   if x.device != packed.device: raise QuantGemvError("activations and packed weights must share a device")
 
-  expected_dtype = dtypes.uint32 if ggml_type == Q4_K else dtypes.uint16
-  expected_bytes = out_features * in_features // GGML_BLOCK_SIZE * QUANT_SIZES[ggml_type]
+  if q4_swizzled and ggml_type != Q4_K: raise QuantGemvError("swizzled Q4 requires Q4_K")
+  if q6_swizzled and not q6_aligned: raise QuantGemvError("swizzled Q6 requires prepared storage")
+  if q6_aligned and ggml_type != Q6_K: raise QuantGemvError("aligned Q6 layout requires Q6_K")
+  expected_dtype = dtypes.uint32 if ggml_type == Q4_K or q6_aligned else dtypes.uint16
+  expected_bytes = out_features * in_features // GGML_BLOCK_SIZE * (Q6_PREPARED_BYTES if q6_aligned else QUANT_SIZES[ggml_type])
   if packed.dtype != expected_dtype or packed.numel() * packed.dtype.itemsize != expected_bytes:
     raise QuantGemvError("packed weight dtype/size does not match the quantization contract")
 
   tokens = int(x.numel()) // in_features
   raw = packed.uop
   xq, xd, xs = q8_quantize(x, tokens, in_features)
-  decode = functools.partial(_quant_decode_kernel, ggml_type=ggml_type)
+  decode = functools.partial(_quant_decode_kernel, ggml_type=ggml_type, q6_aligned=q6_aligned, q6_swizzled=q6_swizzled, q4_swizzled=q4_swizzled)
   chunks = (in_features + 1023) // 1024
   out = Tensor.empty(tokens, out_features, chunks, dtype=dtypes.float32, device=x.device).uop
   sources = (out, raw, xq.uop, xd.uop, xs.uop)

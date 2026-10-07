@@ -13,37 +13,45 @@ from tinygrad.dtype import AddrSpace
 from tinygrad.renderer.cstyle import CUDARenderer
 from tinygrad.uop.ops import AxisType, KernelInfo
 
-from infurnace.kernels.quant_gemv import Q4_K, QUANT_SIZES, _half, _q4_scales
+from infurnace.kernels.quant_gemv import Q4_K, Q6_K, Q6_PREPARED_BYTES, QUANT_SIZES, _half, _q4_scales, _q6_swizzled_index, _q4_word
 
 
 class QuantGemmError(ValueError):
   """Inputs/backend do not satisfy the first prefill kernel contract."""
 
 
-def _q6_byte(raw: UOp, base: UOp, offset: UOp) -> UOp:
-  return (raw[base+offset//2].load().cast(dtypes.uint32) >> ((offset%2)*8).cast(dtypes.uint32)) & 255
+def _q6_byte(raw: UOp, base: UOp, offset: UOp, blocks_per_row: int = 0) -> UOp:
+  size = raw.dtype.itemsize
+  index = _q6_swizzled_index(base, offset//size, blocks_per_row) if blocks_per_row else base+offset//size
+  return (raw[index].load().cast(dtypes.uint32) >> ((offset%size)*8).cast(dtypes.uint32)) & 255
 
 
-def _weight(raw: UOp, row: UOp, col: UOp, width: int, typ: int) -> UOp:
+def _weight(raw: UOp, row: UOp, col: UOp, width: int, typ: int, q6_aligned: bool = False, q6_swizzled: bool = False, q4_swizzled: bool = False) -> UOp:
   block, within = col//256, col%256
   if typ == Q4_K:
-    base = (row*(width//256)+block)*36
+    logical = row*(width//256)+block
+    base = logical if q4_swizzled else logical*36
+    swizzle_width = width//256 if q4_swizzled else 0
     subgroup = within//32
-    word = raw[base+4+(subgroup//2)*8+(within%32)//4].load()
+    word = _q4_word(raw, base, 4+(subgroup//2)*8+(within%32)//4, swizzle_width)
     quant = (word >> ((subgroup%2)*4+(within%4)*8).cast(dtypes.uint32)) & 15
-    d, dmin, scale, minimum = _q4_scales(raw, base, subgroup)
+    d, dmin, scale, minimum = _q4_scales(raw, base, subgroup, swizzle_width)
     return (d*scale*quant.float()-dmin*minimum).cast(dtypes.float16)
-  base = (row*(width//256)+block)*105
+  logical = row*(width//256)+block
+  base = logical if q6_swizzled else logical*(Q6_PREPARED_BYTES//4 if q6_aligned else 105)
+  swizzle_width = width//256 if q6_swizzled else 0
   half, pos = within//128, within%128
-  low = _q6_byte(raw, base, half*64+pos%64) >> ((pos//64)*4).cast(dtypes.uint32)
-  high = _q6_byte(raw, base, 128+half*32+pos%32) >> ((pos//32)*2).cast(dtypes.uint32)
+  low = _q6_byte(raw, base, half*64+pos%64, swizzle_width) >> ((pos//64)*4).cast(dtypes.uint32)
+  high = _q6_byte(raw, base, 128+half*32+pos%32, swizzle_width) >> ((pos//32)*2).cast(dtypes.uint32)
   quant = ((low & 15) | ((high & 3) << 4)).cast(dtypes.int32)-32
-  scale = _q6_byte(raw, base, 192+within//16).cast(dtypes.uint8).bitcast(dtypes.int8).float()
-  return (_half(raw[base+104].load())*quant.float()*scale).cast(dtypes.float16)
+  scale = _q6_byte(raw, base, 192+within//16, swizzle_width).cast(dtypes.uint8).bitcast(dtypes.int8).float()
+  d_index = _q6_swizzled_index(logical, 52, width//256) if q6_swizzled else base+(52 if q6_aligned else 104)
+  return (_half(raw[d_index].load())*quant.float()*scale).cast(dtypes.float16)
 
 
 @functools.cache
-def _prefill_kernel(out: UOp, raw: UOp, x: UOp, *, tokens: int, width: int, rows: int, typ: int) -> UOp:
+def _prefill_kernel(out: UOp, raw: UOp, x: UOp, *, tokens: int, width: int, rows: int, typ: int,
+                    q6_aligned: bool = False, q6_swizzled: bool = False, q4_swizzled: bool = False) -> UOp:
   warps = math.gcd(rows//8, 4)
   output_blocks = rows//(warps*8)
   block = UOp.range((tokens//16)*output_blocks, 0, axis_type=AxisType.GLOBAL)
@@ -58,7 +66,7 @@ def _prefill_kernel(out: UOp, raw: UOp, x: UOp, *, tokens: int, width: int, rows
   # NVIDIA mma.sync m16n8k16.row.col fragment order (not AMD WMMA order).
   a = UOp.stack(*(x[token_base+group+row, k*16+thread*2+col].load()
                   for col_high in (0, 8) for row in (0, 8) for col in (col_high, col_high+1)))
-  b = UOp.stack(*(_weight(raw, output_base+group, k*16+thread*2+col, width, typ) for col in (0, 1, 8, 9)))
+  b = UOp.stack(*(_weight(raw, output_base+group, k*16+thread*2+col, width, typ, q6_aligned, q6_swizzled, q4_swizzled) for col in (0, 1, 8, 9)))
   update = acc.store(UOp.wmma(a, b, acc.after(k), (8, 16, 16), 32)).end(k)
   result = acc.after(update)
   stores = [out[token_base+group+row, output_base+thread*2+col].store(result[i].load())
@@ -75,7 +83,8 @@ def nv_prefill_supported(device: str) -> bool:
     tc.dims == (8, 16, 16) and tc.dtype_in == dtypes.float16 and tc.dtype_out == dtypes.float32 for tc in renderer.tensor_cores)
 
 
-def quant_gemm(x: Tensor, packed: Tensor, *, out_features: int, in_features: int, ggml_type: int) -> Tensor:
+def quant_gemm(x: Tensor, packed: Tensor, *, out_features: int, in_features: int, ggml_type: int,
+               q6_aligned: bool = False, q6_swizzled: bool = False, q4_swizzled: bool = False) -> Tensor:
   """Concrete multi-token packed linear; symbolic padding belongs to the adapter."""
   if ggml_type not in QUANT_SIZES: raise QuantGemmError("only Q4_K/Q6_K prefill is supported")
   if in_features <= 0 or in_features%256 or out_features <= 0 or out_features%8:
@@ -84,8 +93,11 @@ def quant_gemm(x: Tensor, packed: Tensor, *, out_features: int, in_features: int
     raise QuantGemmError("activation dtype/shape does not match prefill contract")
   if not isinstance(x.numel(), int) or x.numel()//in_features < 2:
     raise QuantGemmError("prefill requires a concrete multi-token shape")
-  dtype = dtypes.uint32 if ggml_type == Q4_K else dtypes.uint16
-  expected = out_features*in_features//256*QUANT_SIZES[ggml_type]
+  if q4_swizzled and ggml_type != Q4_K: raise QuantGemmError("swizzled Q4 requires Q4_K")
+  if q6_swizzled and not q6_aligned: raise QuantGemmError("swizzled Q6 requires prepared storage")
+  if q6_aligned and ggml_type != Q6_K: raise QuantGemmError("aligned Q6 layout requires Q6_K")
+  dtype = dtypes.uint32 if ggml_type == Q4_K or q6_aligned else dtypes.uint16
+  expected = out_features*in_features//256*(Q6_PREPARED_BYTES if q6_aligned else QUANT_SIZES[ggml_type])
   if packed.dtype != dtype or packed.numel()*dtype.itemsize != expected:
     raise QuantGemmError("packed dtype/size does not match prefill contract")
   if x.device != packed.device or not isinstance(x.device, str) or x.device.split(":")[0] != "NV":
@@ -97,5 +109,6 @@ def quant_gemm(x: Tensor, packed: Tensor, *, out_features: int, in_features: int
   activation = x.reshape(tokens, in_features).cast(dtypes.float16).pad(((0, padded_tokens-tokens), (0, 0))).contiguous()
   out = Tensor.empty(padded_tokens, out_features, dtype=dtypes.float32, device=x.device)
   result = Tensor.custom_kernel(out, packed.flatten().contiguous(), activation,
-    fxn=functools.partial(_prefill_kernel, tokens=padded_tokens, width=in_features, rows=out_features, typ=ggml_type))[0]
+    fxn=functools.partial(_prefill_kernel, tokens=padded_tokens, width=in_features, rows=out_features, typ=ggml_type,
+                         q6_aligned=q6_aligned, q6_swizzled=q6_swizzled, q4_swizzled=q4_swizzled))[0]
   return result[:tokens].reshape(*x.shape[:-1], out_features)

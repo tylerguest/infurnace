@@ -6,8 +6,8 @@ import math
 from tinygrad import Tensor, Context, dtypes
 from tinygrad.llm.model import Transformer, TransformerConfig, TransformerBlock, apply_rope
 from tinygrad.nn.state import load_state_dict
-from infurnace.gguf import PackedTensor, parse_gguf, _dequant
-from infurnace.kernels.quant_gemv import quant_gemv, QUANT_SIZES
+from infurnace.gguf import PackedTensor, parse_gguf, _dequant, _dequant_q6_k, _dequant_q4_k
+from infurnace.kernels.quant_gemv import quant_gemv, prepare_q6, prepare_q4, Q6_PREPARED_BYTES, QUANT_SIZES
 from infurnace.kernels.quant_gemm import quant_gemm, nv_prefill_supported
 from infurnace.kernels.attention import decode_attention, fused_decode_attention, nv_attention_supported
 
@@ -167,7 +167,7 @@ def enable_decode_attention(blocks, *, fused: bool = False) -> int:
 
 class _NVLinear:
   """Single-token fast path using explicit GGUF identity, never graph-size guessing."""
-  def __init__(self, original, entry: PackedTensor, *, prefill: bool = False):
+  def __init__(self, original, entry: PackedTensor, *, prefill: bool = False, q6_aligned: bool = False, q6_swizzled: bool = True, q4_swizzled: bool = True):
     self.original = original
     self.prefill = prefill
     if prefill and not nv_prefill_supported(entry.data.device):
@@ -177,15 +177,26 @@ class _NVLinear:
     dtype = dtypes.uint32 if entry.ggml_type == 12 else dtypes.uint16
     # Typed preparation may allocate new storage on NV. Generic consumers must
     # use this same storage; _enable_nv_quant also redirects any tied embedding.
-    self.packed = entry.data.contiguous().bitcast(dtype).flatten().realize()
-    # Generic prefill decodes the same storage; don't retain a second Q4 byte copy.
-    original.weight = _dequant(self.packed.bitcast(dtypes.uint8), self.in_features * self.out_features,
-                              self.ggml_type).reshape(entry.shape).cast(dtypes.float16)
+    self.q4_swizzled = q4_swizzled and q6_aligned and entry.ggml_type == 12
+    self.q6_aligned = q6_aligned and entry.ggml_type == 14
+    self.q6_swizzled = self.q6_aligned and q6_swizzled
+    self.packed = (prepare_q4(entry.data, in_features=self.in_features) if self.q4_swizzled else
+                   prepare_q6(entry.data, in_features=self.in_features, swizzled=self.q6_swizzled) if self.q6_aligned else
+                   entry.data.contiguous().bitcast(dtype).flatten().realize())
+    # Generic consumers decode fields directly from the same padded allocation.
+    # Neither the original GGUF bytes nor a second dense weight copy is retained.
+    raw = self.packed.bitcast(dtypes.uint8)
+    decoded = (_dequant_q4_k(raw, swizzled_width=self.in_features//256) if self.q4_swizzled else
+               _dequant_q6_k(raw, block_bytes=Q6_PREPARED_BYTES,
+                               swizzled_width=self.in_features//256 if self.q6_swizzled else 0) if self.q6_aligned else
+               _dequant(raw, self.in_features * self.out_features, self.ggml_type))
+    original.weight = decoded.reshape(entry.shape).cast(dtypes.float16)
     self.weight, self.bias = original.weight, original.bias
 
   def __call__(self, x: Tensor) -> Tensor:
     if isinstance(x.numel(), int) and x.numel() == self.in_features:
-      result = quant_gemv(x, self.packed, out_features=self.out_features, in_features=self.in_features, ggml_type=self.ggml_type)
+      result = quant_gemv(x, self.packed, out_features=self.out_features, in_features=self.in_features, ggml_type=self.ggml_type,
+                          q6_aligned=self.q6_aligned, q6_swizzled=self.q6_swizzled, q4_swizzled=self.q4_swizzled)
       return result if self.bias is None else result + self.bias
     if self.prefill:
       # Upstream prefill uses a symbolic token count. Pad to its fixed maximum
@@ -193,7 +204,8 @@ class _NVLinear:
       symbolic = not isinstance(x.numel(), int)
       activation = x.pad_to(x.max_shape) if symbolic else x
       result = quant_gemm(activation, self.packed, out_features=self.out_features,
-                          in_features=self.in_features, ggml_type=self.ggml_type)
+                          in_features=self.in_features, ggml_type=self.ggml_type, q6_aligned=self.q6_aligned, q6_swizzled=self.q6_swizzled,
+                          q4_swizzled=self.q4_swizzled)
       if symbolic: result = result.shrink(tuple((0, size) for size in (*x.shape[:-1], self.out_features)))
       return result if self.bias is None else result + self.bias
     return self.original(x)
@@ -228,12 +240,17 @@ class Qwen3Model:
   @classmethod
   def from_gguf(cls, path: str | Path, max_context: int | None = None, device: str | None = None, *,
                 nv_quant: bool = False, nv_prefill: bool = False, nv_attention: bool = False,
-                nv_fused_attention: bool = False) -> "Qwen3Model":
+                nv_fused_attention: bool = False, nv_prepared_weights: bool | None = None) -> "Qwen3Model":
     """Load a GGUF, derive the config, and build the model. ``max_context`` caps
     the KV cache (defaults to the model's context length). ``nv_prefill`` opts
     into FP16 tensor-core packed prefill and requires ``nv_quant``.
     ``nv_attention`` opts into experimental parallel-softmax NV decode attention;
-    ``nv_fused_attention`` selects the fused four-query-head GQA path instead."""
+    ``nv_fused_attention`` selects the fused four-query-head GQA path instead.
+    ``nv_prepared_weights`` defaults on with ``nv_quant``: value-preserving
+    tiled/swizzled Q4/Q6 blocks shared by decode, prefill and tied embedding consumers.
+    Pass False to retain native GGUF Q4/Q6 layouts."""
+    if nv_prepared_weights is None: nv_prepared_weights = nv_quant
+    if nv_prepared_weights and not nv_quant: raise ValueError("prepared weights require NV quantized integration")
     if nv_prefill and not nv_quant: raise ValueError("NV prefill requires NV quantized integration")
     if (nv_attention or nv_fused_attention) and not nv_quant: raise ValueError("NV attention requires NV quantized integration")
     metadata, entries = parse_gguf(path)
@@ -250,7 +267,7 @@ class Qwen3Model:
         tensors[name] = resident[name].decode()
     result = cls(config, tensors)
     result.metadata = metadata
-    if nv_quant: result._enable_nv_quant(resident, nv_prefill=nv_prefill)
+    if nv_quant: result._enable_nv_quant(resident, nv_prefill=nv_prefill, nv_prepared_weights=nv_prepared_weights)
     if nv_attention or nv_fused_attention:
       if not nv_attention_supported(result.device): raise ValueError("NV attention requires NV with the CUDA C renderer")
       result.nv_attention_blocks = enable_decode_attention(result.transformer.blk, fused=nv_fused_attention)
@@ -259,13 +276,16 @@ class Qwen3Model:
       result.nv_fused_attention = nv_fused_attention
     return result
 
-  def _enable_nv_quant(self, entries: Mapping[str, PackedTensor], *, nv_prefill: bool = False) -> None:
+  def _enable_nv_quant(self, entries: Mapping[str, PackedTensor], *, nv_prefill: bool = False,
+                       nv_prepared_weights: bool = False) -> None:
     from tinygrad import Device
     from tinygrad.renderer.cstyle import CUDARenderer
     if self.device.split(":")[0] != "NV" or not isinstance(Device[self.device].renderer, CUDARenderer):
       raise ValueError("--nv-quant requires NV with the CUDA C renderer")
     if nv_prefill and not nv_prefill_supported(self.device): raise ValueError("NV prefill requires CUDA-C FP16 tensor cores")
     self.nv_prefill = nv_prefill
+    self.nv_prepared_weights = nv_prepared_weights
+    self.nv_prepared_weight_layout = "q4_tile4_quad_q6_tile4_pair" if nv_prepared_weights else "gguf"
     self.nv_quant_linears = 0
     for name, entry in entries.items():
       if entry.ggml_type not in QUANT_SIZES or len(entry.shape) != 2 or name == "token_embd.weight": continue
@@ -275,7 +295,7 @@ class Qwen3Model:
         _, layer, attribute, _ = name.split(".")
         owner = self.transformer.blk[int(layer)]
       else: continue
-      adapter = _NVLinear(getattr(owner, attribute), entry, prefill=nv_prefill)
+      adapter = _NVLinear(getattr(owner, attribute), entry, prefill=nv_prefill, q6_aligned=nv_prepared_weights)
       setattr(owner, attribute, adapter)
       if name == "output.weight" and entry is entries["token_embd.weight"]:
         # Typed packed preparation can allocate new storage. Keep tied consumers

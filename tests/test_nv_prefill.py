@@ -76,20 +76,24 @@ def test_packed_prefill_fp16_reference_eager_jit(typ, size, tokens, width, rows)
 
 @pytest.mark.skipif(not os.environ.get("INFURNACE_TEST_NV"), reason="set INFURNACE_TEST_NV=1 on an NV GPU")
 @pytest.mark.parametrize("typ,size", [(12, 144), (14, 210)])
-def test_prefill_adapter_symbolic_tails_and_storage(typ, size):
+@pytest.mark.parametrize("prepared", [False, True])
+@pytest.mark.parametrize("width", [256, 1280])
+def test_prefill_adapter_symbolic_tails_and_storage(typ, size, prepared, width):
   from tinygrad import nn
-  width, rows = 256, 16
+  from infurnace.kernels.quant_gemv import Q6_PREPARED_BYTES
+  rows = 16
   rng = random.Random(53)
-  data = bytearray(rng.getrandbits(8) for _ in range(rows*size))
+  data = bytearray(rng.getrandbits(8) for _ in range(rows*width//256*size))
   for base in range(0, len(data), size):
     if typ == 12: data[base:base+4] = struct.pack("<ee", 0.001, 0.0002)
     else: data[base+208:base+210] = struct.pack("<e", 0.001)
   raw = Tensor(bytes(data), dtype=dtypes.uint8, device="NV").realize()
   original = nn.Linear(width, rows, bias=False)
   original.weight = _dequant(raw, rows*width, typ).reshape(rows, width).half()
-  adapter = _NVLinear(original, PackedTensor(raw, (rows, width), typ), prefill=True)
+  adapter = _NVLinear(original, PackedTensor(raw, (rows, width), typ), prefill=True, q6_aligned=prepared)
   assert adapter.original.weight.uop is adapter.weight.uop
-  assert adapter.packed.numel()*adapter.packed.dtype.itemsize == len(data)
+  expected_size = Q6_PREPARED_BYTES if prepared and typ == 14 else size
+  assert adapter.packed.numel()*adapter.packed.dtype.itemsize == len(data)//size*expected_size
   values = [[rng.randint(-16, 16)/16 for _ in range(width)] for _ in range(32)]
   weights = adapter.weight.to("CPU").float().tolist()
   expected = [[sum(a*b for a, b in zip(token, row)) for row in weights] for token in values]

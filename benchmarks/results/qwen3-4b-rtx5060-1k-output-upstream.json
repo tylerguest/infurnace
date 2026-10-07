@@ -1,0 +1,36 @@
+{
+  "mode": "upstream",
+  "model": "Qwen3-4B Q4_K_M",
+  "gpu": "NVIDIA RTX 5060 8 GB",
+  "capacity": 4096,
+  "output_tokens": 1024,
+  "warmup": true,
+  "nv_quant_linears": 253,
+  "nv_prefill": true,
+  "runs": [
+    {
+      "prompt_tokens": 512,
+      "generated_tokens": 1024,
+      "ttft_seconds": 1.0322829360011383,
+      "total_seconds": 18.38118648100135,
+      "prefill_tokens_per_second": 495.98804953939043,
+      "decode_tokens_per_second": 58.96626246993107
+    },
+    {
+      "prompt_tokens": 1000,
+      "generated_tokens": 1024,
+      "ttft_seconds": 2.535599787999672,
+      "total_seconds": 23.44085024800006,
+      "prefill_tokens_per_second": 394.38400520963023,
+      "decode_tokens_per_second": 48.93507504047292
+    },
+    {
+      "prompt_tokens": 2048,
+      "generated_tokens": 1024,
+      "ttft_seconds": 8.109795085998485,
+      "total_seconds": 37.52672766999967,
+      "prefill_tokens_per_second": 252.53412426361552,
+      "decode_tokens_per_second": 34.77588960299596
+    }
+  ]
+}

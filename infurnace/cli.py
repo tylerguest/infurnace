@@ -7,7 +7,7 @@ from pathlib import Path
 import resource
 import sys
 import time
-from tinygrad.helpers import GlobalCounters
+from tinygrad.helpers import GlobalCounters, Timing, profile_marker
 from infurnace.device import select_device, supports_nv_quant
 from infurnace.kernels.quant_gemm import nv_prefill_supported
 from infurnace.benchmark import DEFAULT_PROMPT_TOKENS, benchmark_prompt_ids, validate_benchmark_context
@@ -30,17 +30,21 @@ _SINGLE_SHOT_MAX_TOKENS = 64
 
 def _build(path: str, max_context: int, device: str | None, nv_quant: bool | None = None, *,
            nv_prefill: bool | None = None, nv_attention: bool = False,
-           nv_fused_attention: bool = False) -> tuple[Qwen3Model, Tokenizer]:
+           nv_fused_attention: bool | None = None, nv_prepared_weights: bool | None = None) -> tuple[Qwen3Model, Tokenizer]:
   device = select_device(device)
   enabled = supports_nv_quant(device) if nv_quant is None else nv_quant
   if enabled and not supports_nv_quant(device): raise ValueError("--nv-quant requires NV with the CUDA C renderer")
   kwargs = {"max_context": max_context, "device": device}
   if enabled: kwargs["nv_quant"] = True
+  if nv_prepared_weights is None: nv_prepared_weights = enabled
+  if nv_prepared_weights and not enabled: raise ValueError("--nv-prepared-weights requires NV quantized acceleration")
+  if enabled: kwargs["nv_prepared_weights"] = nv_prepared_weights
   prefill_enabled = enabled and nv_prefill_supported(device) if nv_prefill is None else nv_prefill
   if prefill_enabled:
     if not enabled: raise ValueError("--nv-prefill requires NV quantized acceleration")
     if not nv_prefill_supported(device): raise ValueError("--nv-prefill requires CUDA-C FP16 tensor cores")
     kwargs["nv_prefill"] = True
+  if nv_fused_attention is None: nv_fused_attention = enabled and not nv_attention
   if nv_attention or nv_fused_attention:
     if not enabled: raise ValueError("NV attention requires NV quantized acceleration")
     if nv_attention: kwargs["nv_attention"] = True
@@ -146,6 +150,56 @@ def _measure(model: Qwen3Model, ids: list[int], count: int) -> dict:
   }
 
 
+def _benchmark_spec(value: str) -> tuple[int | None, int]:
+  try:
+    parts = [int(part) for part in value.split(",")]
+    if len(parts) not in (1, 2) or any(part <= 0 for part in parts): raise ValueError
+  except ValueError:
+    raise argparse.ArgumentTypeError("benchmark must be COUNT or PROMPT,COUNT with positive integers") from None
+  return (None, parts[0]) if len(parts) == 1 else (parts[0], parts[1])
+
+
+def _run_step_benchmark(model: Qwen3Model, tokenizer: Tokenizer, count: int, *,
+                        prompt_tokens: int, prompt_text: str | None = None, warmup: bool = False) -> int:
+  ids = benchmark_prompt_ids(tokenizer, prompt_tokens, prompt_text)
+  validate_benchmark_context(len(ids), count, model.config.context_length)
+  if warmup: _warmup(model)
+  model.reset()
+  print(f"device={model.device}, context={model.config.context_length}, prompt={len(ids)}, outputs={count}, "
+        f"fused_attention={getattr(model, 'nv_fused_attention', False)}, "
+        f"prepared_weights={getattr(model, 'nv_prepared_weights', False)}, "
+        f"weight_layout={getattr(model, 'nv_prepared_weight_layout', 'gguf')}, warmup={warmup}")
+  print("GB/s and traffic MB are tinygrad estimates; allocated MB is current allocation, not GPU peak.")
+  stream = model.generate(ids, count)
+  decoder = tokenizer.stream_decoder()
+  text, decode_seconds, decoded = "", 0.0, 0
+  try:
+    for step in range(count):
+      prefill = step == 0
+      profile_marker(f"{'prefill' if prefill else 'decode'} @ {len(ids) if prefill else len(ids)+step-1}")
+      GlobalCounters.reset()
+      timer = Timing(enabled=False)
+      with timer: token = next(stream)  # upstream .item() synchronizes
+      seconds = timer.et*1e-9
+      traffic, allocated = GlobalCounters.global_mem, GlobalCounters.mem_used
+      text += decoder(token)
+      if not prefill:
+        decode_seconds += seconds
+        decoded += 1
+      # Formatting/token decoding/terminal output are outside the measured step.
+      label = f"prefill {len(ids):5d}" if prefill else f"decode  {step-1:5d}"
+      rate = len(ids)/seconds if prefill else 1/seconds
+      print(f"{label}: {seconds*1000:8.2f} ms, {rate:8.2f} tok/s, {traffic/seconds/1e9:7.2f} est GB/s, "
+            f"{traffic/1e6:.2f}/{allocated/1e6:.2f} MB, active={len(ids)+step}  --  "
+            +text.replace("\n", "\\n"), flush=True)
+  finally:
+    stream.close()
+  if decoded:
+    print(f"decode aggregate: {decoded/decode_seconds:.2f} tok/s ({decoded} steps; excludes prefill, includes any decode capture)")
+  print("Prefill includes first-token work; without --warmup, compilation/capture can appear in timed steps.")
+  return 0
+
+
 def _run_benchmark(model: Qwen3Model, tokenizer: Tokenizer, count: int, load_seconds: float = 0.0, *,
                    prompt_tokens: int = DEFAULT_PROMPT_TOKENS, prompt_text: str | None = None) -> int:
   ids = benchmark_prompt_ids(tokenizer, prompt_tokens, prompt_text)
@@ -163,6 +217,8 @@ def _run_benchmark(model: Qwen3Model, tokenizer: Tokenizer, count: int, load_sec
     "decode_input_positions": [len(ids), len(ids)+count-2] if count > 1 else None,
     "nv_quant_linears": getattr(model, "nv_quant_linears", 0),
     "nv_prefill": getattr(model, "nv_prefill", False),
+    "nv_prepared_weights": getattr(model, "nv_prepared_weights", False),
+    "nv_prepared_weight_layout": getattr(model, "nv_prepared_weight_layout", "gguf"),
     "nv_attention": getattr(model, "nv_attention", False),
     "nv_fused_attention": getattr(model, "nv_fused_attention", False),
     "cold": cold, "warm_runs": warm,
@@ -179,7 +235,10 @@ def main() -> int:
   mode = ap.add_mutually_exclusive_group()
   mode.add_argument("--prompt", help="raw single-shot prompt (not chat formatted)")
   mode.add_argument("--chat", action="store_true", help="interactive chat (default)")
-  mode.add_argument("--benchmark", nargs="?", type=int, const=20, metavar="COUNT")
+  mode.add_argument("--benchmark", nargs="?", type=_benchmark_spec, const=(None, 20), metavar="[PROMPT,]COUNT",
+                    help="per-step benchmark; default 20 outputs and 512 prompt tokens")
+  ap.add_argument("--benchmark-format", choices=("text", "json"), default="text", help="benchmark output (default: text)")
+  ap.add_argument("--warmup", action="store_true", help="warm up JIT before benchmarking (chat already warms up)")
   benchmark_prompt = ap.add_mutually_exclusive_group()
   benchmark_prompt.add_argument("--benchmark-prompt-tokens", type=int, help="synthetic prompt length including BOS (default: 512)")
   benchmark_prompt.add_argument("--benchmark-prompt-file", type=Path, help="UTF-8 raw prompt file; not truncated")
@@ -190,18 +249,36 @@ def main() -> int:
   acceleration.add_argument("--nv-quant", dest="nv_quant", action="store_true", help="require NV quantized acceleration")
   acceleration.add_argument("--no-nv-quant", dest="nv_quant", action="store_false", help="use generic tinygrad linears")
   ap.set_defaults(nv_quant=None)
+  prepared = ap.add_mutually_exclusive_group()
+  prepared.add_argument("--nv-prepared-weights", dest="nv_prepared_weights", action="store_true",
+                        help="require tiled/swizzled Q4/Q6 packing (automatic with NV quantized acceleration)")
+  prepared.add_argument("--no-nv-prepared-weights", dest="nv_prepared_weights", action="store_false",
+                        help="use native GGUF Q4/Q6 layouts instead of prepared weights")
+  ap.set_defaults(nv_prepared_weights=None)
   prefill = ap.add_mutually_exclusive_group()
   prefill.add_argument("--nv-prefill", dest="nv_prefill", action="store_true", help="require packed tensor-core prefill")
   prefill.add_argument("--no-nv-prefill", dest="nv_prefill", action="store_false", help="use generic prefill, retaining NV decode")
   ap.set_defaults(nv_prefill=None)
   ap.add_argument("--nv-attention", action="store_true", help="experimental parallel-softmax single-token NV attention")
-  ap.add_argument("--nv-fused-attention", action="store_true", help="experimental fused GQA decode attention (supersedes --nv-attention)")
+  fused = ap.add_mutually_exclusive_group()
+  fused.add_argument("--nv-fused-attention", dest="nv_fused_attention", action="store_true",
+                     help="require fused GQA decode attention (automatic on NV; supersedes --nv-attention)")
+  fused.add_argument("--no-nv-fused-attention", dest="nv_fused_attention", action="store_false",
+                     help="disable automatic fused attention")
+  ap.set_defaults(nv_fused_attention=None)
   ap.add_argument("--no-warmup", action="store_true", help="skip automatic startup warmup for interactive chat")
   ap.add_argument("--no-thinking", action="store_true", help="disable thinking in chat formatting")
   args = ap.parse_args()
+  if args.benchmark is not None:
+    inline_prompt, args.benchmark = args.benchmark
+    if inline_prompt is not None:
+      if args.benchmark_prompt_tokens is not None or args.benchmark_prompt_file is not None:
+        ap.error("PROMPT,COUNT conflicts with --benchmark-prompt-* options")
+      args.benchmark_prompt_tokens = inline_prompt
   for name in ("max_context", "max_tokens", "benchmark", "benchmark_prompt_tokens"):
     value = getattr(args, name)
     if value is not None and value <= 0: ap.error(f"--{name.replace('_', '-')} must be positive")
+  if args.nv_prepared_weights and args.nv_quant is False: ap.error("--nv-prepared-weights conflicts with --no-nv-quant")
   if args.nv_prefill and args.nv_quant is False: ap.error("--nv-prefill conflicts with --no-nv-quant")
   if (args.nv_attention or args.nv_fused_attention) and args.nv_quant is False: ap.error("NV attention conflicts with --no-nv-quant")
   if args.benchmark is None and (args.benchmark_prompt_tokens is not None or args.benchmark_prompt_file is not None):
@@ -210,12 +287,18 @@ def main() -> int:
   try:
     start = time.perf_counter()
     kwargs = {"nv_prefill": args.nv_prefill} if args.nv_prefill is not None else {}
+    if args.nv_prepared_weights is not None: kwargs["nv_prepared_weights"] = args.nv_prepared_weights
     if args.nv_attention: kwargs["nv_attention"] = True
-    if args.nv_fused_attention: kwargs["nv_fused_attention"] = True
+    if args.nv_fused_attention is not None: kwargs["nv_fused_attention"] = args.nv_fused_attention
     model, tokenizer = _build(args.model, args.max_context, args.device, args.nv_quant, **kwargs)
     load_seconds = time.perf_counter()-start
     if args.benchmark is not None:
       text = args.benchmark_prompt_file.read_text(encoding="utf-8") if args.benchmark_prompt_file is not None else None
+      if args.benchmark_format == "text":
+        return _run_step_benchmark(model, tokenizer, args.benchmark,
+                                   prompt_tokens=args.benchmark_prompt_tokens or DEFAULT_PROMPT_TOKENS,
+                                   prompt_text=text, warmup=args.warmup)
+      if args.warmup: _warmup(model)
       return _run_benchmark(model, tokenizer, args.benchmark, load_seconds,
                             prompt_tokens=args.benchmark_prompt_tokens or DEFAULT_PROMPT_TOKENS, prompt_text=text)
     if args.prompt is not None: return _run_single_shot(model, tokenizer, args.prompt, args.max_tokens or _SINGLE_SHOT_MAX_TOKENS)

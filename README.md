@@ -45,10 +45,12 @@ wheel. Uninstall with `pip uninstall infurnace`; model files are retained.
 infurnace                                  # select hardware, warm up, chat
 infurnace --no-thinking                     # chat without thinking
 infurnace --prompt "Hello" --max-tokens 64   # raw single-shot generation
-infurnace --benchmark 32                    # cold/warm benchmark, 512-token prompt
+infurnace --benchmark 512,32 --warmup       # per-token timing, 512-token prompt
+infurnace --benchmark 32 --benchmark-format json # cold/warm JSON report
 infurnace --no-nv-prefill                   # generic prefill, keeping fast NV decode
 infurnace --nv-attention                    # experimental parallel-softmax decode
-infurnace --nv-fused-attention              # experimental fused GQA decode
+infurnace --no-nv-fused-attention           # disable automatic fused GQA decode
+infurnace --no-nv-prepared-weights          # disable automatic tiled/swizzled Q4/Q6 layouts
 infurnace --no-nv-quant                     # generic tinygrad baseline
 infurnace --device CPU                      # explicit device override
 ```
@@ -78,11 +80,12 @@ The custom fast path keeps Q4_K/Q6_K weights packed and uses Q8-rounded
 activations for single-token linear projections. Multi-token prefill automatically
 uses packed Q4/Q6 FP16 tensor-core GEMM on eligible NV devices, with generic
 fallback elsewhere: activations round to FP16, accumulation is FP32,
-and no persistent dense weight copy is retained. Attention defaults to upstream;
-`--nv-attention` opts into parallel masked softmax for supported single-token NV
-decode. `--nv-fused-attention` instead enables shared-KV, split-context fused GQA
-attention with FP32 online softmax and a merge launch. Both remain opt-in and
-leave prefill unchanged. Norms, RoPE, cache allocation and sampling remain upstream.
+and no persistent dense weight copy is retained. Eligible NV runs automatically
+use shared-KV, split-context fused GQA decode attention with FP32 online softmax
+and a merge launch; unsupported shapes retain upstream attention.
+`--no-nv-fused-attention` disables it, while `--nv-attention` selects the parallel
+masked-softmax alternative. `--no-nv-quant` disables automatic NV acceleration.
+Prefill is unchanged. Norms, RoPE, cache allocation and sampling remain upstream.
 
 With a 512-token prompt and 32 generated tokens, local warm tests measured
 **~81 decode tok/s**. Experimental packed prefill reduced warm first-token latency

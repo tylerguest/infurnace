@@ -93,11 +93,15 @@ def _fused_partial(out: UOp, q: UOp, kv: UOp, *, active: int | UOp, heads: int, 
   tiles = (active+15)//16
   tiles = tiles.minimum(partition//16) if isinstance(tiles, UOp) else min(tiles, partition//16)
   tile = UOp.range(tiles, 2, axis_type=AxisType.LOOP)
-  loader = UOp.range(16, 4, axis_type=AxisType.LOOP)
-  position, dimension = start+tile*16+loader, warp*32+lane
+  loader = UOp.range(4, 4, axis_type=AxisType.LOOP)
+  row = loader*4+warp
+  position = start+tile*16+row
   shared = UOp.placeholder((2, 16, 128), dtypes.float16, slot=0, addrspace=AddrSpace.LOCAL)
-  stage = UOp.group(*(shared[half, loader, dimension].store(
-    kv[half, 0, kv_head, position.valid(position < active), dimension].load()) for half in (0, 1))).end(loader).barrier()
+  # Each warp stages a complete row with four adjacent halfwords per lane;
+  # the compiler can coalesce them into vector loads/stores (four loop trips).
+  stage = UOp.group(*(shared[half, row, lane*4+i].store(
+    kv[half, 0, kv_head, position.valid(position < active), lane*4+i].load())
+    for half in (0, 1) for i in range(4))).end(loader).barrier()
   local = shared.after(stage)
   state = UOp.placeholder((6,), dtypes.float32, slot=1, addrspace=AddrSpace.REG)
   state = state.after(UOp.group(state[0].store(UOp.const(float("-inf"), dtypes.float32)),
@@ -144,11 +148,13 @@ def _fused_merge(out: UOp, partial: UOp, *, heads: int, live: int | UOp) -> UOp:
     arg=KernelInfo(name="attention_fused_merge", opts_to_apply=()))
 
 
-def fused_decode_attention(q: Tensor, assigned_kv: Tensor, active_tokens: int | UOp, *, partition: int = 128) -> Tensor:
+def fused_decode_attention(q: Tensor, assigned_kv: Tensor, active_tokens: int | UOp, *, partition: int = 64) -> Tensor:
   """FP32 online-softmax decode with native FP16 KV, shared GQA tiles and merge.
 
   Initial contract: four query heads per KV head, D=128. Two GPU launches; scratch
   is bounded by capacity, never an active-length score/probability matrix.
+  RTX 5060 paired decode checks favor 64-token partitions over the original 128;
+  explicit 128/256 remain available for other workloads and smaller scratch.
   """
   heads, kv_heads, capacity = _validate_attention(q, assigned_kv, active_tokens)
   if heads != kv_heads*4: raise AttentionError("fused attention requires four query heads per KV head")

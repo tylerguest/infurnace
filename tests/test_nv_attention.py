@@ -65,9 +65,12 @@ def test_fused_rejects_noncontiguous_cache(monkeypatch):
 
 
 def reference(q, cache, length):
-  q = q.to("CPU").double()
-  k = cache[0, :, :, :length, :].to("CPU").double()
-  v = cache[1, :, :, :length, :].to("CPU").double()
+  # Snapshot mutable/JIT-reused buffers before building CPU reference operations.
+  # Lazy to()/slice graphs can reuse stale host copies after a cache write.
+  q = Tensor(q.tolist(), device="CPU", dtype=dtypes.float64)
+  snapshot = Tensor(cache.tolist(), device="CPU", dtype=dtypes.float64)
+  k = snapshot[0, :, :, :length, :]
+  v = snapshot[1, :, :, :length, :]
   return q.scaled_dot_product_attention(k, v, enable_gqa=True)
 
 
@@ -105,7 +108,8 @@ def test_dynamic_jit_cache_writes_and_reset(scale, fused):
     update = (Tensor.randn(2, 1, 2, 1, 128, device="NV")*(iteration+1)).half().realize()
     actual = jit(query, cache, update, nt.bind(length)).realize()
     expected = reference(query, cache, length)
-    assert (actual.to("CPU").double()-expected).abs().max().item() < 2e-4
+    snapshot = Tensor(actual.tolist(), device="CPU", dtype=dtypes.float64)
+    assert (snapshot-expected).abs().max().item() < 2e-4, (iteration, length, scale, fused)
 
 
 @NV

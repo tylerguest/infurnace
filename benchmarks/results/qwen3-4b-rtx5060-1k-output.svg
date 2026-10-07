@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1000" viewBox="0 0 1600 1000">
+<rect x="0" y="0" width="1600" height="1000" fill="white"/>
+<text x="800" y="64" font-family="DejaVu Sans, sans-serif" font-size="44" text-anchor="middle" font-weight="bold" fill="#17212b">Infurnace — Qwen3-4B Q4_K_M</text>
+<text x="800" y="108" font-family="DejaVu Sans, sans-serif" font-size="24" text-anchor="middle" font-weight="normal" fill="#17212b">Single-user decode throughput · NVIDIA RTX 5060 (8 GB)</text>
+<rect x="290" y="140" width="26" height="26" fill="#68acd1"/>
+<text x="330" y="163" font-family="DejaVu Sans, sans-serif" font-size="23" text-anchor="start" font-weight="normal" fill="#17212b">Packed NV + upstream attention</text>
+<rect x="890" y="140" width="26" height="26" fill="#ed3b2f"/>
+<text x="930" y="163" font-family="DejaVu Sans, sans-serif" font-size="23" text-anchor="start" font-weight="normal" fill="#17212b">Packed NV + fused attention</text>
+<text x="145" y="200" font-family="DejaVu Sans, sans-serif" font-size="23" text-anchor="start" font-weight="normal" fill="#17212b">Decode tokens / second</text>
+<line x1="145" y1="780.0" x2="1530" y2="780.0" stroke="#d6dce1" stroke-width="1"/>
+<text x="125" y="788.0" font-family="DejaVu Sans, sans-serif" font-size="23" text-anchor="end" font-weight="normal" fill="#17212b">0</text>
+<line x1="145" y1="699.2857142857143" x2="1530" y2="699.2857142857143" stroke="#d6dce1" stroke-width="1"/>
+<text x="125" y="707.2857142857143" font-family="DejaVu Sans, sans-serif" font-size="23" text-anchor="end" font-weight="normal" fill="#17212b">20</text>
+<line x1="145" y1="618.5714285714286" x2="1530" y2="618.5714285714286" stroke="#d6dce1" stroke-width="1"/>
+<text x="125" y="626.5714285714286" font-family="DejaVu Sans, sans-serif" font-size="23" text-anchor="end" font-weight="normal" fill="#17212b">40</text>
+<line x1="145" y1="537.8571428571429" x2="1530" y2="537.8571428571429" stroke="#d6dce1" stroke-width="1"/>
+<text x="125" y="545.8571428571429" font-family="DejaVu Sans, sans-serif" font-size="23" text-anchor="end" font-weight="normal" fill="#17212b">60</text>
+<line x1="145" y1="457.14285714285717" x2="1530" y2="457.14285714285717" stroke="#d6dce1" stroke-width="1"/>
+<text x="125" y="465.14285714285717" font-family="DejaVu Sans, sans-serif" font-size="23" text-anchor="end" font-weight="normal" fill="#17212b">80</text>
+<line x1="145" y1="376.42857142857144" x2="1530" y2="376.42857142857144" stroke="#d6dce1" stroke-width="1"/>
+<text x="125" y="384.42857142857144" font-family="DejaVu Sans, sans-serif" font-size="23" text-anchor="end" font-weight="normal" fill="#17212b">100</text>
+<line x1="145" y1="295.7142857142857" x2="1530" y2="295.7142857142857" stroke="#d6dce1" stroke-width="1"/>
+<text x="125" y="303.7142857142857" font-family="DejaVu Sans, sans-serif" font-size="23" text-anchor="end" font-weight="normal" fill="#17212b">120</text>
+<line x1="145" y1="215.0" x2="1530" y2="215.0" stroke="#d6dce1" stroke-width="1"/>
+<text x="125" y="223.0" font-family="DejaVu Sans, sans-serif" font-size="23" text-anchor="end" font-weight="normal" fill="#17212b">140</text>
+<line x1="145" y1="215" x2="145" y2="780" stroke="#263442" stroke-width="2"/>
+<line x1="145" y1="780" x2="1530" y2="780" stroke="#263442" stroke-width="2"/>
+<rect x="260.4166666666667" y="542.029012174921" width="115.41666666666667" height="237.97098782507896" fill="#68acd1"/>
+<text x="318.125" y="528.029012174921" font-family="DejaVu Sans, sans-serif" font-size="29" text-anchor="middle" font-weight="normal" fill="#17212b">59.0</text>
+<rect x="375.83333333333337" y="341.92420420215575" width="115.41666666666667" height="438.07579579784425" fill="#ed3b2f"/>
+<text x="433.5416666666667" y="327.92420420215575" font-family="DejaVu Sans, sans-serif" font-size="29" text-anchor="middle" font-weight="normal" fill="#17212b">108.5</text>
+<text x="375.83333333333337" y="822" font-family="DejaVu Sans, sans-serif" font-size="28" text-anchor="middle" font-weight="normal" fill="#17212b">512</text>
+<rect x="722.0833333333334" y="582.5120185866629" width="115.41666666666667" height="197.48798141333714" fill="#68acd1"/>
+<text x="779.7916666666667" y="568.5120185866629" font-family="DejaVu Sans, sans-serif" font-size="29" text-anchor="middle" font-weight="normal" fill="#17212b">48.9</text>
+<rect x="837.5" y="354.60824068635986" width="115.41666666666667" height="425.39175931364014" fill="#ed3b2f"/>
+<text x="895.2083333333334" y="340.60824068635986" font-family="DejaVu Sans, sans-serif" font-size="29" text-anchor="middle" font-weight="normal" fill="#17212b">105.4</text>
+<text x="837.5" y="822" font-family="DejaVu Sans, sans-serif" font-size="28" text-anchor="middle" font-weight="normal" fill="#17212b">1,000</text>
+<rect x="1183.75" y="639.6544455307663" width="115.41666666666667" height="140.3455544692337" fill="#68acd1"/>
+<text x="1241.4583333333333" y="625.6544455307663" font-family="DejaVu Sans, sans-serif" font-size="29" text-anchor="middle" font-weight="normal" fill="#17212b">34.8</text>
+<rect x="1299.1666666666667" y="379.974003322978" width="115.41666666666667" height="400.025996677022" fill="#ed3b2f"/>
+<text x="1356.875" y="365.974003322978" font-family="DejaVu Sans, sans-serif" font-size="29" text-anchor="middle" font-weight="normal" fill="#17212b">99.1</text>
+<text x="1299.1666666666667" y="822" font-family="DejaVu Sans, sans-serif" font-size="28" text-anchor="middle" font-weight="normal" fill="#17212b">2,048</text>
+<text x="800" y="872" font-family="DejaVu Sans, sans-serif" font-size="28" text-anchor="middle" font-weight="normal" fill="#17212b">Input Sequence Length (Output Sequence Length = 1024)</text>
+<text x="800" y="921" font-family="DejaVu Sans, sans-serif" font-size="20" text-anchor="middle" font-weight="normal" fill="#17212b">Capacity 4,096 · FP16 KV · packed NV linears + tensor-core prefill in both modes</text>
+<text x="800" y="951" font-family="DejaVu Sans, sans-serif" font-size="19" text-anchor="middle" font-weight="normal" fill="#53606c">One warmed run per mode/length; sequential processes, not alternating statistical evidence.</text>
+<text x="800" y="978" font-family="DejaVu Sans, sans-serif" font-size="18" text-anchor="middle" font-weight="normal" fill="#53606c">Decode = 1023 synchronized steps / elapsed decode time. Prefill excluded. Desktop workload/clocks may vary.</text>
+</svg>

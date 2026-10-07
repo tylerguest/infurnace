@@ -56,7 +56,20 @@ load includes tokenizer construction for both runners.
 
 ## Other measurements
 
-`infurnace --benchmark 32` now also defaults to 512 prompt tokens. Customize it:
+`infurnace --benchmark 32` defaults to 512 prompt tokens and readable per-step
+output using tinygrad's `Timing`, `GlobalCounters.reset()` and profile markers.
+The first line measures prefill plus first-token work; subsequent lines measure
+synchronized decode steps and show ms/token, tok/s, estimated traffic GB/s,
+traffic/current allocation MB, active length and generated text. Formatting and
+printing are outside the timed region. The final aggregate excludes prefill but
+includes any decode compilation/capture; use `--warmup` to prime JIT first.
+Traffic is a compiler estimate, not measured DRAM bandwidth; allocation is not
+GPU peak. Text output is one generation, not three warm repetitions.
+
+`--benchmark PROMPT,COUNT` provides screenshot-style shorthand, e.g.
+`infurnace --benchmark 1000,50 --warmup`. Inline prompt length cannot be combined
+with `--benchmark-prompt-*`. Use `--benchmark-format json` for the existing
+cold/capture/three-warm-run machine-readable report. Customize it:
 
 ```sh
 infurnace --benchmark 32 --benchmark-prompt-tokens 512
@@ -121,16 +134,17 @@ partition, then launches a small merge kernel. Four query warps share FP16 K/V
 staging (16 tokens × 128 dimensions × two tensors = 8 KiB) per KV-head block.
 Queries, scores and accumulators remain FP32; no query FP16 conversion occurs.
 
-Default partition size is 128 tokens. Only live partitions launch and merge;
+Default partition size is 64 tokens (initial version: 128). Only live partitions launch and merge;
 tail loads are masked, and shared memory has producer/consumer barriers before
-reuse. Scratch is `(query_heads, ceil(capacity/128), 130)` FP32 values, bounded by
+reuse. Scratch is `(query_heads, ceil(capacity/64), 130)` FP32 values, bounded by
 capacity rather than session length. The last two values hold max/normalization
 statistics. No full score or probability matrix is retained. Native cache layout
 and the ordered latest-token write remain unchanged. Prefill stays upstream.
 
 Initial supported shape: batch 1, one query token, D=128, four query heads per KV
 head. Unsupported blocks remain upstream. Programmatic loading selects this path
-with `nv_quant=True, nv_fused_attention=True`; CLI/benchmark selection is explicit.
+with `nv_quant=True, nv_fused_attention=True`; CLI automatically selects fused
+attention on eligible NV runs (`--no-nv-fused-attention` opts out).
 
 One same-process comparison, Qwen3-4B/RTX 5060, 4096 capacity, identical synthetic
 prompt IDs, 32 output tokens, packed prefill, no profiler:
@@ -166,6 +180,197 @@ DEV=NV INFURNACE_TEST_MODEL=models/Qwen3-4B-Q4_K_M.gguf INFURNACE_TEST_NV_FUSED_
 ```
 
 The generation smoke test also accepts `INFURNACE_TEST_NV_FUSED_ATTENTION=1`.
+
+### Decode scheduling follow-up
+
+KV staging now loads four adjacent halfwords per lane, one row per warp,
+reducing the loader loop from 16 trips to four. Partition size 64 gives more
+parallel blocks and shorter per-block work than the original 128. The FP32
+attention arithmetic is unchanged within a partition; different merge grouping
+can change rounding. Scratch per partial buffer doubles versus partition 128
+but remains bounded by capacity; explicit partition 128/256 remains supported.
+
+Alternating captured whole-model decode replays, same prefilled prefix per
+context, `item()` synchronization per token, 32 decode steps per batch, four
+pairs, no profiler (RTX 5060, context capacity 4096):
+
+| Prompt tokens | Original fused path | Tuned fused path | Gain |
+| --- | ---: | ---: | ---: |
+| 512 | 92.4 tok/s | 95.2 tok/s | 3.1% |
+| 2048 | 84.5 tok/s | 89.9 tok/s | 6.4% |
+
+Rates are 32 divided by median batch duration. Contexts were checked in separate
+processes; modes alternated within each process. The 512-token batches completed
+before that process was interrupted, so its text log rather than final JSON is
+retained. An earlier single-pass full-generation comparison was mixed, motivating
+these paired checks. Absolute rates vary with clocks and other desktop workloads;
+do not compare directly to earlier sessions' peak rates. This tunes the opt-in
+`--nv-fused-attention` path only; prefill and generic attention are unchanged.
+
+Artifacts: `/tmp/infurnace-decode-replay-512-output.txt`,
+`/tmp/infurnace-decode-replay-ab.json`, and the earlier
+`/tmp/infurnace-decode-tuning-ab.json`. Tile-softmax and subgroup-dot variants were
+screened and rejected because their additional staging/synchronization lost time.
+Broader regression and model-quality checks remain follow-up work.
+
+## Prepared Q4/Q6 weight layouts (experimental)
+
+NV quantized runs automatically prepare Q6 weights once during model loading, adding
+zero alignment bytes to each 210-byte GGUF block (216 bytes/block). Values,
+scales and FP16 block multipliers are unchanged. Prepared Q6 uses row-local
+four-block tiles with word-pair/block interleaving (described below), not a new
+quantization format. Q4 now also uses four-block tiles, but interleaves four-word
+groups to preserve 128-bit payload loads without adding storage (described below).
+The resident buffer is uint32, enabling 64-bit vectorized payload loads; packed
+prefill also reads this layout. Generic decode/embedding interprets the padded
+stride directly, rather than constructing a second tight GGUF allocation.
+Tied embedding/output share the prepared backing and lazy decoded weight.
+
+```sh
+infurnace --nv-prepared-weights --benchmark 512,128 --warmup
+```
+
+Programmatic loading: `Qwen3Model.from_gguf(..., nv_quant=True,
+nv_prepared_weights=True)`. Preparation now defaults on with `nv_quant=True`;
+pass `nv_prepared_weights=False` or CLI `--no-nv-prepared-weights` to opt out.
+`--no-nv-quant` also disables automatic preparation. It remains experimental:
+the measured gain is too small to establish a reliable throughput improvement.
+The model load still has temporary staging allocations; no GPU peak was measured.
+
+Initial 212-byte candidate comparison (historical), fused attention, packed prefill, capacity 4096,
+512 prompt tokens, 128 outputs, three warmed runs per mode, native process first
+then prepared process (no profiler):
+
+| Layout | Decode rates | Median | Current tinygrad allocation |
+| --- | --- | ---: | ---: |
+| Native Q6 | 111.71 / 111.72 / 111.64 tok/s | 111.71 tok/s | 3,691,969,884 bytes |
+| Prepared Q6 | 112.32 / 111.88 / 112.32 tok/s | 112.32 tok/s | 3,698,896,244 bytes |
+
+Approximately 0.5% higher median and 6.9 MB additional allocation; separate
+sequential processes do not establish a causal gain at this scale. Q6 storage
+padding is 0.95%, distinct from whole-model allocation overhead. Artifacts:
+`/tmp/infurnace-q6-prepared-native.json` and
+`/tmp/infurnace-q6-prepared-prepared.json`. Existing benchmark charts are not
+updated with these incomparable measurements. Focused tests cover byte-preserving
+preparation, generic decoding and NV eager/JIT decode and prefill parity, including
+odd/even block positions and partial final chunks.
+
+### UOp packing / vector-load iteration
+
+Current preparation uses a single `_prepare_q6_kernel` UOp STORE/SINK call,
+not a chain of tensor padding/contiguous/bitcast kernels. Tensor is only used as
+the buffer allocation/realization facade. The pinned tinygrad coalescer
+(`codegen/late/coalesce.py`) requires provable alignment to form vector loads.
+A 216-byte block stride guarantees 8-byte alignment; explicit eight-word
+`_load_lanes()` payload accesses lower to uint2 loads. A 224-byte stride enabled
+uint4 loads but was rejected after whole-model throughput decreased.
+
+Generated cubins, inspected with `cuobjdump`, for Q6 FFN-down and vocabulary
+head: 212-byte layout has 22 global-load instructions total per kernel body,
+216-byte layout 14, 224-byte layout 10 (including activation/metadata loads).
+These counts are static instructions, not measured DRAM traffic. No register
+spills in the inspected 212/224 kernels. The 224 FFN-down variant used 48
+registers versus 47 for 212; both head variants used 40.
+
+Same workload as above: 512-token prompt, 128 outputs, capacity 4096,
+three warmed runs per layout, separate processes in order 212, 224, 216:
+
+| Block stride | Decode rates | Median | Current allocation |
+| --- | --- | ---: | ---: |
+| 212 bytes | 113.24 / 113.39 / 113.19 tok/s | 113.24 tok/s | 3,698,896,244 bytes |
+| 224 bytes (rejected) | 112.19 / 111.74 / 112.04 tok/s | 112.04 tok/s | 3,740,307,292 bytes |
+| 216 bytes (retained, now default for NV quantized runs) | 114.46 / 114.06 / 116.36 tok/s | 114.46 tok/s | 3,712,669,532 bytes |
+
+The retained candidate is approximately 1.1% faster than the saved 212-byte
+baseline in this session, not an alternating statistical confirmation. No
+baseline rerun or extrapolation to the longer-context published chart.
+Padding is 2.86% of Q6 storage, about 20.7 MB above tight native Q6 storage.
+Actual allocation shown above includes graph/scratch differences and is not
+GPU peak. The next iteration below adds cross-block swizzling without changing
+the 216-byte storage budget.
+Artifacts: `/tmp/infurnace-q6-vector-{212,216,224}.json`, with generated
+CUDA/cubins/SASS in `/tmp/infurnace-q6-{212,216,224}-{down,head}.*`.
+
+### Four-block Q6 word-pair swizzle
+
+Current prepared Q6 layout groups four adjacent 256-value blocks within each
+weight row. Each tile stores `[word_pair, block_within_tile, pair_element]`;
+tiles at a row's end use their actual block count (1–3), without extra tile
+padding. Block storage remains 216 bytes. This brings the same word pairs from
+the four blocks assigned to a decode warp into contiguous addresses, retaining
+aligned 64-bit loads. Preparation, GEMV and prefill addressing are explicit
+UOps; generic/tied embedding consumers use inverse views and lazy decode of
+that same allocation. No inverse tight-GGUF buffer is explicitly realized.
+
+The 216-byte aligned-only kernel remains available internally for comparison
+(`q6_swizzled=False`); normal prepared adapters select the swizzle. CLI JSON
+records the prepared layout (initially `"q6_tile4_pair_swizzle"`, now
+`"q4_tile4_quad_q6_tile4_pair"`), or `"gguf"` when
+preparation is disabled. This is a format/shape-specific Q6 layout, not a
+second inference engine.
+
+Bounded comparison: RTX 5060, capacity 4096, 512-token prompt, 128 outputs,
+fused attention and packed prefill, three warmed runs in each of two sequential
+processes (aligned first, swizzled second), no profiler:
+
+| Layout | Decode rates | Median | Current allocation |
+| --- | --- | ---: | ---: |
+| Aligned 216-byte | 113.60 / 107.97 / 113.22 tok/s | 113.22 tok/s | 3,712,669,532 bytes |
+| Four-block swizzle | 117.51 / 117.50 / 117.72 tok/s | 117.51 tok/s | 3,712,698,204 bytes |
+
+Approximately 3.8% median improvement in this session; process order, GPU clocks
+and desktop workload remain confounders. No statistical confidence claim or
+long-context extrapolation. Current allocation differs by about 29 KB, not an
+additional full weight copy; transient/GPU peak allocation is not measured.
+TTFT snapshots were 0.983–1.010 s aligned versus 0.963–0.979 s swizzled; this is
+not a separate statistically established prefill improvement.
+
+Inspected cubins contain 14 global-load instructions for both layouts. Q6
+FFN-down registers decreased 49->46; head remains 40, no spills. The intended
+improvement is cross-lane locality, not fewer instructions or proven DRAM
+bandwidth. Tests cover complete/partial tiles, row boundaries, byte-preservation,
+generic decode, one/eight-warp eager/JIT GEMV, and concrete/symbolic prefill.
+Artifacts: `/tmp/infurnace-q6-swizzle-{aligned,swizzled}.json` and generated
+`/tmp/infurnace-q6-{aligned,swizzled}-{down,head}.{cu,cubin,sass}`.
+Published 1024-output chart remains the earlier aligned-layout measurement.
+
+### Four-block Q4 four-word swizzle
+
+Prepared Q4 now stores `[word_group_of_four, block_within_tile, group_element]`
+for four adjacent GGUF blocks in each row. Partial tiles use their actual block
+count. All 144 bytes/block are preserved with no padding; preparation and kernel
+addressing use UOps. Generic decode and prefill consume the same resident layout.
+`--no-nv-prepared-weights` disables both Q4 and Q6 preparation.
+
+A Q4 word-pair variant was rejected (more narrow payload loads). The retained
+four-word variant preserves native 128-bit payload loads while improving intended
+cross-block locality. Inspected gate/down cubins have 10 global-load instructions
+for both native and four-word variants, but 38->36 registers, no spills.
+These are static instruction/resource observations, not DRAM counter measurements.
+
+RTX 5060, 512 prompt tokens, 128 outputs, capacity 4096, fused attention,
+packed prefill, Q6 swizzle enabled throughout, three warmed runs per process:
+
+| Q4 layout | Decode rates | Median | Current allocation |
+| --- | --- | ---: | ---: |
+| Native | 113.38 / 114.30 / 114.57 tok/s | 114.30 tok/s | 3,712,698,204 bytes |
+| Word-pair swizzle (rejected) | 110.91 / 110.97 / 108.43 tok/s | 110.91 tok/s | 3,712,709,676 bytes |
+| Four-word swizzle (retained) | 114.28 / 117.05 / 117.50 tok/s | 117.05 tok/s | 3,712,709,676 bytes |
+
+Sequential processes, native first, then pair, then quad. About 2.4% median gain
+against the saved native baseline, not an alternating statistical confirmation.
+An intermediate runner invocation accidentally selected native rather than quad;
+its report is retained as `/tmp/infurnace-q4-extra-native-control.json` and is
+not used as the candidate. The corrected quad run is the one reported above.
+TTFT snapshots are 0.973–0.990 s native versus 0.973–1.017 s quad; no prefill
+speedup claim. Current allocation changes about 11 KB, not a second full weight
+allocation; peak/transient allocation is not measured.
+
+Parity tests cover every byte, generic decode, partial tile/row boundaries,
+eager/JIT GEMV and concrete/symbolic prefill. Artifacts:
+`/tmp/infurnace-q4-swizzle-{native,swizzled,quad}.json` and generated
+`/tmp/infurnace-q4-{native,quad}-{gate,down}.{cu,cubin,sass}`.
+The published 1024-output chart is unchanged and predates these layout changes.
 
 ## Parallel-softmax reference attention
 

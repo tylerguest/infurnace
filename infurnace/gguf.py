@@ -130,16 +130,43 @@ def _q4_scales(blocks:Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
   minimums = packed[:, 4:8].bitwise_and(63).cat(packed[:, 8:12].rshift(4).bitwise_or(packed[:, 4:8].rshift(6).lshift(4),), dim = -1)
   return d, dmin, scales, minimums
 
-def _dequant_q4_k(data: Tensor) -> Tensor:
-  blocks = data.reshape(-1, QUANT_BLOCK_BYTES[Q4_K]).contiguous()
+def _dequant_q4_k(data: Tensor, *, swizzled_width: int = 0) -> Tensor:
+  if swizzled_width:
+    words = data.bitcast(dtypes.uint32).reshape(-1, swizzled_width*36)
+    full, tail = swizzled_width//4*4, swizzled_width%4
+    parts = []
+    if full:
+      parts.append(words[:, :full*36].reshape(-1, full//4, 9, 4, 4).permute(0, 1, 3, 2, 4).reshape(-1, full, 36))
+    if tail:
+      parts.append(words[:, full*36:].reshape(-1, 9, tail, 4).permute(0, 2, 1, 3).reshape(-1, tail, 36))
+    ordered = parts[0] if len(parts) == 1 else parts[0].cat(parts[1], dim=1)
+    blocks = ordered.reshape(-1, 36).bitcast(dtypes.uint8)
+  else:
+    blocks = data.reshape(-1, QUANT_BLOCK_BYTES[Q4_K]).contiguous()
   d, dmin, scales, minimums = _q4_scales(blocks)
   # Each 32-byte chunk encodes a low-nibble group followed by a high-nibble group.
   qs = blocks[:, 16:144].reshape(-1, 4, 32)
   q = Tensor.stack(qs.bitwise_and(15), qs.rshift(4), dim=2).reshape(-1, 8, 32)
   return (d.unsqueeze(-1) * scales.unsqueeze(-1) * q - dmin.unsqueeze(-1) * minimums.unsqueeze(-1)).flatten()
 
-def _dequant_q6_k(data: Tensor) -> Tensor:
-  blocks = data.reshape(-1, QUANT_BLOCK_BYTES[Q6_K]).contiguous()
+def _dequant_q6_k(data: Tensor, *, block_bytes: int = 210, swizzled_width: int = 0) -> Tensor:
+  # Internal prepared NV storage may add alignment bytes per block.
+  # Decode fields in place, without reconstructing a second tight GGUF buffer.
+  if block_bytes not in (210, 212, 216): raise ValueError("Q6 block stride must be 210, 212 or 216 bytes")
+  if swizzled_width:
+    if block_bytes != 216: raise ValueError("swizzled Q6 requires 216-byte prepared blocks")
+    # Inverse views of [pair, block, element], not a realized tight GGUF copy.
+    words = data.bitcast(dtypes.uint32).reshape(-1, swizzled_width*54)
+    full, tail = swizzled_width//4*4, swizzled_width%4
+    parts = []
+    if full:
+      parts.append(words[:, :full*54].reshape(-1, full//4, 27, 4, 2).permute(0, 1, 3, 2, 4).reshape(-1, full, 54))
+    if tail:
+      parts.append(words[:, full*54:].reshape(-1, 27, tail, 2).permute(0, 2, 1, 3).reshape(-1, tail, 54))
+    ordered = parts[0] if len(parts) == 1 else parts[0].cat(parts[1], dim=1)
+    blocks = ordered.reshape(-1, 54).bitcast(dtypes.uint8)
+  else:
+    blocks = data.reshape(-1, block_bytes).contiguous()
   low = _q_to_uint8(blocks[:, :128].reshape(-1, 2, 64), 4)
   high = _q_to_uint8(blocks[:, 128:192].reshape(-1, 2, 32), 2).lshift(4)
   q = (low.bitwise_or(high).bitcast(dtypes.int8) - 32).reshape(-1, 256)
