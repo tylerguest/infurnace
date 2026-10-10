@@ -30,11 +30,11 @@ def test_attention_requires_nv_quant_before_loading():
 def test_fused_graph_has_shared_kv_and_bounded_partials():
   from tinygrad.dtype import AddrSpace
   from tinygrad.uop.ops import Ops
-  from infurnace.kernels.attention import _fused_partial, _fused_merge
+  from infurnace.kernels.attention import _fused_partial, _fused_merge, _kernel_scalar
   out = UOp.placeholder((32, 32, 130), dtypes.float32, slot=0)
   q = UOp.placeholder((1, 32, 1, 128), dtypes.float32, slot=1)
   kv = UOp.placeholder((2, 1, 8, 4096, 128), dtypes.float16, slot=2)
-  active = UOp.variable("graph_active", 1, 4096, param=True)
+  active = _kernel_scalar(UOp.variable("graph_active", 1, 4096))
   graph = _fused_partial(out, q, kv, active=active, heads=32, capacity=4096, partition=128)
   ops = graph.toposort()
   shared = [u for u in ops if u.op is Ops.BUFFER and u.addrspace == AddrSpace.LOCAL]

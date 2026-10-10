@@ -42,7 +42,8 @@ def test_auto_acceleration(monkeypatch):
   monkeypatch.setattr(cli.Qwen3Model, "from_gguf", build)
   monkeypatch.setattr(cli.Tokenizer, "from_gguf", lambda metadata: None)
   cli._build("model", 16, None)
-  assert calls[-1] == {"max_context": 16, "device": "NV", "nv_quant": True, "nv_prefill": True}
+  assert calls[-1] == {"max_context": 16, "device": "NV", "nv_quant": True, "nv_prefill": True,
+                       "nv_prepared_weights": True, "nv_fused_attention": True}
   cli._build("model", 16, None, False)
   assert "nv_quant" not in calls[-1]
   assert "nv_prefill" not in calls[-1]

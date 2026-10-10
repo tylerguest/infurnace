@@ -29,10 +29,10 @@ def test_decode_graph_keeps_warps_separate_and_eight_integer_dots(typ, rows, wid
   dots = [u for u in nodes if u.op is Ops.CUSTOMI and "__dp4a" in str(u.arg)]
   assert len(dots) == 8  # Q4 sum dots and Q6 signed-byte rebuilding must not return.
   ranges = [u for u in nodes if u.op is Ops.RANGE]
-  assert any(u.arg[-1] is AxisType.WARP and u.src[0].arg == 32 for u in ranges)
+  assert any(getattr(u, 'axis_type', u.arg[-1]) is AxisType.WARP and u.src[0].arg == 32 for u in ranges)
   if warps > 1:
-    assert any(u.arg[-1] is AxisType.LOCAL and u.src[0].arg == warps for u in ranges)
-    assert not any(u.arg[-1] is AxisType.LOCAL and u.src[0].arg == warps*32 for u in ranges)
+    assert any(getattr(u, 'axis_type', u.arg[-1]) is AxisType.LOCAL and u.src[0].arg == warps for u in ranges)
+    assert not any(getattr(u, 'axis_type', u.arg[-1]) is AxisType.LOCAL and u.src[0].arg == warps*32 for u in ranges)
   if typ == 14:
     # Weight parameter uses native halfwords, not padded blocks or aligned-u32 reinterpretation.
     assert any(u.op is Ops.PARAM and u.dtype == dtypes.uint16 for u in nodes)

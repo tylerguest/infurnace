@@ -26,7 +26,8 @@ def _q6_byte(raw: UOp, base: UOp, offset: UOp, blocks_per_row: int = 0) -> UOp:
   return (raw[index].load().cast(dtypes.uint32) >> ((offset%size)*8).cast(dtypes.uint32)) & 255
 
 
-def _weight(raw: UOp, row: UOp, col: UOp, width: int, typ: int, q6_aligned: bool = False, q6_swizzled: bool = False, q4_swizzled: bool = False) -> UOp:
+def _weight(raw: UOp, row: UOp, col: UOp, width: int, typ: int, q6_aligned: bool = False,
+            q6_swizzled: bool = False, q4_swizzled: bool = False) -> UOp:
   block, within = col//256, col%256
   if typ == Q4_K:
     logical = row*(width//256)+block
@@ -62,7 +63,7 @@ def _prefill_kernel(out: UOp, raw: UOp, x: UOp, *, tokens: int, width: int, rows
   group, thread = lane//4, lane%4
   acc = UOp.placeholder((4,), dtypes.float32, slot=3, addrspace=AddrSpace.REG)
   acc = acc.after(acc.store(acc.const_like(0)))
-  k = UOp.range(width//16, 2, axis_type=AxisType.REDUCE)
+  k = UOp.range(width//16, 2, axis_type=getattr(AxisType, 'REDUCE', AxisType.LOOP))
   # NVIDIA mma.sync m16n8k16.row.col fragment order (not AMD WMMA order).
   a = UOp.stack(*(x[token_base+group+row, k*16+thread*2+col].load()
                   for col_high in (0, 8) for row in (0, 8) for col in (col_high, col_high+1)))

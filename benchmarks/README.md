@@ -14,6 +14,80 @@ chosen local GGUF; Infurnace currently validates dense Qwen3 F32/Q4_K/Q6_K.
 NV quantization is enabled for Infurnace by default; `--no-nv-quant` compares
 generic loading/generation instead. For CPU use `--device CPU --no-nv-quant`.
 
+## Experimental EAGLE-3 comparison
+
+```sh
+DEV=NV PYTHONPATH=. .venv/bin/python benchmarks/eagle.py \
+  models/Qwen3-4B-Q4_K_M.gguf models/eagle3-qwen3-4b \
+  --fast-eagle --context 512 --output 256 \
+  --json /tmp/eagle-comparison.json
+```
+
+This keeps one target/draft resident, warms both paths, then brackets EAGLE with
+baseline runs. Thinking stays enabled and every output must match the baseline
+exactly. Timing is synchronized whole-request time, including prompt and draft
+observation; it is not decode-only throughput. JSON separates warmups from
+measurements and checkpoints completed runs with `status=running`; failures
+are marked `aborted`. Only `complete` runs constitute a completed comparison.
+Reports include TTFT, post-first-burst throughput, proposed/accepted counts,
+committed tokens per round and bracketing speedup ratios. Ratios are suppressed
+unless the entire protocol completes; raw records remain available on failure.
+Loading failures also checkpoint `status=aborted`, `stage=loading`. Reports record
+HCQ cache threshold, runtime pool size and imported tinygrad module path.
+Do not run alongside another full-model inference process.
+
+`--fast-eagle` selects the integrated profile now used by CLI `--eagle3`:
+one proposal by default, fused drafting, owned mapped I/O, parallel sampling,
+zero-copy features, and validated exact fused projections. Omit individual
+optimization switches when using this profile. `--draft-tokens` may still be
+overridden. The original checkpoint is used unchanged; a calibrated head is
+not automatically selected. Without `--fast-eagle`, this benchmark retains
+its historical explicit configuration and two-proposal default.
+
+Optimized experimental comparisons reached about **132 vs 107 tok/s** with a
+separately calibrated head. See [latest results](experiments/eagle3/README.md).
+These are workload-specific gains, not a reliability guarantee.
+
+### Historical controls and individual optimization switches
+
+The original arithmetic and JSON trials were slower than their matched baseline. Newer
+attention/sampling candidates require completed repeated-request validation;
+an NV signal timeout is an aborted experiment, not performance evidence.
+The published 1024-output chart is unchanged. Test a smaller draft budget with
+`--draft-tokens 1`; a projection-level improvement is not evidence of an
+application win. `--local-ffn-down` explicitly enables the new CTA-local Q6
+projection candidate; it is disabled by default because repeated application
+measurements aborted with NV synchronization errors. `--loop-projections` tests
+whole-row projection CTAs, including local-token Q6 FFN-down/output-head loops.
+These projection variants preserve partial sums but do not establish a tok/s win.
+`--fused-draft` combines draft observation and proposals in one capture; it is
+separate from experimental target/root sampling and remains disabled by default.
+A completed exact-output original-target trial (256 outputs, one proposal, two
+warmup pairs and two repeats, loop projections and fused draft, HCQ cache disabled)
+measured **94.75 / 94.29 EAGLE versus 109.39–109.70 baseline tok/s**, still slower.
+`--fused-projections` additionally folds chunk sums and residual updates into the
+projection CTA, preserving the target's residual-first accumulation and completed
+warp-sum rounding boundaries. Real-model 2/3/4-row logits/features and replay match
+exactly. A completed 256-output trial measured **93.33 / 93.19 EAGLE versus
+106–109 baseline tok/s**, so this option also remains disabled. Follow-up reports
+are under [`experiments/eagle3`](experiments/eagle3/README.md), not in the published
+chart directory.
+
+`--compact-verify` tests device-side prefix commitment; `--zero-copy-features`
+tests direct feature views. `--draft-confidence MARGIN` requires `--fused-draft`
+and truncates proposals at the first low-confidence token. Higher acceptance
+percentage alone is insufficient: filtering can discard useful accepted tokens
+and create additional rounds. These options do not establish an application gain.
+
+Normal-cache repeated requests remain unreliable; disabling caching is neither
+an application speedup nor a universal fix.
+The updated tinygrad pin fixes submission-signal reinitialization; a later combined
+fused-sampling/zero-copy trial still timed out, so those modes remain disabled.
+Full-row residual reductions and materialized batched Q/K normalization passed
+real-model exactness checks and are enabled within the opt-in verifier.
+`--eagle3 CHECKPOINT` exposes the experimental path in CLI chat and raw
+single-shot generation, but ordinary decode remains the default.
+
 ## Method
 
 Defaults to **512 tokens of deterministic repeated prose**, including optional
@@ -371,6 +445,42 @@ eager/JIT GEMV and concrete/symbolic prefill. Artifacts:
 `/tmp/infurnace-q4-swizzle-{native,swizzled,quad}.json` and generated
 `/tmp/infurnace-q4-{native,quad}-{gate,down}.{cu,cubin,sass}`.
 The published 1024-output chart is unchanged and predates these layout changes.
+
+## Shared Q8 activation packing
+
+Supported `_NVAttentionBlock` single-token decode now packs its already-normalized
+input once for Q/K/V and once for FFN gate/up. `_NVLinear.decode()` passes that
+explicit Q8 tuple into the GEMV UOp call, with dtype/shape/device validation.
+No Python activation cache, norm replacement or change to the upstream function
+boundary. Prefill/unsupported shapes fall back unchanged. On Qwen3-4B this reduces
+packing calls from 253 to 145 per token (108 removed across 36 layers).
+CLI JSON/text records `nv_shared_q8_blocks`. Sharing applies to eligible NV
+parallel/fused attention blocks, not the plain upstream-attention block path.
+
+RTX 5060, 512 prompt tokens, 128 outputs, capacity 4096, current Q4/Q6 prepared
+layouts and fused attention, three warmed runs per mode in separate processes
+(baseline first, shared second), no profiler:
+
+| Packing | Decode rates | Median |
+| --- | --- | ---: |
+| Separate per projection | 111.24 / 111.40 / 111.38 tok/s | 111.38 tok/s |
+| Shared Q/K/V and gate/up | 113.12 / 113.08 / 113.27 tok/s | 113.12 tok/s |
+
+Approximately 1.6% median gain in this session; sequential process order and
+clocks remain confounders, so not statistical confirmation. Tests verify a single
+packing CALL feeding three projections, exact individual projection parity,
+whole toy-block parity through JIT/cache writes/reset, independent KV buffers,
+and unchanged upstream prefill. Published long-output charts are unchanged.
+Reports: `/tmp/infurnace-activation-{baseline,shared}.json`.
+
+An RMSNorm/Q8 UOp fusion prototype passed eight isolated reference/JIT cases but
+its whole-model benchmark hit an NV synchronization timeout after warmup. No
+throughput result or proven cause was obtained; that integration and kernel were
+removed rather than enabled. Prototypes are saved outside the repo as
+`/tmp/infurnace-rmsnorm-q8-prototype.py` and
+`/tmp/infurnace-model-rmsnorm-prototype.py`; failed run logs:
+`/tmp/infurnace-activation-fused{,-stderr}.txt`. RMSNorm fusion remains follow-up
+work requiring reliable whole-model validation.
 
 ## Parallel-softmax reference attention
 

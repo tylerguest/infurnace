@@ -7,7 +7,7 @@ from tinygrad import Tensor, Context, dtypes
 from tinygrad.llm.model import Transformer, TransformerConfig, TransformerBlock, apply_rope
 from tinygrad.nn.state import load_state_dict
 from infurnace.gguf import PackedTensor, parse_gguf, _dequant, _dequant_q6_k, _dequant_q4_k
-from infurnace.kernels.quant_gemv import quant_gemv, prepare_q6, prepare_q4, Q6_PREPARED_BYTES, QUANT_SIZES
+from infurnace.kernels.quant_gemv import quant_gemv, q8_quantize, prepare_q6, prepare_q4, Q6_PREPARED_BYTES, QUANT_SIZES
 from infurnace.kernels.quant_gemm import quant_gemm, nv_prefill_supported
 from infurnace.kernels.attention import decode_attention, fused_decode_attention, nv_attention_supported
 
@@ -133,11 +133,25 @@ class _NVAttentionBlock(TransformerBlock):
   until an upstream hook exists; no dependency or global Tensor method is patched.
   """
   fused_attention = False
+  # Keep packing local to each invocation: no activation cache survives a token,
+  # reset or JIT capture. The upstream function boundary and norm math stay intact.
+  share_q8 = True
+
+  def _feed_forward(self, x):
+    if (self.share_q8 and all(isinstance(s, int) for s in x.shape[:2]) and x.shape[:2] == (1, 1) and
+        all(isinstance(getattr(self, name, None), _NVLinear) for name in ('ffn_gate', 'ffn_up'))):
+      q8 = q8_quantize(x, 1, self.config.dim)
+      return self.ffn_down(self.ffn_gate.decode(x, q8).silu().contiguous()*self.ffn_up.decode(x, q8))
+    return super()._feed_forward(x)
 
   def _attention(self, x, start_pos):
     if not all(isinstance(s, int) for s in x.shape[:2]) or x.shape[:2] != (1, 1):
       return super()._attention(x, start_pos)
-    q, k, v = self.attn_q(x), self.attn_k(x), self.attn_v(x)
+    if self.share_q8 and all(isinstance(getattr(self, name), _NVLinear) for name in ('attn_q', 'attn_k', 'attn_v')):
+      q8 = q8_quantize(x, 1, self.config.dim)
+      q, k, v = (getattr(self, name).decode(x, q8) for name in ('attn_q', 'attn_k', 'attn_v'))
+    else:
+      q, k, v = self.attn_q(x), self.attn_k(x), self.attn_v(x)
     q = self.attn_q_norm(q.reshape(1, 1, self.config.n_heads, 128).transpose(1, 2))
     k = self.attn_k_norm(k.reshape(1, 1, self.config.n_kv_heads, 128).transpose(1, 2))
     v = v.reshape(1, 1, self.config.n_kv_heads, 128).transpose(1, 2)
@@ -193,11 +207,14 @@ class _NVLinear:
     original.weight = decoded.reshape(entry.shape).cast(dtypes.float16)
     self.weight, self.bias = original.weight, original.bias
 
+  def decode(self, x: Tensor, q8: tuple[Tensor, Tensor, Tensor] | None = None) -> Tensor:
+    result = quant_gemv(x, self.packed, out_features=self.out_features, in_features=self.in_features, ggml_type=self.ggml_type,
+                        q6_aligned=self.q6_aligned, q6_swizzled=self.q6_swizzled, q4_swizzled=self.q4_swizzled, q8=q8)
+    return result if self.bias is None else result+self.bias
+
   def __call__(self, x: Tensor) -> Tensor:
     if isinstance(x.numel(), int) and x.numel() == self.in_features:
-      result = quant_gemv(x, self.packed, out_features=self.out_features, in_features=self.in_features, ggml_type=self.ggml_type,
-                          q6_aligned=self.q6_aligned, q6_swizzled=self.q6_swizzled, q4_swizzled=self.q4_swizzled)
-      return result if self.bias is None else result + self.bias
+      return self.decode(x)
     if self.prefill:
       # Upstream prefill uses a symbolic token count. Pad to its fixed maximum
       # for capture, then slice valid rows; the kernel handles the final 16-row tile.
@@ -274,6 +291,9 @@ class Qwen3Model:
       if not result.nv_attention_blocks: raise ValueError("no supported blocks for NV decode attention")
       result.nv_attention = True
       result.nv_fused_attention = nv_fused_attention
+      result.nv_shared_q8_blocks = sum(block.share_q8 and all(isinstance(getattr(block, name, None), _NVLinear)
+        for name in ('attn_q', 'attn_k', 'attn_v', 'ffn_gate', 'ffn_up'))
+        for block in result.transformer.blk if isinstance(block, _NVAttentionBlock))
     return result
 
   def _enable_nv_quant(self, entries: Mapping[str, PackedTensor], *, nv_prefill: bool = False,

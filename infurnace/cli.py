@@ -58,10 +58,15 @@ def _prompt_ids(tokenizer: Tokenizer, prompt: str) -> list[int]:
   return ([tokenizer.bos_id] if tokenizer.bos_id is not None else []) + ids
 
 
-def _stream(model: Qwen3Model, tokenizer: Tokenizer, ids: list[int], max_tokens: int | None) -> str:
+def _stream(model: Qwen3Model, tokenizer: Tokenizer, ids: list[int], max_tokens: int | None, *,
+            eagle=None, draft_tokens: int = 2) -> str:
   decoder, reply = tokenizer.stream_decoder(), []
   budget = model.config.context_length - len(ids) if max_tokens is None else max_tokens
-  stream = model.generate(ids, budget)
+  if eagle is None:
+    stream = model.generate(ids, budget)
+  else:
+    eos = tuple(i for i in (tokenizer.eos_id, tokenizer.eot_id) if i is not None)
+    stream = eagle.stream(ids, max_new_tokens=budget, draft_tokens=draft_tokens, eos_token_ids=eos, batched=True)
   generated, ended, completed = 0, False, False
   try:
     for token in stream:
@@ -89,8 +94,8 @@ def _stream(model: Qwen3Model, tokenizer: Tokenizer, ids: list[int], max_tokens:
   return "".join(reply)
 
 
-def _run_single_shot(model: Qwen3Model, tokenizer: Tokenizer, prompt: str, max_tokens: int) -> int:
-  _stream(model, tokenizer, _prompt_ids(tokenizer, prompt), max_tokens)
+def _run_single_shot(model: Qwen3Model, tokenizer: Tokenizer, prompt: str, max_tokens: int, **stream_options) -> int:
+  _stream(model, tokenizer, _prompt_ids(tokenizer, prompt), max_tokens, **stream_options)
   return 0
 
 
@@ -102,7 +107,7 @@ def _warmup(model: Qwen3Model) -> None:
 
 
 def _run_chat(model: Qwen3Model, tokenizer: Tokenizer, max_tokens: int | None, max_context: int,
-              enable_thinking: bool = True) -> int:
+              enable_thinking: bool = True, **stream_options) -> int:
   history = []
   while True:
     try: text = input(">>> ")
@@ -123,7 +128,7 @@ def _run_chat(model: Qwen3Model, tokenizer: Tokenizer, max_tokens: int | None, m
       continue
     if dropped:
       print(f"[Context window: discarded {dropped} oldest turn(s); earlier details are no longer remembered.]", file=sys.stderr)
-    reply = _stream(model, tokenizer, ids, max_tokens)
+    reply = _stream(model, tokenizer, ids, max_tokens, **stream_options)
     history = messages + [{"role": "assistant", "content": reply}]
 
 
@@ -168,7 +173,8 @@ def _run_step_benchmark(model: Qwen3Model, tokenizer: Tokenizer, count: int, *,
   print(f"device={model.device}, context={model.config.context_length}, prompt={len(ids)}, outputs={count}, "
         f"fused_attention={getattr(model, 'nv_fused_attention', False)}, "
         f"prepared_weights={getattr(model, 'nv_prepared_weights', False)}, "
-        f"weight_layout={getattr(model, 'nv_prepared_weight_layout', 'gguf')}, warmup={warmup}")
+        f"weight_layout={getattr(model, 'nv_prepared_weight_layout', 'gguf')}, "
+        f"shared_q8_blocks={getattr(model, 'nv_shared_q8_blocks', 0)}, warmup={warmup}")
   print("GB/s and traffic MB are tinygrad estimates; allocated MB is current allocation, not GPU peak.")
   stream = model.generate(ids, count)
   decoder = tokenizer.stream_decoder()
@@ -216,6 +222,7 @@ def _run_benchmark(model: Qwen3Model, tokenizer: Tokenizer, count: int, load_sec
     "prompt_source": "raw text" if prompt_text is not None else "synthetic repeated prose",
     "decode_input_positions": [len(ids), len(ids)+count-2] if count > 1 else None,
     "nv_quant_linears": getattr(model, "nv_quant_linears", 0),
+    "nv_shared_q8_blocks": getattr(model, "nv_shared_q8_blocks", 0),
     "nv_prefill": getattr(model, "nv_prefill", False),
     "nv_prepared_weights": getattr(model, "nv_prepared_weights", False),
     "nv_prepared_weight_layout": getattr(model, "nv_prepared_weight_layout", "gguf"),
@@ -266,6 +273,9 @@ def main() -> int:
   fused.add_argument("--no-nv-fused-attention", dest="nv_fused_attention", action="store_false",
                      help="disable automatic fused attention")
   ap.set_defaults(nv_fused_attention=None)
+  ap.add_argument("--eagle3", type=Path, metavar="CHECKPOINT", help="experimental greedy EAGLE-3 checkpoint directory (NV only)")
+  ap.add_argument("--eagle-draft-tokens", type=int, default=None, metavar="N", help="EAGLE descendants per round, 0–7 (default: 1)")
+  ap.add_argument("--no-eagle-fast", action="store_true", help="disable fast EAGLE sampling, mapped I/O and projection optimizations")
   ap.add_argument("--no-warmup", action="store_true", help="skip automatic startup warmup for interactive chat")
   ap.add_argument("--no-thinking", action="store_true", help="disable thinking in chat formatting")
   args = ap.parse_args()
@@ -284,6 +294,17 @@ def main() -> int:
   if args.benchmark is None and (args.benchmark_prompt_tokens is not None or args.benchmark_prompt_file is not None):
     ap.error("--benchmark-prompt-* options require --benchmark")
   if args.no_thinking and (args.prompt is not None or args.benchmark is not None): ap.error("--no-thinking applies only to chat")
+  if args.no_eagle_fast and args.eagle3 is None: ap.error("--no-eagle-fast requires --eagle3")
+  if args.eagle_draft_tokens is not None:
+    if args.eagle3 is None: ap.error("--eagle-draft-tokens requires --eagle3")
+    if not 0 <= args.eagle_draft_tokens <= 7: ap.error("--eagle-draft-tokens must be between zero and seven")
+  if args.eagle3 is not None:
+    if args.benchmark is not None: ap.error("use benchmarks/eagle.py for matched EAGLE measurements")
+    if args.nv_quant is False or args.nv_fused_attention is False or args.nv_attention:
+      ap.error("--eagle3 requires NV quantized acceleration and fused attention")
+    if args.device is not None and args.device.split(':')[0] != 'NV': ap.error("--eagle3 requires --device NV")
+    if not (args.eagle3/'config.json').is_file() or not (args.eagle3/'model.safetensors').is_file():
+      ap.error("--eagle3 directory must contain config.json and model.safetensors")
   try:
     start = time.perf_counter()
     kwargs = {"nv_prefill": args.nv_prefill} if args.nv_prefill is not None else {}
@@ -301,12 +322,29 @@ def main() -> int:
       if args.warmup: _warmup(model)
       return _run_benchmark(model, tokenizer, args.benchmark, load_seconds,
                             prompt_tokens=args.benchmark_prompt_tokens or DEFAULT_PROMPT_TOKENS, prompt_text=text)
-    if args.prompt is not None: return _run_single_shot(model, tokenizer, args.prompt, args.max_tokens or _SINGLE_SHOT_MAX_TOKENS)
+    stream_options = {}
+    if args.eagle3 is not None:
+      from infurnace.eagle.verify import BatchedVerifier
+      from infurnace.eagle import EagleDraft
+      from infurnace.eagle.generate import EagleGenerator
+      BatchedVerifier(model)  # Fail eligibility checks before loading draft weights.
+      eagle = EagleGenerator(model, EagleDraft.from_checkpoint(args.eagle3, model), fast=not args.no_eagle_fast)
+      stream_options = {'eagle': eagle, 'draft_tokens': 1 if args.eagle_draft_tokens is None else args.eagle_draft_tokens}
+      mode = 'basic batched verifier' if args.no_eagle_fast else 'fast sampling and mapped I/O'
+      print(f"EAGLE-3 experimental ({mode}): first-request JIT capture can be slow; NV timeouts remain possible.",
+            file=sys.stderr, flush=True)
+    if args.prompt is not None:
+      return _run_single_shot(model, tokenizer, args.prompt, args.max_tokens or _SINGLE_SHOT_MAX_TOKENS, **stream_options)
     if not args.no_warmup: _warmup(model)
-    return _run_chat(model, tokenizer, args.max_tokens, args.max_context, not args.no_thinking)
+    return _run_chat(model, tokenizer, args.max_tokens, args.max_context, not args.no_thinking, **stream_options)
   except KeyboardInterrupt:
     print("\nInterrupted.", file=sys.stderr)
     return 130
+  except RuntimeError as exc:
+    if 'signal wait timed out' not in str(exc) and 'hang detected' not in str(exc): raise
+    print(f"infurnace: device synchronization failed ({exc}). Restart Infurnace; "
+          "EAGLE-3 is experimental, so retry ordinary decode without --eagle3. No GPU reset was attempted.", file=sys.stderr)
+    return 1
   except MemoryError:
     print("infurnace: out of memory. Stop other model processes or reduce --max-context.", file=sys.stderr)
     return 1

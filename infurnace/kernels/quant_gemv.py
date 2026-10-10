@@ -143,12 +143,14 @@ def _q8_quantize_kernel(q:UOp, scale:UOp, xsum:UOp, x:UOp, tokens:int, in_featur
   group_scale = (warp_reduce(x[token, group, lane].float().abs(), maximum=True, full_wave=True) / 127).maximum(1e-8)
   word_lane = lane.minimum(7)
   xs = tuple(x[token, group, word_lane * 4 + i].float() for i in range(4))
-  word = sum(((v / group_scale).round().clip(-127, 127).cast(dtypes.int8).cast(dtypes.uint8).cast(dtypes.uint32) << (i * 8) for i, v in enumerate(xs)), UOp.const(0, dtypes.uint32))
+  word = sum(((v / group_scale).round().clip(-127, 127).cast(dtypes.int8).cast(dtypes.uint8).cast(dtypes.uint32)
+              << (i * 8) for i, v in enumerate(xs)), UOp.const(0, dtypes.uint32))
   # Sum signed quantized bytes once per activation group, not per output row.
   word_sum = _dp4a(UOp.const(0x01010101, dtypes.uint32), word, UOp.const(0, dtypes.int32))
   # Each half has its own Q6 scale. Q4 uses the sum of both halves.
   # Integer sums in [-2032, 2032] are exact throughout these FP32 reductions.
-  half_sums = tuple(warp_reduce(((lane >= half*4) & (lane < (half+1)*4)).where(word_sum.float(), UOp.const(0, dtypes.float32)), full_wave=True) for half in range(2))
+  half_sums = tuple(warp_reduce(((lane >= half*4) & (lane < (half+1)*4)).where(word_sum.float(), UOp.const(0, dtypes.float32)),
+                                full_wave=True) for half in range(2))
   stores = (q[token, group, lane.valid(lane < 8)].store(word),
             scale[token, group.valid(lane.eq(0))].store(group_scale),
             *(xsum[token, group.valid(lane.eq(0)), half].store(value.cast(dtypes.int32)) for half, value in enumerate(half_sums)))
@@ -168,27 +170,57 @@ def _decode_warps(ggml_type: int, in_features: int, out_features: int) -> int:
   if ggml_type == Q6_K and (out_features, in_features) == (151936, 2560): return 8
   return 1
 
-def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot:Callable[[UOp, UOp, UOp], UOp], name:str, warps_per_block:int=1) -> UOp:
+def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot:Callable[[UOp, UOp, UOp], UOp], name:str,
+                   warps_per_block:int=1, interleave_tokens:bool=False, reuse_tokens:bool=False, local_tokens:bool=False,
+                   loop_chunks:bool=False, fuse_chunks:bool=False, residual:UOp|None=None) -> UOp:
   assert warps_per_block in (1, 2, 4, 8)
   assert out_features % warps_per_block == 0
   chunks = (group_count + 31) // 32
   row_blocks = out_features // warps_per_block
-  block = UOp.range(out.shape[0]*row_blocks*chunks, 0)
+  grid_chunks = 1 if loop_chunks else chunks
+  block = UOp.range((1 if reuse_tokens or local_tokens else out.shape[0])*row_blocks*grid_chunks, 0)
   lane = UOp.range(32, -1, axis_type=AxisType.WARP)
   warp = UOp.range(warps_per_block, 1, axis_type=AxisType.LOCAL)
-  chunk = block%chunks
-  token = block // (row_blocks*chunks)
-  output = ((block//chunks)%row_blocks)*warps_per_block+warp
+  chunk = UOp.range(chunks, 3, axis_type=AxisType.LOOP) if loop_chunks else block%chunks
+  token = (UOp.range(out.shape[0], 2, axis_type=AxisType.LOCAL) if local_tokens else
+           (block//grid_chunks)%out.shape[0] if interleave_tokens else block // (row_blocks*grid_chunks))
+  output = ((block//grid_chunks)//out.shape[0] if interleave_tokens and not (reuse_tokens or local_tokens)
+            else (block//grid_chunks)%row_blocks)*warps_per_block+warp
   group = lane+chunk*32
-  if group_count%32 == 0:
-    value = group_dot(token, output, group)
-  else:
-    value = (group < group_count).where(group_dot(token, output, group.minimum(group_count-1),), UOp.const(0, dtypes.float32))
-  total = warp_reduce(value, full_wave=True)
-  return out[token, output, chunk.valid(lane.eq(0))].store(total.cast(out.dtype)).end(block, warp, lane).sink(arg=KernelInfo(name=name, opts_to_apply=()))
+  stores = []
+  # Static token unrolling gives identical weight indices to every row. UOp
+  # hash-consing shares the packed loads/decode expressions across their dots;
+  # each token retains its original integer dot and FP32 reduction order.
+  for current in (range(out.shape[0]) if reuse_tokens else (token,)):
+    current = UOp.const(current, dtypes.int32) if isinstance(current, int) else current
+    if group_count%32 == 0:
+      value = group_dot(current, output, group)
+    else:
+      value = (group < group_count).where(group_dot(current, output, group.minimum(group_count-1)), UOp.const(0, dtypes.float32))
+    total = warp_reduce(value, full_wave=True)
+    if fuse_chunks:
+      acc = UOp.placeholder((1,), dtypes.float32, slot=len(stores), addrspace=AddrSpace.REG)
+      initial = UOp.const(0.0, dtypes.float32) if residual is None else residual[current, output].load()
+      acc = acc.after(acc[0].store(initial))
+      # A normal ADD is flattened with the last shuffle ADD by tinygrad.
+      # The opaque rounded intrinsic preserves each completed warp sum before
+      # adding it to the residual/previous chunks, as a stored partial does.
+      added = UOp(Ops.CUSTOMI, src=(acc[0].load(), total), arg=('__fadd_rn({}, {})', dtypes.float32))
+      value = chunk.eq(0).where(total, added) if residual is None else added
+      update = acc[0].store(value).end(chunk)
+      summed = acc.after(update)[0].load()
+      stores.append(out[current, output, UOp.const(0).valid(lane.eq(0))].store(summed.cast(out.dtype)))
+    else:
+      stores.append(out[current, output, chunk.valid(lane.eq(0))].store(total.cast(out.dtype)))
+  stored = UOp.group(*stores).end(*((chunk,) if loop_chunks and not fuse_chunks else ()))
+  return stored.end(block, warp, lane, *((token,) if local_tokens else ())).sink(arg=KernelInfo(
+    name=name+('_reuse' if reuse_tokens else '_local' if local_tokens else '')+('_loop' if loop_chunks else '')
+         +('_sum' if fuse_chunks else ''), opts_to_apply=()))
 
 def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, out_features:int, in_features:int, ggml_type:int,
-                         q6_aligned: bool = False, q6_swizzled: bool = False, q4_swizzled: bool = False) -> UOp:
+                         q6_aligned: bool = False, q6_swizzled: bool = False, q4_swizzled: bool = False,
+                         interleave_tokens:bool=False, reuse_tokens:bool=False, local_tokens:bool=False,
+                         loop_chunks:bool=False, fuse_chunks:bool=False, residual:UOp|None=None) -> UOp:
   group_count = in_features // Q8_GROUP_SIZE
   def group_dot(token: UOp, output: UOp, group: UOp) -> UOp:
     block, subgroup = group // 8, group % 8
@@ -241,11 +273,18 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, out_features:
       return (corrected[0]*scales[0] + corrected[1]*scales[1]) * xd[token, group] * _half(raw[d_index].load())
     raise QuantGemvError(f"unsupported quant type {ggml_type}")
   names = {Q4_K: "linear_q4_k", Q6_K: "linear_q6"}
-  warps = _decode_warps(ggml_type, in_features, out_features)
-  return _decode_linear(out, out_features, group_count, group_dot, names[ggml_type], warps_per_block=warps)
+  # Keep CTA-local batches small: one output warp per token, at most 256
+  # threads. Tokens share the SM's weight cache without unrolled registers.
+  warps = 1 if local_tokens else _decode_warps(ggml_type, in_features, out_features)
+  return _decode_linear(out, out_features, group_count, group_dot, names[ggml_type], warps_per_block=warps,
+                        interleave_tokens=interleave_tokens, reuse_tokens=reuse_tokens, local_tokens=local_tokens,
+                        loop_chunks=loop_chunks, fuse_chunks=fuse_chunks, residual=residual)
 
 def quant_gemv(x:Tensor, packed:Tensor, *, out_features:int, in_features:int, ggml_type:int, q6_aligned: bool = False,
-               q6_swizzled: bool = False, q4_swizzled: bool = False) -> Tensor:
+               q6_swizzled: bool = False, q4_swizzled: bool = False,
+               q8: tuple[Tensor, Tensor, Tensor] | None = None, interleave_tokens:bool=False,
+               exact_rows:bool=False, return_parts:bool=False, reuse_tokens:bool=False, local_tokens:bool=False,
+               loop_chunks:bool=False, fuse_chunks:bool=False, residual:Tensor|None=None) -> Tensor:
   if x.dtype not in dtypes.floats: raise QuantGemvError(f"x must be float, got {x.dtype}")
   if ggml_type not in QUANT_SIZES: raise QuantGemvError(f"unsupported quant type {ggml_type}")
   if in_features <= 0 or in_features % GGML_BLOCK_SIZE: raise QuantGemvError("in_features must be a positive multiple of 256")
@@ -262,16 +301,37 @@ def quant_gemv(x:Tensor, packed:Tensor, *, out_features:int, in_features:int, gg
     raise QuantGemvError("packed weight dtype/size does not match the quantization contract")
 
   tokens = int(x.numel()) // in_features
+  if (reuse_tokens or local_tokens) and not 1 <= tokens <= 8: raise QuantGemvError('weight reuse requires one to eight tokens')
+  if reuse_tokens and local_tokens: raise QuantGemvError('select either unrolled or CTA-local token reuse')
+  if type(fuse_chunks) is not bool: raise QuantGemvError('fuse_chunks must be boolean')
+  # These small reductions are left-to-right on the pinned CUDA scheduler.
+  # Do not silently substitute sequential accumulation for larger/tree sums.
+  if fuse_chunks and (in_features+1023)//1024 not in (1, 2, 3, 4, 10):
+    raise QuantGemvError('fused projection supports validated chunk counts 1/2/3/4/10')
+  if residual is not None and (not fuse_chunks or residual.shape != (*x.shape[:-1], out_features)
+                               or residual.dtype != dtypes.float32 or residual.device != x.device):
+    raise QuantGemvError('fused residual requires matching FP32 output rows and fused chunks')
   raw = packed.uop
-  xq, xd, xs = q8_quantize(x, tokens, in_features)
-  decode = functools.partial(_quant_decode_kernel, ggml_type=ggml_type, q6_aligned=q6_aligned, q6_swizzled=q6_swizzled, q4_swizzled=q4_swizzled)
-  chunks = (in_features + 1023) // 1024
+  xq, xd, xs = q8_quantize(x, tokens, in_features) if q8 is None else q8
+  groups = in_features//Q8_GROUP_SIZE
+  for tensor, shape, dtype in ((xq, (tokens, groups, 8), dtypes.uint32),
+                               (xd, (tokens, groups), dtypes.float32), (xs, (tokens, groups, 2), dtypes.int32)):
+    if tensor.shape != shape or tensor.dtype != dtype or tensor.device != x.device:
+      raise QuantGemvError("shared Q8 activation dtype/shape/device does not match the projection")
+  decode = functools.partial(_quant_decode_kernel, ggml_type=ggml_type, q6_aligned=q6_aligned, q6_swizzled=q6_swizzled,
+                             q4_swizzled=q4_swizzled, interleave_tokens=interleave_tokens, reuse_tokens=reuse_tokens,
+                             local_tokens=local_tokens, loop_chunks=loop_chunks or fuse_chunks, fuse_chunks=fuse_chunks)
+  chunks = 1 if fuse_chunks else (in_features + 1023) // 1024
   out = Tensor.empty(tokens, out_features, chunks, dtype=dtypes.float32, device=x.device).uop
   sources = (out, raw, xq.uop, xd.uop, xs.uop)
+  if residual is not None: sources += (residual.reshape(tokens, out_features).contiguous().uop,)
   params = tuple(UOp.placeholder_like(s, slot=i) for i, s in enumerate(sources))
-  kernel = decode(*params, out_features=out_features, in_features=in_features).call(*sources)
+  kernel = decode(*params[:5], out_features=out_features, in_features=in_features,
+                  residual=params[5] if residual is not None else None).call(*sources)
   result = Tensor(out.after(kernel))
-  result = result.sum(-1)
+  if return_parts: return result
+  result = (Tensor.cat(*(result[i:i+1].contiguous().sum(-1) for i in range(tokens)), dim=0)
+            if exact_rows and tokens > 1 else result.sum(-1))
 
   return result.reshape(*x.shape[:-1], out_features)
 

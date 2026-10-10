@@ -12,7 +12,14 @@ CLI. It is not a second transformer implementation or a serving framework.
 | `model.py` | Qwen3 metadata/shape contract, tinygrad config/state loading, bounded generation |
 | `tokenizer.py` | SimpleTokenizer adapter and bundled text-only Qwen3 chat rendering |
 | `cli.py` | Single-shot/chat, UTF-8 streaming, interruption and baseline benchmark reporting |
-| `kernels/quant_gemv.py` | Opt-in NV single-token GEMV; generic fallback and shared packed storage |
+| `kernels/quant_gemv.py` | NV packed projections; generic fallback and shared packed storage |
+| `eagle/draft.py` | EAGLE checkpoint loading, observed draft state and proposals |
+| `eagle/generate.py` | Verified generation, ownership, cancellation and fast-profile defaults |
+| `eagle/reference.py` | Sequential verification reference |
+| `eagle/verify.py` | NV multi-row target verification and reusable captures |
+| `eagle/sampling.py` | Exact sampling expression and prefix RNG commitment |
+| `eagle/io.py` | Owned host-mapped NV scratch; synchronized tiny uploads/readbacks |
+| `kernels/parallel_argmax.py` | Two-pass first-index reduction over unchanged FP32 scores |
 
 Tinygrad owns transformer blocks, Q/K normalization, RoPE, attention, FFN,
 KV-cache writes, prefix reuse, chunked prefill, sampling and TinyJit. Infurnace
@@ -73,6 +80,25 @@ peak RSS and tinygrad current allocated memory. First-token time includes
 prefill/output work and cold compilation; the derived prefill rate is not a
 pure transformer-prefill measurement. GPU peak polling and comparisons with
 upstream/llama.cpp are separate measurements, not implied by the CLI counters.
+
+## EAGLE fast profile
+
+Ordinary decode does not use EAGLE. `--eagle3 CHECKPOINT` creates an
+`EagleGenerator(..., fast=True)` with one proposal by default. Its profile uses
+fused drafting, mapped scratch I/O, parallel sampling, zero-copy features and
+validated fused projections; `--no-eagle-fast` retains the basic batched path.
+The lower-level Python APIs retain their explicit/reference defaults.
+
+Mapped scratch belongs to the draft/verifier capture owner, never a global
+allocator patch. Uploads synchronize previous GPU readers before CPU writes;
+readbacks use tinygrad's synchronized host access. Outputs stay alive through
+capture reuse. Verification cache identity includes I/O and sampling modes.
+Draft I/O is configured before its first observation; replacing storage beneath
+existing captures is rejected. Calibration artifacts are not auto-loaded.
+
+The package is organized by responsibility, not model/GPU name. EAGLE is a
+decoding strategy; GPU kernels remain in `kernels/` and target-model handling
+remains in `model.py`.
 
 ## Scope
 

@@ -10,6 +10,23 @@ from infurnace.model import _NVLinear, Qwen3Model
 from infurnace.kernels.quant_gemv import quant_gemv, QuantGemvError
 
 
+def test_submission_link_reinitializes_reused_signal_storage():
+  # Eager HCQ submissions borrow ring storage that the hardware mutates. A
+  # cached "already wrote this blob" marker must not skip zeroing on reuse.
+  # ce9c84605 fails this invariant; upstream bc5a2d393 removes that shortcut.
+  from tinygrad import UOp
+  from tinygrad.device import Buffer
+  from tinygrad.runtime.support.hcq2 import fold_binary
+  from tinygrad.uop.ops import Ops
+  storage = Buffer('CPU', 4, dtypes.uint64).ensure_allocated()
+  view, initial = UOp.from_buffer(storage, 'CPU'), UOp(Ops.BINARY, arg=bytes(32))
+  fold_binary(view, initial)
+  for repeat in range(4):
+    storage.host.view(fmt='Q')[repeat] = 999999999  # Simulated queue/timeline signal.
+    fold_binary(view, initial)
+    assert list(storage.host.view(fmt='Q')[:]) == [0]*4
+
+
 def test_llm_imports():
   # This failed in the old wheel because tinygrad.llm.kernels was omitted.
   from tinygrad.llm.cli import SimpleTokenizer

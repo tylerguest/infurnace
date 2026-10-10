@@ -95,7 +95,13 @@ def test_prefill_adapter_symbolic_tails_and_storage(typ, size, prepared, width):
   expected_size = Q6_PREPARED_BYTES if prepared and typ == 14 else size
   assert adapter.packed.numel()*adapter.packed.dtype.itemsize == len(data)//size*expected_size
   values = [[rng.randint(-16, 16)/16 for _ in range(width)] for _ in range(32)]
-  weights = adapter.weight.to("CPU").float().tolist()
+  # Snapshot realized device weights before constructing host expectations.
+  # Do not keep a lazy device-to-host/cast graph as a reference to a reused buffer.
+  weights = adapter.weight.realize().tolist()
+  cpu_weights = _dequant(Tensor(bytes(data), dtype=dtypes.uint8, device="CPU"), rows*width, typ).reshape(rows, width).half().tolist()
+  # CPU can emulate half in float32; allow only FP16 rounding error here.
+  for row, reference in zip(weights, cpu_weights):
+    assert row == pytest.approx(reference, rel=5e-4, abs=2e-6)
   expected = [[sum(a*b for a, b in zip(token, row)) for row in weights] for token in values]
   # Upstream consumes symbolic intermediates inside capture and returns a static
   # sampled-token shape. Materialize a static output here to test the same contract.

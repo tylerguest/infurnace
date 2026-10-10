@@ -170,16 +170,17 @@ def test_build_prefill_forwarding_and_backend_gate(monkeypatch):
   monkeypatch.setattr(cli.Qwen3Model, "from_gguf", from_file)
   monkeypatch.setattr(cli.Tokenizer, "from_gguf", lambda md: md)
   assert cli._build("model", 64, "NV", nv_quant=True, nv_prefill=True)[0] is model
-  assert calls == [{"max_context": 64, "device": "NV", "nv_quant": True, "nv_prefill": True}]
+  assert calls == [{"max_context": 64, "device": "NV", "nv_quant": True, "nv_prefill": True,
+                    "nv_prepared_weights": True, "nv_fused_attention": True}]
   with pytest.raises(ValueError, match="requires NV quantized"):
     cli._build("model", 64, "CPU", nv_quant=False, nv_prefill=True)
   assert len(calls) == 1
 
 
 @pytest.mark.parametrize("quant_supported,prefill_supported,quant_override,prefill_override,expected", [
-  (True, True, None, None, {"nv_quant": True, "nv_prefill": True}),
-  (True, True, None, False, {"nv_quant": True}),
-  (True, False, None, None, {"nv_quant": True}),
+  (True, True, None, None, {"nv_quant": True, "nv_prefill": True, "nv_prepared_weights": True, "nv_fused_attention": True}),
+  (True, True, None, False, {"nv_quant": True, "nv_prepared_weights": True, "nv_fused_attention": True}),
+  (True, False, None, None, {"nv_quant": True, "nv_prepared_weights": True, "nv_fused_attention": True}),
   (False, False, None, None, {}),
   (True, True, False, None, {}),
 ])
@@ -210,7 +211,7 @@ def test_build_attention_forwarding_and_gate(monkeypatch, fused):
   monkeypatch.setattr(cli.Tokenizer, "from_gguf", lambda md: md)
   option = {"nv_fused_attention": True} if fused else {"nv_attention": True}
   cli._build("model", 64, "NV", **option)
-  assert calls == [{"max_context": 64, "device": "NV", "nv_quant": True, **option}]
+  assert calls == [{"max_context": 64, "device": "NV", "nv_quant": True, "nv_prepared_weights": True, **option}]
   with pytest.raises(ValueError, match="requires NV quantized"):
     cli._build("model", 64, "CPU", **option)
   assert len(calls) == 1
