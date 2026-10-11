@@ -39,8 +39,9 @@ class DFlashGenerator:
     # the 5060 (one round ~= 3.2 ordinary steps), and the fallback length.
     self.min_tau, self.cooldown_steps = 3.5, 8
     self.plain_cost = None  # measured seconds per one-row target step (kept across requests)
-    # One captured graph per round (commit + draft + verify); off for A/B checks.
-    self.fused = os.environ.get('INFURNACE_DFLASH_FUSED', '1') != '0'
+    # Device-side fused rounds are opt-in (INFURNACE_DFLASH_FUSED=1): faster,
+    # but they can stall NV graph replay under sustained load (see parallel.py).
+    self.fused = os.environ.get('INFURNACE_DFLASH_FUSED', '0') == '1'
     self.stats = DFlashStats()
 
   def stream(self, tokens: list[int], *, max_new_tokens: int, block_size: int | None = None,

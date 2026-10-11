@@ -174,30 +174,23 @@ class ParallelVerifier:
     return packed_gather(ids, head.packed, width=head.in_features, ggml_type=head.ggml_type, q6_aligned=head.q6_aligned,
                          q6_swizzled=head.q6_swizzled, q4_swizzled=head.q4_swizzled)
 
-  def _round_draft(self, previous: UOp, count: UOp, position: UOp, *, draft):
-    # Graph A: commit the pending block, absorb its features, pick the anchor
-    # and draft the next proposals. Each stage realizes in order.
-    self._commit(count, previous)
-    draft._absorb(_raw(self._features), previous)
+  def _pick(self, count: UOp, *, mask: int):
+    # Anchor = the held block's last accepted decision, then noise embeddings.
     index = Tensor.arange(self.rows)
     anchor = (_raw(self._decisions)[0] * (index == Tensor(count) - 1)).sum().cast(dtypes.int32).reshape(1)
     anchor = _stored(self._anchor, anchor).realize()
-    # Every cross-stage value lives in an owned buffer: the JIT memory planner
-    # may otherwise reuse a planned intermediate (e.g. gather ids) across the
-    # opaque custom kernels, and a gather from garbage ids faults the GPU.
-    masks = Tensor.full((self.rows - 1,), draft.config.mask_token, dtype=dtypes.int32)
+    masks = Tensor.full((self.rows - 1,), mask, dtype=dtypes.int32)
     noise_ids = _stored(self._noise_ids, anchor.cat(masks)).realize()
-    noise = _stored(self._noise, self._gather(noise_ids).reshape(1, self.rows, -1)).realize()
-    proposals = _stored(self._proposals, draft._forward(noise, position).reshape(self.rows - 1).cast(dtypes.int32)).realize()
-    verify_ids = _stored(self._verify_ids, _raw(self._anchor).cat(proposals)).realize()
-    return verify_ids
+    return _stored(self._noise, self._gather(noise_ids).reshape(1, self.rows, -1)).realize()
 
-  def _round_verify(self, position: UOp):
-    # Graph B: target forward over [anchor, proposals]; overwrites the
-    # decisions/features graph A just consumed.
-    embeddings = _stored(self._embeddings, self._gather(_raw(self._verify_ids)).reshape(1, self.rows, -1)).realize()
-    decisions, _ = self._forward_store(embeddings, position)
-    return _stored(self._readback, decisions.reshape(self.rows).cat(_raw(self._proposals))).realize()
+  def _ids(self, proposals: Tensor):
+    proposals = _stored(self._proposals, proposals.reshape(self.rows - 1).cast(dtypes.int32)).realize()
+    verify_ids = _stored(self._verify_ids, _raw(self._anchor).cat(proposals)).realize()
+    return _stored(self._embeddings, self._gather(verify_ids).reshape(1, self.rows, -1)).realize()
+
+  def _pack(self):
+    readback = _raw(self._decisions).reshape(self.rows).cat(_raw(self._proposals), _raw(self._anchor))
+    return _stored(self._readback, readback).realize()
 
   def fused_eligible(self, draft) -> bool:
     head = self.observer.model.transformer.output
@@ -212,20 +205,32 @@ class ParallelVerifier:
     if type(count) is not int or not 1 <= count <= self.rows or not self.fits(position): raise ValueError('invalid fused round')
     try:
       with Context(DEV=self.device):
-        # Two captured graphs back to back (no host sync between them): one
-        # graph holding every stage deadlocked on NV replay (HCQ graph batches
-        # can reorder hazards across the commit/draft/verify buffers).
+        # The round is a chain of small captured graphs launched back to back
+        # with one readback at the end. KNOWN ISSUE: back-to-back fused rounds
+        # can stall the GPU inside a captured NV graph (timeline stuck one batch
+        # short, no MMU fault; masked by profiling timestamps or JIT=2; also seen
+        # with newer tinygrad). Fused rounds are therefore opt-in.
         if self._round_jit is None:
-          self._round_jit = (TinyJit(functools.partial(self._round_draft, draft=draft)), TinyJit(self._round_verify))
-        self._round_jit[0](self._commit_position.bind(previous), self._count.bind(count), self._position.bind(position))
-        self._round_jit[1](self._position.bind(position))
+          self._round_jit = (TinyJit(functools.partial(self._pick, mask=draft.config.mask_token)), TinyJit(self._ids),
+                             TinyJit(self._pack))
+          self._draft_position = UOp.variable('dflash_position', 1, draft.capacity - self.rows)
+        pick, ids, pack = self._round_jit
+        self._commit_jit(self._count.bind(count), self._position.bind(previous))
+        draft._absorb_jit(_raw(self._features), draft._start.bind(previous))
+        noise = pick(self._count.bind(count))
+        if self.rows - 1 not in draft._jits: draft._jits[self.rows - 1] = TinyJit(draft._forward)
+        proposals = draft._jits[self.rows - 1](noise, self._draft_position.bind(position))
+        embeddings = ids(proposals)
+        self._forward_jit(embeddings, self._position.bind(position))
+        pack()
         values = [int(v) for v in _raw(self._readback).tolist()]
     except BaseException:
       observer.close()
       raise
     observer.position, observer.next_decision = position, anchor
     draft.length = position  # transient noise K/V never authorizes prefix reuse
-    return values[:self.rows], values[self.rows:]
+    self.last_device_anchor = values[-1]
+    return values[:self.rows], values[self.rows:2*self.rows-1]
 
   def _commit(self, count: UOp, start_pos: UOp):
     # S_m = γ_m S0 + Σ_{j<m} (γ_m/γ_j) u_j k_jᵀ for the m accepted rows.
@@ -278,7 +283,7 @@ class ParallelVerifier:
           self._features = Tensor.empty(1, self.rows, width, device=self.device).realize()
           self._anchor = Tensor.empty(1, dtype=dtypes.int32, device=self.device).realize()
           self._proposals = Tensor.empty(self.rows - 1, dtype=dtypes.int32, device=self.device).realize()
-          self._readback = Tensor.empty(2 * self.rows - 1, dtype=dtypes.int32, device=self.device).realize()
+          self._readback = Tensor.empty(2 * self.rows, dtype=dtypes.int32, device=self.device).realize()
           dim = observer.model.config.embedding_length
           self._noise_ids, self._verify_ids = (Tensor.empty(self.rows, dtype=dtypes.int32, device=self.device).realize() for _ in range(2))
           self._noise, self._embeddings = (Tensor.empty(1, self.rows, dim, device=self.device).realize() for _ in range(2))
