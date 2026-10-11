@@ -1,0 +1,68 @@
+{
+  "status": "aborted",
+  "stage": "requests",
+  "model": "models/qwen35-validation/Qwen3.5-4B-Q4_K_M.gguf",
+  "draft": "models/dflash-qwen35/qwen35-4b-dflash-Q4_K_M.gguf",
+  "device": "NV",
+  "context": 64,
+  "output_limit": 8,
+  "block_size": 4,
+  "seed": 101,
+  "temperature": 0.0,
+  "target_implementation": "unmodified tinygrad Transformer.from_gguf",
+  "verifier": "block",
+  "timing": "synchronized whole request including prefill and drafting",
+  "hcq_cache_thresh": "64",
+  "warmups": [
+    {
+      "mode": "baseline",
+      "seconds": 18.263091515998894,
+      "tokens": 8,
+      "tok_s": 0.43804193791570356,
+      "exact_output": true,
+      "rng_counter": [
+        2979840,
+        0
+      ]
+    },
+    {
+      "mode": "dflash",
+      "seconds": 138.59882658300012,
+      "tokens": 8,
+      "tok_s": 0.0577205463944472,
+      "exact_output": true,
+      "rng_counter": [
+        2979840,
+        0
+      ],
+      "rounds": 5,
+      "proposed": 14,
+      "accepted": 2,
+      "target_steps": 12,
+      "speculative_rows": 12
+    }
+  ],
+  "records": [],
+  "comparisons": [],
+  "prompt": "The capital of France is",
+  "prompt_tokens": [
+    760,
+    6511,
+    314,
+    9338,
+    369
+  ],
+  "feature_layers": [
+    2,
+    6,
+    10,
+    14,
+    18,
+    22,
+    26,
+    30
+  ],
+  "mask_token": 248077,
+  "draft_packed_linears": 43,
+  "error": "RuntimeError: rm_control returned 31: NV_ERR_INVALID_ARGUMENT"
+}

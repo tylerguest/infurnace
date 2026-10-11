@@ -1,0 +1,128 @@
+{
+  "status": "complete",
+  "stage": "requests",
+  "model": "models/qwen35-validation/Qwen3.5-4B-Q4_K_M.gguf",
+  "draft": "models/dflash-qwen35/qwen35-4b-dflash-Q4_K_M.gguf",
+  "device": "NV",
+  "context": 128,
+  "output_limit": 16,
+  "block_size": 4,
+  "seed": 101,
+  "temperature": 0.0,
+  "verifier": "sequential, rejected tokens never executed",
+  "timing": "synchronized whole request including prefill and drafting",
+  "hcq_cache_thresh": "64",
+  "warmups": [
+    {
+      "mode": "baseline",
+      "seconds": 13.286441480999656,
+      "tokens": 16,
+      "tok_s": 1.2042351613019093,
+      "exact_output": true,
+      "rng_counter": [
+        4966400,
+        0
+      ]
+    },
+    {
+      "mode": "dflash",
+      "seconds": 38.727275362,
+      "tokens": 16,
+      "tok_s": 0.4131455117986309,
+      "exact_output": true,
+      "rng_counter": [
+        4966400,
+        0
+      ],
+      "rounds": 9,
+      "proposed": 24,
+      "accepted": 6,
+      "target_steps": 20
+    }
+  ],
+  "records": [
+    {
+      "mode": "baseline",
+      "seconds": 0.32547848200010776,
+      "tokens": 16,
+      "tok_s": 49.15839566928637,
+      "exact_output": true,
+      "rng_counter": [
+        4966400,
+        0
+      ]
+    },
+    {
+      "mode": "dflash",
+      "seconds": 5.811736009000015,
+      "tokens": 16,
+      "tok_s": 2.7530500310445123,
+      "exact_output": true,
+      "rng_counter": [
+        4966400,
+        0
+      ],
+      "rounds": 9,
+      "proposed": 24,
+      "accepted": 6,
+      "target_steps": 20
+    },
+    {
+      "mode": "baseline",
+      "seconds": 0.34389145800014376,
+      "tokens": 16,
+      "tok_s": 46.526308309737985,
+      "exact_output": true,
+      "rng_counter": [
+        4966400,
+        0
+      ]
+    }
+  ],
+  "comparisons": [
+    {
+      "baseline_tok_s": 47.84235198951218,
+      "dflash_tok_s": 2.7530500310445123,
+      "ratio": 0.057544203337829745
+    }
+  ],
+  "prompt": "The capital of France is",
+  "prompt_tokens": [
+    760,
+    6511,
+    314,
+    9338,
+    369
+  ],
+  "feature_layers": [
+    2,
+    6,
+    10,
+    14,
+    18,
+    22,
+    26,
+    30
+  ],
+  "mask_token": 248077,
+  "draft_packed_linears": 43,
+  "output_tokens": [
+    11751,
+    13,
+    198,
+    32,
+    13,
+    2912,
+    198,
+    33,
+    13,
+    3439,
+    198,
+    15666,
+    25,
+    198,
+    32,
+    271
+  ],
+  "output_text": " Paris.\nA. True\nB. False\nAnswer:\nA\n\n"
+}

@@ -181,14 +181,16 @@ def enable_decode_attention(blocks, *, fused: bool = False) -> int:
 
 class _NVLinear:
   """Single-token fast path using explicit GGUF identity, never graph-size guessing."""
-  def __init__(self, original, entry: PackedTensor, *, prefill: bool = False, q6_aligned: bool = False, q6_swizzled: bool = True, q4_swizzled: bool = True):
+  def __init__(self, original, entry: PackedTensor, *, prefill: bool = False, q6_aligned: bool = False,
+               q6_swizzled: bool = True, q4_swizzled: bool = True):
     self.original = original
+    if prefill and entry.ggml_type not in (12, 14): raise ValueError("NV packed prefill supports only Q4_K/Q6_K")
     self.prefill = prefill
     if prefill and not nv_prefill_supported(entry.data.device):
       raise ValueError("NV prefill requires CUDA-C FP16 tensor cores")
     self.in_features, self.out_features = entry.shape[1], entry.shape[0]
     self.ggml_type = entry.ggml_type
-    dtype = dtypes.uint32 if entry.ggml_type == 12 else dtypes.uint16
+    dtype = dtypes.uint32 if entry.ggml_type in (12, 13) else dtypes.uint16
     # Typed preparation may allocate new storage on NV. Generic consumers must
     # use this same storage; _enable_nv_quant also redirects any tied embedding.
     self.q4_swizzled = q4_swizzled and q6_aligned and entry.ggml_type == 12

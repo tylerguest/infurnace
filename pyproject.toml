@@ -11,13 +11,14 @@ requires-python = ">=3.11"
 dependencies = ["tinygrad @ git+https://github.com/tinygrad/tinygrad@bc5a2d393bb37f819c6a87cc65b2c750c060c1cb",]
 
 [project.optional-dependencies]
+qwen35 = ["tokenizers>=0.22,<0.23"]
 dev = ["ruff==0.14.10", "pytest", "jinja2"]
 
 [project.scripts]
 infurnace = "infurnace.cli:main"
 
 [tool.setuptools]
-packages = ["infurnace", "infurnace.eagle", "infurnace.kernels"]
+packages = ["infurnace", "infurnace.eagle", "infurnace.dflash", "infurnace.kernels"]
 
 [tool.ruff]
 preview = true

@@ -32,6 +32,18 @@ def _build(path: str, max_context: int, device: str | None, nv_quant: bool | Non
            nv_prefill: bool | None = None, nv_attention: bool = False,
            nv_fused_attention: bool | None = None, nv_prepared_weights: bool | None = None) -> tuple[Qwen3Model, Tokenizer]:
   device = select_device(device)
+  if Path(path).is_dir(): raise ValueError("--model must name a local GGUF file; Qwen3.5 uses tinygrad's GGUF loader")
+  if Path(path).is_file():
+    from infurnace.gguf import read_gguf_metadata
+    metadata = read_gguf_metadata(path)
+    if metadata.get("general.architecture") == "qwen35":
+      from infurnace.qwen35 import Qwen35Model
+      from infurnace.qwen35_tokenizer import Qwen35Tokenizer
+      if any((nv_quant, nv_prefill, nv_attention, nv_fused_attention, nv_prepared_weights)):
+        raise ValueError("Qwen3.5 uses unmodified tinygrad target projections; Infurnace NV optimization flags are unsupported")
+      tokenizer = Qwen35Tokenizer.from_gguf(metadata)
+      model = Qwen35Model.from_gguf(path, max_context=max_context, device=device)
+      return model, tokenizer
   enabled = supports_nv_quant(device) if nv_quant is None else nv_quant
   if enabled and not supports_nv_quant(device): raise ValueError("--nv-quant requires NV with the CUDA C renderer")
   kwargs = {"max_context": max_context, "device": device}
@@ -59,10 +71,13 @@ def _prompt_ids(tokenizer: Tokenizer, prompt: str) -> list[int]:
 
 
 def _stream(model: Qwen3Model, tokenizer: Tokenizer, ids: list[int], max_tokens: int | None, *,
-            eagle=None, draft_tokens: int = 2) -> str:
+            eagle=None, draft_tokens: int = 2, dflash=None, dflash_block_size: int = 4) -> str:
   decoder, reply = tokenizer.stream_decoder(), []
   budget = model.config.context_length - len(ids) if max_tokens is None else max_tokens
-  if eagle is None:
+  if dflash is not None:
+    eos = tuple(i for i in (tokenizer.eos_id, tokenizer.eot_id) if i is not None)
+    stream = dflash.stream(ids, max_new_tokens=budget, block_size=dflash_block_size, eos_token_ids=eos)
+  elif eagle is None:
     stream = model.generate(ids, budget)
   else:
     eos = tuple(i for i in (tokenizer.eos_id, tokenizer.eot_id) if i is not None)
@@ -238,7 +253,7 @@ def _run_benchmark(model: Qwen3Model, tokenizer: Tokenizer, count: int, load_sec
 
 def main() -> int:
   ap = argparse.ArgumentParser(description="infurnace local Qwen3 runner")
-  ap.add_argument("--model", default=_default_model(), help="local Qwen3 GGUF (or set INFURNACE_MODEL)")
+  ap.add_argument("--model", default=_default_model(), help="local Qwen3/Qwen3.5 GGUF (or set INFURNACE_MODEL)")
   mode = ap.add_mutually_exclusive_group()
   mode.add_argument("--prompt", help="raw single-shot prompt (not chat formatted)")
   mode.add_argument("--chat", action="store_true", help="interactive chat (default)")
@@ -276,6 +291,11 @@ def main() -> int:
   ap.add_argument("--eagle3", type=Path, metavar="CHECKPOINT", help="experimental greedy EAGLE-3 checkpoint directory (NV only)")
   ap.add_argument("--eagle-draft-tokens", type=int, default=None, metavar="N", help="EAGLE descendants per round, 0–7 (default: 1)")
   ap.add_argument("--no-eagle-fast", action="store_true", help="disable fast EAGLE sampling, mapped I/O and projection optimizations")
+  ap.add_argument("--dflash", type=Path, metavar="GGUF", help="experimental tinygrad DFlash draft GGUF (Qwen3.5 target, greedy only)")
+  ap.add_argument("--dflash-block-size", type=int, default=None, metavar="N", help="DFlash block including anchor (default: 4)")
+  ap.add_argument("--dflash-legacy-noncausal", action='store_true', help="use older all-noncausal draft attention instead of upstream layer defaults")
+  ap.add_argument("--dflash-verifier", choices=('sequential', 'block'), default=None,
+                  help="DFlash verification schedule (default: sequential; block is experimental layer-major capture)")
   ap.add_argument("--no-warmup", action="store_true", help="skip automatic startup warmup for interactive chat")
   ap.add_argument("--no-thinking", action="store_true", help="disable thinking in chat formatting")
   args = ap.parse_args()
@@ -294,11 +314,21 @@ def main() -> int:
   if args.benchmark is None and (args.benchmark_prompt_tokens is not None or args.benchmark_prompt_file is not None):
     ap.error("--benchmark-prompt-* options require --benchmark")
   if args.no_thinking and (args.prompt is not None or args.benchmark is not None): ap.error("--no-thinking applies only to chat")
+  if args.dflash is not None:
+    if args.eagle3 is not None: ap.error("--dflash and --eagle3 are mutually exclusive")
+    if args.benchmark is not None: ap.error("use benchmarks/dflash.py for matched DFlash measurements")
+    if not args.dflash.is_file(): ap.error("--dflash must name a local draft GGUF file")
+  if args.dflash_verifier is not None and args.dflash is None: ap.error("--dflash-verifier requires --dflash")
+  if args.dflash_legacy_noncausal and args.dflash is None: ap.error("--dflash-legacy-noncausal requires --dflash")
+  if args.dflash_block_size is not None:
+    if args.dflash is None: ap.error("--dflash-block-size requires --dflash")
+    if args.dflash_block_size <= 0: ap.error("--dflash-block-size must be positive")
   if args.no_eagle_fast and args.eagle3 is None: ap.error("--no-eagle-fast requires --eagle3")
   if args.eagle_draft_tokens is not None:
     if args.eagle3 is None: ap.error("--eagle-draft-tokens requires --eagle3")
     if not 0 <= args.eagle_draft_tokens <= 7: ap.error("--eagle-draft-tokens must be between zero and seven")
   if args.eagle3 is not None:
+    if Path(args.model).is_dir(): ap.error("--eagle3 does not support the Qwen3.5 target")
     if args.benchmark is not None: ap.error("use benchmarks/eagle.py for matched EAGLE measurements")
     if args.nv_quant is False or args.nv_fused_attention is False or args.nv_attention:
       ap.error("--eagle3 requires NV quantized acceleration and fused attention")
@@ -333,6 +363,17 @@ def main() -> int:
       mode = 'basic batched verifier' if args.no_eagle_fast else 'fast sampling and mapped I/O'
       print(f"EAGLE-3 experimental ({mode}): first-request JIT capture can be slow; NV timeouts remain possible.",
             file=sys.stderr, flush=True)
+    elif args.dflash is not None:
+      from infurnace.dflash import DFlashDraft, DFlashGenerator
+      draft = DFlashDraft.from_gguf(args.dflash, model, **({'legacy_noncausal': True} if args.dflash_legacy_noncausal else {}))
+      block = 4 if args.dflash_block_size is None else args.dflash_block_size
+      if block > draft.config.block_size: raise ValueError("--dflash-block-size exceeds the checkpoint's trained block size")
+      dflash = DFlashGenerator(model, draft, **({'verifier': args.dflash_verifier} if args.dflash_verifier is not None else {}))
+      stream_options = {'dflash': dflash, 'dflash_block_size': block}
+      print(f"DFlash experimental: tinygrad {args.dflash_verifier or 'sequential'} verification reference, "
+            "not a speedup claim; first capture can be slow. Draft attention: "
+            f"{'legacy all-noncausal' if args.dflash_legacy_noncausal else 'metadata/upstream layer defaults'}.",
+            file=sys.stderr, flush=True)
     if args.prompt is not None:
       return _run_single_shot(model, tokenizer, args.prompt, args.max_tokens or _SINGLE_SHOT_MAX_TOKENS, **stream_options)
     if not args.no_warmup: _warmup(model)
@@ -343,13 +384,14 @@ def main() -> int:
   except RuntimeError as exc:
     if 'signal wait timed out' not in str(exc) and 'hang detected' not in str(exc): raise
     print(f"infurnace: device synchronization failed ({exc}). Restart Infurnace; "
-          "EAGLE-3 is experimental, so retry ordinary decode without --eagle3. No GPU reset was attempted.", file=sys.stderr)
+          "Speculative decoding is experimental; retry ordinary decode without --eagle3/--dflash. No GPU reset was attempted.", file=sys.stderr)
     return 1
   except MemoryError:
     print("infurnace: out of memory. Stop other model processes or reduce --max-context.", file=sys.stderr)
     return 1
   except FileNotFoundError as exc:
-    print(f"infurnace: file not found: {exc.filename}\nPlace the Qwen3 GGUF in {_default_model()} or pass --model /path/to/model.gguf.",
+    print(f"infurnace: file not found: {exc.filename}\nPlace the Qwen3 GGUF in {_default_model()} "
+          "or pass --model /path/to/model.gguf.",
           file=sys.stderr)
     return 1
   except (ValueError, OSError) as exc:

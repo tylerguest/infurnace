@@ -4,12 +4,13 @@ from pathlib import Path
 from typing import Any
 from tinygrad import Tensor, dtypes
 
-Q4_K, Q6_K = 12, 14
+Q8_0, Q4_K, Q5_K, Q6_K = 8, 12, 13, 14
 GGML_BLOCK_SIZE = 256
-QUANT_BLOCK_BYTES = {Q4_K: 144, Q6_K: 210}
+QUANT_BLOCK_BYTES = {Q8_0: 34, Q4_K: 144, Q5_K: 176, Q6_K: 210}
+QUANT_BLOCK_VALUES = {Q8_0: 32, Q4_K: 256, Q5_K: 256, Q6_K: 256}
 Q4_K_BLOCK_VALUES = 256
 Q4_K_BLOCK_BYTES = 144
-_NATIVE_DTYPES = {0: dtypes.float32}
+_NATIVE_DTYPES = {0: dtypes.float32, 1: dtypes.float16}
 
 def _read_exact(handle, n: int) -> bytes:
   offset = handle.tell()
@@ -98,9 +99,10 @@ def _data_start(handle, metadata: dict[str, Any]) -> int:
 def _tensor_nbytes(n: int, ggml_type: int) -> int:
   if ggml_type in _NATIVE_DTYPES: return n * _NATIVE_DTYPES[ggml_type].itemsize
   if ggml_type in QUANT_BLOCK_BYTES:
-    if n % GGML_BLOCK_SIZE != 0:
+    block_values = QUANT_BLOCK_VALUES[ggml_type]
+    if n % block_values != 0:
       raise ValueError(f"tensor has {n} values, not a whole number of quant blocks")
-    return n // GGML_BLOCK_SIZE * QUANT_BLOCK_BYTES[ggml_type]
+    return n // block_values * QUANT_BLOCK_BYTES[ggml_type]
   raise ValueError(f"unsupported GGML type: {ggml_type}")
 
 def _tensor_range(info: tuple[str, tuple[int, ...], int, int], data_start: int, file_size: int,) -> tuple[int, int]:
@@ -108,8 +110,8 @@ def _tensor_range(info: tuple[str, tuple[int, ...], int, int], data_start: int, 
   if not 1 <= len(dims) <= 4 or any(type(d) is not int or d <= 0 for d in dims):
     raise ValueError(f"tensor {name!r} has invalid dimensions: {dims}")
   if offset < 0: raise ValueError(f"tensor {name!r} has negative offset")
-  if ggml_type in QUANT_BLOCK_BYTES and dims[0] % GGML_BLOCK_SIZE:
-    raise ValueError(f"tensor {name!r} row width {dims[0]} is not a multiple of {GGML_BLOCK_SIZE}")
+  if ggml_type in QUANT_BLOCK_BYTES and dims[0] % QUANT_BLOCK_VALUES[ggml_type]:
+    raise ValueError(f"tensor {name!r} row width {dims[0]} is not a multiple of {QUANT_BLOCK_VALUES[ggml_type]}")
   n = math.prod(dims)
   nbytes = _tensor_nbytes(n, ggml_type)
   start = data_start+offset
@@ -149,6 +151,22 @@ def _dequant_q4_k(data: Tensor, *, swizzled_width: int = 0) -> Tensor:
   q = Tensor.stack(qs.bitwise_and(15), qs.rshift(4), dim=2).reshape(-1, 8, 32)
   return (d.unsqueeze(-1) * scales.unsqueeze(-1) * q - dmin.unsqueeze(-1) * minimums.unsqueeze(-1)).flatten()
 
+def _dequant_q5_k(data: Tensor) -> Tensor:
+  blocks = data.reshape(-1, QUANT_BLOCK_BYTES[Q5_K]).contiguous()
+  d, dmin, scales, minimums = _q4_scales(blocks)
+  qs = blocks[:, 48:176].reshape(-1, 4, 32)
+  low = Tensor.stack(qs.bitwise_and(15), qs.rshift(4), dim=2).reshape(-1, 8, 32)
+  high = blocks[:, 16:48].unsqueeze(1).rshift(Tensor.arange(8).to(data.device).reshape(1, 8, 1))
+  q = low.bitwise_or(high.bitwise_and(1).lshift(4))
+  return (d.unsqueeze(-1) * scales.unsqueeze(-1) * q - dmin.unsqueeze(-1) * minimums.unsqueeze(-1)).flatten()
+
+
+def _dequant_q8_0(data: Tensor) -> Tensor:
+  blocks = data.reshape(-1, 34).contiguous()
+  d = blocks[:, :2].bitcast(dtypes.float16).float()
+  return (d * blocks[:, 2:].bitcast(dtypes.int8).float()).flatten()
+
+
 def _dequant_q6_k(data: Tensor, *, block_bytes: int = 210, swizzled_width: int = 0) -> Tensor:
   # Internal prepared NV storage may add alignment bytes per block.
   # Decode fields in place, without reconstructing a second tight GGUF buffer.
@@ -182,7 +200,9 @@ def _dequant(data: Tensor, n: int, ggml_type: int) -> Tensor:
   if data.device.split(":")[0].upper() == "DISK": raise ValueError("transfer packed GGUF bytes to a compute device before decoding")
   if ggml_type in _NATIVE_DTYPES: return data.contiguous().bitcast(_NATIVE_DTYPES[ggml_type])
   if ggml_type == Q4_K: return _dequant_q4_k(data)
+  if ggml_type == Q5_K: return _dequant_q5_k(data)
   if ggml_type == Q6_K: return _dequant_q6_k(data)
+  if ggml_type == Q8_0: return _dequant_q8_0(data)
   raise ValueError(f"unsupported GGML type: {ggml_type}")
 
 @dataclass(frozen=True)
@@ -219,6 +239,13 @@ def _validate_tensor_infos(infos, metadata: dict[str, Any], data_start: int, fil
   ranges.sort()
   for previous, current in zip(ranges, ranges[1:]):
     if current[0] < previous[1]: raise ValueError(f"tensor ranges overlap: {previous[2]!r} and {current[2]!r}")
+
+def read_gguf_metadata(path: str | Path) -> dict[str, Any]:
+  """Read metadata only, for architecture dispatch before weight allocation."""
+  with Path(path).open("rb") as handle:
+    _, _, metadata_count = _read_header(handle)
+    return _read_metadata(handle, metadata_count)
+
 
 def parse_gguf(path: str | Path) -> tuple[dict[str, Any], dict[str, PackedTensor]]:
   """Validate a single GGUF and return bounded DISK views without transferring weights."""

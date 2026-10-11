@@ -1,0 +1,185 @@
+{
+  "status": "complete",
+  "stage": "requests",
+  "model": "models/qwen35-validation/Qwen3.5-4B-Q4_K_M.gguf",
+  "draft": "models/dflash-qwen35/qwen35-4b-dflash-Q4_K_M.gguf",
+  "device": "NV",
+  "context": 128,
+  "output_limit": 16,
+  "block_size": 4,
+  "seed": 101,
+  "temperature": 0.0,
+  "verifier": "sequential, rejected tokens never executed",
+  "timing": "synchronized whole request including prefill and drafting",
+  "hcq_cache_thresh": "64",
+  "warmups": [
+    {
+      "mode": "baseline",
+      "seconds": 13.586457272000189,
+      "tokens": 16,
+      "tok_s": 1.1776432722438828,
+      "exact_output": true,
+      "rng_counter": [
+        4966400,
+        0
+      ]
+    },
+    {
+      "mode": "dflash",
+      "seconds": 37.49316872399959,
+      "tokens": 16,
+      "tok_s": 0.4267444055684285,
+      "exact_output": true,
+      "rng_counter": [
+        4966400,
+        0
+      ],
+      "rounds": 9,
+      "proposed": 24,
+      "accepted": 6,
+      "target_steps": 20
+    },
+    {
+      "mode": "baseline",
+      "seconds": 0.3422788499997296,
+      "tokens": 16,
+      "tok_s": 46.74551173703149,
+      "exact_output": true,
+      "rng_counter": [
+        4966400,
+        0
+      ]
+    },
+    {
+      "mode": "dflash",
+      "seconds": 6.1703887969997595,
+      "tokens": 16,
+      "tok_s": 2.593029471300044,
+      "exact_output": true,
+      "rng_counter": [
+        4966400,
+        0
+      ],
+      "rounds": 9,
+      "proposed": 24,
+      "accepted": 6,
+      "target_steps": 20
+    }
+  ],
+  "records": [
+    {
+      "mode": "baseline",
+      "seconds": 0.340407850000247,
+      "tokens": 16,
+      "tok_s": 47.002441336145424,
+      "exact_output": true,
+      "rng_counter": [
+        4966400,
+        0
+      ]
+    },
+    {
+      "mode": "dflash",
+      "seconds": 1.8533525140001075,
+      "tokens": 16,
+      "tok_s": 8.633004179796888,
+      "exact_output": true,
+      "rng_counter": [
+        4966400,
+        0
+      ],
+      "rounds": 9,
+      "proposed": 24,
+      "accepted": 6,
+      "target_steps": 20
+    },
+    {
+      "mode": "baseline",
+      "seconds": 0.3402843210001265,
+      "tokens": 16,
+      "tok_s": 47.01950402232623,
+      "exact_output": true,
+      "rng_counter": [
+        4966400,
+        0
+      ]
+    },
+    {
+      "mode": "dflash",
+      "seconds": 1.8013832430001457,
+      "tokens": 16,
+      "tok_s": 8.882063304503996,
+      "exact_output": true,
+      "rng_counter": [
+        4966400,
+        0
+      ],
+      "rounds": 9,
+      "proposed": 24,
+      "accepted": 6,
+      "target_steps": 20
+    },
+    {
+      "mode": "baseline",
+      "seconds": 0.35600143000010576,
+      "tokens": 16,
+      "tok_s": 44.943639692669905,
+      "exact_output": true,
+      "rng_counter": [
+        4966400,
+        0
+      ]
+    }
+  ],
+  "comparisons": [
+    {
+      "baseline_tok_s": 47.01097267923583,
+      "dflash_tok_s": 8.633004179796888,
+      "ratio": 0.18363806762096588
+    },
+    {
+      "baseline_tok_s": 45.98157185749807,
+      "dflash_tok_s": 8.882063304503996,
+      "ratio": 0.1931657171710111
+    }
+  ],
+  "prompt": "The capital of France is",
+  "prompt_tokens": [
+    760,
+    6511,
+    314,
+    9338,
+    369
+  ],
+  "feature_layers": [
+    2,
+    6,
+    10,
+    14,
+    18,
+    22,
+    26,
+    30
+  ],
+  "mask_token": 248077,
+  "draft_packed_linears": 43,
+  "output_tokens": [
+    11751,
+    13,
+    198,
+    32,
+    13,
+    2912,
+    198,
+    33,
+    13,
+    3439,
+    198,
+    15666,
+    25,
+    198,
+    32,
+    271
+  ],
+  "output_text": " Paris.\nA. True\nB. False\nAnswer:\nA\n\n"
+}

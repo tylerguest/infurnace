@@ -8,6 +8,11 @@ strict GGUF validation, a local chat CLI and custom NVIDIA quantized decode
 kernels. The tested target is **Qwen3-4B Q4_K_M on an 8 GB RTX 5060**; other
 models and GPUs are not guaranteed to work.
 
+**Text-only Qwen3.5 support** uses tinygrad's existing Unsloth GGUF model
+implementation without local target math/projection overrides; see [setup](docs/qwen35.md).
+Our [DFlash sequential reference](docs/dflash.md) is available; accelerated batched
+verification and broader validation are still pending.
+
 ## Install
 
 Requires Python 3.11+ and Git. From your clone:

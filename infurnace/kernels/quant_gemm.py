@@ -87,7 +87,7 @@ def nv_prefill_supported(device: str) -> bool:
 def quant_gemm(x: Tensor, packed: Tensor, *, out_features: int, in_features: int, ggml_type: int,
                q6_aligned: bool = False, q6_swizzled: bool = False, q4_swizzled: bool = False) -> Tensor:
   """Concrete multi-token packed linear; symbolic padding belongs to the adapter."""
-  if ggml_type not in QUANT_SIZES: raise QuantGemmError("only Q4_K/Q6_K prefill is supported")
+  if ggml_type not in (Q4_K, Q6_K): raise QuantGemmError("only Q4_K/Q6_K prefill is supported")
   if in_features <= 0 or in_features%256 or out_features <= 0 or out_features%8:
     raise QuantGemmError("prefill requires input width multiple of 256 and output rows multiple of 8")
   if x.dtype not in dtypes.floats or not x.shape or x.shape[-1] != in_features:

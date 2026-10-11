@@ -7,12 +7,13 @@ from tinygrad.dtype import AddrSpace
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops
 
 Q4_K = 12
+Q5_K = 13
 Q6_K = 14
 GGML_BLOCK_SIZE = 256
 Q8_GROUP_SIZE = 32
 Q4_WORDS = 36
 Q6_BYTES = 210
-QUANT_SIZES = {Q4_K:Q4_WORDS*4, Q6_K:Q6_BYTES}
+QUANT_SIZES = {Q4_K:Q4_WORDS*4, Q5_K:176, Q6_K:Q6_BYTES}
 
 class QuantGemvError(ValueError):
   """Quant-GEMV inputs do not satisfy the kernel contract."""
@@ -225,15 +226,19 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, out_features:
   def group_dot(token: UOp, output: UOp, group: UOp) -> UOp:
     block, subgroup = group // 8, group % 8
     xwords = _load_lanes(xq[token, group, 0], 8)
-    if ggml_type == Q4_K:
+    if ggml_type in (Q4_K, Q5_K):
       logical = output*in_features//GGML_BLOCK_SIZE+block
-      base = logical if q4_swizzled else logical*Q4_WORDS
+      block_words = Q4_WORDS if ggml_type == Q4_K else 44
+      base = logical if q4_swizzled else logical*block_words
       swizzle_width = in_features//256 if q4_swizzled else 0
-      payload_start = 4+(subgroup//2)*8
+      payload_start = (4 if ggml_type == Q4_K else 12)+(subgroup//2)*8
       dot = UOp.const(0, dtypes.int32)
       for word_idx in range(8):
         word = (_q4_word(raw, base, payload_start+word_idx, swizzle_width)
                 >> ((subgroup & 1)*4).cast(dtypes.uint32)) & 0x0f0f0f0f
+        if ggml_type == Q5_K:
+          high = (_q4_word(raw, base, 4+word_idx) >> subgroup.cast(dtypes.uint32)) & 0x01010101
+          word = word | (high << 4)
         dot = _dp4a(word, xwords[word_idx], dot)
       d, dmin, scale, minimum = _q4_scales(raw, base, subgroup, swizzle_width)
       qsum = (xs[token, group, 0].load() + xs[token, group, 1].load()).float()
@@ -272,7 +277,7 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, out_features:
       corrected = [(dots[half] - 32*xs[token, group, half].load()).float() for half in range(2)]
       return (corrected[0]*scales[0] + corrected[1]*scales[1]) * xd[token, group] * _half(raw[d_index].load())
     raise QuantGemvError(f"unsupported quant type {ggml_type}")
-  names = {Q4_K: "linear_q4_k", Q6_K: "linear_q6"}
+  names = {Q4_K: "linear_q4_k", Q5_K: "linear_q5_k", Q6_K: "linear_q6"}
   # Keep CTA-local batches small: one output warp per token, at most 256
   # threads. Tokens share the SM's weight cache without unrolled registers.
   warps = 1 if local_tokens else _decode_warps(ggml_type, in_features, out_features)
@@ -295,7 +300,7 @@ def quant_gemv(x:Tensor, packed:Tensor, *, out_features:int, in_features:int, gg
   if q4_swizzled and ggml_type != Q4_K: raise QuantGemvError("swizzled Q4 requires Q4_K")
   if q6_swizzled and not q6_aligned: raise QuantGemvError("swizzled Q6 requires prepared storage")
   if q6_aligned and ggml_type != Q6_K: raise QuantGemvError("aligned Q6 layout requires Q6_K")
-  expected_dtype = dtypes.uint32 if ggml_type == Q4_K or q6_aligned else dtypes.uint16
+  expected_dtype = dtypes.uint32 if ggml_type in (Q4_K, Q5_K) or q6_aligned else dtypes.uint16
   expected_bytes = out_features * in_features // GGML_BLOCK_SIZE * (Q6_PREPARED_BYTES if q6_aligned else QUANT_SIZES[ggml_type])
   if packed.dtype != expected_dtype or packed.numel() * packed.dtype.itemsize != expected_bytes:
     raise QuantGemvError("packed weight dtype/size does not match the quantization contract")

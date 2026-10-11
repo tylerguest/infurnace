@@ -14,6 +14,19 @@ chosen local GGUF; Infurnace currently validates dense Qwen3 F32/Q4_K/Q6_K.
 NV quantization is enabled for Infurnace by default; `--no-nv-quant` compares
 generic loading/generation instead. For CPU use `--device CPU --no-nv-quant`.
 
+## Experimental DFlash reference
+
+`benchmarks/dflash.py` compares ordinary upstream-tinygrad Qwen3.5 generation
+against our tinygrad DFlash verifier, bracketed by baseline runs. Sequential is
+the default; `--verifier block` selects experimental layer-major capture with
+prefix-state/RNG rollback. The full-model block protocol currently has only an
+aborted report (NV timeout), not a measured comparison.
+It checks exact tokens and RNG advancement, with synchronized whole-request
+measurement and explicit running/aborted/complete reports. It requires no other
+model runtime. The reference verifier is currently slower, not a speedup claim.
+See [commands and reports](experiments/dflash/README.md) and [design/limits](../docs/dflash.md).
+Historical local-Qwen3.5-target results are superseded, not current evidence.
+
 ## Experimental EAGLE-3 comparison
 
 ```sh
