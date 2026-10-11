@@ -20,6 +20,7 @@ from tinygrad import Context, Tensor, TinyJit, UOp, dtypes
 from tinygrad.llm.model import GatedDeltaNetBlock, apply_rope
 from infurnace.dflash.target import TargetObserver
 from infurnace.kernels.gdn import gdn_chunk
+from infurnace.kernels.embedding import packed_gather
 
 
 def _raw(tensor):
@@ -72,8 +73,12 @@ class ParallelVerifier:
     self.observer, self.rows, self.device = observer, rows, model.device
     self._operands: dict[int, _Operands] = {}
     self._position = UOp.variable('start_pos', 0, model.config.context_length - rows)
+    # The fused round commits the previous block and verifies the next one in
+    # one graph, so the committed block's start needs its own variable.
+    self._commit_position = UOp.variable('dflash_commit_pos', 0, model.config.context_length - rows)
     self._count = UOp.variable('dflash_commit_rows', 1, rows)
-    self._forward_jit, self._commit_jit = TinyJit(self._forward), TinyJit(self._commit)
+    self._forward_jit, self._commit_jit = TinyJit(self._forward_store), TinyJit(self._commit)
+    self._round_jit = None
     self._fused = rows == 16 and self.device.split(':')[0] == 'NV' and all(
       b.head_k_dim == 128 and b.head_v_dim == 128 for b in model.transformer.blk if isinstance(b, GatedDeltaNetBlock))
 
@@ -158,6 +163,70 @@ class ParallelVerifier:
     logits = target.output(target.output_norm(x))
     return logits.argmax(-1).cast(dtypes.int32).contiguous(), features[0].cat(*features[1:], dim=-1).contiguous()
 
+  def _forward_store(self, x: Tensor, start_pos: UOp):
+    decisions, features = self._forward(x, start_pos)
+    decisions, features = _stored(self._decisions, decisions), _stored(self._features, features)
+    Tensor.realize(decisions, features)
+    return decisions, features
+
+  def _gather(self, ids: Tensor) -> Tensor:
+    head = self.observer.model.transformer.output
+    return packed_gather(ids, head.packed, width=head.in_features, ggml_type=head.ggml_type, q6_aligned=head.q6_aligned,
+                         q6_swizzled=head.q6_swizzled, q4_swizzled=head.q4_swizzled)
+
+  def _round_draft(self, previous: UOp, count: UOp, position: UOp, *, draft):
+    # Graph A: commit the pending block, absorb its features, pick the anchor
+    # and draft the next proposals. Each stage realizes in order.
+    self._commit(count, previous)
+    draft._absorb(_raw(self._features), previous)
+    index = Tensor.arange(self.rows)
+    anchor = (_raw(self._decisions)[0] * (index == Tensor(count) - 1)).sum().cast(dtypes.int32).reshape(1)
+    anchor = _stored(self._anchor, anchor).realize()
+    # Every cross-stage value lives in an owned buffer: the JIT memory planner
+    # may otherwise reuse a planned intermediate (e.g. gather ids) across the
+    # opaque custom kernels, and a gather from garbage ids faults the GPU.
+    masks = Tensor.full((self.rows - 1,), draft.config.mask_token, dtype=dtypes.int32)
+    noise_ids = _stored(self._noise_ids, anchor.cat(masks)).realize()
+    noise = _stored(self._noise, self._gather(noise_ids).reshape(1, self.rows, -1)).realize()
+    proposals = _stored(self._proposals, draft._forward(noise, position).reshape(self.rows - 1).cast(dtypes.int32)).realize()
+    verify_ids = _stored(self._verify_ids, _raw(self._anchor).cat(proposals)).realize()
+    return verify_ids
+
+  def _round_verify(self, position: UOp):
+    # Graph B: target forward over [anchor, proposals]; overwrites the
+    # decisions/features graph A just consumed.
+    embeddings = _stored(self._embeddings, self._gather(_raw(self._verify_ids)).reshape(1, self.rows, -1)).realize()
+    decisions, _ = self._forward_store(embeddings, position)
+    return _stored(self._readback, decisions.reshape(self.rows).cat(_raw(self._proposals))).realize()
+
+  def fused_eligible(self, draft) -> bool:
+    head = self.observer.model.transformer.output
+    return (self.device.split(':')[0] == 'NV' and getattr(head, 'packed', None) is not None and self.rows == draft.config.block_size)
+
+  def fused_round(self, draft, count: int, anchor: int) -> tuple[list[int], list[int]]:
+    """Commit `count` rows of the pending block (whose last decision is `anchor`),
+    draft from them, verify the next block. Returns (decisions, proposals) with
+    one device readback; the new block stays pending."""
+    observer = self.observer
+    previous, position = observer.position, observer.position + count
+    if type(count) is not int or not 1 <= count <= self.rows or not self.fits(position): raise ValueError('invalid fused round')
+    try:
+      with Context(DEV=self.device):
+        # Two captured graphs back to back (no host sync between them): one
+        # graph holding every stage deadlocked on NV replay (HCQ graph batches
+        # can reorder hazards across the commit/draft/verify buffers).
+        if self._round_jit is None:
+          self._round_jit = (TinyJit(functools.partial(self._round_draft, draft=draft)), TinyJit(self._round_verify))
+        self._round_jit[0](self._commit_position.bind(previous), self._count.bind(count), self._position.bind(position))
+        self._round_jit[1](self._position.bind(position))
+        values = [int(v) for v in _raw(self._readback).tolist()]
+    except BaseException:
+      observer.close()
+      raise
+    observer.position, observer.next_decision = position, anchor
+    draft.length = position  # transient noise K/V never authorizes prefix reuse
+    return values[:self.rows], values[self.rows:]
+
   def _commit(self, count: UOp, start_pos: UOp):
     # S_m = γ_m S0 + Σ_{j<m} (γ_m/γ_j) u_j k_jᵀ for the m accepted rows.
     rows, initial, outputs = Tensor(count), Tensor(start_pos).eq(0), []
@@ -204,10 +273,19 @@ class ParallelVerifier:
             if isinstance(block, GatedDeltaNetBlock):
               block._init_state(x)
               self._operands[index] = _Operands(block, self.rows, self.device)
+          width = observer.model.config.embedding_length * len(observer.layers)
+          self._decisions = Tensor.empty(1, self.rows, dtype=dtypes.int32, device=self.device).realize()
+          self._features = Tensor.empty(1, self.rows, width, device=self.device).realize()
+          self._anchor = Tensor.empty(1, dtype=dtypes.int32, device=self.device).realize()
+          self._proposals = Tensor.empty(self.rows - 1, dtype=dtypes.int32, device=self.device).realize()
+          self._readback = Tensor.empty(2 * self.rows - 1, dtype=dtypes.int32, device=self.device).realize()
+          dim = observer.model.config.embedding_length
+          self._noise_ids, self._verify_ids = (Tensor.empty(self.rows, dtype=dtypes.int32, device=self.device).realize() for _ in range(2))
+          self._noise, self._embeddings = (Tensor.empty(1, self.rows, dim, device=self.device).realize() for _ in range(2))
         embeddings = observer.model.embed(padded).contiguous().realize()
-        decisions, features = self._forward_jit(embeddings, self._position.bind(observer.position))
-        decisions = [int(v) for v in _raw(decisions).tolist()[0]]
-        features = _raw(features).clone().realize()
+        self._forward_jit(embeddings, self._position.bind(observer.position))
+        decisions = [int(v) for v in _raw(self._decisions).tolist()[0]]
+        features = _raw(self._features)
       return decisions, features
     except BaseException:
       observer.close()

@@ -38,13 +38,24 @@ shapes). Prompt prefill uses the same forward in 16-row chunks.
 The draft runs as two fixed-shape captures: `absorb` writes context K/V in 16-row
 chunks, and `denoise` predicts the block, so neither recompiles per prompt length.
 
-Measured on an RTX 5060 (8 GB), Qwen3.5-4B Q4_K_M target, chat-formatted prompt,
-64 output tokens, warm captures:
+Measured on an RTX 5060 (8 GB), Qwen3.5-4B Q4_K_M target, Q4_K_M DFlash draft, block 16,
+chat-formatted prompts, 128 output tokens, warm captures (third repeat), prefill included:
 
-| Prompt | Baseline | DFlash parallel, block 16 | Acceptance (τ) | Output |
-|---|---|---|---|---|
-| Fibonacci function (code) | 68 tok/s | **194 tok/s (2.85×)** | 9.1 | identical |
-| Why the sky is blue (prose) | 69 tok/s | 60 tok/s (0.87×) | 1.3 | identical* |
+| Prompt | Thinking | Baseline | DFlash | Speedup | Tokens/round | Output |
+|---|---|---|---|---|---|---|
+| Fibonacci function (code) | off | 81 tok/s | **348 tok/s** | 4.30× | 9.85 | diverges at 69* |
+| Fibonacci function (code) | on | 82 tok/s | 152 tok/s | 1.85× | 3.88 | identical |
+| Pros/cons of remote work | off | 82 tok/s | 109 tok/s | 1.33× | 2.70 | diverges at 47* |
+| Pros/cons of remote work | on | 83 tok/s | **189 tok/s** | 2.28× | 4.92 | diverges at 87* |
+
+Steady state, each round is two captured graphs launched back to back with one
+small readback: (A) commit the previously verified rows, absorb their features into
+the draft, select the anchor on device and draft the next block; (B) gather the
+block's embeddings from the packed head and run the 16-row target forward. A single
+graph holding both deadlocked on NV replay (HCQ graph batches); splitting at this
+boundary removed it (89 back-to-back requests without a hang). Rounds use about
+22 ms. The generator falls back to ordinary one-row decoding while measured wall time
+per emitted token is worse than a one-row step, backing off exponentially.
 
 \* Multirow and one-row kernels reduce in different orders; near-ties can flip a
 greedy choice (an earlier run of this prompt diverged at token 27). Treat outputs as

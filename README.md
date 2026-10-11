@@ -10,9 +10,9 @@ models and GPUs are not guaranteed to work.
 
 **Text-only Qwen3.5 support** uses tinygrad's existing Unsloth GGUF model
 implementation with Infurnace's packed NV projections; see [setup](docs/qwen35.md).
-[DFlash speculative decoding](docs/dflash.md) with multirow verification reached
-194 tok/s vs 68 tok/s baseline on a code prompt (identical greedy output); on
-poorly predicted prose it is still slower than baseline (about 0.9×).
+[DFlash speculative decoding](docs/dflash.md) with fused multirow rounds reaches
+348 tok/s on a code prompt and 189 tok/s on a thinking-mode chat answer, vs ~82 tok/s
+plain decoding (RTX 5060, 128 tokens); gains depend on how predictable the text is.
 
 ## Install
 

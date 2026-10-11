@@ -4,6 +4,8 @@ Both schedules use unchanged upstream target blocks. Block verification is an
 explicit layer-major captured schedule, not a native multirow GEMM replacement.
 """
 from dataclasses import dataclass
+import os
+import time
 from tinygrad import Context
 from infurnace.dflash.target import TargetObserver
 
@@ -15,6 +17,11 @@ class DFlashStats:
   accepted: int = 0
   target_steps: int = 0
   speculative_rows: int = 0
+
+
+def _raw_features(verifier):
+  from infurnace.dflash.parallel import _raw
+  return _raw(verifier._features)
 
 
 class DFlashGenerator:
@@ -31,6 +38,9 @@ class DFlashGenerator:
     # Break-even tokens/round for parallel verification vs one-row decode on
     # the 5060 (one round ~= 3.2 ordinary steps), and the fallback length.
     self.min_tau, self.cooldown_steps = 3.5, 8
+    self.plain_cost = None  # measured seconds per one-row target step (kept across requests)
+    # One captured graph per round (commit + draft + verify); off for A/B checks.
+    self.fused = os.environ.get('INFURNACE_DFLASH_FUSED', '1') != '0'
     self.stats = DFlashStats()
 
   def stream(self, tokens: list[int], *, max_new_tokens: int, block_size: int | None = None,
@@ -69,10 +79,30 @@ class DFlashGenerator:
           for token in tokens[done:]: anchor = step(token)
         else:
           for token in tokens: anchor = step(token)
-        # Adaptive drafting: a parallel round only pays off when enough tokens
-        # are accepted per round. Below that, decode ordinary rows for a while
-        # (still collecting features) and then probe the draft again.
-        tau, cooldown = float(block), 0
+        # Adaptive drafting: draft only while a parallel round costs less wall
+        # time per emitted token than an ordinary one-row step. Otherwise decode
+        # ordinary rows (still collecting features), backing off exponentially
+        # while probes keep losing. Until a one-row step has been timed, a
+        # tokens-per-round threshold decides the first fallback.
+        tau, cooldown, backoff, spec_cost, probing = float(block), 0, 1, None, False
+        # A parallel verify is held uncommitted: the next fused round commits it
+        # on device; any other path flushes it (commit + keep its feature rows).
+        held = held_decisions = None
+        def flush():
+          nonlocal held
+          if held is None: return
+          verifier = self._parallel_verifier(block)
+          verifier.commit(held, held_decisions)
+          with Context(DEV=self.model.device): pending.append(_raw_features(verifier)[:, :held].contiguous().realize())
+          held = None
+        def account(accepted):
+          nonlocal spec_cost, tau, probing, cooldown, backoff
+          cost = (time.perf_counter() - started) / (accepted + 1)
+          spec_cost = cost if spec_cost is None or probing else 0.5 * spec_cost + 0.5 * cost
+          tau, probing = 0.5 * tau + 0.5 * (accepted + 1), False
+          if spec_cost > self.plain_cost if self.plain_cost is not None else tau < self.min_tau:
+            tau, cooldown, backoff = float(block), self.cooldown_steps * backoff, min(backoff * 2, 16)
+          else: backoff = 1
         while emitted < limit:
           emitted += 1
           yield anchor
@@ -80,6 +110,28 @@ class DFlashGenerator:
           count = min(block - 1, limit - emitted, self.model.config.context_length - observer.position - 1)
           if cooldown:
             cooldown, count = cooldown - 1, 0
+            probing = not cooldown
+          started = time.perf_counter()
+          if self.verifier == 'parallel' and count and held is not None:
+            verifier = self._parallel_verifier(block)
+            if self.fused and verifier.fused_eligible(self.draft) and verifier.fits(observer.position + held):
+              decisions, proposals = verifier.fused_round(self.draft, held, anchor)
+              proposals = proposals[:count]
+              self.stats.rounds += 1
+              self.stats.proposed += len(proposals)
+              self.stats.target_steps += 1
+              accepted = 0
+              while accepted < len(proposals) and proposals[accepted] == decisions[accepted]: accepted += 1
+              self.stats.accepted += accepted
+              held, held_decisions = accepted + 1, decisions
+              account(accepted)
+              for token in proposals[:accepted]:
+                emitted += 1
+                yield token
+                if token in eos_token_ids or emitted == limit: return
+              anchor = decisions[accepted]
+              continue
+          flush()
           if count:
             with Context(DEV=self.model.device):
               features = pending[0].cat(*pending[1:], dim=1).contiguous().realize()
@@ -93,16 +145,13 @@ class DFlashGenerator:
           if self.verifier == 'parallel' and proposals:
             verifier = self._parallel_verifier(block)
             if verifier.fits(observer.position):
-              decisions, features = verifier.verify([anchor, *proposals])
+              decisions, _ = verifier.verify([anchor, *proposals])
               accepted = 0
               while accepted < len(proposals) and proposals[accepted] == decisions[accepted]: accepted += 1
-              verifier.commit(accepted + 1, decisions)
               self.stats.target_steps += 1
               self.stats.accepted += accepted
-              tau = 0.5 * tau + 0.5 * (accepted + 1)
-              if tau < self.min_tau: tau, cooldown = self.min_tau, self.cooldown_steps
-              with Context(DEV=self.model.device):
-                pending.append(features[:, :accepted + 1].contiguous().realize())
+              held, held_decisions = accepted + 1, decisions
+              account(accepted)
               for token in proposals[:accepted]:
                 emitted += 1
                 yield token
@@ -131,6 +180,11 @@ class DFlashGenerator:
               else: anchor = commit(len(proposals))
             continue
           current = anchor
+          if not proposals and self.verifier == 'parallel':
+            anchor = step(current)
+            cost = time.perf_counter() - started
+            self.plain_cost = cost if self.plain_cost is None else 0.8 * self.plain_cost + 0.2 * cost
+            continue
           for proposal in proposals:
             selected = step(current)
             if selected != proposal:
