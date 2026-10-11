@@ -91,8 +91,8 @@ def test_nonuniform_forward_and_cache_against_upstream_scalar_contract(tmp_path)
     for features, noise, pos in inputs:
       expected = oracle.forward(features.tolist()[0], noise.tolist()[0], pos)
       position = UOp.variable('reference_position', 2, 12).bind(pos)
-      actual = draft._denoise(features, noise, position).tolist()[0]
+      actual = draft._observe(features, noise, position).tolist()[0]
       for got, wanted in zip(actual, expected): assert got == pytest.approx(wanted, abs=4e-5, rel=4e-5)
       head = model.transformer.output.weight.tolist()
       expected_tokens = [max(range(len(head)), key=linear(row, head).__getitem__) for row in expected]
-      assert draft._forward(features, noise, position).tolist()[0] == expected_tokens
+      assert draft._observe(features, noise, position, tokens=True).tolist()[0] == expected_tokens

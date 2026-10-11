@@ -9,9 +9,10 @@ kernels. The tested target is **Qwen3-4B Q4_K_M on an 8 GB RTX 5060**; other
 models and GPUs are not guaranteed to work.
 
 **Text-only Qwen3.5 support** uses tinygrad's existing Unsloth GGUF model
-implementation without local target math/projection overrides; see [setup](docs/qwen35.md).
-Our [DFlash sequential reference](docs/dflash.md) is available; accelerated batched
-verification and broader validation are still pending.
+implementation with Infurnace's packed NV projections; see [setup](docs/qwen35.md).
+[DFlash speculative decoding](docs/dflash.md) with multirow verification reached
+136 tok/s vs 69 tok/s baseline on a code prompt (identical greedy output); on
+poorly predicted prose it is still slower than baseline (about 0.7×).
 
 ## Install
 

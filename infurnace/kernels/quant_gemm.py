@@ -13,7 +13,7 @@ from tinygrad.dtype import AddrSpace
 from tinygrad.renderer.cstyle import CUDARenderer
 from tinygrad.uop.ops import AxisType, KernelInfo
 
-from infurnace.kernels.quant_gemv import Q4_K, Q6_K, Q6_PREPARED_BYTES, QUANT_SIZES, _half, _q4_scales, _q6_swizzled_index, _q4_word
+from infurnace.kernels.quant_gemv import Q4_K, Q5_K, Q6_K, Q6_PREPARED_BYTES, QUANT_SIZES, _half, _q4_scales, _q6_swizzled_index, _q4_word
 
 
 class QuantGemmError(ValueError):
@@ -38,6 +38,14 @@ def _weight(raw: UOp, row: UOp, col: UOp, width: int, typ: int, q6_aligned: bool
     quant = (word >> ((subgroup%2)*4+(within%4)*8).cast(dtypes.uint32)) & 15
     d, dmin, scale, minimum = _q4_scales(raw, base, subgroup, swizzle_width)
     return (d*scale*quant.float()-dmin*minimum).cast(dtypes.float16)
+  if typ == Q5_K:
+    # 44 words: d/dmin, 12 scale bytes, 32 high-bit bytes (bit `subgroup` of
+    # byte j), then Q4_K-ordered low nibbles.
+    base, subgroup, j = (row*(width//256)+block)*44, within//32, within%32
+    low = (raw[base+12+(subgroup//2)*8+j//4].load() >> ((subgroup%2)*4+(j%4)*8).cast(dtypes.uint32)) & 15
+    high = (raw[base+4+j//4].load() >> ((j%4)*8+subgroup).cast(dtypes.uint32)) & 1
+    d, dmin, scale, minimum = _q4_scales(raw, base, subgroup)
+    return (d*scale*(low | (high << 4)).float()-dmin*minimum).cast(dtypes.float16)
   logical = row*(width//256)+block
   base = logical if q6_swizzled else logical*(Q6_PREPARED_BYTES//4 if q6_aligned else 105)
   swizzle_width = width//256 if q6_swizzled else 0
@@ -73,7 +81,7 @@ def _prefill_kernel(out: UOp, raw: UOp, x: UOp, *, tokens: int, width: int, rows
   stores = [out[token_base+group+row, output_base+thread*2+col].store(result[i].load())
             for i, (row, col) in enumerate(((0, 0), (0, 1), (8, 0), (8, 1)))]
   return UOp.group(*stores).end(block, warp, lane).sink(
-    arg=KernelInfo(name=f"prefill_q{4 if typ == Q4_K else 6}_k_mma", opts_to_apply=()))
+    arg=KernelInfo(name=f"prefill_q{ {Q4_K: 4, Q5_K: 5}.get(typ, 6)}_k_mma", opts_to_apply=()))
 
 
 @functools.cache
@@ -87,7 +95,7 @@ def nv_prefill_supported(device: str) -> bool:
 def quant_gemm(x: Tensor, packed: Tensor, *, out_features: int, in_features: int, ggml_type: int,
                q6_aligned: bool = False, q6_swizzled: bool = False, q4_swizzled: bool = False) -> Tensor:
   """Concrete multi-token packed linear; symbolic padding belongs to the adapter."""
-  if ggml_type not in (Q4_K, Q6_K): raise QuantGemmError("only Q4_K/Q6_K prefill is supported")
+  if ggml_type not in (Q4_K, Q5_K, Q6_K): raise QuantGemmError("only Q4_K/Q5_K/Q6_K prefill is supported")
   if in_features <= 0 or in_features%256 or out_features <= 0 or out_features%8:
     raise QuantGemmError("prefill requires input width multiple of 256 and output rows multiple of 8")
   if x.dtype not in dtypes.floats or not x.shape or x.shape[-1] != in_features:
@@ -97,7 +105,7 @@ def quant_gemm(x: Tensor, packed: Tensor, *, out_features: int, in_features: int
   if q4_swizzled and ggml_type != Q4_K: raise QuantGemmError("swizzled Q4 requires Q4_K")
   if q6_swizzled and not q6_aligned: raise QuantGemmError("swizzled Q6 requires prepared storage")
   if q6_aligned and ggml_type != Q6_K: raise QuantGemmError("aligned Q6 layout requires Q6_K")
-  dtype = dtypes.uint32 if ggml_type == Q4_K or q6_aligned else dtypes.uint16
+  dtype = dtypes.uint32 if ggml_type in (Q4_K, Q5_K) or q6_aligned else dtypes.uint16
   expected = out_features*in_features//256*(Q6_PREPARED_BYTES if q6_aligned else QUANT_SIZES[ggml_type])
   if packed.dtype != dtype or packed.numel()*dtype.itemsize != expected:
     raise QuantGemmError("packed dtype/size does not match prefill contract")

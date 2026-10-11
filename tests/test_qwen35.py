@@ -93,14 +93,25 @@ def test_bounded_wrapper_matches_direct_upstream_rng_and_cache(tmp_path):
     assert model.transformer._cached_tokens == []
 
 
-@pytest.mark.parametrize('flag', ['nv_quant', 'nv_prefill', 'nv_attention', 'nv_fused_attention', 'nv_prepared_weights'])
-def test_cli_rejects_target_projection_overrides_before_loading(tmp_path, monkeypatch, flag):
+@pytest.mark.parametrize('flag', ['nv_attention', 'nv_fused_attention', 'nv_prepared_weights'])
+def test_cli_rejects_attention_overrides_before_loading(tmp_path, monkeypatch, flag):
   from infurnace import cli
   path = tmp_path / 'model.gguf'
   path.touch()
   monkeypatch.setattr('infurnace.gguf.read_gguf_metadata', lambda path: {'general.architecture': 'qwen35'})
   monkeypatch.setattr(Qwen35Model, 'from_gguf', lambda *a, **kw: pytest.fail('loaded target for forbidden override'))
-  with pytest.raises(ValueError, match='unmodified tinygrad'):
+  with pytest.raises(ValueError, match='upstream tinygrad owns attention'):
+    cli._build(str(path), 16, 'CPU', **{flag: True})
+
+
+@pytest.mark.parametrize('flag', ['nv_quant', 'nv_prefill'])
+def test_cli_packed_projection_flags_require_nv_before_loading(tmp_path, monkeypatch, flag):
+  from infurnace import cli
+  path = tmp_path / 'model.gguf'
+  path.touch()
+  monkeypatch.setattr('infurnace.gguf.read_gguf_metadata', lambda path: {'general.architecture': 'qwen35'})
+  monkeypatch.setattr(Qwen35Model, 'from_gguf', lambda *a, **kw: pytest.fail('loaded target without NV packed support'))
+  with pytest.raises(ValueError, match='requires NV'):
     cli._build(str(path), 16, 'CPU', **{flag: True})
 
 

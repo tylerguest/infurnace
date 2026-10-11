@@ -41,6 +41,6 @@ def test_nv_denoise_matches_cpu_hidden_and_transient_cache(tmp_path):
   with Context(DEV='NV'): draft = DFlashDraft(reference.config, gpu, weights)
   for features, noise, pos in inputs:
     position = UOp.variable('cross_position', features.shape[1], 12).bind(pos)
-    with Context(DEV='CPU'): expected = reference._denoise(features, noise, position).tolist()[0]
-    with Context(DEV='NV'): actual = draft._denoise(features.to('NV'), noise.to('NV'), position).tolist()[0]
+    with Context(DEV='CPU'): expected = reference._observe(features, noise, position).tolist()[0]
+    with Context(DEV='NV'): actual = draft._observe(features.to('NV'), noise.to('NV'), position).tolist()[0]
     for got, wanted in zip(actual, expected): assert got == pytest.approx(wanted, abs=5e-5, rel=2e-4)

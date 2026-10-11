@@ -26,11 +26,14 @@ sampling and JIT. Its GGUF implementation already supports this model and its
 Q4_K/Q5_K/Q6_K/Q8_0 tensors. Tiled recurrent head repetition is intentional for
 converted GGUF weights.
 
-Infurnace's Qwen3.5 path rejects explicit Infurnace NV optimization flags rather
-than silently replacing upstream projections. On NV, upstream currently uses
-its generic projection path; its specialized LLM kernels target AMD. This can be
-substantially slower than the superseded local packed target. No target speedup
-is claimed. Ordinary Qwen3/EAGLE behavior remains unchanged.
+On NV (default `--nv-quant`), quantized projection weights are swapped for
+Infurnace's packed tinygrad UOp kernels (`_NVLinear`: Q4_K/Q5_K/Q6_K GEMV for one row,
+tensor-core GEMM for multiple rows), including the output head tied to the token
+embedding. Block math, recurrence, attention and caches stay upstream. Upstream's
+lazy GGUF path otherwise re-unpacks every quantized weight inside each step's
+kernels (about 3 tok/s on the 5060); with packed projections ordinary decode is
+about 69 tok/s. Multirow embedding lookups use a host FP16 copy of the table, since
+a one-hot gather over the packed 248k-row table scans the whole vocabulary on GPU.
 
 The Qwen3.5 text codec remains separate: GGUF vocab/merges, NFC normalization,
 Qwen3.5 pretokenization, byte streaming and basic text chat. The optional

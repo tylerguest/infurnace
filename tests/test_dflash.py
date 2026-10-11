@@ -171,7 +171,7 @@ def test_attention_mask_against_uniform_scalar_oracle(tmp_path, causal, sliding)
     position = UOp.variable('oracle_position', 2, 12).bind(2)
     for future_value in (0., 100.):
       draft.cache[0].assign(Tensor.full(draft.cache[0].shape, future_value, dtype=dtypes.float16)).realize()
-      actual = draft._denoise(features, ids, position).tolist()[0]
+      actual = draft._observe(features, ids, position).tolist()[0]
       for got, wanted in zip(actual, expected): assert got == pytest.approx(wanted, abs=2e-5)
 
 

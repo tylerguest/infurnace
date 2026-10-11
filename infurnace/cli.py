@@ -39,10 +39,13 @@ def _build(path: str, max_context: int, device: str | None, nv_quant: bool | Non
     if metadata.get("general.architecture") == "qwen35":
       from infurnace.qwen35 import Qwen35Model
       from infurnace.qwen35_tokenizer import Qwen35Tokenizer
-      if any((nv_quant, nv_prefill, nv_attention, nv_fused_attention, nv_prepared_weights)):
-        raise ValueError("Qwen3.5 uses unmodified tinygrad target projections; Infurnace NV optimization flags are unsupported")
+      if any((nv_attention, nv_fused_attention, nv_prepared_weights)):
+        raise ValueError("Qwen3.5 supports only --nv-quant/--nv-prefill; upstream tinygrad owns attention and recurrence")
+      packed = supports_nv_quant(device) if nv_quant is None else nv_quant
+      if packed and not supports_nv_quant(device): raise ValueError("--nv-quant requires NV with the CUDA C renderer")
+      if nv_prefill and not packed: raise ValueError("NV prefill requires NV quantized integration")
       tokenizer = Qwen35Tokenizer.from_gguf(metadata)
-      model = Qwen35Model.from_gguf(path, max_context=max_context, device=device)
+      model = Qwen35Model.from_gguf(path, max_context=max_context, device=device, nv_quant=packed, nv_prefill=nv_prefill)
       return model, tokenizer
   enabled = supports_nv_quant(device) if nv_quant is None else nv_quant
   if enabled and not supports_nv_quant(device): raise ValueError("--nv-quant requires NV with the CUDA C renderer")
@@ -292,10 +295,11 @@ def main() -> int:
   ap.add_argument("--eagle-draft-tokens", type=int, default=None, metavar="N", help="EAGLE descendants per round, 0–7 (default: 1)")
   ap.add_argument("--no-eagle-fast", action="store_true", help="disable fast EAGLE sampling, mapped I/O and projection optimizations")
   ap.add_argument("--dflash", type=Path, metavar="GGUF", help="experimental tinygrad DFlash draft GGUF (Qwen3.5 target, greedy only)")
-  ap.add_argument("--dflash-block-size", type=int, default=None, metavar="N", help="DFlash block including anchor (default: 4)")
+  ap.add_argument("--dflash-block-size", type=int, default=None, metavar="N",
+                  help="DFlash block including anchor (default: trained size with parallel verification, else 4)")
   ap.add_argument("--dflash-legacy-noncausal", action='store_true', help="use older all-noncausal draft attention instead of upstream layer defaults")
-  ap.add_argument("--dflash-verifier", choices=('sequential', 'block'), default=None,
-                  help="DFlash verification schedule (default: sequential; block is experimental layer-major capture)")
+  ap.add_argument("--dflash-verifier", choices=('parallel', 'sequential', 'block'), default=None,
+                  help="DFlash verification schedule (default: parallel multirow on NV, else sequential; block is experimental)")
   ap.add_argument("--no-warmup", action="store_true", help="skip automatic startup warmup for interactive chat")
   ap.add_argument("--no-thinking", action="store_true", help="disable thinking in chat formatting")
   args = ap.parse_args()
@@ -366,12 +370,15 @@ def main() -> int:
     elif args.dflash is not None:
       from infurnace.dflash import DFlashDraft, DFlashGenerator
       draft = DFlashDraft.from_gguf(args.dflash, model, **({'legacy_noncausal': True} if args.dflash_legacy_noncausal else {}))
-      block = 4 if args.dflash_block_size is None else args.dflash_block_size
+      verifier = args.dflash_verifier or ('parallel' if model.device.split(':')[0] == 'NV' else 'sequential')
+      default_block = draft.config.block_size if verifier == 'parallel' else 4
+      block = default_block if args.dflash_block_size is None else args.dflash_block_size
       if block > draft.config.block_size: raise ValueError("--dflash-block-size exceeds the checkpoint's trained block size")
-      dflash = DFlashGenerator(model, draft, **({'verifier': args.dflash_verifier} if args.dflash_verifier is not None else {}))
+      if verifier == 'parallel' and block < 2: raise ValueError("parallel DFlash verification needs --dflash-block-size of at least 2")
+      dflash = DFlashGenerator(model, draft, verifier=verifier)
       stream_options = {'dflash': dflash, 'dflash_block_size': block}
-      print(f"DFlash experimental: tinygrad {args.dflash_verifier or 'sequential'} verification reference, "
-            "not a speedup claim; first capture can be slow. Draft attention: "
+      print(f"DFlash experimental: tinygrad {verifier} verification, block {block}; first capture can take minutes. "
+            "Draft attention: "
             f"{'legacy all-noncausal' if args.dflash_legacy_noncausal else 'metadata/upstream layer defaults'}.",
             file=sys.stderr, flush=True)
     if args.prompt is not None:

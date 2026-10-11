@@ -1,5 +1,6 @@
 """One-row tinygrad target observation and exclusive request ownership."""
 from tinygrad import Context, Tensor, TinyJit, UOp, dtypes
+from tinygrad.uop.ops import Ops
 from infurnace.qwen35 import Qwen35Model
 
 
@@ -63,6 +64,10 @@ class TargetObserver:
         features = Tensor(features.uop.buf_uop).reshape(features.shape).clone().realize()
         decision = Tensor(decision.uop.buf_uop).reshape(decision.shape)
         selected = int(decision.item())
+        # Detach the captured RNG update graph in place (buffer identity kept);
+        # live graphs are walked on every realize.
+        counter = Tensor._device_rng_counters[self.model.device]
+        if counter.uop.op is not Ops.BUFFER: counter.replace(Tensor(counter.uop.buf_uop).reshape(counter.shape))
       self.position += 1
       self.next_decision = selected
       return selected, features

@@ -24,10 +24,11 @@ def test_invalid_flags_before_loading(monkeypatch, extra):
   assert exc.value.code == 2
 
 
+@pytest.mark.parametrize('device', ['CPU', 'NV'])
 @pytest.mark.parametrize('block', [None, 8])
 @pytest.mark.parametrize('verifier', [None, 'block'])
 @pytest.mark.parametrize('legacy', [False, True])
-def test_cli_builds_reference_engine(monkeypatch, tmp_path, capsys, block, verifier, legacy):
+def test_cli_builds_reference_engine(monkeypatch, tmp_path, capsys, block, verifier, legacy, device):
   import infurnace.dflash as dflash
   path = tmp_path / 'draft.gguf'
   path.touch()
@@ -36,7 +37,7 @@ def test_cli_builds_reference_engine(monkeypatch, tmp_path, capsys, block, verif
   if verifier is not None: args += ['--dflash-verifier', verifier]
   if legacy: args += ['--dflash-legacy-noncausal']
   monkeypatch.setattr('sys.argv', args)
-  model = SimpleNamespace(config=SimpleNamespace(context_length=16))
+  model = SimpleNamespace(config=SimpleNamespace(context_length=16), device=device)
   draft = SimpleNamespace(config=SimpleNamespace(block_size=16))
   engine = Engine()
   monkeypatch.setattr(cli, '_build', lambda *a, **kw: (model, Tokenizer()))
@@ -46,10 +47,12 @@ def test_cli_builds_reference_engine(monkeypatch, tmp_path, capsys, block, verif
   monkeypatch.setattr(dflash.DFlashDraft, 'from_gguf', load)
   def build(target, loaded, **options):
     assert target is model and loaded is draft
-    assert options == ({} if verifier is None else {'verifier': verifier})
+    # Default: multirow verification on NV, sequential reference elsewhere.
+    assert options == {'verifier': verifier or ('parallel' if device == 'NV' else 'sequential')}
     return engine
   monkeypatch.setattr(dflash, 'DFlashGenerator', build)
   assert cli.main() == 0
   assert engine.calls[0][1]['max_new_tokens'] == 5
-  assert engine.calls[0][1]['block_size'] == (4 if block is None else block)
-  assert engine.closed and 'not a speedup claim' in capsys.readouterr().err
+  default = 16 if verifier is None and device == 'NV' else 4
+  assert engine.calls[0][1]['block_size'] == (default if block is None else block)
+  assert engine.closed and 'DFlash experimental' in capsys.readouterr().err

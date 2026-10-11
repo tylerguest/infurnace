@@ -184,7 +184,7 @@ class _NVLinear:
   def __init__(self, original, entry: PackedTensor, *, prefill: bool = False, q6_aligned: bool = False,
                q6_swizzled: bool = True, q4_swizzled: bool = True):
     self.original = original
-    if prefill and entry.ggml_type not in (12, 14): raise ValueError("NV packed prefill supports only Q4_K/Q6_K")
+    if prefill and entry.ggml_type not in (12, 13, 14): raise ValueError("NV packed prefill supports only Q4_K/Q5_K/Q6_K")
     self.prefill = prefill
     if prefill and not nv_prefill_supported(entry.data.device):
       raise ValueError("NV prefill requires CUDA-C FP16 tensor cores")

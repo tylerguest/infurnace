@@ -11,6 +11,7 @@ from tinygrad.nn.state import get_state_dict, load_state_dict
 from infurnace.gguf import parse_gguf
 from infurnace.model import _NVLinear
 from infurnace.kernels.quant_gemv import QUANT_SIZES
+from infurnace.kernels.quant_gemm import nv_prefill_supported
 from infurnace.qwen35 import Qwen35Model
 
 
@@ -74,9 +75,10 @@ class DFlashConfig:
 
 
 def projection(layer, x):
-  # Draft rows are simultaneous. Reuse our packed tinygrad Q8 projection for
-  # concrete multi-row shapes rather than materializing a dense target head.
-  return layer.decode(x) if isinstance(layer, _NVLinear) else layer(x)
+  # Draft rows are simultaneous. Multirow packed GEMM reads weights once;
+  # otherwise use the packed GEMV rather than materializing a dense head.
+  if not isinstance(layer, _NVLinear): return layer(x)
+  return layer(x) if layer.prefill and x.numel() != layer.in_features else layer.decode(x)
 
 
 class DraftBlock:
@@ -113,9 +115,14 @@ class DFlashDraft:
       state = {name: value.to(self.device).cast(dtypes.float32 if name.endswith('norm.weight') else dtypes.float16)
                for name, value in weights.items()}
       load_state_dict(self.weights, state, verbose=False, realize=False)
-      self.cache = [Tensor.zeros(2, 1, config.kv_heads, self.capacity, config.head_dim, dtype=dtypes.float16,
+      # One extra chunk of rows lets a padded context chunk end past capacity.
+      self.cache_length = self.capacity + config.block_size
+      self.cache = [Tensor.zeros(2, 1, config.kv_heads, self.cache_length, config.head_dim, dtype=dtypes.float16,
                                 device=self.device).contiguous().realize() for _ in range(config.layers)]
-      self.frequencies = precompute_freqs_cis(config.head_dim, self.capacity, config.theta, device=self.device).realize()
+      self.frequencies = precompute_freqs_cis(config.head_dim, self.cache_length, config.theta, device=self.device).realize()
+      self._start = UOp.variable('dflash_context_start', 0, self.capacity - 1)
+      self._absorb_jit = TinyJit(self._absorb)
+      self._context = Tensor.empty(1, config.block_size, config.dim * len(config.feature_layers), device=self.device).realize()
 
   @classmethod
   def from_gguf(cls, path: str | Path, target: Qwen35Model, *, packed: bool = True, legacy_noncausal: bool = False):
@@ -141,7 +148,11 @@ class DFlashDraft:
           owner = result.weights.blk[int(layer)]
         elif name == 'fc.weight': owner, attr = result.weights, 'fc'
         else: continue
-        setattr(owner, attr, _NVLinear(getattr(owner, attr), entry, q6_aligned=True))
+        adapter = _NVLinear(getattr(owner, attr), entry, q6_aligned=True,
+                            prefill=entry.ggml_type in (12, 13, 14) and nv_prefill_supported(target.device))
+        # projection() always uses the packed GEMV; keep no dense decode graph alive.
+        adapter.weight = adapter.original.weight = None
+        setattr(owner, attr, adapter)
         result.packed_linears += 1
     return result
 
@@ -150,39 +161,57 @@ class DFlashDraft:
     # actual target context before it is authorized again.
     self.length = 0
 
-  def _denoise(self, features: Tensor, noise: Tensor, position: UOp):
-    c, weights = self.config, self.weights
-    ctx_rows, rows = features.shape[1], noise.shape[1]
+  def _absorb(self, features: Tensor, start: UOp):
+    # Fixed-width context chunk: write draft K/V for observed target rows.
+    # Padding rows land at positions that are overwritten (later context or the
+    # noise block) or masked before any query can see them.
+    c, weights, width = self.config, self.weights, features.shape[1]
     context = weights.enc['output_norm'](projection(weights.fc, features))
-    x = noise
+    stored = []
+    for i, block in enumerate(weights.blk):
+      k = block.attn_k_norm(projection(block.attn_k, context).reshape(1, width, c.kv_heads, c.head_dim)).transpose(1, 2)
+      v = projection(block.attn_v, context).reshape(1, width, c.kv_heads, c.head_dim).transpose(1, 2)
+      k = apply_rope(k, self.frequencies[start:start + width])
+      store = self.cache[i][:, :, :, start:start + width].uop.store(Tensor.stack(k, v).half().uop)
+      stored.append(Tensor(self.cache[i].uop.after(store)))
+    Tensor.realize(*stored)
+
+  def _denoise(self, noise: Tensor, position: UOp):
+    c, weights, length = self.config, self.weights, self.cache_length
+    rows, x = noise.shape[1], noise
     query_pos = Tensor.arange(rows).reshape(rows, 1) + Tensor(position)
-    key_pos = Tensor.arange(self.capacity).reshape(1, self.capacity)
-    visible = (key_pos < Tensor(position) + rows).expand(rows, self.capacity)
+    key_pos = Tensor.arange(length).reshape(1, length)
+    visible = (key_pos < Tensor(position) + rows).expand(rows, length)
     for i, block in enumerate(weights.blk):
       residual, norm = x, block.attn_norm(x)
       q = block.attn_q_norm(projection(block.attn_q, norm).reshape(1, rows, c.heads, c.head_dim)).transpose(1, 2)
-      k = projection(block.attn_k, context).cat(projection(block.attn_k, norm), dim=1)
-      v = projection(block.attn_v, context).cat(projection(block.attn_v, norm), dim=1)
-      k = block.attn_k_norm(k.reshape(1, ctx_rows + rows, c.kv_heads, c.head_dim)).transpose(1, 2)
-      v = v.reshape(1, ctx_rows + rows, c.kv_heads, c.head_dim).transpose(1, 2)
-      q = apply_rope(q, self.frequencies[position:position + rows])
-      k = apply_rope(k, self.frequencies[position - ctx_rows:position + rows])
-      store = self.cache[i][:, :, :, position - ctx_rows:position + rows].uop.store(Tensor.stack(k, v).half().uop)
+      k = block.attn_k_norm(projection(block.attn_k, norm).reshape(1, rows, c.kv_heads, c.head_dim)).transpose(1, 2)
+      v = projection(block.attn_v, norm).reshape(1, rows, c.kv_heads, c.head_dim).transpose(1, 2)
+      q, k = apply_rope(q, self.frequencies[position:position + rows]), apply_rope(k, self.frequencies[position:position + rows])
+      store = self.cache[i][:, :, :, position:position + rows].uop.store(Tensor.stack(k, v).half().uop)
       cache = Tensor(self.cache[i].uop.after(store))
       layer_causal = c.layer_causal(i)
       layer_visible = visible & (key_pos <= query_pos) if layer_causal else visible
       if c.sliding[i]:
         layer_visible = layer_visible & (query_pos - key_pos < c.window)
         if not layer_causal: layer_visible = layer_visible & (key_pos - query_pos < c.window)
-      mask = layer_visible.where(0.0, float('-inf')).reshape(1, 1, rows, self.capacity)
+      mask = layer_visible.where(0.0, float('-inf')).reshape(1, 1, rows, length)
       attention = q.scaled_dot_product_attention(cache[0], cache[1], attn_mask=mask, enable_gqa=True)
       x = residual + projection(block.attn_output, attention.transpose(1, 2).reshape(1, rows, -1))
       norm = block.ffn_norm(x)
       x = x + projection(block.ffn_down, projection(block.ffn_gate, norm).silu() * projection(block.ffn_up, norm))
     return weights.output_norm(x[:, 1:])
 
-  def _forward(self, features: Tensor, noise: Tensor, position: UOp):
-    logits = projection(self.target.transformer.output, self._denoise(features, noise, position))
+  def _observe(self, features: Tensor, noise: Tensor, position: UOp | int, *, tokens: bool = False) -> Tensor:
+    """Eager absorb-then-denoise over one observation (reference/test path)."""
+    chunk, rows = self.config.block_size, features.shape[1]
+    for offset in range(0, rows, chunk):
+      part = features[:, offset:offset + chunk].float()
+      self._absorb(part.pad(((0, 0), (0, chunk - part.shape[1]), (0, 0))), position - rows + offset)
+    return self._forward(noise, position) if tokens else self._denoise(noise, position)
+
+  def _forward(self, noise: Tensor, position: UOp):
+    logits = projection(self.target.transformer.output, self._denoise(noise, position))
     return logits.argmax(-1).contiguous()
 
   def propose(self, features: Tensor, anchor: int, position: int, count: int) -> list[int]:
@@ -198,17 +227,23 @@ class DFlashDraft:
     if ctx_rows <= 0 or features.device != self.device or features.dtype not in dtypes.floats:
       raise ValueError('invalid DFlash feature dtype/device/rows')
     if count == 0: return []
+    chunk = c.block_size
     with Context(DEV=self.device):
-      # Capture inputs are concrete realized buffers, never executed target graphs.
-      features = features.contiguous().realize()
-      features = Tensor(UOp.from_buffer(features.uop.buffer, self.device)).reshape(features.shape)
-      ids = Tensor([[anchor] + [c.mask_token] * count], dtype=dtypes.int32, device=self.device)
-      noise = self.target.transformer.token_embd(ids).float().contiguous().realize()
+      # Context is absorbed in fixed-width chunks so neither capture depends on
+      # prompt length or accepted-row count.
+      start = position - ctx_rows
+      for offset in range(0, ctx_rows, chunk):
+        rows = min(chunk, ctx_rows - offset)
+        # Copy into one owned input buffer: a realized slice can be a view with
+        # an offset, which a captured JIT input cannot follow.
+        part = features[:, offset:offset + rows].float().pad(((0, 0), (0, chunk - rows), (0, 0)))
+        Tensor(self._context.uop.after(self._context.uop.store(part.uop))).realize()
+        self._absorb_jit(self._context, self._start.bind(start + offset))
+      noise = self.target.embed([anchor] + [c.mask_token] * count).contiguous().realize()
       noise = Tensor(UOp.from_buffer(noise.uop.buffer, self.device)).reshape(noise.shape)
-      key = (ctx_rows, count)
-      if key not in self._jits: self._jits[key] = TinyJit(self._forward)
-      pos = UOp.variable('dflash_position', ctx_rows, self.capacity - count - 1).bind(position)
-      decisions = self._jits[key](features, noise, pos).realize()
+      if count not in self._jits: self._jits[count] = TinyJit(self._forward)
+      pos = UOp.variable('dflash_position', 1, self.capacity - count - 1).bind(position)
+      decisions = self._jits[count](noise, pos).realize()
       output = [int(v) for v in Tensor(decisions.uop.buf_uop).reshape(count).tolist()]
     self.length = position  # Transient noise K/V never authorizes future prefix reuse.
     return output

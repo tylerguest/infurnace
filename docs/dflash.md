@@ -7,17 +7,43 @@ Qwen3.5 GGUF model. No PyTorch or llama.cpp model runtime is used.
 ```sh
 infurnace --device NV --model models/qwen35-validation/Qwen3.5-4B-Q4_K_M.gguf \
   --dflash models/dflash-qwen35/qwen35-4b-dflash-Q4_K_M.gguf \
-  --dflash-block-size 4 --max-context 128 --no-warmup \
-  --prompt 'The capital of France is' --max-tokens 16
+  --max-context 512 --no-warmup \
+  --prompt 'Write a Python function that returns the n-th Fibonacci number.' --max-tokens 64
 ```
 
-This is **not yet a validated DFlash acceleration**. The default verifier is
-sequential: rejected tokens never execute in the target. Both schedules leave the
-final emitted token unprocessed in committed state, preserving ordinary target
-RNG advancement. Generation is greedy-only, bounded, exclusive per target, and
-resets conversation authorization on close/error. CPU and NV one-row upstream
-prefill are currently supported. Block=1 is a no-drafting control; the CLI
-defaults to block4, including the known anchor.
+## Parallel verification (default on NV)
+
+`--dflash-verifier parallel` (`infurnace/dflash/parallel.py`) is the default on NV,
+with the checkpoint's trained block size (16). Each round runs **one** multirow target
+forward over the anchor plus all proposals, so projection weights are read once per
+block via Infurnace's packed tensor-core GEMMs (Q4_K/Q5_K/Q6_K). Prompt prefill uses
+the same forward in 16-row chunks.
+
+- Gated delta-net layers use the chunked (WY/UT) closed form of the gated delta rule
+  instead of a per-row scan; `commit` forms the accepted-prefix state directly from
+  stored U, K and log-decays. No per-row state snapshots are kept.
+- Full-attention layers attend over the fixed-length cache with a causal mask
+  (symbolic key lengths compiled to slow kernels). Rejected suffix K/V stays outside
+  the authorized prefix and is overwritten later.
+- Greedy decisions are argmax over multirow logits. They can differ from one-row
+  decoding only through floating-point reduction order; no RNG is consumed.
+
+The draft runs as two fixed-shape captures: `absorb` writes context K/V in 16-row
+chunks, and `denoise` predicts the block, so neither recompiles per prompt length.
+
+Measured on an RTX 5060 (8 GB), Qwen3.5-4B Q4_K_M target, chat-formatted prompt,
+64 output tokens, warm captures:
+
+| Prompt | Baseline | DFlash parallel, block 16 | Acceptance (τ) | Output |
+|---|---|---|---|---|
+| Fibonacci function (code) | 69 tok/s | **136 tok/s (1.97×)** | 9.1 | identical |
+| Why the sky is blue (prose) | 71 tok/s | 51 tok/s (0.72×) | 1.3 | identical |
+
+Acceptance is content dependent. A parallel round costs about 3.2 ordinary decode
+steps, so it only pays off above that many tokens per round. The generator tracks a
+moving average and, below 3.5, decodes ordinary rows for 8 steps before probing the
+draft again; this limits but does not remove the loss on poorly predicted text. The
+first request compiles the 16-row captures, which takes minutes. Greedy only.
 
 ## Experimental block verification
 
