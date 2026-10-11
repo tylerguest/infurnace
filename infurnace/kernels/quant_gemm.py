@@ -60,28 +60,59 @@ def _weight(raw: UOp, row: UOp, col: UOp, width: int, typ: int, q6_aligned: bool
 
 @functools.cache
 def _prefill_kernel(out: UOp, raw: UOp, x: UOp, *, tokens: int, width: int, rows: int, typ: int,
-                    q6_aligned: bool = False, q6_swizzled: bool = False, q4_swizzled: bool = False) -> UOp:
-  warps = math.gcd(rows//8, 4)
-  output_blocks = rows//(warps*8)
-  block = UOp.range((tokens//16)*output_blocks, 0, axis_type=AxisType.GLOBAL)
+                    q6_aligned: bool = False, q6_swizzled: bool = False, q4_swizzled: bool = False,
+                    tiles: int = 1, splits: int = 1, unroll: int = 1) -> UOp:
+  # Each warp owns 16 tokens x (8*tiles) outputs: one A fragment load feeds
+  # `tiles` independent MMAs. Split-K partitions the reduction across blocks;
+  # partial sums land in out[split] and are reduced by the caller.
+  warps = math.gcd(rows//(8*tiles), 4)
+  output_blocks = rows//(warps*8*tiles)
+  steps = width//16//splits
+  block = UOp.range((tokens//16)*output_blocks*splits, 0, axis_type=AxisType.GLOBAL)
   lane = UOp.range(32, -1, axis_type=AxisType.WARP)
   warp = UOp.range(warps, 1, axis_type=AxisType.LOCAL)
-  token_base = (block//output_blocks)*16
-  output_base = (block%output_blocks)*warps*8+warp*8
+  split, rest = block%splits, block//splits
+  token_base = (rest//output_blocks)*16
+  output_base = (rest%output_blocks)*warps*8*tiles+warp*8*tiles
   group, thread = lane//4, lane%4
-  acc = UOp.placeholder((4,), dtypes.float32, slot=3, addrspace=AddrSpace.REG)
-  acc = acc.after(acc.store(acc.const_like(0)))
-  k = UOp.range(width//16, 2, axis_type=getattr(AxisType, 'REDUCE', AxisType.LOOP))
-  # NVIDIA mma.sync m16n8k16.row.col fragment order (not AMD WMMA order).
-  a = UOp.stack(*(x[token_base+group+row, k*16+thread*2+col].load()
-                  for col_high in (0, 8) for row in (0, 8) for col in (col_high, col_high+1)))
-  b = UOp.stack(*(_weight(raw, output_base+group, k*16+thread*2+col, width, typ, q6_aligned, q6_swizzled, q4_swizzled) for col in (0, 1, 8, 9)))
-  update = acc.store(UOp.wmma(a, b, acc.after(k), (8, 16, 16), 32)).end(k)
-  result = acc.after(update)
-  stores = [out[token_base+group+row, output_base+thread*2+col].store(result[i].load())
-            for i, (row, col) in enumerate(((0, 0), (0, 1), (8, 0), (8, 1)))]
+  accs = []
+  for t in range(tiles):
+    acc = UOp.placeholder((4,), dtypes.float32, slot=3+t, addrspace=AddrSpace.REG)
+    accs.append(acc.after(acc.store(acc.const_like(0))))
+  k = UOp.range(steps//unroll, 2, axis_type=getattr(AxisType, 'REDUCE', AxisType.LOOP))
+  # Unrolled k-steps issue all their loads before the dependent MMAs, keeping
+  # several global loads in flight instead of one latency per step.
+  frags = []
+  for u in range(unroll):
+    kk = split*steps+k*unroll+u
+    # NVIDIA mma.sync m16n8k16.row.col fragment order (not AMD WMMA order).
+    a = UOp.stack(*(x[token_base+group+row, kk*16+thread*2+col].load()
+                    for col_high in (0, 8) for row in (0, 8) for col in (col_high, col_high+1)))
+    bs = [UOp.stack(*(_weight(raw, output_base+t*8+group, kk*16+thread*2+col, width, typ, q6_aligned, q6_swizzled, q4_swizzled)
+                      for col in (0, 1, 8, 9))) for t in range(tiles)]
+    frags.append((a, bs))
+  updates = []
+  for t, acc in enumerate(accs):
+    value = acc.after(k)
+    for a, bs in frags: value = UOp.wmma(a, bs[t], value, (8, 16, 16), 32)
+    updates.append(acc.store(value))
+  done = UOp.group(*updates).end(k)
+  stores = [out[split, token_base+group+row, output_base+t*8+thread*2+col].store(acc.after(done)[i].load())
+            for t, acc in enumerate(accs) for i, (row, col) in enumerate(((0, 0), (0, 1), (8, 0), (8, 1)))]
   return UOp.group(*stores).end(block, warp, lane).sink(
     arg=KernelInfo(name=f"prefill_q{ {Q4_K: 4, Q5_K: 5}.get(typ, 6)}_k_mma", opts_to_apply=()))
+
+
+def _schedule(rows: int, width: int, tokens: int) -> tuple[int, int, int]:
+  """(tiles per warp, K splits, k unroll), tuned on an RTX 5060 from profiler GPU
+  times: four tiles always win; split K only until there are ~64 blocks (each
+  split adds a reduction pass); unroll k by four where it divides."""
+  tiles = next(t for t in (4, 2, 1) if rows % (8*t) == 0)
+  warps = math.gcd(rows//(8*tiles), 4)
+  blocks, chunks = (tokens//16)*(rows//(warps*8*tiles)), width//256
+  splits = next(s for s in range(1, chunks+1) if chunks % s == 0 and (blocks*s >= 64 or s == chunks))
+  steps = width//16//splits
+  return tiles, splits, next(u for u in (4, 2, 1) if steps % u == 0)
 
 
 @functools.cache
@@ -116,8 +147,10 @@ def quant_gemm(x: Tensor, packed: Tensor, *, out_features: int, in_features: int
   tokens = x.numel()//in_features
   padded_tokens = (tokens+15)//16*16
   activation = x.reshape(tokens, in_features).cast(dtypes.float16).pad(((0, padded_tokens-tokens), (0, 0))).contiguous()
-  out = Tensor.empty(padded_tokens, out_features, dtype=dtypes.float32, device=x.device)
+  tiles, splits, unroll = _schedule(out_features, in_features, padded_tokens)
+  out = Tensor.empty(splits, padded_tokens, out_features, dtype=dtypes.float32, device=x.device)
   result = Tensor.custom_kernel(out, packed.flatten().contiguous(), activation,
     fxn=functools.partial(_prefill_kernel, tokens=padded_tokens, width=in_features, rows=out_features, typ=ggml_type,
-                         q6_aligned=q6_aligned, q6_swizzled=q6_swizzled, q4_swizzled=q4_swizzled))[0]
+                         q6_aligned=q6_aligned, q6_swizzled=q6_swizzled, q4_swizzled=q4_swizzled, tiles=tiles, splits=splits, unroll=unroll))[0]
+  result = result[0] if splits == 1 else result.sum(0)
   return result[:tokens].reshape(*x.shape[:-1], out_features)

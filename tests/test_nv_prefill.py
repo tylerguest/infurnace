@@ -19,15 +19,17 @@ def test_invalid_gemm_geometry(width, rows, typ):
                in_features=width, out_features=rows, ggml_type=typ)
 
 
-@pytest.mark.parametrize("typ,size,dtype", [(12, 144, dtypes.uint32), (14, 210, dtypes.uint16)])
-def test_prefill_graph_uses_tensor_cores_without_dense_weights(typ, size, dtype):
-  out = UOp.placeholder((32, 32), dtypes.float32, slot=0)
-  raw = UOp.placeholder((32*size//dtype.itemsize,), dtype, slot=1)
-  x = UOp.placeholder((32, 256), dtypes.float16, slot=2)
-  graph = _prefill_kernel(out, raw, x, tokens=32, width=256, rows=32, typ=typ)
+@pytest.mark.parametrize("tiles,splits,unroll", [(1, 1, 1), (4, 2, 2)])
+@pytest.mark.parametrize("typ,size,dtype", [(12, 144, dtypes.uint32), (13, 176, dtypes.uint32), (14, 210, dtypes.uint16)])
+def test_prefill_graph_uses_tensor_cores_without_dense_weights(typ, size, dtype, tiles, splits, unroll):
+  out = UOp.placeholder((splits, 32, 32), dtypes.float32, slot=0)
+  raw = UOp.placeholder((32*2*size//dtype.itemsize,), dtype, slot=1)
+  x = UOp.placeholder((32, 512), dtypes.float16, slot=2)
+  graph = _prefill_kernel(out, raw, x, tokens=32, width=512, rows=32, typ=typ, tiles=tiles, splits=splits, unroll=unroll)
   ops = graph.toposort()
   mma = [u for u in ops if u.op is Ops.WMMA]
-  assert len(mma) == 1
+  # One A fragment feeds every tile; each unrolled k-step issues its own MMAs.
+  assert len(mma) == tiles * unroll
   assert mma[0].arg[:3] == ((8, 16, 16), dtypes.float16, 32)
   assert [s.shape for s in mma[0].src] == [(8,), (4,), (4,)]
   assert len([u for u in ops if u.op is Ops.PARAM and u.addrspace == AddrSpace.GLOBAL]) == 3

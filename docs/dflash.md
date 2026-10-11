@@ -16,8 +16,9 @@ infurnace --device NV --model models/qwen35-validation/Qwen3.5-4B-Q4_K_M.gguf \
 `--dflash-verifier parallel` (`infurnace/dflash/parallel.py`) is the default on NV,
 with the checkpoint's trained block size (16). Each round runs **one** multirow target
 forward over the anchor plus all proposals, so projection weights are read once per
-block via Infurnace's packed tensor-core GEMMs (Q4_K/Q5_K/Q6_K). Prompt prefill uses
-the same forward in 16-row chunks.
+block via Infurnace's packed tensor-core GEMMs (Q4_K/Q5_K/Q6_K: each warp reuses
+one activation fragment across four 8-row output tiles, with split-K only for narrow
+shapes). Prompt prefill uses the same forward in 16-row chunks.
 
 - Gated delta-net layers use the chunked (WY/UT) closed form of the gated delta rule
   instead of a per-row scan; `commit` forms the accepted-prefix state directly from
@@ -36,8 +37,12 @@ Measured on an RTX 5060 (8 GB), Qwen3.5-4B Q4_K_M target, chat-formatted prompt,
 
 | Prompt | Baseline | DFlash parallel, block 16 | Acceptance (τ) | Output |
 |---|---|---|---|---|
-| Fibonacci function (code) | 69 tok/s | **136 tok/s (1.97×)** | 9.1 | identical |
-| Why the sky is blue (prose) | 71 tok/s | 51 tok/s (0.72×) | 1.3 | identical |
+| Fibonacci function (code) | 69 tok/s | **158 tok/s (2.27×)** | 9.1 | identical |
+| Why the sky is blue (prose) | 70 tok/s | 55 tok/s (0.78×) | 1.2 | diverges at token 27* |
+
+\* Multirow and one-row kernels reduce in different orders; near-ties can flip a
+greedy choice. Earlier runs of the same prompt matched; treat outputs as equivalent
+up to floating-point ties, not bitwise identical to one-row decoding.
 
 Acceptance is content dependent. A parallel round costs about 3.2 ordinary decode
 steps, so it only pays off above that many tokens per round. The generator tracks a
