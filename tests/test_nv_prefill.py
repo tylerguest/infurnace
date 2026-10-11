@@ -1,3 +1,4 @@
+import functools
 import os
 import random
 import struct
@@ -32,6 +33,19 @@ def test_prefill_graph_uses_tensor_cores_without_dense_weights(typ, size, dtype,
   assert len(mma) == tiles * unroll
   assert mma[0].arg[:3] == ((8, 16, 16), dtypes.float16, 32)
   assert [s.shape for s in mma[0].src] == [(8,), (4,), (4,)]
+  assert len([u for u in ops if u.op is Ops.PARAM and u.addrspace == AddrSpace.GLOBAL]) == 3
+
+
+@pytest.mark.parametrize("typ,words", [(12, 36), (13, 44), (14, 54)])
+def test_paired_prefill_graph_issues_one_mma_per_tile_step(typ, words):
+  from infurnace.kernels.quant_gemm import _prefill_q4_paired, _prefill_q6_paired
+  out = UOp.placeholder((1, 16, 64), dtypes.float32, slot=0)
+  raw = UOp.placeholder((64*2*words,), dtypes.uint32, slot=1)
+  x = UOp.placeholder((16, 512), dtypes.float16, slot=2)
+  kernel = _prefill_q6_paired if typ == 14 else functools.partial(_prefill_q4_paired, typ=typ)
+  ops = kernel(out, raw, x, tokens=16, width=512, rows=64, tiles=4).toposort()
+  # Each 256-column block is 16 permuted k-steps; one A fragment feeds all tiles.
+  assert len([u for u in ops if u.op is Ops.WMMA]) == 4*16
   assert len([u for u in ops if u.op is Ops.PARAM and u.addrspace == AddrSpace.GLOBAL]) == 3
 
 

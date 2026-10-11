@@ -19,6 +19,7 @@ import functools
 from tinygrad import Context, Tensor, TinyJit, UOp, dtypes
 from tinygrad.llm.model import GatedDeltaNetBlock, apply_rope
 from infurnace.dflash.target import TargetObserver
+from infurnace.kernels.gdn import gdn_chunk
 
 
 def _raw(tensor):
@@ -73,6 +74,8 @@ class ParallelVerifier:
     self._position = UOp.variable('start_pos', 0, model.config.context_length - rows)
     self._count = UOp.variable('dflash_commit_rows', 1, rows)
     self._forward_jit, self._commit_jit = TinyJit(self._forward), TinyJit(self._commit)
+    self._fused = rows == 16 and self.device.split(':')[0] == 'NV' and all(
+      b.head_k_dim == 128 and b.head_v_dim == 128 for b in model.transformer.blk if isinstance(b, GatedDeltaNetBlock))
 
   def fits(self, position: int) -> bool:
     return 0 <= position <= self.observer.model.config.context_length - self.rows
@@ -101,6 +104,13 @@ class ParallelVerifier:
     # Chunked closed form of the gated delta rule (WY/UT form; see module doc).
     g = _stored(ops.g, log_alpha.transpose(1, 2)[..., 0].cumsum(-1))                 # (B,H,T) log decay
     k = _stored(ops.k, k)
+    if self._fused:
+      # One NV kernel per layer: closed-form chunk, RMSNorm and gate (kernels/gdn.py).
+      keep = (1 - initial.float()).reshape(1)
+      z, u = gdn_chunk(q[0], k[0], v[0], beta[0], g[0], _raw(block.recurrent_state).reshape(H, V, K), out_gate[0],
+                       block.ssm_norm.weight, keep, block.ssm_norm.eps)
+      u = _stored(ops.u, u.unsqueeze(0))
+      return block.ssm_out(Tensor(z.uop.after(u.uop)).reshape(B, T, -1))
     state = initial.where(0, _raw(block.recurrent_state).float())                       # S0 (B,H,V,K)
     strict, inclusive = _decays(g, T)
     A = beta.unsqueeze(-1) * strict * (k @ k.transpose(-1, -2))

@@ -69,7 +69,9 @@ def test_q6_prepared_decode_and_prefill(width, swizzled, warps, monkeypatch):
   baseline = quant_gemm(x, native, out_features=rows, in_features=width, ggml_type=14)
   actual = quant_gemm(x, prepared, out_features=rows, in_features=width, ggml_type=14,
                       q6_aligned=True, q6_swizzled=swizzled)
-  assert (baseline-actual).abs().max().item() < 1e-5
+  # Prepared Q6 uses the paired kernel, which sums the same products in a
+  # permuted k order: compare relative to the output scale, not bitwise.
+  assert ((baseline-actual).abs().max()/baseline.abs().max().maximum(1)).item() < 1e-5
 
 
 @pytest.mark.parametrize('override,expected', [(None, True), (True, True), (False, False)])

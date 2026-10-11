@@ -22,7 +22,13 @@ shapes). Prompt prefill uses the same forward in 16-row chunks.
 
 - Gated delta-net layers use the chunked (WY/UT) closed form of the gated delta rule
   instead of a per-row scan; `commit` forms the accepted-prefix state directly from
-  stored U, K and log-decays. No per-row state snapshots are kept.
+  stored U, K and log-decays. No per-row state snapshots are kept. On NV the chunk,
+  RMSNorm and output gate run as one kernel per layer (`kernels/gdn.py`: one block
+  per head, one thread per value row, forward substitution in registers).
+- Packed GEMMs permute the k order so each lane's tensor-core slots map to
+  contiguous packed bytes (`_prefill_q4_paired` for Q4_K/Q5_K, `_prefill_q6_paired`
+  for prepared Q6_K): one 8/16-byte load fills four k-steps and every nibble is
+  read once. The reduction order changes, not the products.
 - Full-attention layers attend over the fixed-length cache with a causal mask
   (symbolic key lengths compiled to slow kernels). Rejected suffix K/V stays outside
   the authorized prefix and is overwritten later.
@@ -37,12 +43,12 @@ Measured on an RTX 5060 (8 GB), Qwen3.5-4B Q4_K_M target, chat-formatted prompt,
 
 | Prompt | Baseline | DFlash parallel, block 16 | Acceptance (τ) | Output |
 |---|---|---|---|---|
-| Fibonacci function (code) | 69 tok/s | **158 tok/s (2.27×)** | 9.1 | identical |
-| Why the sky is blue (prose) | 70 tok/s | 55 tok/s (0.78×) | 1.2 | diverges at token 27* |
+| Fibonacci function (code) | 68 tok/s | **194 tok/s (2.85×)** | 9.1 | identical |
+| Why the sky is blue (prose) | 69 tok/s | 60 tok/s (0.87×) | 1.3 | identical* |
 
 \* Multirow and one-row kernels reduce in different orders; near-ties can flip a
-greedy choice. Earlier runs of the same prompt matched; treat outputs as equivalent
-up to floating-point ties, not bitwise identical to one-row decoding.
+greedy choice (an earlier run of this prompt diverged at token 27). Treat outputs as
+equivalent up to floating-point ties, not bitwise identical to one-row decoding.
 
 Acceptance is content dependent. A parallel round costs about 3.2 ordinary decode
 steps, so it only pays off above that many tokens per round. The generator tracks a
