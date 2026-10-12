@@ -215,7 +215,8 @@ class DFlashGenerator:
     return graphs
 
   def _graph_cache_path(self, block: int):
-    if os.environ.get('INFURNACE_GRAPH_CACHE', '1') == '0' or self.verifier != 'parallel': return None
+    # Opt-in: a cached entry has been seen to hang its first replay in later processes (cause not yet found).
+    if os.environ.get('INFURNACE_GRAPH_CACHE', '0') != '1' or self.verifier != 'parallel': return None
     if self.model.device.split(':')[0] != 'NV' or getattr(self.model, '_path', None) is None: return None
     from infurnace.dflash import graph_cache
     return graph_cache.cache_dir() / f'{graph_cache.key(self, block)}.pkl'
