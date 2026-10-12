@@ -16,8 +16,11 @@ class TargetObserver:
     self._block_active = False
     self.next_decision = None
     self._position = UOp.variable('start_pos', 0, model.config.context_length - 1)
+    # The input token is a bound variable patched into the captured graph's
+    # kernel arguments: no host-to-device upload or store kernel per step.
+    self._token = UOp.variable('dflash_token', 0, model.config.vocab_size - 1)
     self._jit = TinyJit(self._forward)
-    self._ids = self._temperature = None
+    self._temperature = None
 
   def __enter__(self):
     if self.active or self.model._generating: raise RuntimeError('only one generation may run at a time')
@@ -36,9 +39,9 @@ class TargetObserver:
       self.model.transformer._cached_tokens = []
       self.model._generating = self.active = False
 
-  def _forward(self, tokens, position, temperature):
+  def _forward(self, token, position, temperature):
     target = self.model.transformer
-    x, features = target.token_embd(tokens).float(), []
+    x, features = target.token_embd(Tensor(token).cast(dtypes.int32).reshape(1, 1)).float(), []
     for index, block in enumerate(target.blk):
       # GGUF tap N means HF hidden_states[N], i.e. after target block N-1.
       if index in self.layers: features.append(x)
@@ -57,13 +60,9 @@ class TargetObserver:
     if self.position >= self.model.config.context_length: raise ValueError('target context exhausted')
     try:
       with Context(DEV=self.model.device):
-        # Persistent input buffers: the captured graph always sees the same addresses.
-        if self._ids is None:
-          self._ids = Tensor.empty(1, 1, dtype=dtypes.int32, device=self.model.device).realize()
-          self._temperature = Tensor([0.0], device=self.model.device).realize()
-        token_value = Tensor([[token]], dtype=dtypes.int32, device=self.model.device)
-        Tensor(self._ids.uop.after(self._ids.uop.store(token_value.uop))).realize()
-        decision, features = self._jit(self._ids, self._position.bind(self.position), self._temperature)
+        # A persistent temperature buffer: the captured graph always sees the same address.
+        if self._temperature is None: self._temperature = Tensor([0.0], device=self.model.device).realize()
+        decision, features = self._jit(self._token.bind(token), self._position.bind(self.position), self._temperature)
         Tensor.realize(decision, features)
         # JIT outputs alias capture scratch. Copy only executed storage before
         # another target row overwrites it; detach executed RNG/target graphs.

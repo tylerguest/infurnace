@@ -4,6 +4,7 @@ Sequential verification steps the unchanged upstream target one row at a time;
 parallel verification runs the whole draft block through the target at once
 (see parallel.py).
 """
+import collections
 from dataclasses import dataclass
 import os
 import time
@@ -35,8 +36,11 @@ class DFlashGenerator:
     self._parallel = {}
     # Break-even tokens/round for parallel verification vs one-row decode on
     # the 5060 (one round ~= 3.2 ordinary steps), and the fallback length.
-    self.min_tau, self.cooldown_steps = 3.5, 8
+    self.min_tau, self.cooldown_steps, self.max_backoff = 3.5, 8, 16
     self.plain_cost = None  # measured seconds per one-row target step (kept across requests)
+    # Timing samples seen per kind ('plain', 'fused'): the first calls of a
+    # captured graph run eagerly and then capture, so they are not timed.
+    self._samples = collections.Counter()
     # Device-side fused rounds are opt-in (INFURNACE_DFLASH_FUSED=1) until the
     # timing fallback also covers them (see parallel.py for the tinygrad fix).
     self.fused = os.environ.get('INFURNACE_DFLASH_FUSED', '0') == '1'
@@ -78,12 +82,16 @@ class DFlashGenerator:
           for token in tokens[done:]: anchor = step(token)
         else:
           for token in tokens: anchor = step(token)
-        # Adaptive drafting: draft only while a parallel round costs less wall
-        # time per emitted token than an ordinary one-row step. Otherwise decode
+        # Adaptive drafting: draft only while parallel rounds cost less wall time
+        # per emitted token than an ordinary one-row step. Otherwise decode
         # ordinary rows (still collecting features), backing off exponentially
         # while probes keep losing. Until a one-row step has been timed, a
         # tokens-per-round threshold decides the first fallback.
-        tau, cooldown, backoff, spec_cost, probing = float(block), 0, 1, None, False
+        # The cost is a ratio of running sums (round time / emitted tokens), so a
+        # single round with nothing accepted cannot outweigh good rounds.
+        tau, cooldown, backoff, probing = float(block), 0, 1, False
+        spec_time = spec_tokens = None
+        timed_rounds = 0  # timed rounds since the last probe
         # A parallel verify is held uncommitted: the next fused round commits it
         # on device; any other path flushes it (commit + keep its feature rows).
         held = held_decisions = None
@@ -95,13 +103,22 @@ class DFlashGenerator:
           with Context(DEV=self.model.device): pending.append(_raw_features(verifier)[:, :held].contiguous().realize())
           held = None
         def account(accepted):
-          nonlocal spec_cost, tau, probing, cooldown, backoff
-          cost = (time.perf_counter() - started) / (accepted + 1)
-          spec_cost = cost if spec_cost is None or probing else 0.5 * spec_cost + 0.5 * cost
-          tau, probing = 0.5 * tau + 0.5 * (accepted + 1), False
-          if spec_cost > self.plain_cost if self.plain_cost is not None else tau < self.min_tau:
-            tau, cooldown, backoff = float(block), self.cooldown_steps * backoff, min(backoff * 2, 16)
-          else: backoff = 1
+          nonlocal spec_time, spec_tokens, timed_rounds, tau, probing, cooldown, backoff
+          elapsed = time.perf_counter() - started
+          if spec_time is None or probing: spec_time, spec_tokens, timed_rounds = elapsed, accepted + 1, 0
+          else: spec_time, spec_tokens = 0.7 * spec_time + 0.3 * elapsed, 0.7 * spec_tokens + 0.3 * (accepted + 1)
+          tau, probing, timed_rounds = 0.5 * tau + 0.5 * (accepted + 1), False, timed_rounds + 1
+          if self.plain_cost is not None: losing = timed_rounds >= 2 and spec_time / spec_tokens > self.plain_cost
+          else: losing = tau < self.min_tau
+          if losing: tau, cooldown, backoff = float(block), self.cooldown_steps * backoff, min(backoff * 2, self.max_backoff)
+          elif timed_rounds >= 2: backoff = 1
+        def account_untimed(accepted):
+          # A round whose wall time is not representative (a capture, or the
+          # unfused probe that re-enters fused rounds) only updates the
+          # tokens-per-round estimate; `probing` stays set for the next timed round.
+          nonlocal tau, cooldown, backoff
+          tau = 0.5 * tau + 0.5 * (accepted + 1)
+          if tau < self.min_tau: tau, cooldown, backoff = float(block), self.cooldown_steps * backoff, min(backoff * 2, self.max_backoff)
         while emitted < limit:
           emitted += 1
           yield anchor
@@ -123,7 +140,8 @@ class DFlashGenerator:
               while accepted < len(proposals) and proposals[accepted] == decisions[accepted]: accepted += 1
               self.stats.accepted += accepted
               held, held_decisions = accepted + 1, decisions
-              account(accepted)
+              self._samples['fused'] += 1
+              (account if self._samples['fused'] > 2 else account_untimed)(accepted)
               for token in proposals[:accepted]:
                 emitted += 1
                 yield token
@@ -150,7 +168,8 @@ class DFlashGenerator:
               self.stats.target_steps += 1
               self.stats.accepted += accepted
               held, held_decisions = accepted + 1, decisions
-              account(accepted)
+              fused_next = self.fused and verifier.fused_eligible(self.draft)
+              (account_untimed if fused_next else account)(accepted)
               for token in proposals[:accepted]:
                 emitted += 1
                 yield token
@@ -159,9 +178,14 @@ class DFlashGenerator:
               continue
           current = anchor
           if not proposals and self.verifier == 'parallel':
+            # Time the step alone: flush() above is a one-off per fallback and
+            # compiles per held-row count. Skip capture samples and outliers.
+            stepped = time.perf_counter()
             anchor = step(current)
-            cost = time.perf_counter() - started
-            self.plain_cost = cost if self.plain_cost is None else 0.8 * self.plain_cost + 0.2 * cost
+            cost = time.perf_counter() - stepped
+            self._samples['plain'] += 1
+            if self._samples['plain'] > 2 and (self.plain_cost is None or cost < 4 * self.plain_cost):
+              self.plain_cost = cost if self.plain_cost is None else 0.8 * self.plain_cost + 0.2 * cost
             continue
           for proposal in proposals:
             selected = step(current)
