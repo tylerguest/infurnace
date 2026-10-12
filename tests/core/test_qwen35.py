@@ -67,6 +67,52 @@ def test_upstream_loader_and_exact_block_types(tmp_path):
     for cap in (0, -1, True):
       with pytest.raises(ValueError): Qwen35Model.from_gguf(path, max_context=cap)
 
+@pytest.mark.parametrize('tied_head', [False, True])
+@pytest.mark.parametrize('head_type', [0, 12])
+def test_packed_loader_preserves_embedding_aliases(monkeypatch, tied_head, head_type):
+  """Exercise packed-load aliasing on CPU, replacing only the NV adapter."""
+  from types import SimpleNamespace
+  from tinygrad import nn, dtypes
+  from infurnace.gguf import PackedTensor
+  import infurnace.models.qwen35 as qwen35
+
+  embedding = Tensor.ones(16, 256, device='CPU').realize()
+  output = embedding if tied_head else Tensor.full((16, 256), 2, device='CPU').realize()
+  transformer = SimpleNamespace(token_embd=nn.Embedding(16, 256), output=nn.Linear(256, 16, bias=False))
+  transformer.token_embd.weight, transformer.output.weight = embedding, output
+  model = Qwen35Model.__new__(Qwen35Model)
+  model.transformer, model.device, model.nv_quant_linears = transformer, 'CPU', 0
+  entry = PackedTensor(Tensor(bytes(1), device='CPU', dtype=dtypes.uint8), (16, 256), head_type)
+  entries = {'token_embd.weight': entry}
+  if not tied_head: entries['output.weight'] = entry
+  monkeypatch.setattr(qwen35, 'parse_gguf', lambda path: ({}, entries))
+  adapters = []
+
+  class Adapter:
+    def __init__(self, original, entry, *, prefill, keep_weight, realize):
+      self.original, self.keep_weight = original, keep_weight
+      self.decoded = original.weight.clone().realize()
+      self.weight = original.weight = self.decoded if keep_weight else None
+      self.packed = Tensor.zeros(1, device='CPU').realize()
+      adapters.append(self)
+
+  monkeypatch.setattr(qwen35, '_PackedLinear', Adapter)
+  model._enable_packed('unused.gguf', prefill=False)
+  assert model._tied_head is tied_head
+  assert transformer.token_embd.weight.tolist() == embedding.tolist()
+  if head_type == 0:
+    assert not adapters and model.nv_quant_linears == 0
+    assert transformer.token_embd.weight is embedding
+    assert transformer.output.weight is output
+  else:
+    adapter, = adapters
+    assert model.nv_quant_linears == 1
+    assert adapter.keep_weight is tied_head
+    assert adapter.weight is None and adapter.original.weight is None
+    assert transformer.token_embd.weight is (adapter.decoded if tied_head else embedding)
+    assert adapter.decoded.tolist() == output.tolist()
+
+
 def test_bounded_wrapper_matches_direct_upstream_rng_and_cache(tmp_path):
   with Context(DEV='CPU'):
     path = checkpoint(tmp_path)

@@ -243,7 +243,7 @@ class Qwen35Model(Qwen3Model):
           _, layer, attribute, _ = name.split('.')
           owner = self.transformer.blk[int(layer)]
         else: continue
-        tied = name == 'output.weight'
+        tied = name == 'output.weight' and self._tied_head
         # Lazy copy + repack; each layer is realized in one schedule below
         # (one realize per weight costs ~20 ms of graph bookkeeping each).
         adapter = _PackedLinear(getattr(owner, attribute), entry.to(self.device, realize=False), prefill=prefill,
