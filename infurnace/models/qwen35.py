@@ -22,7 +22,7 @@ from tinygrad.llm.gguf import ggml_data_to_tensor
 from tinygrad.llm.model import GatedDeltaNetBlock, Transformer
 from tinygrad.nn.state import get_state_dict
 from infurnace.gguf import parse_gguf, read_gguf_metadata
-from infurnace.kernels.gdn import gdn_decode
+from infurnace.kernels.gdn import gdn_decode, gdn_prefill
 from infurnace.kernels.quant_gemm import nv_prefill_supported
 from infurnace.models.linear import _NVLinear
 
@@ -115,16 +115,53 @@ class _PackedLinear(_NVLinear):
     if self.prefill: return super().__call__(x)
     return self.decode(x)
 
-def _fused_gdn_decode(block: GatedDeltaNetBlock):
-  """Upstream GatedDeltaNetBlock._attention for one-row decoding, with the conv, q/k norms,
-  recurrence, RMSNorm and gate in one NV kernel (upstream fuses the recurrence only on AMD;
-  elsewhere the step is dozens of small kernels). Other shapes use upstream's path."""
+PREFILL_ROWS = 16  # prompt chunk for the fused multirow GDN kernel (it is specialized to 16 rows)
+
+def _fused_gdn(block: GatedDeltaNetBlock):
+  """Upstream GatedDeltaNetBlock._attention with NV kernels where upstream has them only on AMD.
+
+  One-row decoding: the conv, q/k norms, recurrence, RMSNorm and gate in one kernel (elsewhere the
+  step is dozens of small kernels). 16-row prompt chunks: upstream's input processing, then one
+  closed-form kernel for the scan instead of its row-by-row loop. Other shapes use upstream's path."""
   upstream_attention = block._attention
   H, K, V = block.num_v_heads, block.head_k_dim, block.head_v_dim
+  def prefill(x: Tensor, start_pos: UOp) -> Tensor:
+    # Upstream's input processing, verbatim for the non-KDA case; only the scan below differs.
+    B, T, _ = x.shape
+    T_pad = x.max_shape[1]
+    initial = Tensor(start_pos).eq(0)
+    x = x.half()
+    out_gate = block.attn_gate(x).reshape(B, T, H, V)
+    beta = block.ssm_beta(x).sigmoid().reshape(B, T, H)
+    log_alpha = (block.ssm_alpha(x).float() + block.ssm_dt['bias']).softplus().reshape(B, T, H, -1) * block.ssm_a.reshape(H, -1)
+    conv_state = initial.where(0, block.conv_state)
+    conv_window = conv_state.cat(block.attn_qkv(x).cast(conv_state.dtype), dim=1)
+    conv_window = conv_window.pad_to((B, block.ssm_conv_kernel - 1 + T_pad, block.conv_channels)).contiguous()
+    conv_state_store = block.conv_state.uop.store(conv_window[:, T:T + block.ssm_conv_kernel - 1].cast(block.conv_state.dtype).uop)
+    conv_out = functools.reduce(lambda a, b: a + b,
+      (conv_window[:, i:i + T_pad] * block.ssm_conv1d['weight'][:, i] for i in range(block.ssm_conv_kernel))).silu()
+    # Padding rows are no-ops: beta 0 (no update) and log-decay 0 (no decay).
+    out_gate, beta = out_gate.pad_to((B, T_pad, H, V)), beta.pad_to((B, T_pad, H))
+    log_alpha = log_alpha.pad_to((B, T_pad, *log_alpha.shape[2:]))
+    q, k, v = conv_out.split([block.q_dim, block.q_dim, block.conv_channels - 2 * block.q_dim], dim=-1)
+    q, k = (z.reshape(B, T_pad, block.num_k_heads, K).normalize(dim=-1, eps=1e-6).repeat(1, 1, H // block.num_k_heads, 1)
+            for z in (q, k))
+    v = v.reshape(B, T_pad, H, V)
+    q, k, v, beta = (z.transpose(1, 2).float() for z in (q, k, v, beta))
+    q = q * K**-0.5
+    # The scan, RMSNorm and gate in one kernel that also advances the recurrent state in place,
+    # ordered after the conv state write like upstream's AMD kernel.
+    g = log_alpha.transpose(1, 2)[..., 0].cumsum(-1)
+    state = Tensor(block.recurrent_state.uop.after(conv_state_store)).reshape(H, V, K)
+    z = gdn_prefill(q[0], k[0], v[0], beta[0], g[0], state, out_gate[0], block.ssm_norm.weight,
+                    (1 - initial.float()).reshape(1), block.ssm_norm.eps)
+    return block.ssm_out(z.reshape(1, T_pad, H * V)[:, :T])
   def attention(x: Tensor, start_pos):
     B, T, _ = x.shape
-    if B != 1 or T != 1: return upstream_attention(x, start_pos)
     if not isinstance(start_pos, UOp): start_pos = UOp.variable('start_pos', 0, block.config.max_context - 1).bind(start_pos)
+    multirow = isinstance(T, UOp) or T > 1  # prompt chunks have a symbolic row count
+    if B == 1 and multirow and x.max_shape[1] == PREFILL_ROWS: return prefill(x, start_pos)
+    if B != 1 or multirow: return upstream_attention(x, start_pos)
     initial = Tensor(start_pos).eq(0)
     x = x.half()
     out_gate = block.attn_gate(x).reshape(H, V)
@@ -174,11 +211,13 @@ class Qwen35Model:
     self.nv_prefill = False
     self._path, self._host_embedding = None, None
     self._tied_head = False  # the packed output head is the token embedding table
+    self._multirow_prefill = False  # prompts go through the fused 16-row GDN kernel (see _prefill)
 
   def warmup(self) -> None:
     """Prime upstream prefill/decode JIT using the same chunk size as normal generation."""
     if self.config.context_length < 2: return
-    prompt = [0] * min(2, self.config.context_length - 1)
+    # Long enough to capture the multirow prompt graph too (one full chunk and a partial one).
+    prompt = [0] * min(PREFILL_ROWS + 2, self.config.context_length - 1)
     count = min(4, self.config.context_length - len(prompt))
     try:
       # First calls execute, second calls capture, third calls verify replay.
@@ -214,15 +253,34 @@ class Qwen35Model:
     count = min(max_new_tokens, self.config.context_length - len(tokens))
     if count == 0: return
     self._generating = True
-    stream = self.transformer.generate(list(tokens), chunk_size=chunk_size, temperature=float(temperature))
+    stream = None
     try:
+      with Context(DEV=self.device): self._prefill(tokens, float(temperature))
+      stream = self.transformer.generate(list(tokens), chunk_size=chunk_size, temperature=float(temperature))
       for _ in range(count):
         # Do not leave a device context active while yielding control to a caller.
         with Context(DEV=self.device): token = next(stream)
         yield token
     finally:
-      stream.close()
+      if stream is not None: stream.close()
       self._generating = False
+
+  def _prefill(self, tokens: list[int], temperature: float):
+    """Upstream prefills hybrid models one row per step except on AMD (its scan is a row-by-row
+    loop elsewhere). With the fused GDN kernels, run all but the last prompt token through
+    upstream's own forward in 16-row chunks, then record them as the cached prefix: upstream's
+    generate resumes there and processes the last token as an ordinary one-row step."""
+    t = self.transformer
+    start, end = t.get_start_pos(tokens), len(tokens) - 1
+    if not self._multirow_prefill or end <= start: return
+    v_start = UOp.variable('start_pos', 0, t.max_context - 1)
+    v_rows = UOp.variable('toks', 1, PREFILL_ROWS)
+    ids = Tensor(tokens + [0] * (t.max_context - len(tokens)), dtype='int32').reshape(1, t.max_context)
+    temp = Tensor([temperature])
+    for position in range(start, end, PREFILL_ROWS):
+      sp, rows = v_start.bind(position), v_rows.bind(min(PREFILL_ROWS, end - position))
+      t(ids[:, sp:sp + rows], sp, temp).realize()
+    t._cached_tokens = tokens[:end]
 
   def embed(self, tokens: list[int]) -> Tensor:
     """Embedding rows as a (1, len(tokens), dim) float tensor on the model device.
@@ -277,15 +335,17 @@ class Qwen35Model:
     result = cls(transformer, metadata, device)
     result._path = Path(path)
     result._enable_packed(path, nv_prefill_supported(device) if nv_prefill is None else nv_prefill)
+    gdn = [block for block in transformer.blk if isinstance(block, GatedDeltaNetBlock)]
+    fused = [block for block in gdn if getattr(block, 'ssm_g_a', None) is None and block.head_k_dim == 128 and block.head_v_dim == 128]
     if os.environ.get('INFURNACE_FUSED_GDN', '1') != '0':
-      for block in transformer.blk:
-        if (isinstance(block, GatedDeltaNetBlock) and getattr(block, 'ssm_g_a', None) is None
-            and block.head_k_dim == 128 and block.head_v_dim == 128):
-          block._attention = _fused_gdn_decode(block)
-          # The fused step updates the recurrent state in place, so it must be a real buffer.
-          with Context(DEV=device):
-            block._init_state(Tensor.empty(1, 1, result.config.embedding_length))
-            Tensor.realize(block.conv_state, block.recurrent_state)
+      for block in fused:
+        block._attention = _fused_gdn(block)
+        # The fused step updates the recurrent state in place, so it must be a real buffer.
+        with Context(DEV=device):
+          block._init_state(Tensor.empty(1, 1, result.config.embedding_length))
+          Tensor.realize(block.conv_state, block.recurrent_state)
+      # Multirow prompts need every GDN layer on the fused kernel and the packed GEMM for the projections.
+      result._multirow_prefill = len(fused) == len(gdn) and result.nv_prefill and os.environ.get('INFURNACE_MULTIROW_PREFILL', '1') != '0'
     # Placeholder initialization leaves an unrealized host RNG update chain that
     # every later realize would walk. Swap in a fresh counter rather than realize
     # it (that would materialize the placeholders); host sampling is unused.

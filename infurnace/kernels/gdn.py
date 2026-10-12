@@ -1,4 +1,4 @@
-"""Fused gated delta-net chunk for multirow verification (NV, one block per head).
+"""Fused gated delta-net chunk for multirow verification and prompt prefill (NV, one block per head).
 
 Computes, for T rows of one GatedDeltaNet layer and initial state S0 (V x K):
   u_t   = β_t (v_t - γ_t S0 k_t - Σ_{s<t} (γ_t/γ_s)(k_t·k_s) u_s)     (forward substitution)
@@ -8,6 +8,10 @@ with γ_t = exp(g_t) from cumulative log-decays g. Each of the 128 threads owns 
 value row v: it streams S0[v, :] once and keeps its column of U in registers, so
 the triangular solve needs no synchronization. Only K/Q tiles, the T x T Gram
 matrices and the norm partials live in shared memory. U is written for `commit`.
+
+Prefill keeps every row, so `gdn_prefill` also advances the state in place:
+  S_T   = γ_T S0 + Σ_t (γ_T/γ_t) u_t k_tᵀ
+each thread writing its own value row from the U column it already holds.
 """
 import functools
 
@@ -22,7 +26,7 @@ def _silu(x: UOp) -> UOp:
 
 @functools.cache
 def _gdn_chunk_kernel(z: UOp, u: UOp, q: UOp, k: UOp, v: UOp, beta: UOp, g: UOp, state: UOp, gate: UOp,
-                      weight: UOp, keep: UOp, *, heads: int, rows: int, eps: float) -> UOp:
+                      weight: UOp, keep: UOp, *, heads: int, rows: int, eps: float, advance: bool = False) -> UOp:
   T, D = rows, 128
   head = UOp.range(heads, 0, axis_type=AxisType.GLOBAL)
   warp = UOp.range(4, 1, axis_type=AxisType.LOCAL)
@@ -85,7 +89,14 @@ def _gdn_chunk_kernel(z: UOp, u: UOp, q: UOp, k: UOp, v: UOp, beta: UOp, g: UOp,
     scale = (mean+eps).sqrt().reciprocal()*weight[col].load()
     stores.append(z[t, head, col].store((outs[t]*scale*_silu(gate[t, head, col].load().float())).cast(dtypes.float16)))
     stores.append(u[head, t, col].store(us[t]))
-  return UOp.group(*stores).end(head, warp, lane).sink(arg=KernelInfo(name="gdn_chunk", opts_to_apply=()))
+  if advance:
+    # S_T[v, :] = γ_T S0[v, :] + Σ_t (γ_T/γ_t) u_t[v] k_t; this thread read only row v of S0 above.
+    weights = [(gs[T-1]-gs[t]).exp()*us[t] for t in range(T)]
+    i = UOp.range(D, 4, axis_type=AxisType.LOOP)
+    total = sum((weights[t]*ksh[t, i].load() for t in range(T)), gs[T-1].exp()*state[head, col, i].load()*keep[0].load())
+    stores.append(state[head, col, i].store(total).end(i))
+  name = "gdn_prefill" if advance else "gdn_chunk"
+  return UOp.group(*stores).end(head, warp, lane).sink(arg=KernelInfo(name=name, opts_to_apply=()))
 
 def gdn_chunk(q: Tensor, k: Tensor, v: Tensor, beta: Tensor, g: Tensor, state: Tensor, gate: Tensor,
               weight: Tensor, keep: Tensor, eps: float) -> tuple[Tensor, Tensor]:
@@ -100,6 +111,18 @@ def gdn_chunk(q: Tensor, k: Tensor, v: Tensor, beta: Tensor, g: Tensor, state: T
                                                                          keep.float().contiguous()]
   z, u = Tensor.custom_kernel(z, u, *inputs, fxn=functools.partial(_gdn_chunk_kernel, heads=heads, rows=rows, eps=eps))[:2]
   return z, u
+
+def gdn_prefill(q: Tensor, k: Tensor, v: Tensor, beta: Tensor, g: Tensor, state: Tensor, gate: Tensor,
+                weight: Tensor, keep: Tensor, eps: float) -> Tensor:
+  """`gdn_chunk` for prompt prefill: every row is kept, so `state` (H, 128, 128) FP32 is advanced
+  past all 16 rows in place. Padding rows (β = 0, log-decay 0) leave it unchanged. Returns z (T, H, 128) FP16."""
+  heads, rows, dim = q.shape
+  if dim != 128 or rows != 16: raise ValueError("fused GDN prefill requires 16 rows of 128-dimensional heads")
+  z = Tensor.empty(rows, heads, dim, dtype=dtypes.float16, device=q.device)
+  u = Tensor.empty(heads, rows, dim, dtype=dtypes.float32, device=q.device)
+  inputs = [t.float().contiguous() for t in (q, k, v, beta, g)] + [state, gate.contiguous(), weight.float().contiguous(),
+                                                                  keep.float().contiguous()]
+  return Tensor.custom_kernel(z, u, *inputs, fxn=functools.partial(_gdn_chunk_kernel, heads=heads, rows=rows, eps=eps, advance=True))[0]
 
 @functools.cache
 def _gdn_decode_kernel(z: UOp, state: UOp, qkv: UOp, conv: UOp, conv_w: UOp, x: UOp, w_beta: UOp, w_alpha: UOp, dt_bias: UOp,

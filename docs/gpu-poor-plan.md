@@ -37,21 +37,41 @@ Tensor-core GEMM also needs an `(8,16,16)` FP16 tensor core, so older cards that
 
 ## 2. Plain decoding reads prompts one token at a time
 
-- [ ] Route plain decoding's prompt through the multirow forward
+- [x] Read prompts in 16-row chunks through a fused NV kernel (`gdn_prefill`)
+- [ ] Cut the extra warmup it adds (see below)
 
 **Problem.** Upstream `Transformer.generate` (`tinygrad/llm/model.py`) does:
 ```python
 if self.has_recurrent_block and not amd_custom_kernels_supported(...): chunk_size = 1
 ```
-So on `NV`, Qwen3.5 prefills **one token per step** in every mode except DFlash chat:
-`--no-dflash`, `--prompt` without a draft, and all of `--serve`. A 2,000-token prompt waits ~18 s
-for the first token at ~110 tok/s. Agent-style serve clients with long prompts feel it most.
+Its multirow recurrent scan is a row-by-row loop unrolled into the graph, so off AMD it reads
+prompts one token per step: `--no-dflash`, `--prompt` without a draft, and all of `--serve`.
 
-**Fix.** `ParallelVerifier.prefill` (`dflash/parallel.py`) already runs 16 rows at a time; only
-DFlash uses it. Reuse it, or the same multirow forward, for plain decoding's prompt.
+**Done.** The kernel route, like upstream's AMD branch:
+- `gdn_prefill` (`kernels/gdn.py`) is DFlash's closed-form 16-row chunk kernel with one addition:
+  it also advances the recurrent state in place, since prefill keeps every row.
+- `_fused_gdn` (`models/qwen35.py`) runs upstream's input processing for 16-row chunks, then that
+  kernel instead of upstream's loop.
+- `Qwen35Model._prefill` feeds all but the last prompt token through upstream's own forward in
+  16-row chunks and records them as the cached prefix; upstream's `generate` resumes from there.
+  It respects existing prefix reuse. `INFURNACE_MULTIROW_PREFILL=0` turns it off.
 
-**Check.** Time to first token for a 2,000-token prompt with `--no-dflash`, before and after.
-Output must match the current path token for token.
+Measured on the RTX 5060, plain decoding, 4,096 context:
+
+| Prompt | First token before | After |
+|---|---|---|
+| 100 tokens | 0.91 s | 0.19 s |
+| 2,532 tokens | 26.9 s | 6.5 s |
+
+Decode speed is unchanged. Output matched on both prompts and on 4 of 5 test prompts. The fifth
+flips its first token on a near-tie ("1" vs "M", 0.04 logits apart): one-row projections quantize
+activations to 8 bits, the 16-row GEMM multiplies in FP16, so logits agree to ~1%, not exactly.
+Tests: `tests/dflash/test_nv_dflash_kernels.py` (kernel vs one-row scan, padding, reset) and
+`tests/core/test_nv_qwen35_prefill.py` (logits tolerance, generate, prefix reuse).
+
+**Open: warmup cost.** Plain-decoding warmup went from 12 s to 45 s. The first 16-row chunk
+costs 19 s eagerly plus 14 s to capture; replays are free. Realizing the KV caches first and
+skipping the eager pass (as DFlash's `captured()` does) should save part of that, unmeasured.
 
 ## 3. DFlash chat re-reads the whole conversation every turn
 

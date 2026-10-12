@@ -95,3 +95,32 @@ def test_gdn_decode_matches_upstream_math_and_updates_states_in_place():
       assert ((z - z_ref).abs().max() / z_ref.abs().max()).item() < 2e-3
       assert ((S0 - S_ref).abs().max() / S_ref.abs().max()).item() < 1e-4   # updated in place
       assert conv0.tolist() == window[1:].tolist()                          # conv window shifted in place
+
+@pytest.mark.parametrize('rows', [16, 5])
+def test_gdn_prefill_matches_sequential_scan_and_advances_state(rows):
+  from infurnace.kernels.gdn import gdn_prefill
+  H, T, D, eps = 32, 16, 128, 1e-6
+  with Context(DEV='NV'):
+    Tensor.manual_seed(7)
+    k, q = Tensor.randn(H, T, D).normalize(dim=-1).realize(), (Tensor.randn(H, T, D).normalize(dim=-1) * D**-0.5).realize()
+    v = Tensor.randn(H, T, D).realize()
+    # Rows past `rows` are upstream's padding: beta 0 and log-decay 0 make them no-ops.
+    live = (Tensor.arange(T) < rows).reshape(1, T)
+    beta = (Tensor.rand(H, T) * live).realize()
+    log_alpha = (-Tensor.rand(H, T) * 0.3 * live).realize()
+    gate, weight = Tensor.randn(T, H, D).half().realize(), (Tensor.rand(D) + 0.5).realize()
+    for keep in (1.0, 0.0):  # 0 = sequence start: the old state is ignored
+      S0 = (Tensor.randn(H, D, D) * 0.1).contiguous().realize()
+      # Reference: upstream's one-row-at-a-time scan.
+      S, outs = S0 * keep, []
+      for t in range(rows):
+        s1 = S * log_alpha[:, t].exp().reshape(H, 1, 1)
+        delta = (v[:, t] - (s1 * k[:, t].reshape(H, 1, D)).sum(-1)) * beta[:, t].reshape(H, 1)
+        S = s1 + delta.reshape(H, D, 1) * k[:, t].reshape(H, 1, D)
+        outs.append((S * q[:, t].reshape(H, 1, D)).sum(-1))
+      core = Tensor.stack(*outs)
+      z_ref = core * (core.square().mean(-1, keepdim=True) + eps).rsqrt() * weight * gate[:rows].float().silu()
+      z_ref, S_ref = z_ref.realize(), S.realize()  # before the kernel overwrites S0
+      z = gdn_prefill(q, k, v, beta, log_alpha.cumsum(-1), S0, gate, weight, Tensor([keep]), eps).realize()
+      assert ((z[:rows].float() - z_ref).abs().max() / z_ref.abs().max()).item() < 2e-3
+      assert ((S0 - S_ref).abs().max() / S_ref.abs().max()).item() < 1e-4   # advanced in place, padding ignored
