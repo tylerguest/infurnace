@@ -78,13 +78,14 @@ def _prepare_q4_kernel(out: UOp, raw: UOp, *, blocks_per_row: int, gpu: bool = T
     arg=KernelInfo(name="prepare_q4_swizzled", opts_to_apply=()))
 
 
-def prepare_q4(raw: Tensor, *, in_features: int) -> Tensor:
+def prepare_q4(raw: Tensor, *, in_features: int, realize: bool = True) -> Tensor:
   if (raw.dtype != dtypes.uint8 or raw.numel() <= 0 or in_features <= 0 or in_features%256
       or raw.numel()%(in_features//256*144)):
     raise QuantGemvError("swizzled Q4 preparation requires complete uint8 rows with width multiple of 256")
   out = Tensor.empty(raw.numel()//4, dtype=dtypes.uint32, device=raw.device)
   fxn = functools.partial(_prepare_q4_kernel, blocks_per_row=in_features//256, gpu=raw.device.split(':')[0] == 'NV')
-  return Tensor(UOp.custom_kernel(out.uop, raw.uop.flatten(), fxn=fxn)[0]).realize()
+  result = Tensor(UOp.custom_kernel(out.uop, raw.uop.flatten(), fxn=fxn)[0])
+  return result.realize() if realize else result
 
 
 def _prepare_q6_kernel(out: UOp, raw: UOp, *, gpu: bool = True, blocks_per_row: int = 0) -> UOp:
@@ -106,7 +107,7 @@ def _prepare_q6_kernel(out: UOp, raw: UOp, *, gpu: bool = True, blocks_per_row: 
     arg=KernelInfo(name="prepare_q6_aligned", opts_to_apply=()))
 
 
-def prepare_q6(raw: Tensor, *, in_features: int | None = None, swizzled: bool = False) -> Tensor:
+def prepare_q6(raw: Tensor, *, in_features: int | None = None, swizzled: bool = False, realize: bool = True) -> Tensor:
   """Value-preserving 210->216 byte blocks; UOp packing, one resident output."""
   if raw.dtype != dtypes.uint8 or raw.numel() <= 0 or raw.numel()%Q6_BYTES:
     raise QuantGemvError("Q6 preparation requires whole uint8 GGUF blocks")
@@ -115,7 +116,8 @@ def prepare_q6(raw: Tensor, *, in_features: int | None = None, swizzled: bool = 
   out = Tensor.empty(raw.numel()//Q6_BYTES*(Q6_PREPARED_BYTES//4), dtype=dtypes.uint32, device=raw.device)
   fxn = functools.partial(_prepare_q6_kernel, gpu=raw.device.split(':')[0] == 'NV',
                          blocks_per_row=in_features//256 if swizzled else 0)
-  return Tensor(UOp.custom_kernel(out.uop, raw.uop.flatten(), fxn=fxn)[0]).realize()
+  result = Tensor(UOp.custom_kernel(out.uop, raw.uop.flatten(), fxn=fxn)[0])
+  return result.realize() if realize else result
 
 
 def _q6_word(raw:UOp, base:UOp, byte_offset:UOp) -> UOp:

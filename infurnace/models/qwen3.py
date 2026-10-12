@@ -182,7 +182,7 @@ def enable_decode_attention(blocks, *, fused: bool = False) -> int:
 class _NVLinear:
   """Single-token fast path using explicit GGUF identity, never graph-size guessing."""
   def __init__(self, original, entry: PackedTensor, *, prefill: bool = False, q6_aligned: bool = False,
-               q6_swizzled: bool = True, q4_swizzled: bool = True):
+               q6_swizzled: bool = True, q4_swizzled: bool = True, realize: bool = True):
     self.original = original
     if prefill and entry.ggml_type not in (12, 13, 14): raise ValueError("NV packed prefill supports only Q4_K/Q5_K/Q6_K")
     self.prefill = prefill
@@ -196,9 +196,11 @@ class _NVLinear:
     self.q4_swizzled = q4_swizzled and q6_aligned and entry.ggml_type == 12
     self.q6_aligned = q6_aligned and entry.ggml_type == 14
     self.q6_swizzled = self.q6_aligned and q6_swizzled
-    self.packed = (prepare_q4(entry.data, in_features=self.in_features) if self.q4_swizzled else
-                   prepare_q6(entry.data, in_features=self.in_features, swizzled=self.q6_swizzled) if self.q6_aligned else
-                   entry.data.contiguous().bitcast(dtype).flatten().realize())
+    # realize=False leaves `packed` lazy so a caller can realize many adapters in one schedule.
+    self.packed = (prepare_q4(entry.data, in_features=self.in_features, realize=realize) if self.q4_swizzled else
+                   prepare_q6(entry.data, in_features=self.in_features, swizzled=self.q6_swizzled, realize=realize) if self.q6_aligned else
+                   entry.data.contiguous().bitcast(dtype).flatten())
+    if realize: self.packed.realize()
     # Generic consumers decode fields directly from the same padded allocation.
     # Neither the original GGUF bytes nor a second dense weight copy is retained.
     raw = self.packed.bitcast(dtypes.uint8)

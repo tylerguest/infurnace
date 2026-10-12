@@ -21,8 +21,8 @@ class _PackedLinear(_NVLinear):
   dequantization graphs cost tens of milliseconds per call. Rows go through
   the packed GEMM when available, otherwise the multirow packed GEMV.
   """
-  def __init__(self, original, entry, *, prefill: bool, keep_weight: bool = False):
-    super().__init__(original, entry, prefill=prefill, q6_aligned=True)
+  def __init__(self, original, entry, *, prefill: bool, keep_weight: bool = False, realize: bool = True):
+    super().__init__(original, entry, prefill=prefill, q6_aligned=True, realize=realize)
     if not keep_weight: self.weight = original.weight = None
 
   def __call__(self, x):
@@ -96,7 +96,7 @@ class Qwen35Model(Qwen3Model):
     _, entries = parse_gguf(path)
     # Converted Qwen3.5 GGUFs tie the output head to the token embedding.
     entries.setdefault('output.weight', entries['token_embd.weight'])
-    packed = set()
+    packed, layers = set(), {}
     with Context(DEV=self.device):
       for name, entry in entries.items():
         if name == 'token_embd.weight' or len(entry.shape) != 2 or entry.shape[1] % 256 or entry.shape[0] % 16: continue
@@ -107,8 +107,11 @@ class Qwen35Model(Qwen3Model):
           owner = self.transformer.blk[int(layer)]
         else: continue
         tied = name == 'output.weight'
-        adapter = _PackedLinear(getattr(owner, attribute), entry.to(self.device), prefill=prefill,
-                                keep_weight=tied)
+        # Lazy copy + repack; each layer is realized in one schedule below
+        # (one realize per weight costs ~20 ms of graph bookkeeping each).
+        adapter = _PackedLinear(getattr(owner, attribute), entry.to(self.device, realize=False), prefill=prefill,
+                                keep_weight=tied, realize=False)
+        layers.setdefault(name.split('.')[1] if name.startswith('blk.') else name, []).append(adapter.packed)
         setattr(owner, attribute, adapter)
         packed.add(name)
         if tied:
@@ -116,7 +119,10 @@ class Qwen35Model(Qwen3Model):
           self.transformer.token_embd.weight = adapter.weight
           adapter.weight = adapter.original.weight = None
         self.nv_quant_linears += 1
-      # Move what remains (norms, conv, decay, small Q8_0 gates) as realized FP tensors.
-      for name, tensor in get_state_dict(self.transformer).items():
-        if tensor.device == self.device: continue
-        tensor.replace(tensor.to(self.device).contiguous().realize())
+      # Per layer, so staged raw copies never all coexist on the GPU.
+      for group in layers.values(): Tensor.realize(*group)
+      # Move what remains (norms, conv, decay, small Q8_0 gates) as realized FP tensors, in one schedule.
+      moved = [(tensor, tensor.to(self.device).contiguous()) for tensor in get_state_dict(self.transformer).values()
+               if tensor.device != self.device]
+      if moved: Tensor.realize(*[copy for _, copy in moved])
+      for tensor, copy in moved: tensor.replace(copy)

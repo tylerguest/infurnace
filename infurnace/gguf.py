@@ -212,8 +212,9 @@ class PackedTensor:
   shape: tuple[int, ...]
   ggml_type: int
 
-  def to(self, device: str | None = None) -> "PackedTensor":
-    return PackedTensor(self.data.to(device).realize(), self.shape, self.ggml_type)
+  def to(self, device: str | None = None, *, realize: bool = True) -> "PackedTensor":
+    data = self.data.to(device)
+    return PackedTensor(data.realize() if realize else data, self.shape, self.ggml_type)
 
   def decode(self) -> Tensor:
     return _dequant(self.data, math.prod(self.shape), self.ggml_type).reshape(self.shape)
@@ -240,23 +241,34 @@ def _validate_tensor_infos(infos, metadata: dict[str, Any], data_start: int, fil
   for previous, current in zip(ranges, ranges[1:]):
     if current[0] < previous[1]: raise ValueError(f"tensor ranges overlap: {previous[2]!r} and {current[2]!r}")
 
-def read_gguf_metadata(path: str | Path) -> dict[str, Any]:
-  """Read metadata only, for architecture dispatch before weight allocation."""
-  with Path(path).open("rb") as handle:
-    _, _, metadata_count = _read_header(handle)
-    return _read_metadata(handle, metadata_count)
-
-
-def parse_gguf(path: str | Path) -> tuple[dict[str, Any], dict[str, PackedTensor]]:
-  """Validate a single GGUF and return bounded DISK views without transferring weights."""
-  path = Path(path).resolve()
-  file_size = path.stat().st_size
+@functools.lru_cache(maxsize=8)
+def _read_gguf(path: Path, file_size: int, mtime_ns: int) -> tuple[dict[str, Any], list, int]:
+  # Metadata holds the whole vocabulary and merges (~0.5M strings for Qwen3.5); one
+  # load reads it from several places, so parse each file version once.
   with path.open("rb") as handle:
     _, tensor_count, metadata_count = _read_header(handle)
     metadata = _read_metadata(handle, metadata_count)
     infos = _read_multi_tensor_info(handle, tensor_count)
     data_start = _data_start(handle, metadata)
   _validate_tensor_infos(infos, metadata, data_start, file_size)
+  return metadata, infos, data_start
+
+
+def _cached_gguf(path: str | Path) -> tuple[Path, int, dict[str, Any], list, int]:
+  path = Path(path).resolve()
+  stat = path.stat()
+  metadata, infos, data_start = _read_gguf(path, stat.st_size, stat.st_mtime_ns)
+  return path, stat.st_size, dict(metadata), infos, data_start  # a fresh dict: callers may add keys
+
+
+def read_gguf_metadata(path: str | Path) -> dict[str, Any]:
+  """Read metadata only, for architecture dispatch before weight allocation."""
+  return _cached_gguf(path)[2]
+
+
+def parse_gguf(path: str | Path) -> tuple[dict[str, Any], dict[str, PackedTensor]]:
+  """Validate a single GGUF and return bounded DISK views without transferring weights."""
+  path, file_size, metadata, infos, data_start = _cached_gguf(path)
   raw = Tensor.empty(file_size, dtype=dtypes.uint8, device=f"disk:{path}")
   entries = {}
   for info in infos:
