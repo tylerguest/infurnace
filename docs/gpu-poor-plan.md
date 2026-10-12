@@ -164,13 +164,31 @@ that's exactly the GPU-poor range. Peak memory has never been measured.
 
 ## 9. Check whether DFlash-by-default slows ordinary chat
 
-- [ ] Same prose prompt with and without `--no-dflash`, matched length
-- [ ] Time a fallback step against a plain step
+- [x] Same prose prompts with and without DFlash, matched length
+- [x] Time a fallback step against a plain step
+- [ ] Make probing cheaper when drafting keeps losing (thinking-off prose)
 
-**Problem.** A 192-token prose run measured ~88 tok/s with DFlash, against the ~110 the README
-quotes for plain decoding. Not a matched comparison, but if it holds, the default makes ordinary
-English chat slower. A likely cause: fallback steps still feed every target row's features to the
-draft (`draft.observe`).
+**Measured** (RTX 5060, 2026-10-12): warm runs, 256 tokens each with EOS ignored, DFlash block 16.
+
+| Prompt | Thinking on (default chat) | Thinking off (`--no-thinking`) |
+|---|---|---|
+| Prose: history of the printing press | 1.29× (135 vs 105 tok/s) | **0.79×** (83 vs 105) |
+| Prose: making friends in a new city | 1.61× | **0.84×** |
+| Prose: why the sky is blue | 1.39× | **0.85×** |
+| Code: merge two sorted lists | 1.73× | 2.78× |
+
+**Default chat is fine:** with thinking on, DFlash beats plain decoding on prose as well as code;
+reasoning text is predictable. The earlier ~88 tok/s prose figure came from a thinking-off run.
+
+**Thinking-off prose loses 15–21%.** Not the fallback step: inside DFlash it costs the same as a
+plain step (9.1–9.3 ms vs 9.3–9.4 ms). The loss is the probing. In the history prompt, about 63 of
+190 rounds were drafting rounds, averaging ~1 accepted token each at roughly three steps' cost,
+and they produced about half the output. `_DraftPolicy` spends at least `min_timed_rounds` (4)
+timed rounds per probe before it can back off, and its cooldown tops out at 8 × 16 = 128 steps.
+
+**Ideas.** Decide sooner when a probe accepts almost nothing (e.g. back off after the first timed
+round with ~0 accepted), or allow longer backoff. Check that a change doesn't cost the thinking-on
+and code cases above.
 
 ## Code simplification
 
