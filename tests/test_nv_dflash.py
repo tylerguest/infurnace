@@ -11,8 +11,7 @@ pytestmark = pytest.mark.skipif(not os.environ.get('INFURNACE_TEST_NV'), reason=
 
 
 @pytest.mark.parametrize('block', [1, 4])
-@pytest.mark.parametrize('verifier', ['sequential', 'block'])
-def test_nv_verified_output_rng_and_replay(tmp_path, block, verifier):
+def test_nv_verified_output_rng_and_replay(tmp_path, block, verifier='sequential'):
   with Context(DEV='CPU'): checkpoint(tmp_path)
   model = Qwen35Model.from_gguf(tmp_path / 'model.gguf', device='NV')
   with Context(DEV='NV'):

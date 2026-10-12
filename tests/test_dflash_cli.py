@@ -14,7 +14,7 @@ def test_dflash_stream_eos_and_close(capsys):
 
 
 @pytest.mark.parametrize('extra', [
-  ['--dflash-block-size', '4'], ['--dflash', 'missing.gguf'], ['--dflash-verifier', 'block'], ['--dflash-legacy-noncausal'],
+  ['--dflash-block-size', '4'], ['--dflash', 'missing.gguf'], ['--dflash-verifier', 'sequential'], ['--dflash-legacy-noncausal'],
   ['--dflash', 'draft.gguf', '--dflash-block-size', '0'],
   ['--dflash', 'draft.gguf', '--benchmark', '8'], ['--dflash', 'draft.gguf', '--eagle3', 'eagle']])
 def test_invalid_flags_before_loading(monkeypatch, extra):
@@ -26,7 +26,7 @@ def test_invalid_flags_before_loading(monkeypatch, extra):
 
 @pytest.mark.parametrize('device', ['CPU', 'NV'])
 @pytest.mark.parametrize('block', [None, 8])
-@pytest.mark.parametrize('verifier', [None, 'block'])
+@pytest.mark.parametrize('verifier', [None, 'sequential'])
 @pytest.mark.parametrize('legacy', [False, True])
 def test_cli_builds_reference_engine(monkeypatch, tmp_path, capsys, block, verifier, legacy, device):
   import infurnace.dflash as dflash

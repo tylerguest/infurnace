@@ -67,34 +67,6 @@ moving average and, below 3.5, decodes ordinary rows for 8 steps before probing 
 draft again; this limits but does not remove the loss on poorly predicted text. The
 first request compiles the 16-row captures, which takes minutes. Greedy only.
 
-## Experimental block verification
-
-`--dflash-verifier block` opts into `infurnace/dflash/verify.py`. It executes
-candidate rows **layer-major in one captured graph**, still calling each
-unchanged upstream block with one row. It does not introduce multirow GEMM or
-replace target recurrence, attention, projections or their positional bounds.
-
-Recurrent and convolution states have checkpoints at every row, including zero.
-RNG advancement has matching checkpoints. Verification restores zero before
-returning to Python; commitment then advances one row at a time across output
-yields. Rejected inputs cannot be committed. This preserves cancellation/EOS
-semantics even inside an accepted block. Speculative suffix K/V may remain in
-storage but is outside the authorized causal prefix and is overwritten when
-needed. Output features are independently snapshotted before another capture.
-
-All shapes share one history allocation, resized between requests. The selected
-4B target needs approximately 50 MB per checkpoint (about 250 MB for block4,
-850 MB for block16), in addition to normal model/draft memory. Owned, allocated
-hidden/feature scratch prevents a reproduced pinned-planner aliasing failure
-across opaque upstream calls; no global planner disable is installed. Executed
-RNG graphs are detached in place without changing counter storage identity.
-
-This schedule is **opt-in**. Its first real-model warmup matched output/RNG,
-but the protocol later aborted with the existing NV signal timeout and
-`NV_ERR_INVALID_ARGUMENT`. It produced no measured comparison. That attempt
-predates the RNG graph cleanup; only small NV controls have completed afterward.
-No performance benefit or full-model reliability is established.
-
 ## Draft identity and metadata
 
 - Repository: [Anbeeld/Qwen3.5-4B-DFlash-GGUF](https://huggingface.co/Anbeeld/Qwen3.5-4B-DFlash-GGUF)

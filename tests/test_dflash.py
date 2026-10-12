@@ -43,8 +43,7 @@ class RecordedDraft:
 
 @pytest.mark.parametrize('wrong', [False, True])
 @pytest.mark.parametrize('budget', [1, 2, 7, 13])
-@pytest.mark.parametrize('verifier', ['sequential', 'block'])
-def test_exact_output_rng_and_terminal_row(tmp_path, wrong, budget, verifier):
+def test_exact_output_rng_and_terminal_row(tmp_path, wrong, budget, verifier='sequential'):
   with Context(DEV='CPU'):
     model = tiny_target(tmp_path)
     prompt = [1, 2, 3]
@@ -64,8 +63,7 @@ def test_exact_output_rng_and_terminal_row(tmp_path, wrong, budget, verifier):
     elif budget > 1: assert generator.stats.accepted > 0
 
 
-@pytest.mark.parametrize('verifier', ['sequential', 'block'])
-def test_observation_alignment_and_snapshot_lifetime(tmp_path, verifier):
+def test_observation_alignment_and_snapshot_lifetime(tmp_path, verifier='sequential'):
   with Context(DEV='CPU'):
     model = tiny_target(tmp_path)
     prompt = [1, 2, 3]
@@ -86,8 +84,7 @@ def test_observation_alignment_and_snapshot_lifetime(tmp_path, verifier):
       assert snapshots[0].tolist() != snapshots[-1].tolist()
 
 
-@pytest.mark.parametrize('verifier', ['sequential', 'block'])
-def test_cancellation_eos_and_replay(tmp_path, verifier):
+def test_cancellation_eos_and_replay(tmp_path, verifier='sequential'):
   with Context(DEV='CPU'):
     model = tiny_target(tmp_path)
     prompt = [1, 2]
@@ -124,8 +121,7 @@ def test_real_draft_determinism_and_transient_cache(tmp_path):
     with pytest.raises(ValueError): draft.propose(features, 2, 3, 4)
 
 
-@pytest.mark.parametrize('verifier', ['sequential', 'block'])
-def test_real_tiny_draft_verified_output(tmp_path, verifier):
+def test_real_tiny_draft_verified_output(tmp_path, verifier='sequential'):
   with Context(DEV='CPU'):
     model = tiny_target(tmp_path)
     expected = list(model.generate([1, 2, 3], 7, reuse_cache=False))

@@ -1,8 +1,8 @@
 """Synchronized baseline/DFlash/baseline exact-output protocol, all in tinygrad.
 
-The sequential and layer-major block verifiers are experimental, not an acceleration
-claim. Results are separate from the published decode chart. Requires no external
-model runtime. RNG storage identities remain stable across captured replays.
+Times whole requests, including prefill (plain decoding prefills one row at a time).
+Results are separate from the published decode chart. Requires no external model runtime.
+RNG storage identities remain stable across captured replays.
 """
 import argparse
 import json
@@ -22,7 +22,7 @@ def main():
   parser.add_argument('--context', type=int, default=512)
   parser.add_argument('--output', type=int, default=64)
   parser.add_argument('--block-size', type=int, default=4)
-  parser.add_argument('--verifier', choices=('sequential', 'block'), default='sequential')
+  parser.add_argument('--verifier', choices=('sequential', 'parallel'), default='parallel')
   parser.add_argument('--legacy-noncausal', action='store_true')
   parser.add_argument('--warmup-pairs', type=int, default=2)
   parser.add_argument('--repeats', type=int, default=2)

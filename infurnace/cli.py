@@ -298,8 +298,8 @@ def main() -> int:
   ap.add_argument("--dflash-block-size", type=int, default=None, metavar="N",
                   help="DFlash block including anchor (default: trained size with parallel verification, else 4)")
   ap.add_argument("--dflash-legacy-noncausal", action='store_true', help="use older all-noncausal draft attention instead of upstream layer defaults")
-  ap.add_argument("--dflash-verifier", choices=('parallel', 'sequential', 'block'), default=None,
-                  help="DFlash verification schedule (default: parallel multirow on NV, else sequential; block is experimental)")
+  ap.add_argument("--dflash-verifier", choices=('parallel', 'sequential'), default=None,
+                  help="DFlash verification schedule (default: parallel multirow on NV, else sequential)")
   ap.add_argument("--no-warmup", action="store_true", help="skip automatic startup warmup for interactive chat")
   ap.add_argument("--no-thinking", action="store_true", help="disable thinking in chat formatting")
   args = ap.parse_args()

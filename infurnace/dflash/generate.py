@@ -1,7 +1,8 @@
-"""Greedy DFlash generation with sequential or transactional block verification.
+"""Greedy DFlash generation with sequential or parallel (multirow) verification.
 
-Both schedules use unchanged upstream target blocks. Block verification is an
-explicit layer-major captured schedule, not a native multirow GEMM replacement.
+Sequential verification steps the unchanged upstream target one row at a time;
+parallel verification runs the whole draft block through the target at once
+(see parallel.py).
 """
 from dataclasses import dataclass
 import os
@@ -16,7 +17,6 @@ class DFlashStats:
   proposed: int = 0
   accepted: int = 0
   target_steps: int = 0
-  speculative_rows: int = 0
 
 
 def _raw_features(verifier):
@@ -29,11 +29,9 @@ class DFlashGenerator:
     if model.device.split(':')[0] not in ('CPU', 'NV'):
       raise ValueError('DFlash reference currently requires CPU/NV one-row upstream prefill')
     if draft.target is not model or draft.device != model.device: raise ValueError('DFlash draft belongs to a different target/device')
-    if verifier not in ('sequential', 'block', 'parallel'): raise ValueError('invalid DFlash verifier')
+    if verifier not in ('sequential', 'parallel'): raise ValueError('invalid DFlash verifier')
     self.model, self.draft, self.verifier = model, draft, verifier
     self.observer = TargetObserver(model, draft.config.feature_layers)
-    from infurnace.dflash.verify import BlockVerifier
-    self.block_verifier = BlockVerifier(self.observer) if verifier == 'block' else None
     self._parallel = {}
     # Break-even tokens/round for parallel verification vs one-row decode on
     # the 5060 (one round ~= 3.2 ordinary steps), and the fallback length.
@@ -159,27 +157,6 @@ class DFlashGenerator:
                 if token in eos_token_ids or emitted == limit: return
               anchor = decisions[accepted]
               continue
-          if self.block_verifier is not None and proposals:
-            self.block_verifier.prepare(block)
-            with self.block_verifier.verify([anchor, *proposals]) as packet:
-              self.stats.speculative_rows += len(packet.inputs)
-              def commit(row):
-                packet.commit(row + 1)
-                self.stats.target_steps += 1
-                self.stats.speculative_rows -= 1
-                pending.append(packet.feature(row))
-                return packet.decisions[row]
-              for row, proposal in enumerate(proposals):
-                selected = commit(row)
-                if selected != proposal:
-                  anchor = selected
-                  break
-                self.stats.accepted += 1
-                emitted += 1
-                yield selected
-                if selected in eos_token_ids or emitted == limit: return
-              else: anchor = commit(len(proposals))
-            continue
           current = anchor
           if not proposals and self.verifier == 'parallel':
             anchor = step(current)
