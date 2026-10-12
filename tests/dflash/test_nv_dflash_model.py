@@ -1,6 +1,6 @@
 """Real-model checks for fused DFlash rounds (Qwen3.5-4B Q4_K_M + Q4_K_M draft, NV).
 
-Opt-in: needs INFURNACE_TEST_NV=1 and the model files below; loads ~3 GB once.
+Marked nv (INFURNACE_TEST_NV=1); needs the model files below; loads ~3 GB once.
 """
 import os
 from pathlib import Path
@@ -8,8 +8,8 @@ import pytest
 
 TARGET = Path('models/qwen35-validation/Qwen3.5-4B-Q4_K_M.gguf')
 DRAFT = Path('models/dflash-qwen35/qwen35-4b-dflash-Q4_K_M.gguf')
-pytestmark = pytest.mark.skipif(not (os.environ.get('INFURNACE_TEST_NV') and TARGET.is_file() and DRAFT.is_file()),
-                                reason='set INFURNACE_TEST_NV=1 with the Qwen3.5-4B target and DFlash draft present')
+pytestmark = [pytest.mark.nv, pytest.mark.skipif(not (TARGET.is_file() and DRAFT.is_file()),
+                                                  reason='needs the Qwen3.5-4B target and DFlash draft under models/')]
 
 
 @pytest.fixture(scope='module')

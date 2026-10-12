@@ -1,4 +1,3 @@
-import os
 import pytest
 from tinygrad import Context, Tensor, UOp
 from tinygrad.nn.state import get_state_dict
@@ -7,7 +6,7 @@ from infurnace.models.qwen35 import Qwen35Model
 from test_dflash import tiny_draft
 from test_qwen35 import checkpoint
 
-pytestmark = pytest.mark.skipif(not os.environ.get('INFURNACE_TEST_NV'), reason='set INFURNACE_TEST_NV=1 on an NV GPU')
+pytestmark = pytest.mark.nv
 
 
 @pytest.mark.parametrize('block', [1, 4])

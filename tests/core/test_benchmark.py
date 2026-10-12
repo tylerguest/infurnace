@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-spec = importlib.util.spec_from_file_location("compare_benchmark", Path(__file__).resolve().parents[1]/"benchmarks/compare.py")
+spec = importlib.util.spec_from_file_location("compare_benchmark", Path(__file__).resolve().parents[2]/"benchmarks/compare.py")
 benchmark = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(benchmark)
 

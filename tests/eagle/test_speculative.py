@@ -206,7 +206,7 @@ def nv_model():
   return model
 
 
-@pytest.mark.skipif(not os.environ.get('INFURNACE_TEST_NV'), reason='set INFURNACE_TEST_NV=1')
+@pytest.mark.nv
 def test_nv_packed_target_features_jit_and_stale_tail():
   model, reference = nv_model(), nv_model()
   layers, prompt = (0, 1, 3), [1, 2, 3, 4, 5]

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-spec = importlib.util.spec_from_file_location('eagle_benchmark', Path(__file__).resolve().parents[1]/'benchmarks/eagle.py')
+spec = importlib.util.spec_from_file_location('eagle_benchmark', Path(__file__).resolve().parents[2]/'benchmarks/eagle.py')
 benchmark = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(benchmark)
 

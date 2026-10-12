@@ -1,4 +1,3 @@
-import os
 import random
 import struct
 
@@ -28,7 +27,7 @@ def test_invalid_shared_q8_contract():
     quant_gemv(x, w, out_features=16, in_features=256, ggml_type=12, q8=wrong)
 
 
-@pytest.mark.skipif(not os.environ.get('INFURNACE_TEST_NV'), reason='set INFURNACE_TEST_NV=1')
+@pytest.mark.nv
 @pytest.mark.parametrize('typ', [12, 14])
 def test_shared_q8_projection_parity_and_graph(typ):
   rows, width = 16, 1280
@@ -49,7 +48,7 @@ def test_shared_q8_projection_parity_and_graph(typ):
       assert (actual-reference).abs().max().item() == 0
 
 
-@pytest.mark.skipif(not os.environ.get('INFURNACE_TEST_NV'), reason='set INFURNACE_TEST_NV=1')
+@pytest.mark.nv
 def test_block_shared_packing_prefill_jit_and_reset():
   import copy
   from tinygrad import Context, UOp

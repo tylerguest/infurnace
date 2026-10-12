@@ -1,4 +1,3 @@
-import os
 import random
 import struct
 import pytest
@@ -9,7 +8,7 @@ from infurnace.kernels.embedding import packed_gather
 from infurnace.kernels.gdn import gdn_chunk
 from infurnace.kernels.quant_gemv import prepare_q4, prepare_q6
 
-pytestmark = pytest.mark.skipif(not os.environ.get('INFURNACE_TEST_NV'), reason='set INFURNACE_TEST_NV=1 on an NV GPU')
+pytestmark = pytest.mark.nv
 
 
 def test_gdn_chunk_matches_tensor_closed_form():

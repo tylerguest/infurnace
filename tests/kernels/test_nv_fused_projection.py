@@ -1,4 +1,3 @@
-import os
 
 import pytest
 from tinygrad import Tensor, TinyJit, dtypes
@@ -6,7 +5,7 @@ from tinygrad import Tensor, TinyJit, dtypes
 from infurnace.kernels.quant_gemv import prepare_q4, prepare_q6, quant_gemv
 from test_nv_shared_q8 import packed
 
-pytestmark = pytest.mark.skipif(not os.environ.get('INFURNACE_TEST_NV'), reason='set INFURNACE_TEST_NV=1')
+pytestmark = pytest.mark.nv
 
 
 @pytest.mark.parametrize('typ', [12, 14])

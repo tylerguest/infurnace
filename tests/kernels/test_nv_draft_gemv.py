@@ -1,4 +1,3 @@
-import os
 
 import pytest
 from tinygrad import Tensor, TinyJit, dtypes
@@ -6,7 +5,7 @@ from tinygrad import Tensor, TinyJit, dtypes
 from infurnace.kernels.dense_gemv import bf16_gemv
 
 
-@pytest.mark.skipif(not os.environ.get('INFURNACE_TEST_NV'), reason='set INFURNACE_TEST_NV=1')
+@pytest.mark.nv
 @pytest.mark.parametrize('width', [128, 2560, 9728])
 @pytest.mark.parametrize('count', [1, 2, 3, 8])
 def test_bf16_gemv_exact_binary_reference_and_replay(width, count):

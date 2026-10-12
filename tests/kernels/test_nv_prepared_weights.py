@@ -1,4 +1,3 @@
-import os
 import random
 import struct
 
@@ -46,7 +45,7 @@ def test_q6_preparation_preserves_blocks(rows, width, swizzled):
   assert (native-prepared).abs().max().item() == 0
 
 
-@pytest.mark.skipif(not os.environ.get('INFURNACE_TEST_NV'), reason='set INFURNACE_TEST_NV=1')
+@pytest.mark.nv
 @pytest.mark.parametrize('width', [256, 1280, 2560, 9728])
 @pytest.mark.parametrize('swizzled', [False, True])
 @pytest.mark.parametrize('warps', [1, 8])

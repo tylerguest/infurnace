@@ -1,11 +1,10 @@
-import os
 
 import pytest
 from tinygrad import Tensor, TinyJit, UOp
 
 from infurnace.kernels.attention import fused_chain_attention, fused_decode_attention
 
-pytestmark = pytest.mark.skipif(not os.environ.get('INFURNACE_TEST_NV'), reason='set INFURNACE_TEST_NV=1')
+pytestmark = pytest.mark.nv
 
 
 @pytest.mark.parametrize('count', [2, 3, 4, 8])

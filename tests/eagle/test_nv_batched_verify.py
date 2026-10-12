@@ -11,7 +11,7 @@ from test_nv_shared_q8 import packed
 from test_speculative import nv_model, reference_step
 
 
-pytestmark = pytest.mark.skipif(not os.environ.get('INFURNACE_TEST_NV'), reason='set INFURNACE_TEST_NV=1')
+pytestmark = pytest.mark.nv
 
 
 @pytest.mark.parametrize('typ', [12, 14])

@@ -1,12 +1,11 @@
 """Experimental reduction must preserve target decisions, including special values."""
-import os
 
 import pytest
 from tinygrad import Tensor, TinyJit, Context, dtypes
 
 from benchmarks.experiments.eagle3.parallel_argmax import parallel_argmax
 
-pytestmark = pytest.mark.skipif(not os.environ.get('INFURNACE_TEST_NV'), reason='set INFURNACE_TEST_NV=1')
+pytestmark = pytest.mark.nv
 
 
 @pytest.mark.parametrize('size', [1, 32, 511, 512, 513, 151936])

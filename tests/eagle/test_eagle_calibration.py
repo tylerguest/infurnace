@@ -9,7 +9,7 @@ import pytest
 from tinygrad import Tensor, dtypes
 from tinygrad.nn.state import safe_save
 
-TOOLS = Path(__file__).resolve().parents[1]/'benchmarks'/'experiments'/'eagle3'
+TOOLS = Path(__file__).resolve().parents[2]/'benchmarks'/'experiments'/'eagle3'
 
 
 def load_tool(name):

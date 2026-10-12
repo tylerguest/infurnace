@@ -1,4 +1,3 @@
-import os
 import random
 import struct
 
@@ -37,7 +36,7 @@ def test_q4_swizzle_bytes_and_generic_decode(width):
   assert (decoded-_dequant_q4_k(native)).abs().max().item() == 0
 
 
-@pytest.mark.skipif(not os.environ.get('INFURNACE_TEST_NV'), reason='set INFURNACE_TEST_NV=1')
+@pytest.mark.nv
 @pytest.mark.parametrize('width', [1280, 2560, 9728])
 def test_q4_swizzle_decode_jit_and_prefill(width):
   rows = 16

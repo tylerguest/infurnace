@@ -8,7 +8,7 @@ import pytest
 
 @pytest.fixture
 def inspection():
-  path = Path(__file__).resolve().parents[1]/'benchmarks/experiments/eagle3/inspect_verification.py'
+  path = Path(__file__).resolve().parents[2]/'benchmarks/experiments/eagle3/inspect_verification.py'
   spec = importlib.util.spec_from_file_location('eagle_assembly_inspection', path)
   module = importlib.util.module_from_spec(spec)
   spec.loader.exec_module(module)
@@ -48,7 +48,7 @@ def test_mapped_io_scope_preserves_baseline_and_restores_descriptors(materialize
   from infurnace.eagle import EagleDraft
   old_draft_chain = EagleDraft.__dict__['_observe_and_chain']
   old_init = BatchedVerifier.__dict__['__init__']
-  path = Path(__file__).resolve().parents[1]/'benchmarks/experiments/eagle3/mapped_io_benchmark.py'
+  path = Path(__file__).resolve().parents[2]/'benchmarks/experiments/eagle3/mapped_io_benchmark.py'
   spec = importlib.util.spec_from_file_location('eagle_mapped_io', path)
   module = importlib.util.module_from_spec(spec)
   spec.loader.exec_module(module)
@@ -69,7 +69,7 @@ def test_mapped_io_scope_preserves_baseline_and_restores_descriptors(materialize
 
 def test_mapped_io_does_not_bypass_unowned_buffer_copies(monkeypatch):
   from tinygrad.device import Buffer
-  path = Path(__file__).resolve().parents[1]/'benchmarks/experiments/eagle3/mapped_io_benchmark.py'
+  path = Path(__file__).resolve().parents[2]/'benchmarks/experiments/eagle3/mapped_io_benchmark.py'
   spec = importlib.util.spec_from_file_location('eagle_mapped_copy_scope', path)
   module = importlib.util.module_from_spec(spec)
   spec.loader.exec_module(module)

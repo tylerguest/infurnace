@@ -1,4 +1,3 @@
-import os
 from types import SimpleNamespace
 
 import pytest
@@ -41,7 +40,7 @@ def test_token_scratch_rejects_mismatched_size():
     with pytest.raises(ValueError, match='shape/dtype'): upload_tokens(tensor, [1])
 
 
-@pytest.mark.skipif(not os.environ.get('INFURNACE_TEST_NV'), reason='set INFURNACE_TEST_NV=1')
+@pytest.mark.nv
 @pytest.mark.parametrize('scored', [False, True])
 def test_fast_draft_io_matches_reference_reset_and_replay(scored):
   from test_eagle import make_draft
@@ -63,7 +62,7 @@ def test_fast_draft_io_matches_reference_reset_and_replay(scored):
     assert all(t.uop.buffer.get_storage().host is not None for t in fast._proposal_outputs.values())
 
 
-@pytest.mark.skipif(not os.environ.get('INFURNACE_TEST_NV'), reason='set INFURNACE_TEST_NV=1')
+@pytest.mark.nv
 def test_verifier_cache_invalidates_when_io_and_sampling_mode_changes():
   from infurnace.eagle.verify import BatchedVerifier
   from test_speculative import nv_model
