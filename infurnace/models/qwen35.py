@@ -116,6 +116,9 @@ class _PackedLinear(_NVLinear):
     return self.decode(x)
 
 PREFILL_ROWS = 16  # prompt chunk for the fused multirow GDN kernel (it is specialized to 16 rows)
+# Capturing the 16-row prompt graph costs ~19 s and a one-row step ~9 ms (RTX 5060), so outside warmup
+# it is captured only for a prompt long enough to pay for it.
+PREFILL_CAPTURE_TOKENS = 2048
 
 def _fused_gdn(block: GatedDeltaNetBlock):
   """Upstream GatedDeltaNetBlock._attention with NV kernels where upstream has them only on AMD.
@@ -212,6 +215,7 @@ class Qwen35Model:
     self._path, self._host_embedding = None, None
     self._tied_head = False  # the packed output head is the token embedding table
     self._multirow_prefill = False  # prompts go through the fused 16-row GDN kernel (see _prefill)
+    self._warming = False
 
   def warmup(self) -> None:
     """Prime upstream prefill/decode JIT using the same chunk size as normal generation."""
@@ -219,6 +223,7 @@ class Qwen35Model:
     # Long enough to capture the multirow prompt graph too (one full chunk and a partial one).
     prompt = [0] * min(PREFILL_ROWS + 2, self.config.context_length - 1)
     count = min(4, self.config.context_length - len(prompt))
+    self._warming = True
     try:
       # First calls execute, second calls capture, third calls verify replay.
       for _ in range(3):
@@ -227,6 +232,7 @@ class Qwen35Model:
           for _ in stream: pass
         finally: stream.close()
     finally:
+      self._warming = False
       self.reset()  # No dummy tokens become conversation history or reusable prefix.
 
   def realize_state(self) -> None:
@@ -287,9 +293,12 @@ class Qwen35Model:
     t = self.transformer
     start, end = t.get_start_pos(tokens), len(tokens) - 1
     if not self._multirow_prefill or end <= start: return
-    if t.prefill_jit.cnt == 0:
-      # Skip TinyJit's eager first call (~19 s scheduling the 16-row graph) and capture right away:
-      # with every state buffer already real, the eager call has nothing left to set up.
+    if t.prefill_jit.captured is None:
+      # Not captured yet: worth it during warmup or for a long prompt, otherwise upstream reads
+      # this prompt one row at a time (a short cold `--prompt` would wait ~19 s to save ~0.2 s).
+      if not (self._warming or end - start >= PREFILL_CAPTURE_TOKENS): return
+      # Skip TinyJit's eager first call and capture right away: with every state buffer already
+      # real, the eager call has nothing left to set up.
       self.realize_state()
       t.prefill_jit.cnt = 1
     v_start = UOp.variable('start_pos', 0, t.max_context - 1)

@@ -75,6 +75,13 @@ chunk ran 19 s eagerly, then 14 s to capture. `_prefill` now realizes every stat
 DFlash's `captured()` does: warmup is **31 s**, output unchanged. The remaining ~19 s over the
 one-row baseline is the capture itself, scheduling and compiling the 16-row graph.
 
+**Who waits for it.** A cold one-shot `--prompt` doesn't warm up, so the capture landed on the
+request: a short prompt took 21 s → 40 s. Outside warmup, `_prefill` now captures the 16-row graph
+only for prompts of `PREFILL_CAPTURE_TOKENS` (2,048) or more, where it pays for itself; shorter
+cold prompts read one row at a time as before (23.7 s). Chat now warms up on a background thread
+while the user types the first message (`cli.BackgroundWarmup`), and waits for it only if the
+message arrives first. `--serve` still warms up before it listens.
+
 ## 3. DFlash chat re-reads the whole conversation every turn
 
 - [ ] Save the recurrent state after each prompt prefill and reuse it on the next turn

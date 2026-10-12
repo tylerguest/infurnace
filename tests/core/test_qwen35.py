@@ -175,3 +175,15 @@ def test_tokenizer_reference(tmp_path):
     stream = tokenizer.stream_decoder()
     assert ''.join(stream(i) for i in ids) + stream(None) == decoded
   assert tokenizer.is_end(tokenizer.eos_id) and tokenizer.is_end(tokenizer.eot_id)
+
+def test_cold_short_prompt_does_not_capture():
+  # A short one-shot prompt on a fresh model reads its prompt one row at a time rather than
+  # spending ~19 s capturing the 16-row graph.
+  from infurnace.models import qwen35
+  model = qwen35.Qwen35Model.__new__(qwen35.Qwen35Model)
+  transformer = type('T', (), {})()
+  transformer.prefill_jit = type('J', (), {'captured': None, 'cnt': 0})()
+  transformer.get_start_pos = lambda tokens: 0
+  model.transformer, model._multirow_prefill, model._warming = transformer, True, False
+  model._prefill(list(range(40)), 0.0)
+  assert transformer.prefill_jit.cnt == 0 and not hasattr(transformer, '_cached_tokens')

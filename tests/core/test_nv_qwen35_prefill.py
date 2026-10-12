@@ -13,6 +13,9 @@ def loaded():
   from infurnace.loader import load_model
   model, tokenizer = load_model(str(TARGET), 1024, 'NV')
   assert model._multirow_prefill
+  # Outside warmup, short prompts never capture the 16-row graph; warm up so these tests exercise it.
+  model.warmup()
+  assert model.transformer.prefill_jit.captured is not None
   return model, tokenizer
 
 def ids(tokenizer, text):

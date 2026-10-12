@@ -1,3 +1,4 @@
+import pytest
 from types import SimpleNamespace
 
 from infurnace import cli
@@ -93,3 +94,34 @@ def test_warmup_status(capsys):
   output = capsys.readouterr()
   assert not output.out
   assert "Warming up CPU" in output.err and "Ready" in output.err
+def test_chat_waits_for_warmup_before_each_reply(monkeypatch, capsys):
+  events = []
+  model = Model()
+  original = model.generate
+  def generate(ids, count):
+    events.append("generate")
+    return original(ids, count)
+  values = iter(["hello"])
+  def input_line(prompt):
+    events.append("input")
+    try: return next(values)
+    except StopIteration: raise EOFError
+  monkeypatch.setattr("builtins.input", input_line)
+  assert cli.chat(generate, Tokenizer(), 16, 3, ready=lambda: events.append("ready")) == 0
+  assert events == ["input", "ready", "generate", "input"]
+
+def test_background_warmup_runs_off_the_main_thread_and_reraises(capsys):
+  import threading
+  started, release = threading.Event(), threading.Event()
+  model = Model()
+  def slow_failure():
+    started.set()
+    assert threading.current_thread() is not threading.main_thread()
+    release.wait(5)
+    raise RuntimeError("warmup failed")
+  model.warmup = slow_failure
+  background = cli.BackgroundWarmup(model)
+  assert started.wait(5)  # running while the main thread is free (e.g. reading the keyboard)
+  release.set()
+  with pytest.raises(RuntimeError, match="warmup failed"): background.wait()
+  background.wait()  # the error is reported once

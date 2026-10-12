@@ -2,6 +2,7 @@
 from __future__ import annotations
 import argparse
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Callable, Iterator
@@ -93,13 +94,36 @@ def generator(model, tokenizer, dflash=None) -> Callable[[list[int], int], Itera
   eos, block = tuple(i for i in (tokenizer.eos_id, tokenizer.eot_id) if i is not None), _dflash_block(dflash)
   return lambda ids, budget: dflash.stream(ids, max_new_tokens=budget, block_size=block, eos_token_ids=eos)
 
-def warmup(model, dflash=None) -> None:
-  print(f"Warming up {model.device} (first startup may take a while)...", file=sys.stderr, flush=True)
-  start = time.perf_counter()
+def _warm(model, dflash=None) -> None:
   # DFlash requests never use plain generation's graphs, so it captures its own.
   if dflash is not None: dflash.warmup(_dflash_block(dflash))
   else: model.warmup()
+
+def warmup(model, dflash=None) -> None:
+  print(f"Warming up {model.device} (first startup may take a while)...", file=sys.stderr, flush=True)
+  start = time.perf_counter()
+  _warm(model, dflash)
   print(f"Ready in {time.perf_counter() - start:.1f}s.", file=sys.stderr, flush=True)
+
+class BackgroundWarmup:
+  """Warm up on a thread while the user types the first message. tinygrad is not thread-safe, but
+  nothing else touches it meanwhile: the main thread only reads the keyboard until it calls wait()."""
+  def __init__(self, model, dflash=None):
+    self.failure: BaseException | None = None
+    def work():
+      try: _warm(model, dflash)
+      except BaseException as exc: self.failure = exc
+    self.thread = threading.Thread(target=work, name="infurnace-warmup", daemon=True)
+    self.thread.start()
+
+  def wait(self) -> None:
+    """Block until warmup has finished; re-raise its error, if any."""
+    if self.thread.is_alive():
+      print("Finishing warmup...", file=sys.stderr, flush=True)
+      self.thread.join()
+    if self.failure is not None:
+      failure, self.failure = self.failure, None
+      raise failure
 
 def encode(tokenizer, text: str) -> list[int]:
   return ([tokenizer.bos_id] if tokenizer.bos_id is not None else []) + tokenizer.encode(text)
@@ -126,8 +150,9 @@ def reply(generate, tokenizer, ids: list[int], max_tokens: int | None, context: 
           file=sys.stderr)
   return text
 
-def chat(generate, tokenizer, context: int, max_tokens: int | None, thinking: bool = True) -> int:
-  """Interactive chat. When a new message would not fit, the oldest turns are dropped."""
+def chat(generate, tokenizer, context: int, max_tokens: int | None, thinking: bool = True, ready: Callable[[], None] | None = None) -> int:
+  """Interactive chat. When a new message would not fit, the oldest turns are dropped.
+  `ready()` is called before each reply (it waits for a background warmup)."""
   history: list[dict] = []
   reserve = min(max_tokens or 1024, max(1, context // 2))  # room left for the reply
   while True:
@@ -144,6 +169,7 @@ def chat(generate, tokenizer, context: int, max_tokens: int | None, thinking: bo
       continue
     if (dropped := (len(history) - len(retained)) // 2):
       print(f"[Context window: discarded {dropped} oldest turn(s); earlier details are no longer remembered.]", file=sys.stderr)
+    if ready is not None: ready()
     history = retained + [message, {"role": "assistant", "content": reply(generate, tokenizer, ids, max_tokens, context)}]
 
 def run(args: argparse.Namespace) -> int:
@@ -160,12 +186,17 @@ def run(args: argparse.Namespace) -> int:
   if args.prompt is not None:
     reply(generate, tokenizer, encode(tokenizer, args.prompt), args.max_tokens or PROMPT_MAX_TOKENS, context)
     return 0
-  if not args.no_warmup: warmup(model, dflash)
   if args.serve is not None:
     from infurnace.serve import serve
+    if not args.no_warmup: warmup(model, dflash)  # once per server start, before it listens
     serve(model, tokenizer, args.serve, args.host, enable_thinking=not args.no_thinking)
     return 0
-  return chat(generate, tokenizer, min(args.max_context, context), args.max_tokens, thinking=not args.no_thinking)
+  window, thinking = min(args.max_context, context), not args.no_thinking
+  if args.no_warmup: return chat(generate, tokenizer, window, args.max_tokens, thinking)
+  print(f"Warming up {model.device} in the background; you can type your first message now.", file=sys.stderr, flush=True)
+  background = BackgroundWarmup(model, dflash)
+  try: return chat(generate, tokenizer, window, args.max_tokens, thinking, ready=background.wait)
+  finally: background.thread.join()  # never exit while the warmup thread is using the GPU
 
 def main(argv: list[str] | None = None) -> int:
   args = parse_args(argv)
