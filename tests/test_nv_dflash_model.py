@@ -5,7 +5,6 @@ Opt-in: needs INFURNACE_TEST_NV=1 and the model files below; loads ~3 GB once.
 import os
 from pathlib import Path
 import pytest
-from tinygrad import Context
 
 TARGET = Path('models/qwen35-validation/Qwen3.5-4B-Q4_K_M.gguf')
 DRAFT = Path('models/dflash-qwen35/qwen35-4b-dflash-Q4_K_M.gguf')
@@ -36,7 +35,7 @@ def prompt(tokenizer, text, thinking=False):
 
 
 fused_only = pytest.mark.skipif(os.environ.get('INFURNACE_DFLASH_FUSED') != '1',
-  reason='fused rounds are opt-in: they can stall NV graph replay under sustained load (see parallel.py)')
+  reason='fused rounds are opt-in: set INFURNACE_DFLASH_FUSED=1')
 
 
 @fused_only

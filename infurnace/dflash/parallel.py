@@ -206,22 +206,24 @@ class ParallelVerifier:
     try:
       with Context(DEV=self.device):
         # The round is a chain of small captured graphs launched back to back
-        # with one readback at the end. KNOWN ISSUE: back-to-back fused rounds
-        # can stall the GPU inside a captured NV graph (timeline stuck one batch
-        # short, no MMU fault; masked by profiling timestamps or JIT=2; also seen
-        # with newer tinygrad). Fused rounds are therefore opt-in.
+        # with one readback at the end. Back-to-back submissions need the pinned
+        # tinygrad's NV fix (GPPut read back before the doorbell); without it the
+        # GPU can miss the last submission and the readback never completes.
         if self._round_jit is None:
           self._round_jit = (TinyJit(functools.partial(self._pick, mask=draft.config.mask_token)), TinyJit(self._ids),
                              TinyJit(self._pack))
           self._draft_position = UOp.variable('dflash_position', 1, draft.capacity - self.rows)
+          # Dedicated graphs for the fused round, never shared with the unfused
+          # path: every captured graph always sees the same input buffers, so no
+          # replay has to re-patch input addresses (see `run`).
+          self._fused_absorb, self._fused_draft = TinyJit(draft._absorb), TinyJit(draft._forward)
         pick, ids, pack = self._round_jit
         self._commit_jit(self._count.bind(count), self._position.bind(previous))
-        draft._absorb_jit(_raw(self._features), draft._start.bind(previous))
-        noise = pick(self._count.bind(count))
-        if self.rows - 1 not in draft._jits: draft._jits[self.rows - 1] = TinyJit(draft._forward)
-        proposals = draft._jits[self.rows - 1](noise, self._draft_position.bind(position))
-        embeddings = ids(proposals)
-        self._forward_jit(embeddings, self._position.bind(position))
+        self._fused_absorb(_raw(self._features), draft._start.bind(previous))
+        pick(self._count.bind(count))
+        proposals = self._fused_draft(_raw(self._noise), self._draft_position.bind(position))
+        ids(proposals)
+        self._forward_jit(_raw(self._embeddings), self._position.bind(position))
         pack()
         values = [int(v) for v in _raw(self._readback).tolist()]
     except BaseException:
@@ -287,8 +289,9 @@ class ParallelVerifier:
           dim = observer.model.config.embedding_length
           self._noise_ids, self._verify_ids = (Tensor.empty(self.rows, dtype=dtypes.int32, device=self.device).realize() for _ in range(2))
           self._noise, self._embeddings = (Tensor.empty(1, self.rows, dim, device=self.device).realize() for _ in range(2))
-        embeddings = observer.model.embed(padded).contiguous().realize()
-        self._forward_jit(embeddings, self._position.bind(observer.position))
+        # Always the same persistent input buffer for the captured forward.
+        _stored(self._embeddings, observer.model.embed(padded)).realize()
+        self._forward_jit(_raw(self._embeddings), self._position.bind(observer.position))
         decisions = [int(v) for v in _raw(self._decisions).tolist()[0]]
         features = _raw(self._features)
       return decisions, features

@@ -17,6 +17,7 @@ class TargetObserver:
     self.next_decision = None
     self._position = UOp.variable('start_pos', 0, model.config.context_length - 1)
     self._jit = TinyJit(self._forward)
+    self._ids = self._temperature = None
 
   def __enter__(self):
     if self.active or self.model._generating: raise RuntimeError('only one generation may run at a time')
@@ -56,8 +57,13 @@ class TargetObserver:
     if self.position >= self.model.config.context_length: raise ValueError('target context exhausted')
     try:
       with Context(DEV=self.model.device):
-        ids = Tensor([[token]], dtype=dtypes.int32, device=self.model.device)
-        decision, features = self._jit(ids.contiguous(), self._position.bind(self.position), Tensor([0.0], device=self.model.device))
+        # Persistent input buffers: the captured graph always sees the same addresses.
+        if self._ids is None:
+          self._ids = Tensor.empty(1, 1, dtype=dtypes.int32, device=self.model.device).realize()
+          self._temperature = Tensor([0.0], device=self.model.device).realize()
+        token_value = Tensor([[token]], dtype=dtypes.int32, device=self.model.device)
+        Tensor(self._ids.uop.after(self._ids.uop.store(token_value.uop))).realize()
+        decision, features = self._jit(self._ids, self._position.bind(self.position), self._temperature)
         Tensor.realize(decision, features)
         # JIT outputs alias capture scratch. Copy only executed storage before
         # another target row overwrites it; detach executed RNG/target graphs.

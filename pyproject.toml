@@ -8,7 +8,7 @@ version = "0.0.0"
 description = "Run a single LLM fast on your GPU with tinygrad"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["tinygrad @ git+https://github.com/tinygrad/tinygrad@bc5a2d393bb37f819c6a87cc65b2c750c060c1cb",]
+dependencies = ["tinygrad @ git+https://github.com/tylerguest/tinygrad@61e7cb08f4d5fe6000d4016746e64b6c2900f409",]
 
 [project.optional-dependencies]
 qwen35 = ["tokenizers>=0.22,<0.23"]

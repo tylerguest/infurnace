@@ -122,6 +122,7 @@ class DFlashDraft:
       self.frequencies = precompute_freqs_cis(config.head_dim, self.cache_length, config.theta, device=self.device).realize()
       self._start = UOp.variable('dflash_context_start', 0, self.capacity - 1)
       self._absorb_jit = TinyJit(self._absorb)
+      self._noise_inputs: dict[int, Tensor] = {}
       self._context = Tensor.empty(1, config.block_size, config.dim * len(config.feature_layers), device=self.device).realize()
 
   @classmethod
@@ -239,8 +240,13 @@ class DFlashDraft:
         part = features[:, offset:offset + rows].float().pad(((0, 0), (0, chunk - rows), (0, 0)))
         Tensor(self._context.uop.after(self._context.uop.store(part.uop))).realize()
         self._absorb_jit(self._context, self._start.bind(start + offset))
-      noise = self.target.embed([anchor] + [c.mask_token] * count).contiguous().realize()
-      noise = Tensor(UOp.from_buffer(noise.uop.buffer, self.device)).reshape(noise.shape)
+      # A persistent input buffer per noise shape: captured graphs always see
+      # the same input addresses.
+      if count not in self._noise_inputs:
+        self._noise_inputs[count] = Tensor.empty(1, count + 1, c.dim, device=self.device).realize()
+      noise = self._noise_inputs[count]
+      embedded = self.target.embed([anchor] + [c.mask_token] * count)
+      Tensor(noise.uop.after(noise.uop.store(embedded.uop))).realize()
       if count not in self._jits: self._jits[count] = TinyJit(self._forward)
       pos = UOp.variable('dflash_position', 1, self.capacity - count - 1).bind(position)
       decisions = self._jits[count](noise, pos).realize()
