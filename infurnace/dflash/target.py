@@ -22,8 +22,23 @@ class TargetObserver:
     self._jit = TinyJit(self._forward)
     self._temperature = None
 
+  def _realize_state(self):
+    # Upstream creates KV caches and recurrent states lazily (unrealized zeros)
+    # and realizes them on its own first call. DFlash's verifier stores into them
+    # directly, so they must be real buffers before any DFlash work: otherwise a
+    # cold first request writes K/V into a temporary and attends over zeros.
+    target = self.model.transformer
+    with Context(DEV=self.model.device):
+      x = Tensor.empty(1, 1, self.model.config.embedding_length)
+      states = []
+      for block in target.blk:
+        block._init_state(x)
+        states += [getattr(block, name) for name in ('cache_kv', 'conv_state', 'recurrent_state') if hasattr(block, name)]
+      if pending := [t for t in states if not t.uop.is_realized]: Tensor.realize(*pending)
+
   def __enter__(self):
     if self.active or self.model._generating: raise RuntimeError('only one generation may run at a time')
+    self._realize_state()
     self.model.transformer._cached_tokens = []
     self.model._generating = self.active = True
     self.position = 0
