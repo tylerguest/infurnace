@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from infurnace import cli
+from infurnace import benchmark, cli
 
 
 @pytest.mark.parametrize("value,expected", [("32", (None, 32)), ("1000,50", (1000, 50))])
@@ -22,6 +22,7 @@ def test_per_step_output_and_cleanup(monkeypatch, capsys):
     device = "CPU"
     closed = False
     def reset(self): pass
+    def warmup(self): pass
     def generate(self, ids, count):
       try:
         yield from [3, 4, 5][:count]
@@ -35,10 +36,10 @@ def test_per_step_output_and_cleanup(monkeypatch, capsys):
     def __init__(self, **kwargs): pass
     def __enter__(self): pass
     def __exit__(self, *args): pass
-  monkeypatch.setattr(cli, "Timing", Timer)
-  monkeypatch.setattr(cli, "profile_marker", lambda marker: None)
+  monkeypatch.setattr(benchmark, "Timing", Timer)
+  monkeypatch.setattr(benchmark, "profile_marker", lambda marker: None)
   model = Model()
-  cli._run_step_benchmark(model, Tokenizer(), 3, prompt_tokens=2, prompt_text="hi")
+  benchmark.run_steps(model, Tokenizer(), 3, prompt_tokens=2, prompt_text="hi")
   text = capsys.readouterr().out
   assert "prefill     2:" in text
   assert "decode      0:" in text and "decode      1:" in text

@@ -26,7 +26,7 @@ sampling and JIT. Its GGUF implementation already supports this model and its
 Q4_K/Q5_K/Q6_K/Q8_0 tensors. Tiled recurrent head repetition is intentional for
 converted GGUF weights.
 
-On NV (default `--nv-quant`), quantized projection weights are swapped for
+On NV (automatically), quantized projection weights are swapped for
 Infurnace's packed tinygrad UOp kernels (`_NVLinear`: Q4_K/Q5_K/Q6_K GEMV for one row,
 tensor-core GEMM for multiple rows), including the output head tied to the token
 embedding. Block math, recurrence, attention and caches stay upstream. Upstream's

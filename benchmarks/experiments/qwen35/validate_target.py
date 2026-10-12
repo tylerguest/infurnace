@@ -14,7 +14,7 @@ import urllib.error
 import urllib.request
 
 from tinygrad import Device
-from infurnace.cli import _build
+from infurnace.loader import load_model as _build
 
 
 def post(url, body):

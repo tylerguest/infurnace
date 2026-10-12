@@ -149,22 +149,19 @@ The first line measures prefill plus first-token work; subsequent lines measure
 synchronized decode steps and show ms/token, tok/s, estimated traffic GB/s,
 traffic/current allocation MB, active length and generated text. Formatting and
 printing are outside the timed region. The final aggregate excludes prefill but
-includes any decode compilation/capture; use `--warmup` to prime JIT first.
+excludes compilation/capture: the run warms up first.
 Traffic is a compiler estimate, not measured DRAM bandwidth; allocation is not
 GPU peak. Text output is one generation, not three warm repetitions.
 
-`--benchmark PROMPT,COUNT` provides screenshot-style shorthand, e.g.
-`infurnace --benchmark 1000,50 --warmup`. Inline prompt length cannot be combined
-with `--benchmark-prompt-*`. Use `--benchmark-format json` for the existing
-cold/capture/three-warm-run machine-readable report. Customize it:
+`--benchmark PROMPT,COUNT` sets the prompt length, e.g. `infurnace --benchmark 1000,50`
+(raise `--max-context` for long prompts). Use `--benchmark-format json` for the
+cold/capture/three-warm-run machine-readable report. Raw-text prompts are available
+programmatically (`infurnace.benchmark.run_steps(..., prompt_text=...)`).
 
-```sh
-infurnace --benchmark 32 --benchmark-prompt-tokens 512
-infurnace --benchmark 32 --benchmark-prompt-tokens 2048 --max-context 4096
-infurnace --benchmark 32 --benchmark-prompt-file prompt.txt
-```
-
-CLI prompt options require `--benchmark`. Previous measurements used an 8-token
+Commands further down this file record the flags of the time; the `--nv-*`,
+`--warmup` and `--benchmark-prompt-*` CLI flags have since been removed (NV
+acceleration is automatic; `infurnace.loader.load_model` still accepts the `nv_*`
+options for comparisons). Previous measurements used an 8-token
 prompt (CLI) or a one-token seed (comparison); do not compare their rates directly
 to these longer-context results.
 `python benchmarks/wrapper.py --device NV --tokens 20` measures wrapper overhead
@@ -173,13 +170,12 @@ on the SAME loaded generic transformer; it is not an independent engine test.
 ## Experimental packed prefill
 
 The CLI and comparison benchmark enable tensor-core prefill automatically on
-eligible NV devices. Use `--no-nv-prefill` to keep accelerated decode with generic
-prefill, or `--no-nv-quant` for the fully generic baseline. `--nv-prefill` explicitly
-requires support instead of falling back. Programmatic `from_gguf` defaults remain
+eligible NV devices; `compare.py --no-nv-prefill` / `--no-nv-quant` select generic
+prefill or the fully generic baseline. Programmatic `from_gguf` defaults remain
 generic; opt in with `nv_quant=True, nv_prefill=True`.
 
 ```sh
-infurnace --device NV --nv-quant --nv-prefill --benchmark 32
+infurnace --device NV --benchmark 32
 python benchmarks/compare.py --model models/Qwen3-4B-Q4_K_M.gguf \
   --tokens 32 --runs 1 --nv-prefill --output /tmp/comparison-prefill.json
 ```

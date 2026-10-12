@@ -1,19 +1,17 @@
 # infurnace
 
-A small, single-user **local Qwen3 runner on tinygrad**. Load one GGUF, warm up
+A small, single-user **local LLM runner on tinygrad**. Load one GGUF, warm up
 and chat, or serve a single-user OpenAI-compatible API—no batching or scheduler.
 
 Tinygrad provides the transformer, tokenizer, KV cache and JIT. Infurnace adds
-strict GGUF validation, a local chat CLI and custom NVIDIA quantized decode
-kernels. The tested target is **Qwen3-4B Q4_K_M on an 8 GB RTX 5060**; other
-models and GPUs are not guaranteed to work.
+strict GGUF validation, a local chat CLI and custom NVIDIA kernels. The tested setup
+is **Qwen3.5-4B Q4_K_M with its DFlash draft on an 8 GB RTX 5060** (Qwen3-4B also
+works); other models and GPUs are not guaranteed to work.
 
-**Text-only Qwen3.5 support** uses tinygrad's existing Unsloth GGUF model
-implementation with Infurnace's packed NV projections; see [setup](docs/qwen35.md).
-[DFlash speculative decoding](docs/dflash.md) with fused multirow rounds speeds up
-decoding only as far as the draft predicts the text: about 1.4× over ~88 tok/s plain
-decoding on 512-token code answers, more on highly predictable code, and slower than
-plain decoding on open-ended English (RTX 5060). A fuller benchmark is pending.
+Plain decoding runs at ~110 tok/s. [DFlash speculative decoding](docs/dflash.md)
+speeds that up as far as the draft predicts the text: 1.4–2.2× on code answers,
+roughly break-even on open-ended English (it falls back to plain decoding when
+drafting loses). Qwen3.5 setup: [docs/qwen35.md](docs/qwen35.md).
 
 ## Install
 
@@ -54,25 +52,22 @@ wheel. Uninstall with `pip uninstall infurnace`; model files are retained.
 ## Run
 
 ```sh
-infurnace                                  # select hardware, warm up, chat
+infurnace                                   # warm up and chat (DFlash on when its draft is installed)
 infurnace --no-thinking                     # chat without thinking
-infurnace --prompt "Hello" --max-tokens 64   # raw single-shot generation
-infurnace --benchmark 512,32 --warmup       # per-token timing, 512-token prompt
-infurnace --benchmark 32 --benchmark-format json # cold/warm JSON report
-infurnace --no-nv-prefill                   # generic prefill, keeping fast NV decode
-infurnace --nv-attention                    # experimental parallel-softmax decode
-infurnace --no-nv-fused-attention           # disable automatic fused GQA decode
-infurnace --no-nv-prepared-weights          # disable automatic tiled/swizzled Q4/Q6 layouts
-infurnace --no-nv-quant                     # generic tinygrad baseline
+infurnace --prompt "Hello" --max-tokens 64  # one raw prompt, no chat template
+infurnace --serve                           # OpenAI-compatible server on 127.0.0.1:8000
+infurnace --no-dflash                       # plain decoding
+infurnace --benchmark 512,32                # per-step timing: 512-token prompt, 32 outputs
+infurnace --benchmark 32 --benchmark-format json  # cold/warm JSON report
 infurnace --device CPU                      # explicit device override
 ```
 
-- **Hardware:** probes for a usable GPU, falling back to CPU. Supported
-  NV/CUDA-C devices automatically use quantized decode and, where supported,
-  packed tensor-core prefill. `--no-nv-prefill` disables only prefill acceleration;
-  `--no-nv-quant` disables both. This is backend
-  preference, not a fastest-device benchmark or a guarantee the model fits.
-  `--device` or `DEV` overrides selection.
+`infurnace --help` lists every option.
+
+- **Hardware:** probes for a usable GPU, falling back to CPU. NV/CUDA-C devices
+  automatically use packed quantized kernels and, where supported, tensor-core
+  prefill. `--device` or `DEV` overrides selection. (Benchmark scripts can force
+  individual accelerations through `infurnace.loader.load_model`.)
 - **Startup:** interactive chat warms up before the first prompt and shows
   progress. `--no-warmup` skips it. Single-shot generation skips automatic
   warmup; benchmarks measure cold and warm passes separately.
@@ -91,9 +86,7 @@ The local AngelSlim Qwen3-4B EAGLE-3 checkpoint can now be used in chat or raw
 single-shot generation:
 
 ```sh
-infurnace --device NV --eagle3 models/eagle3-qwen3-4b
-# Diagnostic opt-out: retain EAGLE, disable the fast optimization profile.
-infurnace --device NV --eagle3 models/eagle3-qwen3-4b --no-eagle-fast
+infurnace --model models/Qwen3-4B-Q4_K_M.gguf --eagle3 models/eagle3-qwen3-4b
 ```
 
 Requires the matching checkpoint directory (`config.json`, `model.safetensors`),
@@ -104,13 +97,10 @@ are reused across requests, but speculative chat currently repeats prefill
 rather than reusing conversation prefixes. First-request compilation/capture
 can take a minute or more; ordinary warmup does not prime all EAGLE shapes.
 
-`--eagle3` now selects **one draft token and the fast profile by default**:
-fused draft observation/proposal, owned host-mapped token/decision/proposal
-buffers, parallel exact-score sampling, zero-copy feature handoff, and looped
-projections with exact fused reductions on validated shapes. These are integrated
-implementations, not process-wide benchmark monkeypatches. `--eagle-draft-tokens`
-overrides the proposal count; `--no-eagle-fast` disables the profile. Ordinary
-generation without `--eagle3` is unchanged.
+`--eagle3` drafts **one token per round with the fast profile**: fused draft
+observation/proposal, owned host-mapped token/decision/proposal buffers, parallel
+exact-score sampling, zero-copy feature handoff, and looped projections with exact
+fused reductions on validated shapes. Ordinary generation without `--eagle3` is unchanged.
 
 **This remains experimental, not a guaranteed speedup or reliability fix.**
 The calibrated-head experimental combination reached about 132 tok/s versus
@@ -131,8 +121,6 @@ fallback elsewhere: activations round to FP16, accumulation is FP32,
 and no persistent dense weight copy is retained. Eligible NV runs automatically
 use shared-KV, split-context fused GQA decode attention with FP32 online softmax
 and a merge launch; unsupported shapes retain upstream attention.
-`--no-nv-fused-attention` disables it, while `--nv-attention` selects the parallel
-masked-softmax alternative. `--no-nv-quant` disables automatic NV acceleration.
 Prefill is unchanged. Norms, RoPE, cache allocation and sampling remain upstream.
 
 With a 512-token prompt and 32 generated tokens, local warm tests measured

@@ -14,7 +14,7 @@ import tinygrad
 from tinygrad import Device, Tensor
 from tinygrad.device import Compiled
 
-from infurnace.cli import _build
+from infurnace.loader import load_model as _build
 from infurnace.eagle import EagleDraft
 from infurnace.eagle.generate import EagleGenerator
 

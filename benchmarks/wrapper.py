@@ -9,7 +9,9 @@ from types import SimpleNamespace
 
 from tinygrad import Context
 
-from infurnace.cli import _build, _measure, _prompt_ids
+from infurnace.benchmark import _measure
+from infurnace.chat import prompt_ids as _prompt_ids
+from infurnace.loader import load_model as _build
 
 
 def main():

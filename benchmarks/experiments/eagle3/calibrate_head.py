@@ -13,7 +13,7 @@ from tinygrad import Context, Tensor, TinyJit, dtypes
 from tinygrad.nn.optim import Adam
 from tinygrad.nn.state import safe_load, safe_save
 
-from infurnace.cli import _build
+from infurnace.loader import load_model as _build
 from infurnace.eagle import EagleDraft
 from infurnace.kernels.dense_gemv import bf16_gemv
 from infurnace.eagle.reference import SequentialVerifier

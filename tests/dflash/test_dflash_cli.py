@@ -1,86 +1,56 @@
 from types import SimpleNamespace
 import pytest
-from infurnace import cli
+from infurnace import cli, loader
+from infurnace.chat import Decoder, stream_reply
 from test_eagle_cli import Engine, Tokenizer
 
 
-def test_dflash_stream_eos_and_close(capsys):
+@pytest.mark.parametrize('verifier,block', [('parallel', 16), ('sequential', 4)])
+def test_dflash_stream_block_eos_and_close(capsys, verifier, block):
   model = SimpleNamespace(config=SimpleNamespace(context_length=16))
-  engine = Engine()
-  assert cli._stream(model, Tokenizer(), [1, 2], None, dflash=engine, dflash_block_size=8) == '3!'
+  engine = Engine(verifier=verifier)
+  assert stream_reply(Decoder(model, Tokenizer(), dflash=engine), Tokenizer(), [1, 2], None) == '3!'
   assert engine.closed
-  assert engine.calls == [([1, 2], {'max_new_tokens': 14, 'block_size': 8, 'eos_token_ids': (9, 10)})]
+  assert engine.calls == [([1, 2], {'max_new_tokens': 14, 'block_size': block, 'eos_token_ids': (9, 10)})]
   assert capsys.readouterr().out == '3!\n'
 
 
-@pytest.mark.parametrize('extra', [
-  ['--dflash-block-size', '4'], ['--dflash', 'missing.gguf'], ['--dflash-verifier', 'sequential'], ['--dflash-legacy-noncausal'],
-  ['--dflash', 'draft.gguf', '--dflash-block-size', '0'],
-  ['--dflash', 'draft.gguf', '--benchmark', '8'], ['--dflash', 'draft.gguf', '--eagle3', 'eagle']])
+@pytest.mark.parametrize('extra', [['--dflash', 'missing.gguf'], ['--dflash', 'draft.gguf', '--benchmark', '8'],
+                                   ['--dflash', 'draft.gguf', '--eagle3', 'eagle'], ['--dflash', 'draft.gguf', '--no-dflash'],
+                                   ['--dflash-block-size', '4']])
 def test_invalid_flags_before_loading(monkeypatch, extra):
-  monkeypatch.setattr('sys.argv', ['infurnace', *extra])
-  monkeypatch.setattr(cli, '_build', lambda *a, **kw: pytest.fail('loaded model for invalid flags'))
-  with pytest.raises(SystemExit) as exc: cli.main()
+  monkeypatch.setattr(loader, 'load_model', lambda *a, **kw: pytest.fail('loaded model for invalid flags'))
+  with pytest.raises(SystemExit) as exc: cli.main(extra)
   assert exc.value.code == 2
 
 
 @pytest.mark.parametrize('device', ['CPU', 'NV'])
-@pytest.mark.parametrize('block', [None, 8])
-@pytest.mark.parametrize('verifier', [None, 'sequential'])
-@pytest.mark.parametrize('legacy', [False, True])
-def test_cli_builds_reference_engine(monkeypatch, tmp_path, capsys, block, verifier, legacy, device):
-  import infurnace.dflash as dflash
+def test_explicit_draft_is_used_on_any_device(monkeypatch, tmp_path, capsys, device):
   path = tmp_path / 'draft.gguf'
   path.touch()
-  args = ['infurnace', '--dflash', str(path), '--prompt', 'hello', '--max-tokens', '5']
-  if block is not None: args += ['--dflash-block-size', str(block)]
-  if verifier is not None: args += ['--dflash-verifier', verifier]
-  if legacy: args += ['--dflash-legacy-noncausal']
-  monkeypatch.setattr('sys.argv', args)
-  model = SimpleNamespace(config=SimpleNamespace(context_length=16), device=device)
-  draft = SimpleNamespace(config=SimpleNamespace(block_size=16))
-  engine = Engine()
-  monkeypatch.setattr(cli, '_build', lambda *a, **kw: (model, Tokenizer()))
-  def load(checkpoint, target, **options):
-    assert options == ({'legacy_noncausal': True} if legacy else {})
-    return draft
-  monkeypatch.setattr(dflash.DFlashDraft, 'from_gguf', load)
-  def build(target, loaded, **options):
-    assert target is model and loaded is draft
-    # Default: multirow verification on NV, sequential reference elsewhere.
-    assert options == {'verifier': verifier or ('parallel' if device == 'NV' else 'sequential')}
-    return engine
-  monkeypatch.setattr(dflash, 'DFlashGenerator', build)
-  assert cli.main() == 0
-  assert engine.calls[0][1]['max_new_tokens'] == 5
-  default = 16 if verifier is None and device == 'NV' else 4
-  assert engine.calls[0][1]['block_size'] == (default if block is None else block)
-  assert engine.closed and 'DFlash' in capsys.readouterr().err
+  model, engine = SimpleNamespace(config=SimpleNamespace(context_length=16), device=device), Engine()
+  monkeypatch.setattr(loader, 'load_model', lambda *a, **kw: (model, Tokenizer()))
+  monkeypatch.setattr(loader, 'load_dflash', lambda target, draft: engine if (target, draft) == (model, path) else None)
+  assert cli.main(['--dflash', str(path), '--prompt', 'hello', '--max-tokens', '5']) == 0
+  assert engine.calls[0][1]['max_new_tokens'] == 5 and engine.closed and 'DFlash' in capsys.readouterr().err
 
 
 @pytest.mark.parametrize('device,flags,enabled', [('NV', [], True), ('CPU', [], False), ('NV', ['--no-dflash'], False),
                                                   ('NV', ['--serve'], False)])
-def test_cli_enables_installed_dflash_draft_automatically(monkeypatch, tmp_path, device, flags, enabled):
-  import infurnace.dflash as dflash
+def test_installed_draft_is_used_automatically(monkeypatch, tmp_path, device, flags, enabled):
   target, draft = tmp_path / 'target.gguf', tmp_path / 'draft.gguf'
   target.touch()
   draft.touch()
   monkeypatch.setenv('INFURNACE_DFLASH_DRAFT', str(draft))
-  monkeypatch.setattr('infurnace.gguf.read_gguf_metadata', lambda path: {'general.architecture': 'qwen35'})
-  run = ['--prompt', 'hello', '--max-tokens', '5'] if '--serve' not in flags else []
-  monkeypatch.setattr('sys.argv', ['infurnace', '--model', str(target), *run, *flags])
+  monkeypatch.setattr(loader, 'is_qwen35', lambda path: True)
   model = SimpleNamespace(config=SimpleNamespace(context_length=16), device=device)
-  monkeypatch.setattr(cli, '_build', lambda *a, **kw: (model, Tokenizer()))
-  loaded = []
-  def load(checkpoint, target_model, **options):
-    loaded.append(checkpoint)
-    return SimpleNamespace(config=SimpleNamespace(block_size=16))
-  monkeypatch.setattr(dflash.DFlashDraft, 'from_gguf', load)
-  monkeypatch.setattr(dflash, 'DFlashGenerator', lambda target_model, draft_model, **options: Engine())
-  runs = []
-  monkeypatch.setattr(cli, '_run_single_shot', lambda *a, **options: runs.append(options) or 0)
-  monkeypatch.setattr(cli, '_warmup', lambda model: None)
-  monkeypatch.setattr('infurnace.serve.serve', lambda *a, **kw: runs.append({}))
-  assert cli.main() == 0
+  monkeypatch.setattr(loader, 'load_model', lambda *a, **kw: (model, Tokenizer()))
+  loaded, decoders = [], []
+  monkeypatch.setattr(loader, 'load_dflash', lambda target_model, path: loaded.append(path) or Engine())
+  monkeypatch.setattr(cli, 'run_prompt', lambda decoder, *a: decoders.append(decoder) or 0)
+  monkeypatch.setattr(Decoder, 'warmup', lambda self: None)
+  monkeypatch.setattr('infurnace.serve.serve', lambda model, *a, **kw: decoders.append(None))
+  run = ['--prompt', 'hello'] if '--serve' not in flags else []
+  assert cli.main(['--model', str(target), *run, *flags]) == 0
   assert loaded == ([draft] if enabled else [])
-  assert ('dflash' in runs[0]) == enabled
+  if '--serve' not in flags: assert (decoders[0].dflash is not None) == enabled

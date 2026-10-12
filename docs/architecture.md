@@ -64,7 +64,7 @@ bundled Qwen3 template. Thinking is on by default, configurable with
 ## Baseline and optimization
 
 The baseline disables custom quantized linears and uses generic tinygrad ops on
-NV. `--nv-quant` installs linear adapters using explicit GGUF descriptors:
+NV. Packed quantized acceleration (automatic on NV) installs linear adapters using explicit GGUF descriptors:
 concrete single-token inputs use GEMV, multi-token inputs use the original
 linear. The final output projection may use GEMV during prefill because it
 projects only the last token. Packed typed storage is prepared once and shared
@@ -86,7 +86,7 @@ upstream/llama.cpp are separate measurements, not implied by the CLI counters.
 Ordinary decode does not use EAGLE. `--eagle3 CHECKPOINT` creates an
 `EagleGenerator(..., fast=True)` with one proposal by default. Its profile uses
 fused drafting, mapped scratch I/O, parallel sampling, zero-copy features and
-validated fused projections; `--no-eagle-fast` retains the basic batched path.
+validated fused projections; `fast=False` retains the basic batched path.
 The lower-level Python APIs retain their explicit/reference defaults.
 
 Mapped scratch belongs to the draft/verifier capture owner, never a global

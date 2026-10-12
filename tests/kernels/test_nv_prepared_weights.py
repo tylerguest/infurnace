@@ -76,14 +76,14 @@ def test_q6_prepared_decode_and_prefill(width, swizzled, warps, monkeypatch):
 @pytest.mark.parametrize('override,expected', [(None, True), (True, True), (False, False)])
 def test_cli_prepared_default_and_override(monkeypatch, override, expected):
   from types import SimpleNamespace
-  from infurnace import cli
+  from infurnace import loader
   seen = {}
   def load(path, **kwargs):
     seen.update(kwargs)
     return SimpleNamespace(metadata={})
-  monkeypatch.setattr(cli, 'select_device', lambda device: 'NV')
-  monkeypatch.setattr(cli, 'supports_nv_quant', lambda device: True)
-  monkeypatch.setattr(cli.Qwen3Model, 'from_gguf', load)
-  monkeypatch.setattr(cli.Tokenizer, 'from_gguf', lambda metadata: None)
-  cli._build('unused', 64, 'NV', nv_prefill=False, nv_prepared_weights=override)
+  monkeypatch.setattr(loader, 'select_device', lambda device: 'NV')
+  monkeypatch.setattr(loader, 'supports_nv_quant', lambda device: True)
+  monkeypatch.setattr(loader.Qwen3Model, 'from_gguf', load)
+  monkeypatch.setattr(loader.Tokenizer, 'from_gguf', lambda metadata: None)
+  loader.load_model('unused', 64, 'NV', nv_prefill=False, nv_prepared_weights=override)
   assert seen['nv_prepared_weights'] is expected

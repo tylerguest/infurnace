@@ -15,7 +15,7 @@ infurnace --model models/qwen35-validation/Qwen3.5-4B-Q4_K_M.gguf \
 
 ## Parallel verification (default on NV)
 
-`--dflash-verifier parallel` (`infurnace/dflash/parallel.py`) is the default on NV,
+Parallel verification (`infurnace/dflash/parallel.py`) is used on NV,
 with the checkpoint's trained block size (16). Each round runs **one** multirow target
 forward over the anchor plus all proposals, so projection weights are read once per
 block via Infurnace's packed tensor-core GEMMs (Q4_K/Q5_K/Q6_K: each warp reuses
@@ -106,8 +106,8 @@ Attention defaults now match the audited current official repository: sliding
 layers are causal; the final full-attention layer is noncausal. An explicit GGUF
 `dflash.attention.causal` overrides all layers. The selected GGUF has no such
 flag and does not identify its inference-code version. Older official/converter
-code defaulted every layer to noncausal; use `--dflash-legacy-noncausal` to
-reproduce that policy. No weights or target math are substituted.
+code defaulted every layer to noncausal; `DFlashDraft.from_gguf(..., legacy_noncausal=True)`
+reproduces that policy. No weights or target math are substituted.
 
 See the [pinned upstream audit](../benchmarks/experiments/dflash/upstream-audit.md)
 for the version difference and operation-by-operation comparison. Transient

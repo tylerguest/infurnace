@@ -1,7 +1,7 @@
 import pytest
 
 from infurnace import device
-from infurnace import cli
+from infurnace import loader
 
 
 def test_prefer_gpu(monkeypatch):
@@ -30,20 +30,20 @@ def test_explicit_override(monkeypatch):
 
 
 def test_auto_acceleration(monkeypatch):
-  monkeypatch.setattr(cli, "select_device", lambda requested: "NV")
-  monkeypatch.setattr(cli, "supports_nv_quant", lambda device: True)
-  monkeypatch.setattr(cli, "nv_prefill_supported", lambda device: True)
+  monkeypatch.setattr(loader, "select_device", lambda requested: "NV")
+  monkeypatch.setattr(loader, "supports_nv_quant", lambda device: True)
+  monkeypatch.setattr(loader, "nv_prefill_supported", lambda device: True)
   calls = []
   class Model:
     metadata = {}
   def build(path, **kwargs):
     calls.append(kwargs)
     return Model()
-  monkeypatch.setattr(cli.Qwen3Model, "from_gguf", build)
-  monkeypatch.setattr(cli.Tokenizer, "from_gguf", lambda metadata: None)
-  cli._build("model", 16, None)
+  monkeypatch.setattr(loader.Qwen3Model, "from_gguf", build)
+  monkeypatch.setattr(loader.Tokenizer, "from_gguf", lambda metadata: None)
+  loader.load_model("model", 16, None)
   assert calls[-1] == {"max_context": 16, "device": "NV", "nv_quant": True, "nv_prefill": True,
                        "nv_prepared_weights": True, "nv_fused_attention": True}
-  cli._build("model", 16, None, False)
+  loader.load_model("model", 16, None, False)
   assert "nv_quant" not in calls[-1]
   assert "nv_prefill" not in calls[-1]

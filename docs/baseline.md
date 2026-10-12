@@ -91,8 +91,8 @@ The no-thinking hello chat smoke passes on both paths. Isolated GPU tests cover
 Q8-reference numerical parity, JIT replay and generic multi-token fallback.
 
 ```sh
-infurnace --device NV --nv-quant --no-thinking
-infurnace --device NV --nv-quant --benchmark 20
+infurnace --device NV --no-thinking
+infurnace --device NV --benchmark 20
 ```
 
 ## Repeatable verification

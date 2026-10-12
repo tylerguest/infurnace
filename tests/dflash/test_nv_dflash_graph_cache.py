@@ -13,7 +13,7 @@ pytestmark = [pytest.mark.nv, pytest.mark.skipif(not (TARGET.is_file() and DRAFT
 
 RUN = f'''
 import json
-from infurnace.cli import _build
+from infurnace.loader import load_model as _build
 from infurnace.dflash import DFlashDraft, DFlashGenerator
 model, tokenizer = _build({str(TARGET)!r}, 1024, 'NV')
 generator = DFlashGenerator(model, DFlashDraft.from_gguf({str(DRAFT)!r}, model), verifier='parallel')
