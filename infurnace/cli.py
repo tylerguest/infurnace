@@ -133,9 +133,9 @@ def _warmup(model: Qwen3Model, dflash=None, dflash_block_size: int | None = None
   print(f"Warming up {model.device} (first startup may take a while)...", file=sys.stderr, flush=True)
   start = time.perf_counter()
   # DFlash requests never use plain generation's graphs; capture DFlash's own instead.
-  if dflash is not None: dflash.warmup(dflash_block_size)
-  else: model.warmup()
-  print(f"Ready in {time.perf_counter()-start:.1f}s.", file=sys.stderr, flush=True)
+  how = dflash.warmup(dflash_block_size) if dflash is not None else model.warmup()
+  note = {'cached': ' (DFlash graphs from cache)', 'captured': ' (DFlash graphs cached for next time)'}.get(how, '')
+  print(f"Ready in {time.perf_counter()-start:.1f}s{note}.", file=sys.stderr, flush=True)
 
 
 def _run_chat(model: Qwen3Model, tokenizer: Tokenizer, max_tokens: int | None, max_context: int,

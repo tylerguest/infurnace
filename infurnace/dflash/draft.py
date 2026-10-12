@@ -7,7 +7,7 @@ from pathlib import Path
 
 from tinygrad import Context, Tensor, UOp, nn, dtypes
 from tinygrad.llm.model import apply_rope, precompute_freqs_cis
-from tinygrad.nn.state import get_state_dict, load_state_dict
+from tinygrad.nn.state import get_parameters, get_state_dict, load_state_dict
 from infurnace.gguf import parse_gguf
 from infurnace.models.qwen3 import _NVLinear
 from infurnace.kernels.quant_gemv import QUANT_SIZES
@@ -147,7 +147,7 @@ class DFlashDraft:
       if entry.shape != expected[name].shape: raise ValueError(f'invalid DFlash shape: {name}, {entry.shape}')
     resident = {name: entry.to(target.device) for name, entry in entries.items()}
     result = cls(config, target, {name: entry.decode() for name, entry in resident.items()})
-    result.metadata = metadata
+    result.metadata, result.path = metadata, Path(path)
     result.packed_linears = 0
     if packed and target.device.split(':')[0] == 'NV':
       for name, entry in resident.items():
@@ -163,6 +163,10 @@ class DFlashDraft:
         adapter.weight = adapter.original.weight = None
         setattr(owner, attr, adapter)
         result.packed_linears += 1
+    # Realize what stays dense (norms, small projections): captured graphs then
+    # read real buffers instead of recomputing the casts on every replay.
+    with Context(DEV=result.device):
+      if lazy := [t for t in get_parameters(result.weights) if not t.uop.is_realized]: Tensor.realize(*lazy)
     return result
 
   def reset(self):
@@ -251,6 +255,15 @@ class DFlashDraft:
     logits = projection(self.target.transformer.output, self._denoise(noise, position))
     return logits.argmax(-1).contiguous()
 
+  def _denoise_graph(self, count: int):
+    """The captured denoise graph for `count` proposals and its persistent noise
+    input (one buffer per shape: captured graphs always see the same address)."""
+    if count not in self._jits:
+      with Context(DEV=self.device):
+        self._noise_inputs[count] = Tensor.empty(1, count + 1, self.config.dim, device=self.device).realize()
+      self._jits[count] = captured(self._forward)
+    return self._jits[count]
+
   def propose(self, anchor: int, position: int, count: int) -> list[int]:
     """Draft `count` tokens after `anchor` at `position`; every target row
     before `position` must have been observed."""
@@ -264,16 +277,12 @@ class DFlashDraft:
       # A partial chunk is absorbed padded; its padding rows land where later
       # context or this noise block overwrites them, or stay masked.
       if self._staged: self._absorb_jit(self._context, self._start.bind(self.observed - self._staged))
-      # A persistent input buffer per noise shape: captured graphs always see
-      # the same input addresses.
-      if count not in self._noise_inputs:
-        self._noise_inputs[count] = Tensor.empty(1, count + 1, c.dim, device=self.device).realize()
+      graph = self._denoise_graph(count)
       noise = self._noise_inputs[count]
       embedded = self.target.embed([anchor] + [c.mask_token] * count)
       Tensor(noise.uop.after(noise.uop.store(embedded.uop))).realize()
-      if count not in self._jits: self._jits[count] = captured(self._forward)
       pos = UOp.variable('dflash_position', 1, self.capacity - count - 1).bind(position)
-      decisions = self._jits[count](noise, pos).realize()
+      decisions = graph(noise, pos).realize()
       output = [int(v) for v in Tensor(decisions.uop.buf_uop).reshape(count).tolist()]
     self.length = position  # Transient noise K/V never authorizes future prefix reuse.
     return output

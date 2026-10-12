@@ -34,7 +34,12 @@ class TargetObserver:
       for block in target.blk:
         block._init_state(x)
         states += [getattr(block, name) for name in ('cache_kv', 'freqs_cis', 'conv_state', 'recurrent_state') if hasattr(block, name)]
+      # The step's sampling reads the device RNG; create it without advancing the stream.
+      if self.model.device not in Tensor._device_seeds: Tensor._next_counter(self.model.device, 0)
+      states += [Tensor._device_seeds[self.model.device], Tensor._device_rng_counters[self.model.device]]
       if pending := [t for t in states if not t.uop.is_realized]: Tensor.realize(*pending)
+      # A persistent temperature buffer: the captured step always sees the same address.
+      if self._temperature is None: self._temperature = Tensor([0.0], device=self.model.device).realize()
 
   def __enter__(self):
     if self.active or self.model._generating: raise RuntimeError('only one generation may run at a time')
@@ -79,8 +84,6 @@ class TargetObserver:
     if self.position >= self.model.config.context_length: raise ValueError('target context exhausted')
     try:
       with Context(DEV=self.model.device):
-        # A persistent temperature buffer: the captured graph always sees the same address.
-        if self._temperature is None: self._temperature = Tensor([0.0], device=self.model.device).realize()
         decision, features = self._jit(self._token.bind(token), self._position.bind(self.position), self._temperature)
         Tensor.realize(decision, features)
         # JIT outputs alias capture scratch. Copy only executed storage before

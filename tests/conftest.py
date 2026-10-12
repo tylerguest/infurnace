@@ -30,3 +30,4 @@ def pytest_collection_modifyitems(config, items):
 def _no_installed_dflash_draft(monkeypatch, tmp_path):
   # The CLI enables an installed DFlash draft automatically; tests opt in explicitly.
   monkeypatch.setenv('INFURNACE_DFLASH_DRAFT', str(tmp_path / 'no-draft.gguf'))
+  monkeypatch.setenv('XDG_CACHE_HOME', str(tmp_path / 'cache'))  # never touch the user's DFlash graph cache

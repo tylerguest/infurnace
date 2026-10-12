@@ -74,8 +74,16 @@ steps, doubling up to 128 while probes keep losing. Samples taken while a graph 
 compiling or capturing are not timed; until a one-row step has been timed, a
 tokens-per-round threshold (3.5) decides. During fallback the target's feature rows
 are copied into the draft's fixed-shape 16-row staging buffer as they are produced
-and absorbed in full chunks, so returning to drafting never recompiles. The first
-request compiles the captures, which takes minutes. Greedy only.
+and absorbed in full chunks, so returning to drafting never recompiles. Greedy only.
+
+**Startup and graph cache.** Chat warms DFlash's captured graphs before the first
+prompt (~45 s the first time). They are then saved to
+`~/.cache/infurnace/dflash-graphs/` (`XDG_CACHE_HOME` respected, ~130 MB, newest four
+kept), and later launches load them in ~7 s. Weights and caches are not written:
+buffers owned by the model, draft and verifier are stored by name and re-bound on load.
+Any change to tinygrad or infurnace sources, either GGUF file, the context length,
+block size, fused rounds, device or compile flags selects a new entry.
+`INFURNACE_GRAPH_CACHE=0` disables the cache.
 
 ## Draft identity and metadata
 

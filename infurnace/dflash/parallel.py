@@ -210,15 +210,7 @@ class ParallelVerifier:
         # with one readback at the end. Back-to-back submissions need the pinned
         # tinygrad's NV fix (GPPut read back before the doorbell); without it the
         # GPU can miss the last submission and the readback never completes.
-        if self._round_jit is None:
-          self._round_jit = (captured(functools.partial(self._pick, mask=draft.config.mask_token)), captured(self._ids),
-                             captured(self._pack))
-          self._draft_position = UOp.variable('dflash_position', 1, draft.capacity - self.rows)
-          # Dedicated graphs for the fused round, never shared with the unfused
-          # path: every captured graph always sees the same input buffers, so no
-          # replay has to re-patch input addresses (see `run`).
-          self._fused_absorb, self._fused_draft = captured(draft._absorb), captured(draft._forward)
-        pick, ids, pack = self._round_jit
+        pick, ids, pack = self._round_graphs(draft)
         self._commit_jit(self._count.bind(count), self._position.bind(previous))
         self._fused_absorb(_raw(self._features), draft._start.bind(previous))
         pick(self._count.bind(count))
@@ -266,6 +258,38 @@ class ParallelVerifier:
     """Process up to `rows` known prompt tokens; caller commits all of them."""
     return self.run(tokens)
 
+  def _allocate(self):
+    """Owned buffers every captured graph reads or writes (idempotent)."""
+    if self._operands: return
+    observer = self.observer
+    with Context(DEV=self.device):
+      x = Tensor.empty(1, 1, observer.model.config.embedding_length, device=self.device)
+      for index, block in enumerate(observer.model.transformer.blk):
+        if isinstance(block, GatedDeltaNetBlock):
+          block._init_state(x)
+          self._operands[index] = _Operands(block, self.rows, self.device)
+      width = observer.model.config.embedding_length * len(observer.layers)
+      self._decisions = Tensor.empty(1, self.rows, dtype=dtypes.int32, device=self.device).realize()
+      self._features = Tensor.empty(1, self.rows, width, device=self.device).realize()
+      self._anchor = Tensor.empty(1, dtype=dtypes.int32, device=self.device).realize()
+      self._proposals = Tensor.empty(self.rows - 1, dtype=dtypes.int32, device=self.device).realize()
+      self._readback = Tensor.empty(2 * self.rows, dtype=dtypes.int32, device=self.device).realize()
+      dim = observer.model.config.embedding_length
+      self._noise_ids, self._verify_ids = (Tensor.empty(self.rows, dtype=dtypes.int32, device=self.device).realize() for _ in range(2))
+      self._noise, self._embeddings = (Tensor.empty(1, self.rows, dim, device=self.device).realize() for _ in range(2))
+
+  def _round_graphs(self, draft):
+    """The fused round's captured graphs (created once, idempotent)."""
+    if self._round_jit is None:
+      self._round_jit = (captured(functools.partial(self._pick, mask=draft.config.mask_token)), captured(self._ids),
+                         captured(self._pack))
+      self._draft_position = UOp.variable('dflash_position', 1, draft.capacity - self.rows)
+      # Dedicated graphs for the fused round, never shared with the unfused
+      # path: every captured graph always sees the same input buffers, so no
+      # replay has to re-patch input addresses (see `run`).
+      self._fused_absorb, self._fused_draft = captured(draft._absorb), captured(draft._forward)
+    return self._round_jit
+
   def run(self, inputs: list[int]) -> tuple[list[int], Tensor]:
     observer = self.observer
     if not observer.active: raise RuntimeError('use verifier inside the target observer')
@@ -275,21 +299,7 @@ class ParallelVerifier:
     padded = inputs + [inputs[-1]] * (self.rows - len(inputs))
     try:
       with Context(DEV=self.device):
-        if not self._operands:
-          x = Tensor.empty(1, 1, observer.model.config.embedding_length, device=self.device)
-          for index, block in enumerate(observer.model.transformer.blk):
-            if isinstance(block, GatedDeltaNetBlock):
-              block._init_state(x)
-              self._operands[index] = _Operands(block, self.rows, self.device)
-          width = observer.model.config.embedding_length * len(observer.layers)
-          self._decisions = Tensor.empty(1, self.rows, dtype=dtypes.int32, device=self.device).realize()
-          self._features = Tensor.empty(1, self.rows, width, device=self.device).realize()
-          self._anchor = Tensor.empty(1, dtype=dtypes.int32, device=self.device).realize()
-          self._proposals = Tensor.empty(self.rows - 1, dtype=dtypes.int32, device=self.device).realize()
-          self._readback = Tensor.empty(2 * self.rows, dtype=dtypes.int32, device=self.device).realize()
-          dim = observer.model.config.embedding_length
-          self._noise_ids, self._verify_ids = (Tensor.empty(self.rows, dtype=dtypes.int32, device=self.device).realize() for _ in range(2))
-          self._noise, self._embeddings = (Tensor.empty(1, self.rows, dim, device=self.device).realize() for _ in range(2))
+        self._allocate()
         # Always the same persistent input buffer for the captured forward.
         _stored(self._embeddings, observer.model.embed(padded)).realize()
         self._forward_jit(_raw(self._embeddings), self._position.bind(observer.position))
