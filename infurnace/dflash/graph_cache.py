@@ -13,40 +13,25 @@ infurnace sources, both GGUF files, context length, block size, fused rounds,
 the device and compilation flags. Any mismatch or failure is a cache miss.
 """
 from __future__ import annotations
-import functools, hashlib, os, pickle, sys
+import hashlib, os, pickle, sys
 from pathlib import Path
 from tinygrad import Device, Tensor
 from tinygrad.device import Buffer
 from tinygrad.engine.jit import CapturedJit, _TinyJit
 from tinygrad.uop.ops import Ops
+from infurnace import disk_cache
 
 FORMAT = 1
 _FLAGS = ('BEAM', 'JITBEAM', 'NOOPT', 'PROFILE', 'DEBUG', 'JIT', 'IMAGE', 'HCQ_CACHE_THRESH', 'VALIDATE_WITH_CPU')
 
 
 def cache_dir() -> Path:
-  return Path(os.environ.get('XDG_CACHE_HOME', str(Path.home() / '.cache'))).expanduser() / 'infurnace' / 'dflash-graphs'
-
-
-def _source_hash(package_dir: Path, digest) -> None:
-  for path in sorted(package_dir.rglob('*.py')):
-    digest.update(str(path.relative_to(package_dir)).encode())
-    digest.update(path.read_bytes())
-
-
-@functools.cache
-def _sources() -> str:
-  import tinygrad, infurnace
-  digest = hashlib.sha256()
-  for module in (tinygrad, infurnace): _source_hash(Path(module.__file__).parent, digest)
-  return digest.hexdigest()
+  return disk_cache.root() / 'dflash-graphs'
 
 
 def key(generator, block: int) -> str:
-  digest = hashlib.sha256(f'format {FORMAT} python {sys.version_info[:2]} {_sources()}'.encode())
-  for path in (generator.model._path, generator.draft.path):
-    stat = Path(path).stat()
-    digest.update(f'{Path(path).resolve()} {stat.st_size} {stat.st_mtime_ns}'.encode())
+  digest = hashlib.sha256(f'format {FORMAT} python {sys.version_info[:2]} {disk_cache.sources()}'.encode())
+  for path in (generator.model._path, generator.draft.path): digest.update(disk_cache.file_identity(path).encode())
   device = Device[generator.model.device]
   digest.update(f'{generator.model.config.context_length} {block} {generator.fused} {device.device} {getattr(device, "arch", "")}'.encode())
   digest.update(repr([(flag, os.environ.get(flag)) for flag in _FLAGS]).encode())
@@ -104,8 +89,7 @@ def save(path: Path, graphs: dict[str, _TinyJit], buffers: dict[str, Buffer]) ->
   partial = path.with_suffix('.tmp')
   with partial.open('wb') as f: _Pickler(f, {buffer: name for name, buffer in buffers.items()}).dump({'format': FORMAT, 'graphs': captured})
   partial.replace(path)
-  # Keep the newest few entries: each holds only graph-private buffers.
-  for old in sorted(path.parent.glob('*.pkl'), key=lambda p: p.stat().st_mtime)[:-4]: old.unlink(missing_ok=True)
+  disk_cache.prune(path.parent, keep=4)  # each entry holds only graph-private buffers
 
 
 def load(path: Path, buffers: dict[str, Buffer]) -> dict[str, CapturedJit] | None:

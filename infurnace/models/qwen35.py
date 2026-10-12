@@ -6,13 +6,16 @@ quantized projection weights for Infurnace's packed tinygrad UOp kernels (the
 same `_NVLinear` adapter the Qwen3 path uses). Block math is never replaced.
 """
 import contextlib
+import hashlib
 import math
+import os
 from pathlib import Path
 from tinygrad import Context, Tensor
 import tinygrad.llm.model as upstream_model
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from tinygrad.llm.model import Transformer
 from tinygrad.nn.state import get_state_dict
+from infurnace import disk_cache
 from infurnace.gguf import parse_gguf, read_gguf_metadata
 from infurnace.kernels.quant_gemm import nv_prefill_supported
 from infurnace.models.qwen3 import Qwen3Config, Qwen3Model, _NVLinear
@@ -129,6 +132,11 @@ class Qwen35Model(Qwen3Model):
       counter.replace(Tensor.zeros(*counter.shape, dtype=counter.dtype, device='CPU').contiguous().realize())
     return result
 
+  def _param_cache_path(self, path):
+    if os.environ.get('INFURNACE_PARAM_CACHE', '1') == '0': return None
+    key = hashlib.sha256(f'{disk_cache.sources()} {disk_cache.file_identity(path)} {self.device}'.encode()).hexdigest()[:32]
+    return disk_cache.root() / 'params' / f'{key}.bin'
+
   def _enable_packed(self, path, prefill: bool):
     _, entries = parse_gguf(path)
     # Converted Qwen3.5 GGUFs tie the output head to the token embedding.
@@ -167,8 +175,18 @@ class Qwen35Model(Qwen3Model):
           Tensor.realize(*group)
           group, size = [], 0
       if group: Tensor.realize(*group)
-      # Move what remains (norms, conv, decay, small Q8_0 gates) as realized FP tensors, in one schedule.
-      moved = [(tensor, tensor.to(self.device).contiguous()) for tensor in get_state_dict(self.transformer).values()
-               if tensor.device != self.device]
-      if moved: Tensor.realize(*[copy for _, copy in moved])
-      for tensor, copy in moved: tensor.replace(copy)
+      # Move what remains (norms, conv, decay, small Q8_0 gates) as realized FP16 tensors. Preparing
+      # them schedules ~700 tiny kernels (~2 s) for ~10 MB, so the result is cached on disk.
+      remaining = {name: tensor for name, tensor in get_state_dict(self.transformer).items() if tensor.device != self.device}
+      cache = self._param_cache_path(path) if remaining else None
+      cached = disk_cache.load_tensors(cache, self.device) if cache is not None and cache.is_file() else None
+      if cached is not None and set(cached) == set(remaining) and all(
+          cached[name].shape == tensor.shape and cached[name].dtype == tensor.dtype for name, tensor in remaining.items()):
+        for name, tensor in remaining.items(): tensor.replace(cached[name])
+      elif remaining:
+        moved = [(tensor, tensor.to(self.device).contiguous()) for tensor in remaining.values()]
+        Tensor.realize(*[copy for _, copy in moved])
+        for tensor, copy in moved: tensor.replace(copy)
+        if cache is not None:
+          disk_cache.save_tensors(cache, remaining)
+          disk_cache.prune(cache.parent, keep=4)

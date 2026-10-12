@@ -83,7 +83,10 @@ kept), and later launches load them in ~7 s. Weights and caches are not written:
 buffers owned by the model, draft and verifier are stored by name and re-bound on load.
 Any change to tinygrad or infurnace sources, either GGUF file, the context length,
 block size, fused rounds, device or compile flags selects a new entry.
-`INFURNACE_GRAPH_CACHE=0` disables the cache.
+`INFURNACE_GRAPH_CACHE=0` disables the cache. The target's small prepared
+parameters (norms, gates; ~10 MB that otherwise take ~2 s of kernel scheduling) are
+cached alongside in `~/.cache/infurnace/params/`; `INFURNACE_PARAM_CACHE=0` disables
+that. With both caches warm, chat is ready ~16 s after launch.
 
 ## Draft identity and metadata
 
