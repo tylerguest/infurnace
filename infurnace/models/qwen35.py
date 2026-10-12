@@ -2,10 +2,11 @@
 
 Tinygrad owns loading, transformer math, recurrence, caches, RNG and JIT. This
 adapter exposes Infurnace's bounded generation/lifecycle API and, on NV, swaps
-quantized projection weights for Infurnace's packed tinygrad UOp kernels (the
-same `_NVLinear` adapter the Qwen3 path uses). Block math is never replaced.
+quantized projection weights for Infurnace's packed tinygrad UOp kernels.
+Block math is never replaced.
 """
 import contextlib
+from dataclasses import dataclass
 import functools
 import hashlib
 import json
@@ -13,6 +14,7 @@ import math
 import os
 import struct
 from pathlib import Path
+from typing import Iterator
 from tinygrad import Context, Tensor, UOp, dtypes
 from tinygrad.device import Buffer
 import tinygrad.llm.model as upstream_model
@@ -22,7 +24,23 @@ from tinygrad.nn.state import get_state_dict
 from infurnace.gguf import parse_gguf, read_gguf_metadata
 from infurnace.kernels.gdn import gdn_decode
 from infurnace.kernels.quant_gemm import nv_prefill_supported
-from infurnace.models.qwen3 import Qwen3Config, Qwen3Model, _NVLinear
+from infurnace.models.linear import _NVLinear
+
+@dataclass(frozen=True)
+class Qwen35Config:
+  """Runner-facing hyperparameters from tinygrad's loaded Qwen3.5 transformer."""
+  block_count: int
+  embedding_length: int
+  feed_forward_length: int
+  attention_head_count: int
+  attention_head_count_kv: int
+  key_length: int
+  value_length: int
+  rope_dimension_count: int
+  rope_freq_base: float
+  rms_norm_epsilon: float
+  vocab_size: int
+  context_length: int
 
 # The parameter cache lives under $XDG_CACHE_HOME/infurnace/params and is
 # keyed on everything that changes what it holds. A key mismatch, missing file or read error is a miss.
@@ -141,19 +159,70 @@ def _lazy_upstream_weights(path):
   try: yield
   finally: upstream_model.gguf_parse, upstream_model.gguf_shard = parse, shard
 
-class Qwen35Model(Qwen3Model):
+class Qwen35Model:
+  """Bounded single-request runner around tinygrad's Qwen3.5 transformer."""
   def __init__(self, transformer: Transformer, metadata: dict, device: str | None = None):
     if metadata.get('general.architecture') != 'qwen35': raise ValueError('expected dense Qwen3.5 GGUF')
     if not transformer.blk: raise ValueError('Qwen3.5 must contain transformer blocks')
     c = transformer.blk[0].config
-    self.config = Qwen3Config(c.num_blocks, c.dim, c.hidden_dim, c.n_heads, c.n_kv_heads,
+    self.config = Qwen35Config(c.num_blocks, c.dim, c.hidden_dim, c.n_heads, c.n_kv_heads,
       c.head_dim, c.v_head_dim, c.rope_dim, c.rope_theta, c.norm_eps, c.vocab_size, transformer.max_context)
     self.transformer, self.metadata = transformer, metadata
     self.device = device or transformer.token_embd.weight.device
     self._generating = False
     self.nv_quant_linears = 0
+    self.nv_prefill = False
     self._path, self._host_embedding = None, None
     self._tied_head = False  # the packed output head is the token embedding table
+
+  def warmup(self) -> None:
+    """Prime upstream prefill/decode JIT using the same chunk size as normal generation."""
+    if self.config.context_length < 2: return
+    prompt = [0] * min(2, self.config.context_length - 1)
+    count = min(4, self.config.context_length - len(prompt))
+    try:
+      # First calls execute, second calls capture, third calls verify replay.
+      for _ in range(3):
+        stream = self.generate(prompt, count, reuse_cache=False)
+        try:
+          for _ in stream: pass
+        finally: stream.close()
+    finally:
+      self.reset()  # No dummy tokens become conversation history or reusable prefix.
+
+  def reset(self) -> None:
+    """Invalidate prefix reuse without reallocating tinygrad's cache or JIT."""
+    if self._generating: raise RuntimeError("cannot reset during generation")
+    self.transformer._cached_tokens = []
+
+  def generate(self, tokens: list[int], max_new_tokens: int, temperature: float = 0.0, *,
+               chunk_size: int = 32, reuse_cache: bool = True) -> Iterator[int]:
+    """Bound upstream generation; callers check EOS and must close abandoned streams.
+
+    Sampling and prefix reuse are upstream behavior. Context exhaustion bounds
+    output; an already-full prompt is rejected, never silently truncated.
+    """
+    if self._generating: raise RuntimeError("only one generation may run at a time")
+    if not isinstance(tokens, list) or not tokens: raise ValueError("prompt must contain at least one token")
+    if any(type(t) is not int or not 0 <= t < self.config.vocab_size for t in tokens): raise ValueError("invalid prompt token ID")
+    if type(max_new_tokens) is not int or max_new_tokens < 0: raise ValueError("max_new_tokens must be a nonnegative integer")
+    if type(chunk_size) is not int or chunk_size <= 0: raise ValueError("chunk_size must be a positive integer")
+    if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or not math.isfinite(temperature) or temperature < 0:
+      raise ValueError("temperature must be finite and nonnegative")
+    if len(tokens) >= self.config.context_length: raise ValueError("prompt exceeds available context; shorten history or increase --max-context")
+    if not reuse_cache: self.reset()
+    count = min(max_new_tokens, self.config.context_length - len(tokens))
+    if count == 0: return
+    self._generating = True
+    stream = self.transformer.generate(list(tokens), chunk_size=chunk_size, temperature=float(temperature))
+    try:
+      for _ in range(count):
+        # Do not leave a device context active while yielding control to a caller.
+        with Context(DEV=self.device): token = next(stream)
+        yield token
+    finally:
+      stream.close()
+      self._generating = False
 
   def embed(self, tokens: list[int]) -> Tensor:
     """Embedding rows as a (1, len(tokens), dim) float tensor on the model device.
@@ -191,6 +260,7 @@ class Qwen35Model(Qwen3Model):
   def from_gguf(cls, path: str | Path, max_context: int | None = None, device: str = 'CPU', *,
                 nv_quant: bool = False, nv_prefill: bool | None = None) -> 'Qwen35Model':
     if max_context is not None and (type(max_context) is not int or max_context <= 0): raise ValueError('invalid max_context')
+    if nv_prefill and not nv_quant: raise ValueError('NV prefill requires NV quantized acceleration')
     # Architecture dispatch is a cheap metadata-only check. Tensor loading,
     # configuration and block math remain upstream.
     if read_gguf_metadata(path).get('general.architecture') != 'qwen35': raise ValueError('expected dense Qwen3.5 GGUF')
@@ -229,6 +299,7 @@ class Qwen35Model(Qwen3Model):
     return cache_root() / 'params' / f'{key}.bin'
 
   def _enable_packed(self, path, prefill: bool):
+    self.nv_prefill = prefill
     _, entries = parse_gguf(path)
     # Converted Qwen3.5 GGUFs tie the output head to the token embedding.
     self._tied_head = 'output.weight' not in entries

@@ -74,8 +74,7 @@ def report(model, tokenizer, count: int, load_seconds: float, prompt_tokens: int
     "prompt_source": "raw text" if prompt_text is not None else "synthetic repeated prose",
     "decode_input_positions": [len(ids), len(ids) + count - 2] if count > 1 else None,
     **{name: getattr(model, name, default) for name, default in (
-      ("nv_quant_linears", 0), ("nv_shared_q8_blocks", 0), ("nv_prefill", False), ("nv_prepared_weights", False),
-      ("nv_prepared_weight_layout", "gguf"), ("nv_attention", False), ("nv_fused_attention", False))},
+      ("nv_quant_linears", 0), ("nv_prefill", False))},
     "cold": cold, "warm_runs": warm,
     "host_peak_rss_bytes": rss if sys.platform == "darwin" else rss * 1024,
     "tinygrad_current_allocated_bytes": GlobalCounters.mem_used,

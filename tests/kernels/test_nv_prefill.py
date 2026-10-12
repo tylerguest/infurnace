@@ -8,7 +8,7 @@ from tinygrad import Tensor, TinyJit, UOp, dtypes, function
 
 from infurnace.gguf import PackedTensor
 from tinygrad.llm.gguf import ggml_data_to_tensor as _dequant
-from infurnace.models.qwen3 import _NVLinear
+from infurnace.models.linear import _NVLinear
 from infurnace.kernels.quant_gemm import quant_gemm, QuantGemmError, _prefill_kernel
 from tinygrad.dtype import AddrSpace
 from tinygrad.uop.ops import Ops
@@ -47,9 +47,9 @@ def test_paired_prefill_graph_issues_one_mma_per_tile_step(typ, words):
   assert len([u for u in ops if u.op is Ops.PARAM and u.addrspace == AddrSpace.GLOBAL]) == 3
 
 def test_prefill_requires_nv_quant_before_loading():
-  from infurnace.models.qwen3 import Qwen3Model
+  from infurnace.models.qwen35 import Qwen35Model
   with pytest.raises(ValueError, match="requires NV quantized"):
-    Qwen3Model.from_gguf("does-not-exist.gguf", nv_prefill=True)
+    Qwen35Model.from_gguf("does-not-exist.gguf", nv_prefill=True)
 
 def test_prefill_rejects_single_token_and_bad_packed_storage():
   with pytest.raises(QuantGemmError, match="multi-token"):

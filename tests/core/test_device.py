@@ -35,11 +35,10 @@ def test_auto_acceleration(monkeypatch):
   def build(path, **kwargs):
     calls.append(kwargs)
     return Model()
-  monkeypatch.setattr(loader.Qwen3Model, "from_gguf", build)
-  monkeypatch.setattr(loader.Tokenizer, "from_gguf", lambda metadata: None)
+  monkeypatch.setattr(loader, 'read_gguf_metadata', lambda path: {'general.architecture': 'qwen35'})
+  monkeypatch.setattr(loader.Qwen35Model, "from_gguf", build)
+  monkeypatch.setattr(loader.Qwen35Tokenizer, "from_gguf", lambda metadata: None)
   loader.load_model("model", 16, None)
-  assert calls[-1] == {"max_context": 16, "device": "NV", "nv_quant": True, "nv_prefill": True,
-                       "nv_prepared_weights": True, "nv_fused_attention": True}
+  assert calls[-1] == {"max_context": 16, "device": "NV", "nv_quant": True, "nv_prefill": True}
   loader.load_model("model", 16, None, False)
-  assert "nv_quant" not in calls[-1]
-  assert "nv_prefill" not in calls[-1]
+  assert calls[-1] == {"max_context": 16, "device": "NV", "nv_quant": False, "nv_prefill": False}

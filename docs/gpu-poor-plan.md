@@ -19,11 +19,12 @@ ordered by impact. Each one says where the problem is in the code and how to che
 - [ ] Publish a "what works on what" table in the README
 
 **Problem.** The packed kernels turn on only for tinygrad's `NV` backend with its CUDA renderer:
-`supports_nv_quant` (`infurnace/device.py`), `nv_attention_supported` (`kernels/attention.py`),
+`supports_nv_quant` (`infurnace/device.py`) and
 `nv_prefill_supported` (`kernels/quant_gemm.py`). `NV` drives the NVIDIA kernel driver directly:
 Linux only, and probably Turing or newer (check tinygrad's support list). Everything else runs
-upstream's generic path, measured at ~10.75 tok/s against ~93 for Qwen3. Tensor-core prefill also
-needs an `(8,16,16)` FP16 tensor core, so older cards that pass the `NV` check still prefill slowly.
+upstream's generic Qwen3.5 path; benchmark each backend rather than assuming parity with NV.
+Tensor-core GEMM also needs an `(8,16,16)` FP16 tensor core, so older cards that pass the
+`NV` check cannot use that multirow fast path.
 
 **Ideas.**
 - tinygrad has its own RDNA3/4 kernels (`amd_custom_kernels_supported` in
@@ -106,7 +107,8 @@ against greedy decoding in thinking mode because it tends to repeat itself.
 - [x] Say in the README where the DFlash draft GGUF comes from
 
 **Problem.** A plain `pip install -e .` lacks the `qwen35` extra, so bare `infurnace` stops with
-"install infurnace[qwen35]". Model files must be found and copied by hand under exact filenames.
+"install infurnace[qwen35]". Named models now download on first use; tokenizer installation
+is the remaining extra step.
 
 **Check.** On a clean machine, `pip install -e .` then `infurnace` reaches a chat prompt with no
 other steps.
@@ -143,9 +145,7 @@ draft (`draft.observe`).
 
 ## Code simplification
 
-- [ ] Decide whether to keep the Qwen3 path. It carries its own NV attention, prepared-weight
-  options and the benchmark-only `nv_*` options in `loader.load_model`. Qwen3.5 borrows `_NVLinear`
-  from `models/qwen3.py`, so that class would need to move first.
-- [ ] Rewrite or delete `docs/roadmap.md`. It still describes Qwen3-4B as the target, old tinygrad
-  pins and removed flags such as `--no-nv-quant`.
+- [x] Limit the runner to Qwen3.5-4B and DFlash; move shared `_NVLinear` into
+  `models/linear.py`, remove unused model-family attention adapters and loader options.
+- [x] Rewrite `docs/roadmap.md` around the current target and validation gates.
 - [ ] Add direct `_DraftPolicy` tests with fake timings (`dflash/generate.py`).

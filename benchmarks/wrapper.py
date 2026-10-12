@@ -11,18 +11,18 @@ from tinygrad import Context
 
 from decode import measure as _measure
 from infurnace.cli import encode as _prompt_ids
-from infurnace.loader import load_model as _build
+from infurnace.loader import fetch_model, load_model as _build
 
 
 def main():
   parser = argparse.ArgumentParser()
-  parser.add_argument("--model", default="models/Qwen3-4B-Q4_K_M.gguf")
+  parser.add_argument("--model", default="qwen3.5:4b", help="Qwen3.5 model name or local GGUF path")
   parser.add_argument("--device", default="NV")
   parser.add_argument("--context", type=int, default=2048)
   parser.add_argument("--tokens", type=int, default=20)
   args = parser.parse_args()
   if args.tokens < 2: parser.error("--tokens must be at least 2 for decode timing")
-  model, tokenizer = _build(args.model, args.context, args.device, nv_quant=False)
+  model, tokenizer = _build(fetch_model(args.model), args.context, args.device, nv_quant=False)
   ids = _prompt_ids(tokenizer, "Hello, explain what a GPU does.")
 
   def direct_generate(tokens, count):

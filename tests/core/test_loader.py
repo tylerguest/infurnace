@@ -30,83 +30,73 @@ def test_path_is_used_as_is(tiny_models):
 
 def test_dflash_draft_for_names_and_paths(tiny_models, monkeypatch, tmp_path):
   monkeypatch.delenv("INFURNACE_DFLASH_DRAFT")
-  assert loader.dflash_draft("tiny:1b") == "https://example.com/m/tiny-draft.gguf"  # downloaded only when used
+  assert loader.dflash_draft("tiny:1b") == "https://example.com/m/tiny-draft.gguf"
   assert loader.dflash_draft(str(tmp_path / "missing.gguf")) is None
   monkeypatch.setenv("INFURNACE_DFLASH_DRAFT", "~/draft.gguf")
   assert loader.dflash_draft("tiny:1b") == Path.home() / "draft.gguf"
 
-def test_build_uses_loaded_metadata(monkeypatch):
-  metadata = {"test": True}
-  model = SimpleNamespace(metadata=metadata)
+def test_only_supported_preset():
+  assert list(loader.MODELS) == ['qwen3.5:4b']
+  assert loader.MODELS['qwen3.5:4b'][1].endswith('qwen35-4b-dflash-Q4_K_M.gguf')
+
+@pytest.fixture
+def model_loader(monkeypatch):
+  metadata = {'general.architecture': 'qwen35'}
+  monkeypatch.setattr(loader, 'read_gguf_metadata', lambda path: metadata)
+  monkeypatch.setattr(loader, 'select_device', lambda device: device)
+  monkeypatch.setattr(loader, 'supports_nv_quant', lambda device: device == 'NV')
+  monkeypatch.setattr(loader, 'nv_prefill_supported', lambda device: device == 'NV')
   calls = []
-  def from_file(path, **kwargs):
+  model = SimpleNamespace(metadata=metadata)
+  def load(path, **kwargs):
     calls.append((path, kwargs))
     return model
-  monkeypatch.setattr(loader.Qwen3Model, "from_gguf", from_file)
-  monkeypatch.setattr(loader.Tokenizer, "from_gguf", lambda md: md)
-  result, tokenizer = loader.load_model("model", 16, "CPU")
+  monkeypatch.setattr(loader.Qwen35Model, 'from_gguf', load)
+  monkeypatch.setattr(loader.Qwen35Tokenizer, 'from_gguf', lambda md: md)
+  return metadata, model, calls
+
+def test_build_uses_validated_metadata(model_loader):
+  metadata, model, calls = model_loader
+  result, tokenizer = loader.load_model('model', 16, 'CPU')
   assert result is model and tokenizer is metadata
-  assert calls == [("model", {"max_context": 16, "device": "CPU"})]
+  assert calls == [('model', {'max_context': 16, 'device': 'CPU', 'nv_quant': False, 'nv_prefill': False})]
 
-def test_build_prefill_forwarding_and_backend_gate(monkeypatch):
-  monkeypatch.setattr(loader, "select_device", lambda device: device)
-  monkeypatch.setattr(loader, "supports_nv_quant", lambda device: device == "NV")
-  monkeypatch.setattr(loader, "nv_prefill_supported", lambda device: device == "NV")
-  calls = []
-  model = SimpleNamespace(metadata={})
-  def from_file(path, **kwargs):
-    calls.append(kwargs)
-    return model
-  monkeypatch.setattr(loader.Qwen3Model, "from_gguf", from_file)
-  monkeypatch.setattr(loader.Tokenizer, "from_gguf", lambda md: md)
-  assert loader.load_model("model", 64, "NV", nv_quant=True, nv_prefill=True)[0] is model
-  assert calls == [{"max_context": 64, "device": "NV", "nv_quant": True, "nv_prefill": True,
-                    "nv_prepared_weights": True, "nv_fused_attention": True}]
-  with pytest.raises(ValueError, match="requires NV quantized"):
-    loader.load_model("model", 64, "CPU", nv_quant=False, nv_prefill=True)
-  assert len(calls) == 1
+@pytest.mark.parametrize('architecture', ['qwen3', 'llama', 'qwen35moe', None])
+def test_rejects_other_architectures_before_loading(model_loader, architecture):
+  metadata, _, calls = model_loader
+  metadata['general.architecture'] = architecture
+  with pytest.raises(ValueError, match='only dense Qwen3.5'):
+    loader.load_model('model', 16, 'CPU')
+  assert not calls
 
-@pytest.mark.parametrize("quant_supported,prefill_supported,quant_override,prefill_override,expected", [
-  (True, True, None, None, {"nv_quant": True, "nv_prefill": True, "nv_prepared_weights": True, "nv_fused_attention": True}),
-  (True, True, None, False, {"nv_quant": True, "nv_prepared_weights": True, "nv_fused_attention": True}),
-  (True, False, None, None, {"nv_quant": True, "nv_prepared_weights": True, "nv_fused_attention": True}),
-  (False, False, None, None, {}),
-  (True, True, False, None, {}),
+@pytest.mark.parametrize('quant_supported,prefill_supported,quant_override,prefill_override,packed,prefill', [
+  (True, True, None, None, True, True),
+  (True, True, None, False, True, False),
+  (True, False, None, None, True, False),
+  (False, False, None, None, False, False),
+  (True, True, False, None, False, False),
 ])
-def test_build_automatic_prefill(monkeypatch, quant_supported, prefill_supported, quant_override, prefill_override, expected):
-  monkeypatch.setattr(loader, "select_device", lambda device: device)
-  monkeypatch.setattr(loader, "supports_nv_quant", lambda device: quant_supported)
-  monkeypatch.setattr(loader, "nv_prefill_supported", lambda device: prefill_supported)
-  calls = []
-  def from_file(path, **kwargs):
-    calls.append(kwargs)
-    return SimpleNamespace(metadata={})
-  monkeypatch.setattr(loader.Qwen3Model, "from_gguf", from_file)
-  monkeypatch.setattr(loader.Tokenizer, "from_gguf", lambda md: md)
-  loader.load_model("model", 64, "test-device", quant_override, nv_prefill=prefill_override)
-  assert calls == [{"max_context": 64, "device": "test-device", **expected}]
+def test_automatic_acceleration(model_loader, monkeypatch, quant_supported, prefill_supported, quant_override,
+                                prefill_override, packed, prefill):
+  _, _, calls = model_loader
+  monkeypatch.setattr(loader, 'supports_nv_quant', lambda device: quant_supported)
+  monkeypatch.setattr(loader, 'nv_prefill_supported', lambda device: prefill_supported)
+  loader.load_model('model', 64, 'test-device', quant_override, nv_prefill=prefill_override)
+  assert calls == [('model', {'max_context': 64, 'device': 'test-device', 'nv_quant': packed, 'nv_prefill': prefill})]
 
-@pytest.mark.parametrize("fused", [False, True])
-def test_build_attention_forwarding_and_gate(monkeypatch, fused):
-  monkeypatch.setattr(loader, "select_device", lambda device: device)
-  monkeypatch.setattr(loader, "supports_nv_quant", lambda device: device == "NV")
-  monkeypatch.setattr(loader, "nv_prefill_supported", lambda device: False)
-  calls = []
-  def from_file(path, **kwargs):
-    calls.append(kwargs)
-    return SimpleNamespace(metadata={})
-  monkeypatch.setattr(loader.Qwen3Model, "from_gguf", from_file)
-  monkeypatch.setattr(loader.Tokenizer, "from_gguf", lambda md: md)
-  option = {"nv_fused_attention": True} if fused else {"nv_attention": True}
-  loader.load_model("model", 64, "NV", **option)
-  assert calls == [{"max_context": 64, "device": "NV", "nv_quant": True, "nv_prepared_weights": True, **option}]
-  with pytest.raises(ValueError, match="requires NV quantized"):
-    loader.load_model("model", 64, "CPU", **option)
+def test_prefill_forwarding_and_backend_gate(model_loader):
+  _, model, calls = model_loader
+  assert loader.load_model('model', 64, 'NV', nv_quant=True, nv_prefill=True)[0] is model
+  assert calls == [('model', {'max_context': 64, 'device': 'NV', 'nv_quant': True, 'nv_prefill': True})]
+  with pytest.raises(ValueError, match='requires NV quantized'):
+    loader.load_model('model', 64, 'CPU', nv_quant=False, nv_prefill=True)
+  with pytest.raises(ValueError, match='requires NV with'):
+    loader.load_model('model', 64, 'CPU', nv_quant=True)
   assert len(calls) == 1
 
-def test_build_explicit_prefill_rejects_unsupported_tensor_cores(monkeypatch):
-  monkeypatch.setattr(loader, "select_device", lambda device: device)
-  monkeypatch.setattr(loader, "supports_nv_quant", lambda device: True)
-  monkeypatch.setattr(loader, "nv_prefill_supported", lambda device: False)
-  with pytest.raises(ValueError, match="requires CUDA-C FP16 tensor cores"):
-    loader.load_model("model", 64, "NV", nv_prefill=True)
+def test_explicit_prefill_rejects_unsupported_tensor_cores(model_loader, monkeypatch):
+  _, _, calls = model_loader
+  monkeypatch.setattr(loader, 'nv_prefill_supported', lambda device: False)
+  with pytest.raises(ValueError, match='requires CUDA-C FP16 tensor cores'):
+    loader.load_model('model', 64, 'NV', nv_prefill=True)
+  assert not calls

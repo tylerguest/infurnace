@@ -1,7 +1,7 @@
 """Synchronized baseline/DFlash/baseline exact-output protocol, all in tinygrad.
 
 Times whole requests, including prefill (plain decoding prefills one row at a time).
-Results are separate from the published decode chart. Requires no external model runtime.
+Requires the Qwen3.5 target and its draft; no external model runtime.
 RNG storage identities remain stable across captured replays.
 """
 import argparse

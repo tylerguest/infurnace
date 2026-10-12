@@ -43,32 +43,3 @@ def test_shared_q8_projection_parity_and_graph(typ):
     reference = quant_gemv(x, w, out_features=rows, in_features=width, ggml_type=typ)
     for actual in jit(x):
       assert (actual-reference).abs().max().item() == 0
-
-@pytest.mark.nv
-def test_block_shared_packing_prefill_jit_and_reset():
-  import copy
-  from tinygrad import Context, UOp
-  from tinygrad.llm.model import TransformerBlock, TransformerConfig
-  from infurnace.gguf import PackedTensor
-  from infurnace.models.qwen3 import _NVLinear, enable_decode_attention
-  config = TransformerConfig(num_blocks=1, dim=256, hidden_dim=512, n_heads=8, n_kv_heads=2,
-    norm_eps=1e-6, vocab_size=256, head_dim=128, v_head_dim=128, rope_theta=10000,
-    rope_dim=128, qk_norm=128, max_context=32)
-  with Context(DEV='NV'):
-    baseline = TransformerBlock(config)
-    for name in ('attn_q', 'attn_k', 'attn_v', 'attn_output', 'ffn_gate', 'ffn_up', 'ffn_down'):
-      original = getattr(baseline, name)
-      rows, width = original.weight.shape
-      raw = packed(12, rows, width, 'NV').bitcast(dtypes.uint8)
-      setattr(baseline, name, _NVLinear(original, PackedTensor(raw, (rows, width), 12), prefill=True, q6_aligned=True))
-    candidate = copy.copy(baseline)
-    assert enable_decode_attention([baseline, candidate], fused=True) == 2
-    baseline.share_q8, candidate.share_q8 = False, True
-    x = Tensor.randn(1, 2, config.dim, device='NV').realize()
-    assert (baseline(x, 0)-candidate(x, 0)).abs().max().item() == 0
-    jit_baseline, jit_candidate = TinyJit(baseline), TinyJit(candidate)
-    position = UOp.variable('packing_position', 0, 31)
-    for pos in (2, 3, 4, 5, 0, 1):
-      x = Tensor.randn(1, 1, config.dim, device='NV').realize()
-      assert (jit_baseline(x, position.bind(pos))-jit_candidate(x, position.bind(pos))).abs().max().item() == 0
-    assert baseline.cache_kv.uop.buffer is not candidate.cache_kv.uop.buffer

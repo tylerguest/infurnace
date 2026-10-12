@@ -59,14 +59,26 @@ def test_prefill_selection_forwarded_to_children(monkeypatch, flags, expected):
   assert ("--nv-prefill" in commands[0]) is (expected is True)
   assert ("--no-nv-prefill" in commands[0]) is (expected is False)
 
-@pytest.mark.parametrize("flag", ["--nv-attention", "--nv-fused-attention"])
-def test_attention_forwarded_to_child(monkeypatch, flag):
+@pytest.mark.parametrize('worker', ['infurnace', 'tinygrad'])
+def test_comparison_worker_runs_qwen35_fixture(tmp_path, monkeypatch, worker):
   from types import SimpleNamespace
-  args = benchmark.parser().parse_args([flag])
-  commands = []
-  def run(command, **kwargs):
-    commands.append(command)
-    return SimpleNamespace(returncode=0, stdout="{}", stderr="")
-  monkeypatch.setattr(benchmark.subprocess, "run", run)
-  benchmark.run_child(args, "infurnace")
-  assert flag in commands[0]
+  from tinygrad import Context
+  from infurnace.tokenizer import Qwen35Tokenizer
+  from test_qwen35 import checkpoint
+  monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / 'benchmarks'))
+  with Context(DEV='CPU'):
+    path = checkpoint(tmp_path)
+  tokenizer = SimpleNamespace(bos_id=None, encode=lambda text: [1, 2])
+  monkeypatch.setattr(Qwen35Tokenizer, 'from_gguf', lambda metadata: tokenizer)
+  args = benchmark.parser().parse_args(['--worker', worker, '--model', str(path), '--device', 'CPU', '--context', '16',
+                                       '--tokens', '3', '--runs', '1', '--prompt-tokens', '2', '--no-nv-quant'])
+  report = benchmark.worker(args)
+  assert report['runner'] == worker
+  assert report['prompt_ids'] == [1, 2]
+  assert report['context_capacity'] == 16
+  assert report['warm_runs'][0]['all_steps']['tokens'] == 3
+  assert report['nv_quant_linears'] == 0
+
+
+def test_comparison_defaults_to_supported_model():
+  assert benchmark.parser().parse_args([]).model == 'qwen3.5:4b'

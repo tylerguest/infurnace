@@ -1,82 +1,70 @@
 # Architecture
 
-Infurnace is a single-user local Qwen3 application **on tinygrad**. It validates
-local GGUF input, adapts tinygrad's transformer/tokenizer, and provides a small
-CLI. It is not a second transformer implementation or a serving framework.
+Infurnace is a single-user **Qwen3.5-4B application on tinygrad**, with its DFlash
+speculative draft. It is not a second inference engine or general model runner.
 
 ## Ownership
 
 | Module | Responsibility |
 |---|---|
-| `gguf.py` | tinygrad's GGUF parser; packed DISK views and lazy decoding |
-| `models/qwen3.py` | Qwen3 metadata/shape contract, tinygrad config/state loading, bounded generation |
-| `tokenizer.py` | SimpleTokenizer adapter and bundled text-only Qwen3 chat rendering |
-| `cli.py` | Single-shot/chat, UTF-8 streaming, interruption and baseline benchmark reporting |
-| `kernels/quant_gemv.py` | NV packed projections; generic fallback and shared packed storage |
+| `loader.py` | One supported preset, first-use downloads, architecture validation and device dispatch |
+| `gguf.py` | Tinygrad's GGUF parser, truncation checks, packed DISK views and lazy decoding |
+| `models/qwen35.py` | Upstream model loading, runner-facing config, bounded generation, packed loading and parameter cache |
+| `models/linear.py` | Packed NV projection adapter shared by target and draft |
+| `tokenizer.py` | Qwen3.5 BPE/NFC encoding, byte-stream decoding and text-only chat |
+| `cli.py` | Chat, raw prompts, warmup, context rollover and per-step benchmarks |
+| `serve.py` | Device/lifecycle adapter and GGUF template for tinygrad's HTTP server |
+| `dflash/` | Draft features/cache, request ownership, adaptive drafting and parallel verification |
+| `kernels/` | Packed GEMV/GEMM, embedding lookup and fused GDN operations |
 
-Tinygrad owns transformer blocks, Q/K normalization, RoPE, attention, FFN,
-KV-cache writes, prefix reuse, chunked prefill, sampling and TinyJit. Infurnace
-uses the pinned `Transformer` and its state loader rather than reproducing math.
+Tinygrad owns hybrid layer configuration, ordinary transformer execution, cache
+allocation/prefix reuse, RoPE, sampling and JIT. Infurnace dispatches packed
+projections and supported one-row GDN work to custom tinygrad UOp kernels.
+DFlash's multirow verifier implements speculative execution and commits only
+accepted recurrent-state rows; see [DFlash](dflash.md).
 
 ## Loading
 
 ```text
-GGUF → parse/validate metadata and descriptors
-     → validate Qwen3 config and weight shapes
-     → transfer packed bytes once to explicit CPU/NV device
-     → lazy decoded views, FP16 casts (same cast for tied weights)
-     → tinygrad TransformerConfig + Transformer + load_state_dict(realize=False)
+qwen3.5:4b or local GGUF
+  → resolve/download target
+  → validate dense Qwen3.5 architecture
+  → build Qwen3.5 tokenizer and upstream Transformer
+  → on eligible NV, stage packed weights and install packed projections
+  → realize remaining small parameters, using a source/model-keyed disk cache
 ```
 
-No whole-model FP16 realization is requested. This does not promise that every
-consumer fuses decoding: measure schedules and memory. DISK is storage only.
-The custom loader remains while its stricter validation/storage control is
-useful; replacing it with preflight checks plus upstream loading is an option.
+The tied output head and embedding share packed storage. An explicit untied
+output head must not replace the embedding table. Multirow embeddings use a
+packed gather for tied weights or a host FP16 table otherwise.
+
+Other architectures are rejected; there is no alternate model-family fallback.
+The supported preset is 4B, though small Qwen3.5 fixtures exercise CPU behavior.
 
 ## Generation and state
 
-`Qwen3Model.generate()` validates inputs, copies the prompt list, bounds output
-by token/context limits, and delegates to upstream generation. Upstream samples
-and synchronizes each token before returning its Python integer. Temperature
-zero follows upstream sampling semantics (temperature is clamped internally).
+`Qwen35Model.generate()` validates IDs and budgets, copies the prompt, bounds
+output by context, and delegates to upstream generation. Its device context is
+active only while advancing upstream, not while yielding application tokens.
+Only one stream may own the model; callers must close abandoned streams.
+Reset invalidates reusable prefix tokens without reallocating caches or JITs.
 
-The device Context is active only while advancing upstream generation, not
-while yielding to application code. Only one stream may be active per model;
-callers must close abandoned generators. Reset invalidates upstream's cached
-prefix, not the allocated KV tensors or captured programs. Prefix reuse is
-upstream token-based behavior; changed chat formatting may reduce reuse.
+DFlash holds the same exclusive model ownership, resets its transient state per
+request, and invalidates ordinary-generation prefix reuse. Sequential verification
+steps one row at a time; NV defaults to fixed-width parallel verification.
 
-The CLI checks EOS, closes streams and flushes incremental UTF-8 decoding at all
-exit paths. Chat reserves response space by dropping oldest complete turns
-with a notice; it rejects an individual oversized message without changing
-history. Default chat generation runs until EOS or remaining context rather
-than an artificial response cap. Explicit --max-tokens remains available. `--prompt` is raw text; `--chat` uses the
-bundled Qwen3 template. Thinking is on by default, configurable with
-`--no-thinking`. Tools and non-text content are unsupported.
+The CLI handles EOS and UTF-8 flushes, rejects oversized individual messages,
+and drops oldest complete turns with a visible notice. Thinking is enabled by
+default. HTTP serving uses the GGUF Jinja template and upstream tool parser;
+it does not use DFlash or the basic CLI chat formatter.
 
-## Baseline and optimization
+## Performance boundary
 
-The baseline disables custom quantized linears and uses generic tinygrad ops on
-NV. Packed quantized acceleration (automatic on NV) installs linear adapters using explicit GGUF descriptors:
-concrete single-token inputs use GEMV, multi-token inputs use the original
-linear. The final output projection may use GEMV during prefill because it
-projects only the last token. Packed typed storage is prepared once and shared
-with the generic dequant expression. Activation Q8 changes numerical behavior;
-this remains experimental pending full-model quality and longer-context evaluation.
-The CLI now selects a usable GPU by preference (NV, AMD, Metal, CUDA, CL), then
-CPU, respecting explicit --device/DEV overrides. Supported NV/CUDA-C devices
-use the fast path automatically; --no-nv-quant restores generic operations.
-This is not an exhaustive fastest-device benchmark or model-fit guarantee.
+Packed GEMV uses Q8-rounded activations; multirow tensor-core GEMM rounds to
+FP16 and accumulates in FP32. These differ numerically from generic operations.
+Use `loader.load_model(..., nv_quant=False)` or benchmark `--no-nv-quant` for
+the generic baseline. Plain NV generation still prefills recurrent models one
+row at a time; DFlash's prefill is multirow.
 
-Benchmarks report cold/warm first-token and decode timings, actual counts, host
-peak RSS and tinygrad current allocated memory. First-token time includes
-prefill/output work and cold compilation; the derived prefill rate is not a
-pure transformer-prefill measurement. GPU peak polling and comparisons with
-upstream/llama.cpp are separate measurements, not implied by the CLI counters.
-
-## Scope
-
-Runtime dependency: pinned tinygrad. Development tests use Jinja as the actual
-GGUF-template oracle and optionally llama.cpp for tokenizer parity. No server,
-scheduler, batching or multi-GPU. Evaluate the upstream server before adding a
-thin localhost adapter for Pi. See [roadmap](roadmap.md) for gates and status.
+Timing counters estimate traffic and work, not measured DRAM bandwidth or GPU
+peak memory. See [benchmarks](../benchmarks/README.md) and [roadmap](roadmap.md).

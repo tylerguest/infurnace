@@ -7,7 +7,8 @@ from tinygrad import Tensor, TinyJit, dtypes
 
 from infurnace.gguf import PackedTensor
 from tinygrad.llm.gguf import ggml_data_to_tensor as _dequant
-from infurnace.models.qwen3 import _NVLinear, Qwen3Model
+from infurnace.models.linear import _NVLinear
+from infurnace.models.qwen35 import Qwen35Model
 from infurnace.kernels.quant_gemv import quant_gemv, QuantGemvError
 
 def test_submission_link_reinitializes_reused_signal_storage():
@@ -52,7 +53,7 @@ def test_kernel_rejects_packed_size():
 @pytest.mark.skipif(not os.environ.get("INFURNACE_TEST_NV"), reason="set INFURNACE_TEST_NV=1 on an NV GPU")
 @pytest.mark.parametrize("typ,size", [(12, 144), (14, 210)])
 @pytest.mark.parametrize("tied", [True, False])
-def test_nv_adapter_preserves_embedding_ties(typ, size, tied):
+def test_nv_adapter_preserves_embedding_ties(typ, size, tied, monkeypatch):
   from types import SimpleNamespace
   from tinygrad import nn
   raw = Tensor(bytes(16*size), dtype=dtypes.uint8, device="NV").realize()
@@ -63,20 +64,23 @@ def test_nv_adapter_preserves_embedding_ties(typ, size, tied):
   old_embedding = embedding.weight
   output = nn.Linear(256, 16, bias=False)
   output.weight = old_embedding if tied else output_entry.decode().half()
-  runner = object.__new__(Qwen3Model)
-  runner.device = "NV"
+  runner = object.__new__(Qwen35Model)
+  runner.device, runner.nv_quant_linears = "NV", 0
   runner.transformer = SimpleNamespace(output=output, token_embd=embedding, blk=[])
-  runner._enable_nv_quant({"token_embd.weight": embedding_entry, "output.weight": output_entry})
+  entries = {'token_embd.weight': embedding_entry}
+  if not tied: entries['output.weight'] = output_entry
+  monkeypatch.setattr('infurnace.models.qwen35.parse_gguf', lambda path: ({}, entries))
+  runner._enable_packed('unused.gguf', prefill=False)
   adapter = runner.transformer.output
+  assert runner._tied_head is tied
+  assert adapter.weight is None and adapter.original.weight is None
   if tied:
-    assert embedding.weight.uop is adapter.weight.uop
     # Every resident buffer reachable through the embedding is on adapter storage.
     from tinygrad.uop.ops import Ops
     bases = {u.buffer.base for u in embedding.weight.uop.toposort() if u.op is Ops.BUFFER}
     assert bases == {adapter.packed.uop.buffer.base}
   else:
     assert embedding.weight is old_embedding
-    assert embedding.weight.uop is not adapter.weight.uop
 
 @pytest.mark.skipif(not os.environ.get("INFURNACE_TEST_NV"), reason="set INFURNACE_TEST_NV=1 on an NV GPU")
 @pytest.mark.parametrize("typ,size", [(12, 144), (14, 210)])
