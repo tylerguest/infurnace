@@ -21,6 +21,58 @@ def _raw_features(verifier):
   from infurnace.dflash.parallel import _raw
   return _raw(verifier._features)
 
+def _accepted(proposals: list[int], decisions: list[int]) -> int:
+  accepted = 0
+  while accepted < len(proposals) and proposals[accepted] == decisions[accepted]: accepted += 1
+  return accepted
+
+class _DraftPolicy:
+  """Adaptive drafting: draft only while a round costs less wall time per emitted token than an
+  ordinary one-row step. Otherwise decode ordinary rows (still collecting features) for a cooldown,
+  backing off exponentially while probes keep losing. Until a one-row step has been timed, a
+  tokens-per-round threshold decides the first fallback. The cost is a ratio of running averages
+  (round time / emitted tokens), so a single round with nothing accepted cannot outweigh good rounds.
+
+  min_tau and plain_cost are read from the generator on every decision: warmup overrides them,
+  and plain steps update plain_cost mid-request."""
+  def __init__(self, generator, block: int):
+    self.generator, self.block = generator, block
+    self.tau, self.cooldown, self.backoff, self.probing = float(block), 0, 1, False
+    self.spec_time = self.spec_tokens = None
+    self.timed_rounds = 0  # timed rounds since the last probe
+    self.started = 0.0
+
+  def start(self, count: int) -> int:
+    """Proposals for the next round (0 while cooling down); starts the round's timer."""
+    if self.cooldown:
+      self.cooldown, count = self.cooldown - 1, 0
+      self.probing = not self.cooldown
+    self.started = time.perf_counter()
+    return count
+
+  def record(self, accepted: int):
+    g, elapsed = self.generator, time.perf_counter() - self.started
+    if self.spec_time is None or self.probing: self.spec_time, self.spec_tokens, self.timed_rounds = elapsed, accepted + 1, 0
+    else:
+      m = g.spec_memory
+      self.spec_time, self.spec_tokens = m * self.spec_time + (1 - m) * elapsed, m * self.spec_tokens + (1 - m) * (accepted + 1)
+    self.tau, self.probing, self.timed_rounds = 0.5 * self.tau + 0.5 * (accepted + 1), False, self.timed_rounds + 1
+    if g.plain_cost is not None: losing = self.timed_rounds >= g.min_timed_rounds and self.spec_time / self.spec_tokens > g.plain_cost
+    else: losing = self.tau < g.min_tau
+    if losing: self._back_off()
+    elif self.timed_rounds >= g.min_timed_rounds: self.backoff = 1
+
+  def record_untimed(self, accepted: int):
+    """A round whose wall time is not representative (a capture, or the unfused probe that
+    re-enters fused rounds) only updates the tokens-per-round estimate; `probing` stays set
+    for the next timed round."""
+    self.tau = 0.5 * self.tau + 0.5 * (accepted + 1)
+    if self.tau < self.generator.min_tau: self._back_off()
+
+  def _back_off(self):
+    g = self.generator
+    self.tau, self.cooldown, self.backoff = float(self.block), g.cooldown_steps * self.backoff, min(self.backoff * 2, g.max_backoff)
+
 class DFlashGenerator:
   def __init__(self, model, draft, *, verifier: str = 'sequential'):
     if model.device.split(':')[0] not in ('CPU', 'NV'):
@@ -60,148 +112,130 @@ class DFlashGenerator:
     with self.observer as observer:
       self.stats = DFlashStats()
       self.draft.reset()
-      emitted = 0
-      # Every committed target row's features go to the draft as they are
-      # produced (draft.observe copies them into fixed-shape staging).
-      def step(token):
-        decision, _ = observer.step(token, snapshot=False, consume=self.draft.observe)
-        self.stats.target_steps += 1
-        return decision
+      # A parallel verify is held uncommitted: the next fused round commits it
+      # on device; any other path flushes it (commit + keep its feature rows).
+      self._held = self._held_decisions = None
       try:
-        if self.verifier == 'parallel' and block > 1:
-          # Multirow prompt prefill in fixed-width chunks; the tail falls back
-          # to one-row steps only when a chunk would overrun the context.
-          verifier, done = self._parallel_verifier(block), 0
-          while done < len(tokens) and verifier.fits(observer.position):
-            chunk = tokens[done:done + verifier.rows]
-            decisions, features = verifier.prefill(chunk)
-            verifier.commit(len(chunk), decisions)
-            self.stats.target_steps += 1
-            self.draft.observe(features[:, :len(chunk)])
-            anchor, done = decisions[len(chunk) - 1], done + len(chunk)
-          for token in tokens[done:]: anchor = step(token)
-        else:
-          for token in tokens: anchor = step(token)
-        # Adaptive drafting: draft only while parallel rounds cost less wall time
-        # per emitted token than an ordinary one-row step. Otherwise decode
-        # ordinary rows (still collecting features), backing off exponentially
-        # while probes keep losing. Until a one-row step has been timed, a
-        # tokens-per-round threshold decides the first fallback.
-        # The cost is a ratio of running sums (round time / emitted tokens), so a
-        # single round with nothing accepted cannot outweigh good rounds.
-        tau, cooldown, backoff, probing = float(block), 0, 1, False
-        spec_time = spec_tokens = None
-        timed_rounds = 0  # timed rounds since the last probe
-        # A parallel verify is held uncommitted: the next fused round commits it
-        # on device; any other path flushes it (commit + keep its feature rows).
-        held = held_decisions = None
-        def flush():
-          nonlocal held
-          if held is None: return
-          verifier = self._parallel_verifier(block)
-          verifier.commit(held, held_decisions)
-          self.draft.observe(_raw_features(verifier)[:, :held])
-          held = None
-        def account(accepted):
-          nonlocal spec_time, spec_tokens, timed_rounds, tau, probing, cooldown, backoff
-          elapsed = time.perf_counter() - started
-          if spec_time is None or probing: spec_time, spec_tokens, timed_rounds = elapsed, accepted + 1, 0
-          else:
-            m = self.spec_memory
-            spec_time, spec_tokens = m * spec_time + (1 - m) * elapsed, m * spec_tokens + (1 - m) * (accepted + 1)
-          tau, probing, timed_rounds = 0.5 * tau + 0.5 * (accepted + 1), False, timed_rounds + 1
-          if self.plain_cost is not None: losing = timed_rounds >= self.min_timed_rounds and spec_time / spec_tokens > self.plain_cost
-          else: losing = tau < self.min_tau
-          if losing: tau, cooldown, backoff = float(block), self.cooldown_steps * backoff, min(backoff * 2, self.max_backoff)
-          elif timed_rounds >= self.min_timed_rounds: backoff = 1
-        def account_untimed(accepted):
-          # A round whose wall time is not representative (a capture, or the
-          # unfused probe that re-enters fused rounds) only updates the
-          # tokens-per-round estimate; `probing` stays set for the next timed round.
-          nonlocal tau, cooldown, backoff
-          tau = 0.5 * tau + 0.5 * (accepted + 1)
-          if tau < self.min_tau: tau, cooldown, backoff = float(block), self.cooldown_steps * backoff, min(backoff * 2, self.max_backoff)
-        while emitted < limit:
+        anchor, policy, emitted = self._prefill(tokens, block), _DraftPolicy(self, block), 0
+        while True:
           emitted += 1
           yield anchor
           if anchor in eos_token_ids or emitted == limit: return
-          count = min(block - 1, limit - emitted, self.model.config.context_length - observer.position - 1)
-          if cooldown:
-            cooldown, count = cooldown - 1, 0
-            probing = not cooldown
-          started = time.perf_counter()
-          if self.verifier == 'parallel' and count and held is not None:
-            verifier = self._parallel_verifier(block)
-            if self.fused and verifier.fused_eligible(self.draft) and verifier.fits(observer.position + held):
-              decisions, proposals = verifier.fused_round(self.draft, held, anchor)
-              proposals = proposals[:count]
-              self.stats.rounds += 1
-              self.stats.proposed += len(proposals)
-              self.stats.target_steps += 1
-              accepted = 0
-              while accepted < len(proposals) and proposals[accepted] == decisions[accepted]: accepted += 1
-              self.stats.accepted += accepted
-              held, held_decisions = accepted + 1, decisions
-              self._samples['fused'] += 1
-              (account if self._samples['fused'] > 2 else account_untimed)(accepted)
-              for token in proposals[:accepted]:
-                emitted += 1
-                yield token
-                if token in eos_token_ids or emitted == limit: return
-              anchor = decisions[accepted]
-              continue
-          flush()
-          if count:
-            proposals = self.draft.propose(anchor, observer.position, count)
-            if len(proposals) != count or any(type(t) is not int or not 0 <= t < self.model.config.vocab_size for t in proposals):
-              raise ValueError('invalid DFlash proposals')
-          else: proposals = []
-          self.stats.rounds += 1
-          self.stats.proposed += len(proposals)
-          if self.verifier == 'parallel' and proposals:
-            verifier = self._parallel_verifier(block)
-            if verifier.fits(observer.position):
-              decisions, _ = verifier.verify([anchor, *proposals])
-              accepted = 0
-              while accepted < len(proposals) and proposals[accepted] == decisions[accepted]: accepted += 1
-              self.stats.target_steps += 1
-              self.stats.accepted += accepted
-              held, held_decisions = accepted + 1, decisions
-              fused_next = self.fused and verifier.fused_eligible(self.draft)
-              (account_untimed if fused_next else account)(accepted)
-              for token in proposals[:accepted]:
-                emitted += 1
-                yield token
-                if token in eos_token_ids or emitted == limit: return
-              anchor = decisions[accepted]
-              continue
-          current = anchor
-          if not proposals and self.verifier == 'parallel':
-            # Time the step alone: flush() above is a one-off per fallback and
-            # compiles per held-row count. Skip capture samples and outliers.
-            stepped = time.perf_counter()
-            anchor = step(current)
-            cost = time.perf_counter() - stepped
-            self._samples['plain'] += 1
-            if self._samples['plain'] > 2 and (self.plain_cost is None or cost < 4 * self.plain_cost):
-              self.plain_cost = cost if self.plain_cost is None else 0.8 * self.plain_cost + 0.2 * cost
-            continue
-          for proposal in proposals:
-            selected = step(current)
-            if selected != proposal:
-              anchor = selected
+          count = policy.start(min(block - 1, limit - emitted, self.model.config.context_length - observer.position - 1))
+          # A round yields its accepted tokens and returns the next anchor. Stopping here leaves it
+          # suspended, so a sequential round never steps the target past an EOS or the limit.
+          drafted = self._round(block, anchor, count, policy)
+          while True:
+            try: token = next(drafted)
+            except StopIteration as stop:
+              anchor = stop.value
               break
-            self.stats.accepted += 1
             emitted += 1
-            yield selected
-            if selected in eos_token_ids or emitted == limit: return
-            current = selected
-          else:
-            # Produce the bonus anchor after a fully accepted block (or the
-            # ordinary next anchor for block=1). Never process the final output.
-            anchor = step(current)
+            yield token
+            if token in eos_token_ids or emitted == limit: return
       finally:
         self.draft.reset()
+
+  def _step(self, token: int) -> int:
+    # Every committed target row's features go to the draft as they are
+    # produced (draft.observe copies them into fixed-shape staging).
+    decision, _ = self.observer.step(token, snapshot=False, consume=self.draft.observe)
+    self.stats.target_steps += 1
+    return decision
+
+  def _prefill(self, tokens: list[int], block: int) -> int:
+    """Run the prompt through the target; returns its decision for the first output."""
+    if self.verifier == 'parallel' and block > 1:
+      # Multirow prompt prefill in fixed-width chunks; the tail falls back
+      # to one-row steps only when a chunk would overrun the context.
+      verifier, done = self._parallel_verifier(block), 0
+      while done < len(tokens) and verifier.fits(self.observer.position):
+        chunk = tokens[done:done + verifier.rows]
+        decisions, features = verifier.prefill(chunk)
+        verifier.commit(len(chunk), decisions)
+        self.stats.target_steps += 1
+        self.draft.observe(features[:, :len(chunk)])
+        anchor, done = decisions[len(chunk) - 1], done + len(chunk)
+      for token in tokens[done:]: anchor = self._step(token)
+    else:
+      for token in tokens: anchor = self._step(token)
+    return anchor
+
+  def _flush(self, block: int):
+    if self._held is None: return
+    verifier = self._parallel_verifier(block)
+    verifier.commit(self._held, self._held_decisions)
+    self.draft.observe(_raw_features(verifier)[:, :self._held])
+    self._held = None
+
+  def _round(self, block: int, anchor: int, count: int, policy: _DraftPolicy):
+    """One round after `anchor`: fused, parallel or sequential drafting, or a plain step when `count` is 0."""
+    parallel = self.verifier == 'parallel'
+    if parallel and count and self._held is not None:
+      verifier = self._parallel_verifier(block)
+      if self.fused and verifier.fused_eligible(self.draft) and verifier.fits(self.observer.position + self._held):
+        return (yield from self._fused_round(verifier, anchor, count, policy))
+    self._flush(block)
+    proposals = self.draft.propose(anchor, self.observer.position, count) if count else []
+    if len(proposals) != count or any(type(t) is not int or not 0 <= t < self.model.config.vocab_size for t in proposals):
+      raise ValueError('invalid DFlash proposals')
+    self.stats.rounds += 1  # plain steps count as rounds too
+    self.stats.proposed += len(proposals)
+    if parallel and proposals and self._parallel_verifier(block).fits(self.observer.position):
+      return (yield from self._parallel_round(self._parallel_verifier(block), anchor, proposals, policy))
+    if parallel and not proposals: return self._plain_step(anchor)
+    return (yield from self._sequential_round(anchor, proposals))
+
+  def _fused_round(self, verifier, anchor: int, count: int, policy: _DraftPolicy):
+    """Commit the held block, draft and verify the next one on device (one readback)."""
+    decisions, proposals = verifier.fused_round(self.draft, self._held, anchor)
+    proposals = proposals[:count]
+    accepted = _accepted(proposals, decisions)
+    self.stats.rounds += 1
+    self.stats.proposed += len(proposals)
+    self.stats.target_steps += 1
+    self.stats.accepted += accepted
+    self._held, self._held_decisions = accepted + 1, decisions
+    self._samples['fused'] += 1
+    (policy.record if self._samples['fused'] > 2 else policy.record_untimed)(accepted)
+    yield from proposals[:accepted]
+    return decisions[accepted]
+
+  def _parallel_round(self, verifier, anchor: int, proposals: list[int], policy: _DraftPolicy):
+    """Verify host-drafted proposals in one multirow target forward; the block is held uncommitted."""
+    decisions, _ = verifier.verify([anchor, *proposals])
+    accepted = _accepted(proposals, decisions)
+    self.stats.target_steps += 1
+    self.stats.accepted += accepted
+    self._held, self._held_decisions = accepted + 1, decisions
+    # The unfused round that re-enters fused rounds is a probe; its time is not representative.
+    (policy.record_untimed if self.fused and verifier.fused_eligible(self.draft) else policy.record)(accepted)
+    yield from proposals[:accepted]
+    return decisions[accepted]
+
+  def _plain_step(self, anchor: int) -> int:
+    # Time the step alone: the flush before it is a one-off per fallback and
+    # compiles per held-row count. Skip capture samples and outliers.
+    stepped = time.perf_counter()
+    anchor = self._step(anchor)
+    cost = time.perf_counter() - stepped
+    self._samples['plain'] += 1
+    if self._samples['plain'] > 2 and (self.plain_cost is None or cost < 4 * self.plain_cost):
+      self.plain_cost = cost if self.plain_cost is None else 0.8 * self.plain_cost + 0.2 * cost
+    return anchor
+
+  def _sequential_round(self, anchor: int, proposals: list[int]):
+    """Step the target one row per proposal, stopping at the first mismatch."""
+    current = anchor
+    for proposal in proposals:
+      selected = self._step(current)
+      if selected != proposal: return selected
+      self.stats.accepted += 1
+      yield selected
+      current = selected
+    # The bonus anchor after a fully accepted block (or the ordinary next anchor
+    # when nothing was proposed). Never reached past an EOS or the limit.
+    return self._step(current)
 
   def warmup(self, block_size: int | None = None) -> None:
     """Capture the graphs a request uses before the first one: drafting rounds
