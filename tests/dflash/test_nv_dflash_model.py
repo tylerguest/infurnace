@@ -31,7 +31,7 @@ def test_cold_first_request_matches_plain_decoding_prefix(loaded):
   # Must run first in this module: DFlash is the model's first work, as for a
   # bare `infurnace --prompt` run. Upstream target state starts lazy; before it
   # was realized up front, this request diverged within a few tokens.
-  from infurnace.chat import prompt_ids as _prompt_ids
+  from infurnace.cli import encode as _prompt_ids
   model, tokenizer, generator = loaded
   ids = _prompt_ids(tokenizer, 'Write a Python function that returns the n-th Fibonacci number.')
   generator.min_tau, generator.plain_cost, generator.fused = 3.5, None, True  # CLI defaults: adaptive, so plain steps run too

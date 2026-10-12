@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from tinygrad import Context
 
 from decode import measure as _measure
-from infurnace.chat import prompt_ids as _prompt_ids
+from infurnace.cli import encode as _prompt_ids
 from infurnace.loader import load_model as _build
 
 

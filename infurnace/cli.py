@@ -2,10 +2,11 @@
 from __future__ import annotations
 import argparse
 import sys
+import time
 from pathlib import Path
+from typing import Callable, Iterator
 from tinygrad.helpers import GlobalCounters, Timing, profile_marker
 from infurnace import loader
-from infurnace.chat import Decoder, run_chat, run_prompt
 
 PROMPT_MAX_TOKENS = 64
 
@@ -86,6 +87,72 @@ def _dflash_draft(args: argparse.Namespace) -> tuple[Path | None, bool]:
   draft = loader.default_dflash_draft()
   return (draft, True) if draft is not None and draft.is_file() and loader.is_qwen35(args.model) else (None, False)
 
+def _dflash_block(dflash) -> int:
+  # Parallel verification checks a whole trained block; the sequential reference checks 4 rows.
+  return dflash.draft.config.block_size if dflash.verifier == 'parallel' else 4
+
+def generator(model, tokenizer, dflash=None, eagle=None) -> Callable[[list[int], int], Iterator[int]]:
+  """generate(ids, budget): plain decoding, or a DFlash / EAGLE-3 speculative generator."""
+  eos = tuple(i for i in (tokenizer.eos_id, tokenizer.eot_id) if i is not None)
+  if dflash is not None:
+    block = _dflash_block(dflash)
+    return lambda ids, budget: dflash.stream(ids, max_new_tokens=budget, block_size=block, eos_token_ids=eos)
+  if eagle is not None: return lambda ids, budget: eagle.stream(ids, max_new_tokens=budget, draft_tokens=1, eos_token_ids=eos, batched=True)
+  return model.generate
+
+def warmup(model, dflash=None) -> None:
+  print(f"Warming up {model.device} (first startup may take a while)...", file=sys.stderr, flush=True)
+  start = time.perf_counter()
+  # DFlash requests never use plain generation's graphs, so it captures its own.
+  how = dflash.warmup(_dflash_block(dflash)) if dflash is not None else model.warmup()
+  note = {'cached': ' (DFlash graphs from cache)', 'captured': ' (DFlash graphs cached for next time)'}.get(how, '')
+  print(f"Ready in {time.perf_counter() - start:.1f}s{note}.", file=sys.stderr, flush=True)
+
+def encode(tokenizer, text: str) -> list[int]:
+  return ([tokenizer.bos_id] if tokenizer.bos_id is not None else []) + tokenizer.encode(text)
+
+def reply(generate, tokenizer, ids: list[int], max_tokens: int | None, context: int) -> str:
+  """Print a reply as it is generated and return its text. Without max_tokens it may fill the context."""
+  budget = context - len(ids) if max_tokens is None else max_tokens
+  decode, text, generated, ended = tokenizer.stream_decoder(), "", 0, False
+  stream = generate(ids, budget)
+  try:
+    for token in stream:
+      generated += 1
+      if (ended := tokenizer.is_end(token)): break
+      print(piece := decode(token), end="", flush=True)
+      text += piece
+  finally:
+    stream.close()
+    print(piece := decode(None), flush=True)
+    text += piece
+  if not ended and generated >= context - len(ids):
+    print("[Response stopped: context limit reached. Increase --max-context for longer answers.]", file=sys.stderr)
+  elif not ended:
+    print(f"[Response stopped: {budget}-token limit reached (includes thinking). Increase --max-tokens or use --no-thinking.]",
+          file=sys.stderr)
+  return text
+
+def chat(generate, tokenizer, context: int, max_tokens: int | None, thinking: bool = True) -> int:
+  """Interactive chat. When a new message would not fit, the oldest turns are dropped."""
+  history: list[dict] = []
+  reserve = min(max_tokens or 1024, max(1, context // 2))  # room left for the reply
+  while True:
+    try: message = {"role": "user", "content": input(">>> ")}
+    except EOFError: return 0
+    retained = list(history)
+    while True:
+      ids = encode(tokenizer, tokenizer.render_chat(retained + [message], enable_thinking=thinking))
+      if len(ids) < context - reserve or not retained: break
+      retained = retained[2:]  # history is user/assistant pairs; keep the newest
+    if len(ids) >= context:
+      print("Message exceeds context even without history; shorten it or increase --max-context. History was not truncated.",
+            file=sys.stderr)
+      continue
+    if (dropped := (len(history) - len(retained)) // 2):
+      print(f"[Context window: discarded {dropped} oldest turn(s); earlier details are no longer remembered.]", file=sys.stderr)
+    history = retained + [message, {"role": "assistant", "content": reply(generate, tokenizer, ids, max_tokens, context)}]
+
 def run(args: argparse.Namespace) -> int:
   draft, automatic = _dflash_draft(args)
   model, tokenizer = loader.load_model(args.model, args.max_context, args.device)
@@ -98,16 +165,17 @@ def run(args: argparse.Namespace) -> int:
   if args.eagle3 is not None:
     eagle = loader.load_eagle(model, args.eagle3)
     print("EAGLE-3 speculative decoding (experimental): the first reply captures graphs and can be slow.", file=sys.stderr, flush=True)
-  decoder = Decoder(model, tokenizer, dflash=dflash, eagle=eagle)
+  generate, context = generator(model, tokenizer, dflash, eagle), model.config.context_length
 
+  if args.prompt is not None:
+    reply(generate, tokenizer, encode(tokenizer, args.prompt), args.max_tokens or PROMPT_MAX_TOKENS, context)
+    return 0
+  if not args.no_warmup: warmup(model, dflash)
   if args.serve is not None:
     from infurnace.serve import serve
-    if not args.no_warmup: decoder.warmup()
     serve(model, tokenizer, args.serve, args.host, enable_thinking=not args.no_thinking)
     return 0
-  if args.prompt is not None: return run_prompt(decoder, tokenizer, args.prompt, args.max_tokens or PROMPT_MAX_TOKENS)
-  if not args.no_warmup: decoder.warmup()
-  return run_chat(decoder, tokenizer, args.max_tokens, args.max_context, thinking=not args.no_thinking)
+  return chat(generate, tokenizer, min(args.max_context, context), args.max_tokens, thinking=not args.no_thinking)
 
 def main(argv: list[str] | None = None) -> int:
   args = parse_args(argv)

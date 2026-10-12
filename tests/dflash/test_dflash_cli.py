@@ -1,14 +1,13 @@
 from types import SimpleNamespace
 import pytest
 from infurnace import cli, loader
-from infurnace.chat import Decoder, stream_reply
 from test_eagle_cli import Engine, Tokenizer
 
 @pytest.mark.parametrize('verifier,block', [('parallel', 16), ('sequential', 4)])
 def test_dflash_stream_block_eos_and_close(capsys, verifier, block):
   model = SimpleNamespace(config=SimpleNamespace(context_length=16))
   engine = Engine(verifier=verifier)
-  assert stream_reply(Decoder(model, Tokenizer(), dflash=engine), Tokenizer(), [1, 2], None) == '3!'
+  assert cli.reply(cli.generator(model, Tokenizer(), dflash=engine), Tokenizer(), [1, 2], None, 16) == '3!'
   assert engine.closed
   assert engine.calls == [([1, 2], {'max_new_tokens': 14, 'block_size': block, 'eos_token_ids': (9, 10)})]
   assert capsys.readouterr().out == '3!\n'
@@ -39,14 +38,14 @@ def test_installed_draft_is_used_automatically(monkeypatch, tmp_path, device, fl
   draft.touch()
   monkeypatch.setenv('INFURNACE_DFLASH_DRAFT', str(draft))
   monkeypatch.setattr(loader, 'is_qwen35', lambda path: True)
-  model = SimpleNamespace(config=SimpleNamespace(context_length=16), device=device)
+  plain = []
+  model = SimpleNamespace(config=SimpleNamespace(context_length=16), device=device, generate=lambda ids, n: (t for t in plain.append(ids) or ()))
   monkeypatch.setattr(loader, 'load_model', lambda *a, **kw: (model, Tokenizer()))
-  loaded, decoders = [], []
-  monkeypatch.setattr(loader, 'load_dflash', lambda target_model, path: loaded.append(path) or Engine())
-  monkeypatch.setattr(cli, 'run_prompt', lambda decoder, *a: decoders.append(decoder) or 0)
-  monkeypatch.setattr(Decoder, 'warmup', lambda self: None)
-  monkeypatch.setattr('infurnace.serve.serve', lambda model, *a, **kw: decoders.append(None))
+  loaded, engine = [], Engine()
+  monkeypatch.setattr(loader, 'load_dflash', lambda target_model, path: loaded.append(path) or engine)
+  monkeypatch.setattr(cli, 'warmup', lambda *a: None)
+  monkeypatch.setattr('infurnace.serve.serve', lambda model, *a, **kw: None)
   run = ['--prompt', 'hello'] if '--serve' not in flags else []
   assert cli.main(['--model', str(target), *run, *flags]) == 0
   assert loaded == ([draft] if enabled else [])
-  if '--serve' not in flags: assert (decoders[0].dflash is not None) == enabled
+  if '--serve' not in flags: assert (bool(engine.calls), bool(plain)) == (enabled, not enabled)

@@ -3,7 +3,6 @@ from types import SimpleNamespace
 import pytest
 
 from infurnace import cli, loader
-from infurnace.chat import Decoder, stream_reply
 
 class Tokenizer:
   bos_id = None
@@ -27,7 +26,7 @@ class Engine:
 def test_eagle_stream_eos_budget_and_cancellation(capsys):
   model = SimpleNamespace(config=SimpleNamespace(context_length=16))
   engine = Engine()
-  assert stream_reply(Decoder(model, Tokenizer(), eagle=engine), Tokenizer(), [1, 2], None) == '3!'
+  assert cli.reply(cli.generator(model, Tokenizer(), eagle=engine), Tokenizer(), [1, 2], None, 16) == '3!'
   assert engine.closed
   assert engine.calls == [([1, 2], dict(max_new_tokens=14, draft_tokens=1, eos_token_ids=(9, 10), batched=True))]
   assert capsys.readouterr().out == '3!\n'

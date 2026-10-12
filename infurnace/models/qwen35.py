@@ -6,20 +6,81 @@ quantized projection weights for Infurnace's packed tinygrad UOp kernels (the
 same `_NVLinear` adapter the Qwen3 path uses). Block math is never replaced.
 """
 import contextlib
+import functools
 import hashlib
+import json
 import math
 import os
+import struct
 from pathlib import Path
-from tinygrad import Context, Tensor, UOp
+from tinygrad import Context, Tensor, UOp, dtypes
+from tinygrad.device import Buffer
 import tinygrad.llm.model as upstream_model
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from tinygrad.llm.model import GatedDeltaNetBlock, Transformer
 from tinygrad.nn.state import get_state_dict
-from infurnace import disk_cache
 from infurnace.gguf import parse_gguf, read_gguf_metadata
 from infurnace.kernels.gdn import gdn_decode
 from infurnace.kernels.quant_gemm import nv_prefill_supported
 from infurnace.models.qwen3 import Qwen3Config, Qwen3Model, _NVLinear
+
+# On-disk caches (this file's parameters, DFlash's graphs) live under $XDG_CACHE_HOME/infurnace and are
+# keyed on everything that changes what they hold. A key mismatch, missing file or read error is a miss.
+def cache_root() -> Path:
+  return Path(os.environ.get('XDG_CACHE_HOME', str(Path.home() / '.cache'))).expanduser() / 'infurnace'
+
+@functools.cache
+def source_hash() -> str:
+  """Hash of the tinygrad and infurnace sources: any code change selects new entries."""
+  import tinygrad, infurnace
+  digest = hashlib.sha256()
+  for module in (tinygrad, infurnace):
+    package = Path(module.__file__).parent
+    for path in sorted(package.rglob('*.py')):
+      digest.update(str(path.relative_to(package)).encode())
+      digest.update(path.read_bytes())
+  return digest.hexdigest()
+
+def file_identity(path: str | Path) -> str:
+  stat = Path(path).stat()
+  return f'{Path(path).resolve()} {stat.st_size} {stat.st_mtime_ns}'
+
+def prune_cache(directory: Path, keep: int) -> None:
+  for old in sorted(directory.glob('*'), key=lambda p: p.stat().st_mtime)[:-keep]: old.unlink(missing_ok=True)
+
+_ALIGN, _MAGIC = 256, b'INFTENS1'
+
+def _save_tensors(path: Path, tensors: dict[str, Tensor]) -> None:
+  """Realized tensors as one blob, each 256-byte aligned, plus a name/dtype/shape/offset index."""
+  index, chunks, offset = [], [], 0
+  for name, tensor in tensors.items():
+    data = bytes(tensor.data())
+    index.append({'name': name, 'dtype': tensor.dtype.name, 'shape': list(tensor.shape), 'offset': offset, 'nbytes': len(data)})
+    chunks.append(data + bytes(-len(data) % _ALIGN))
+    offset += len(chunks[-1])
+  header = json.dumps(index).encode()
+  path.parent.mkdir(parents=True, exist_ok=True)
+  partial = path.with_suffix('.tmp')
+  with partial.open('wb') as f:
+    f.write(_MAGIC + struct.pack('<Q', len(header)) + header)
+    f.write(bytes(-f.tell() % _ALIGN))
+    for chunk in chunks: f.write(chunk)
+  partial.replace(path)
+
+def _load_tensors(path: Path, device: str) -> dict[str, Tensor] | None:
+  """One host read and one copy to `device`; each tensor is a view into that buffer."""
+  try:
+    raw = path.read_bytes()
+    if raw[:8] != _MAGIC: return None
+    size = struct.unpack_from('<Q', raw, 8)[0]
+    index = json.loads(raw[16:16 + size])
+    blob = raw[16 + size + (-(16 + size) % _ALIGN):]
+    if any(entry['offset'] + entry['nbytes'] > len(blob) for entry in index): return None
+    base = Buffer(device, max(len(blob), 1), initial_value=blob)
+    return {entry['name']: Tensor(UOp.from_buffer(Buffer(device, entry['nbytes'], base=base, offset=entry['offset']).ensure_allocated(),
+                                                  getattr(dtypes, entry['dtype']))).reshape(entry['shape']) for entry in index}
+  except (OSError, ValueError, KeyError, TypeError, AttributeError, struct.error):
+    return None
 
 class _PackedLinear(_NVLinear):
   """Packed projection that keeps no dense decode graph alive.
@@ -164,8 +225,8 @@ class Qwen35Model(Qwen3Model):
 
   def _param_cache_path(self, path):
     if os.environ.get('INFURNACE_PARAM_CACHE', '1') == '0': return None
-    key = hashlib.sha256(f'{disk_cache.sources()} {disk_cache.file_identity(path)} {self.device}'.encode()).hexdigest()[:32]
-    return disk_cache.root() / 'params' / f'{key}.bin'
+    key = hashlib.sha256(f'{source_hash()} {file_identity(path)} {self.device}'.encode()).hexdigest()[:32]
+    return cache_root() / 'params' / f'{key}.bin'
 
   def _enable_packed(self, path, prefill: bool):
     _, entries = parse_gguf(path)
@@ -209,7 +270,7 @@ class Qwen35Model(Qwen3Model):
       # them schedules ~700 tiny kernels (~2 s) for ~10 MB, so the result is cached on disk.
       remaining = {name: tensor for name, tensor in get_state_dict(self.transformer).items() if tensor.device != self.device}
       cache = self._param_cache_path(path) if remaining else None
-      cached = disk_cache.load_tensors(cache, self.device) if cache is not None and cache.is_file() else None
+      cached = _load_tensors(cache, self.device) if cache is not None and cache.is_file() else None
       if cached is not None and set(cached) == set(remaining) and all(
           cached[name].shape == tensor.shape and cached[name].dtype == tensor.dtype for name, tensor in remaining.items()):
         for name, tensor in remaining.items(): tensor.replace(cached[name])
@@ -218,5 +279,5 @@ class Qwen35Model(Qwen3Model):
         Tensor.realize(*[copy for _, copy in moved])
         for tensor, copy in moved: tensor.replace(copy)
         if cache is not None:
-          disk_cache.save_tensors(cache, remaining)
-          disk_cache.prune(cache.parent, keep=4)
+          _save_tensors(cache, remaining)
+          prune_cache(cache.parent, keep=4)

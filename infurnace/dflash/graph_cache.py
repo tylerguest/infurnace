@@ -19,17 +19,17 @@ from tinygrad import Device, Tensor
 from tinygrad.device import Buffer
 from tinygrad.engine.jit import CapturedJit, _TinyJit
 from tinygrad.uop.ops import Ops
-from infurnace import disk_cache
+from infurnace.models.qwen35 import cache_root, file_identity, prune_cache, source_hash
 
 FORMAT = 1
 _FLAGS = ('BEAM', 'JITBEAM', 'NOOPT', 'PROFILE', 'DEBUG', 'JIT', 'IMAGE', 'HCQ_CACHE_THRESH', 'VALIDATE_WITH_CPU')
 
 def cache_dir() -> Path:
-  return disk_cache.root() / 'dflash-graphs'
+  return cache_root() / 'dflash-graphs'
 
 def key(generator, block: int) -> str:
-  digest = hashlib.sha256(f'format {FORMAT} python {sys.version_info[:2]} {disk_cache.sources()}'.encode())
-  for path in (generator.model._path, generator.draft.path): digest.update(disk_cache.file_identity(path).encode())
+  digest = hashlib.sha256(f'format {FORMAT} python {sys.version_info[:2]} {source_hash()}'.encode())
+  for path in (generator.model._path, generator.draft.path): digest.update(file_identity(path).encode())
   device = Device[generator.model.device]
   digest.update(f'{generator.model.config.context_length} {block} {generator.fused} {device.device} {getattr(device, "arch", "")}'.encode())
   digest.update(repr([(flag, os.environ.get(flag)) for flag in _FLAGS]).encode())
@@ -83,7 +83,7 @@ def save(path: Path, graphs: dict[str, _TinyJit], buffers: dict[str, Buffer]) ->
   partial = path.with_suffix('.tmp')
   with partial.open('wb') as f: _Pickler(f, {buffer: name for name, buffer in buffers.items()}).dump({'format': FORMAT, 'graphs': captured})
   partial.replace(path)
-  disk_cache.prune(path.parent, keep=4)  # each entry holds only graph-private buffers
+  prune_cache(path.parent, keep=4)  # each entry holds only graph-private buffers
 
 def load(path: Path, buffers: dict[str, Buffer]) -> dict[str, CapturedJit] | None:
   try:
