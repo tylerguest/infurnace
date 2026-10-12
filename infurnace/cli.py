@@ -11,7 +11,7 @@ from tinygrad.helpers import GlobalCounters, Timing, profile_marker
 from infurnace.device import select_device, supports_nv_quant
 from infurnace.kernels.quant_gemm import nv_prefill_supported
 from infurnace.benchmark import DEFAULT_PROMPT_TOKENS, benchmark_prompt_ids, validate_benchmark_context
-from infurnace.model import Qwen3Model
+from infurnace.models.qwen3 import Qwen3Model
 from infurnace.tokenizer import Tokenizer
 
 _MODEL_FILENAME = "Qwen3-4B-Q4_K_M.gguf"
@@ -37,8 +37,8 @@ def _build(path: str, max_context: int, device: str | None, nv_quant: bool | Non
     from infurnace.gguf import read_gguf_metadata
     metadata = read_gguf_metadata(path)
     if metadata.get("general.architecture") == "qwen35":
-      from infurnace.qwen35 import Qwen35Model
-      from infurnace.qwen35_tokenizer import Qwen35Tokenizer
+      from infurnace.models.qwen35 import Qwen35Model
+      from infurnace.tokenizer import Qwen35Tokenizer
       if any((nv_attention, nv_fused_attention, nv_prepared_weights)):
         raise ValueError("Qwen3.5 supports only --nv-quant/--nv-prefill; upstream tinygrad owns attention and recurrence")
       packed = supports_nv_quant(device) if nv_quant is None else nv_quant

@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 from tinygrad import Tensor
 
-import infurnace.model as model
+import infurnace.models.qwen3 as model
 from infurnace.gguf import parse_gguf
 
 

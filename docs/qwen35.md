@@ -2,7 +2,7 @@
 
 Infurnace uses **tinygrad's existing model implementation directly**:
 `tinygrad.llm.model.Transformer.from_gguf()`. The small adapter in
-`infurnace/qwen35.py` provides only Infurnace's bounded generation/lifecycle API.
+`infurnace/models/qwen35.py` provides only Infurnace's bounded generation/lifecycle API.
 There is no local target recurrence, attention, FFN, weight mapping or projection
 replacement. The tinygrad pin and separate local tinygrad checkout are unchanged.
 

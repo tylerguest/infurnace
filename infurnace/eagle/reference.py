@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 from tinygrad import Context, Tensor, TinyJit, UOp, dtypes
 
 if TYPE_CHECKING:
-  from infurnace.model import Qwen3Model
+  from infurnace.models.qwen3 import Qwen3Model
 
 
 @dataclass(frozen=True)

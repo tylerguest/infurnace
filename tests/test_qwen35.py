@@ -4,7 +4,7 @@ import pytest
 from tinygrad import Context, Tensor
 from tinygrad.llm.model import Transformer, TransformerConfig, SSMConfig, GatedDeltaNetBlock, TransformerBlock
 from tinygrad.nn.state import get_state_dict
-from infurnace.qwen35 import Qwen35Model
+from infurnace.models.qwen35 import Qwen35Model
 
 
 def checkpoint(path, *, permuted_head=False):
@@ -118,7 +118,7 @@ def test_cli_packed_projection_flags_require_nv_before_loading(tmp_path, monkeyp
 def test_tokenizer_reference(tmp_path):
   tokenizers = pytest.importorskip('tokenizers')
   from tokenizers import Regex, models, trainers, pre_tokenizers, decoders, normalizers
-  from infurnace.qwen35_tokenizer import Qwen35Tokenizer
+  from infurnace.tokenizer import Qwen35Tokenizer
   hf = tokenizers.Tokenizer(models.BPE())
   hf.normalizer = normalizers.NFC()
   pattern = (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}|"

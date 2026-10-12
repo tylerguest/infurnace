@@ -14,7 +14,7 @@ from infurnace.eagle.io import mapped_tensor, mapped_output, upload_tokens
 
 from infurnace.kernels.attention import fused_chain_attention
 from infurnace.kernels.quant_gemv import q8_quantize, quant_gemv
-from infurnace.model import _NVAttentionBlock, _NVLinear, apply_rope
+from infurnace.models.qwen3 import _NVAttentionBlock, _NVLinear, apply_rope
 from infurnace.eagle.reference import SequentialVerifier
 
 

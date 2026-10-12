@@ -141,7 +141,7 @@ def test_kernel_cache_reuses_captures_without_reusing_session_state(compact, fas
 
 @pytest.mark.skipif(not os.environ.get('INFURNACE_TEST_MODEL'), reason='set INFURNACE_TEST_MODEL')
 def test_local_nv_batched_logits_and_features_exact():
-  from infurnace.model import Qwen3Model
+  from infurnace.models.qwen3 import Qwen3Model
   model = Qwen3Model.from_gguf(os.environ['INFURNACE_TEST_MODEL'], max_context=512, device='NV',
                               nv_quant=True, nv_prefill=True, nv_fused_attention=True)
   prompt = list(range(1, 36))

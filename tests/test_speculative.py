@@ -5,7 +5,7 @@ import struct
 import pytest
 from tinygrad import Context, Tensor, UOp, dtypes
 
-from infurnace.model import Qwen3Config, Qwen3Model, expected_weight_shapes
+from infurnace.models.qwen3 import Qwen3Config, Qwen3Model, expected_weight_shapes
 from infurnace.eagle.reference import SequentialVerifier
 
 
@@ -186,7 +186,7 @@ def test_invalid_inputs_and_lifecycle():
 
 def nv_model():
   from infurnace.gguf import PackedTensor
-  from infurnace.model import enable_decode_attention
+  from infurnace.models.qwen3 import enable_decode_attention
   config = Qwen3Config(4, 256, 512, 32, 8, 128, 128, 128, 1000000.0, 1e-6, 32, 64)
   rng, weights, entries = random.Random(29), {}, {}
   for name, shape in expected_weight_shapes(config).items():

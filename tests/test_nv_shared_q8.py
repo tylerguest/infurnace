@@ -55,7 +55,7 @@ def test_block_shared_packing_prefill_jit_and_reset():
   from tinygrad import Context, UOp
   from tinygrad.llm.model import TransformerBlock, TransformerConfig
   from infurnace.gguf import PackedTensor
-  from infurnace.model import _NVLinear, enable_decode_attention
+  from infurnace.models.qwen3 import _NVLinear, enable_decode_attention
   config = TransformerConfig(num_blocks=1, dim=256, hidden_dim=512, n_heads=8, n_kv_heads=2,
     norm_eps=1e-6, vocab_size=256, head_dim=128, v_head_dim=128, rope_theta=10000,
     rope_dim=128, qk_norm=128, max_context=32)

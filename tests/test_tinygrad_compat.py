@@ -6,7 +6,7 @@ import pytest
 from tinygrad import Tensor, TinyJit, dtypes
 
 from infurnace.gguf import _dequant, PackedTensor
-from infurnace.model import _NVLinear, Qwen3Model
+from infurnace.models.qwen3 import _NVLinear, Qwen3Model
 from infurnace.kernels.quant_gemv import quant_gemv, QuantGemvError
 
 

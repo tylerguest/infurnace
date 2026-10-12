@@ -66,7 +66,7 @@ def worker(args) -> dict:
   from infurnace.tokenizer import Tokenizer
   from tinygrad.llm.cli import SimpleTokenizer
   from tinygrad.llm.model import Transformer
-  from infurnace.model import Qwen3Model
+  from infurnace.models.qwen3 import Qwen3Model
   from infurnace.kernels.quant_gemm import nv_prefill_supported
   from infurnace.benchmark import benchmark_prompt_ids, validate_benchmark_context
 

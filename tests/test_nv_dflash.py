@@ -3,7 +3,7 @@ import pytest
 from tinygrad import Context, Tensor, UOp
 from tinygrad.nn.state import get_state_dict
 from infurnace.dflash import DFlashDraft, DFlashGenerator
-from infurnace.qwen35 import Qwen35Model
+from infurnace.models.qwen35 import Qwen35Model
 from test_dflash import tiny_draft
 from test_qwen35 import checkpoint
 

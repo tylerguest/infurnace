@@ -22,7 +22,7 @@ def test_symbolic_length_bounds():
 
 
 def test_attention_requires_nv_quant_before_loading():
-  from infurnace.model import Qwen3Model
+  from infurnace.models.qwen3 import Qwen3Model
   with pytest.raises(ValueError, match="requires NV quantized"):
     Qwen3Model.from_gguf("does-not-exist.gguf", nv_attention=True)
 
@@ -134,7 +134,7 @@ def test_fused_standalone_binding_gqa_partitions_and_reset(partition):
 @pytest.mark.parametrize("fused", [False, True])
 def test_decode_block_matches_upstream_and_retains_state(fused):
   from tinygrad.llm.model import TransformerBlock, TransformerConfig
-  from infurnace.model import enable_decode_attention, _NVAttentionBlock
+  from infurnace.models.qwen3 import enable_decode_attention, _NVAttentionBlock
   config = TransformerConfig(num_blocks=1, dim=256, hidden_dim=256, n_heads=4, n_kv_heads=1,
                              vocab_size=32, norm_eps=1e-6, rope_theta=1e6,
                              head_dim=128, v_head_dim=128, rope_dim=128, qk_norm=128, max_context=64)
@@ -165,10 +165,10 @@ def test_decode_block_matches_upstream_and_retains_state(fused):
                         (os.environ.get("INFURNACE_TEST_NV_ATTENTION") or os.environ.get("INFURNACE_TEST_NV_FUSED_ATTENTION"))),
                     reason="set INFURNACE_TEST_MODEL and INFURNACE_TEST_NV_ATTENTION=1 for real-model logits")
 def test_local_model_teacher_forced_attention_logits():
-  from infurnace.model import Qwen3Model
+  from infurnace.models.qwen3 import Qwen3Model
   from infurnace.tokenizer import Tokenizer
   from infurnace.benchmark import benchmark_prompt_ids
-  from infurnace.model import enable_decode_attention
+  from infurnace.models.qwen3 import enable_decode_attention
   model = Qwen3Model.from_gguf(os.environ["INFURNACE_TEST_MODEL"], max_context=2048,
                               device="NV", nv_quant=True, nv_prefill=True)
   transformer = model.transformer

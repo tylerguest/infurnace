@@ -34,7 +34,7 @@ They are different runtimes; this review does not upgrade the dependency.
 | Code | Finding and implication |
 |---|---|
 | `infurnace/kernels/quant_gemv.py` | Separate activation quantization, packed GEMV and partial-sum reduction. Q4 recomputes activation sums for every output row; Q6 unpacks/repackages individual bytes. One 32-thread block per output/chunk. |
-| `infurnace/model.py::_NVLinear` | 253 eligible linears; explicit packed identity and generic/fast storage sharing. Only concrete single-token inputs accelerate; prefill remains generic except the last-token output head. |
+| `infurnace/models/qwen3.py::_NVLinear` | 253 eligible linears; explicit packed identity and generic/fast storage sharing. Only concrete single-token inputs accelerate; prefill remains generic except the last-token output head. |
 | `tinygrad/llm/kernels/amd.py` | Reusable designs: quantize each activation once, precompute activation sums, wordwise quant math, grouped output rows, tiled prefill and online-softmax attention. Some improvements already exist in our pin. Newer Q6 uses native 210-byte blocks via halfword storage instead of padded copies. These are AMD implementations, not drop-in NV kernels. |
 | `tinygrad/llm/model.py` | Separate prefill/decode JITs already exist. Every prefill chunk computes output logits and sampling even when its result is discarded. NV Qwen3 uses generic attention; the AMD flash dispatch is also restricted to hybrid models. |
 | `tinygrad/engine/jit.py`, NV runtime | The pin already batches supported captured work into graphs. Newer upstream has substantial HCQ2/runtime changes. Profile replay/dispatch before proposing another graph layer or assuming an upgrade is faster. |

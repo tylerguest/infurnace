@@ -508,7 +508,7 @@ prefix; scores/probabilities are not yet eliminated or fused with those operatio
 Unused positions are masked before max/exp. Native FP16 cache storage and its
 ordered latest-token write are preserved. Prefill stays upstream.
 
-The pinned runtime lacks a dispatch hook. `infurnace/model.py` installs a
+The pinned runtime lacks a dispatch hook. `infurnace/models/qwen3.py` installs a
 per-model decode-only block subclass, retaining parameter/cache identities and
 reusing upstream projections, norms and RoPE; unsupported configurations and
 prefill call the original method. No installed dependency or global Tensor method

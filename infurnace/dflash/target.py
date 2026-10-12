@@ -1,7 +1,7 @@
 """One-row tinygrad target observation and exclusive request ownership."""
 from tinygrad import Context, Tensor, TinyJit, UOp, dtypes
 from tinygrad.uop.ops import Ops
-from infurnace.qwen35 import Qwen35Model
+from infurnace.models.qwen35 import Qwen35Model
 
 
 class TargetObserver:

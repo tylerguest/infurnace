@@ -7,7 +7,7 @@ from tinygrad import Context, Tensor, dtypes
 from tinygrad.llm.model import Transformer
 from tinygrad.nn.state import load_state_dict
 
-from infurnace.model import Qwen3Config, Qwen3Model, expected_weight_shapes, transformer_config
+from infurnace.models.qwen3 import Qwen3Config, Qwen3Model, expected_weight_shapes, transformer_config
 
 
 def tiny_model():

@@ -2,7 +2,7 @@ import pytest
 from tinygrad import Context, Tensor
 from infurnace.dflash import DFlashGenerator
 from infurnace.dflash.parallel import _decays, _unit_lower_inverse
-from infurnace.qwen35 import Qwen35Model
+from infurnace.models.qwen35 import Qwen35Model
 from test_dflash import RecordedDraft, tiny_draft
 from test_qwen35 import checkpoint
 

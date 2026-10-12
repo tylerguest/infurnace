@@ -9,10 +9,10 @@ from tinygrad import Context, Tensor, TinyJit, UOp, nn, dtypes
 from tinygrad.llm.model import apply_rope, precompute_freqs_cis
 from tinygrad.nn.state import get_state_dict, load_state_dict
 from infurnace.gguf import parse_gguf
-from infurnace.model import _NVLinear
+from infurnace.models.qwen3 import _NVLinear
 from infurnace.kernels.quant_gemv import QUANT_SIZES
 from infurnace.kernels.quant_gemm import nv_prefill_supported
-from infurnace.qwen35 import Qwen35Model
+from infurnace.models.qwen35 import Qwen35Model
 
 
 @dataclass(frozen=True)

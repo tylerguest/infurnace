@@ -11,7 +11,7 @@ from tinygrad.llm.model import Transformer
 from tinygrad.nn.state import get_state_dict
 from infurnace.gguf import parse_gguf, read_gguf_metadata
 from infurnace.kernels.quant_gemm import nv_prefill_supported
-from infurnace.model import Qwen3Config, Qwen3Model, _NVLinear
+from infurnace.models.qwen3 import Qwen3Config, Qwen3Model, _NVLinear
 
 
 class _PackedLinear(_NVLinear):
