@@ -14,17 +14,29 @@ from infurnace.benchmark import DEFAULT_PROMPT_TOKENS, benchmark_prompt_ids, val
 from infurnace.models.qwen3 import Qwen3Model
 from infurnace.tokenizer import Tokenizer
 
-_MODEL_FILENAME = "Qwen3-4B-Q4_K_M.gguf"
+# Default target (Qwen3.5 with its DFlash draft, else Qwen3) and where each is looked for in a checkout's models/.
+_TARGETS = (("Qwen3.5-4B-Q4_K_M.gguf", ("", "qwen35-validation")), ("Qwen3-4B-Q4_K_M.gguf", ("",)))
+_DFLASH_DRAFT = ("qwen35-4b-dflash-Q4_K_M.gguf", ("", "dflash-qwen35"))
+
+def _find(candidates: tuple[tuple[str, tuple[str, ...]], ...]) -> Path | None:
+  """User storage first (every candidate), then an editable checkout's models/."""
+  data_home = Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local/share"))).expanduser()
+  checkout = Path(__file__).resolve().parent.parent / "models"
+  for path in [data_home / "infurnace/models" / name for name, _ in candidates] + \
+              [checkout / sub / name for name, subs in candidates for sub in subs]:
+    if path.is_file(): return path
+  return None
 
 def _default_model() -> str:
   """Prefer explicit configuration, then user storage, then an editable checkout."""
   if path := os.environ.get("INFURNACE_MODEL"): return str(Path(path).expanduser())
+  if found := _find(_TARGETS): return str(found)
   data_home = Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local/share"))).expanduser()
-  installed_model = data_home / "infurnace/models" / _MODEL_FILENAME
-  checkout_model = Path(__file__).resolve().parent.parent / "models" / _MODEL_FILENAME
-  if installed_model.is_file(): return str(installed_model)
-  if checkout_model.is_file(): return str(checkout_model)
-  return str(installed_model)
+  return str(data_home / "infurnace/models" / _TARGETS[-1][0])
+
+def _default_dflash_draft() -> Path | None:
+  if path := os.environ.get("INFURNACE_DFLASH_DRAFT"): return Path(path).expanduser()
+  return _find((_DFLASH_DRAFT,))
 _SINGLE_SHOT_MAX_TOKENS = 64
 
 
@@ -296,7 +308,9 @@ def main() -> int:
   ap.add_argument("--eagle3", type=Path, metavar="CHECKPOINT", help="experimental greedy EAGLE-3 checkpoint directory (NV only)")
   ap.add_argument("--eagle-draft-tokens", type=int, default=None, metavar="N", help="EAGLE descendants per round, 0–7 (default: 1)")
   ap.add_argument("--no-eagle-fast", action="store_true", help="disable fast EAGLE sampling, mapped I/O and projection optimizations")
-  ap.add_argument("--dflash", type=Path, metavar="GGUF", help="experimental tinygrad DFlash draft GGUF (Qwen3.5 target, greedy only)")
+  ap.add_argument("--dflash", type=Path, metavar="GGUF",
+                  help="DFlash draft GGUF (Qwen3.5 target, greedy only; found automatically, or set INFURNACE_DFLASH_DRAFT)")
+  ap.add_argument("--no-dflash", action="store_true", help="decode without the automatic DFlash draft")
   ap.add_argument("--dflash-block-size", type=int, default=None, metavar="N",
                   help="DFlash block including anchor (default: trained size with parallel verification, else 4)")
   ap.add_argument("--dflash-legacy-noncausal", action='store_true', help="use older all-noncausal draft attention instead of upstream layer defaults")
@@ -324,6 +338,14 @@ def main() -> int:
   if args.benchmark is None and (args.benchmark_prompt_tokens is not None or args.benchmark_prompt_file is not None):
     ap.error("--benchmark-prompt-* options require --benchmark")
   if args.no_thinking and (args.prompt is not None or args.benchmark is not None): ap.error("--no-thinking applies only to chat")
+  if args.no_dflash and args.dflash is not None: ap.error("--no-dflash conflicts with --dflash")
+  # Plain chat/prompt runs on a Qwen3.5 target use the DFlash draft when one is installed (NV only, checked after loading).
+  auto_dflash = False
+  if (args.dflash is None and not args.no_dflash and args.serve is None and args.benchmark is None and args.eagle3 is None
+      and args.dflash_verifier is None and args.dflash_block_size is None and not args.dflash_legacy_noncausal
+      and (draft_path := _default_dflash_draft()) is not None and draft_path.is_file() and Path(args.model).is_file()):
+    from infurnace.gguf import read_gguf_metadata
+    if read_gguf_metadata(args.model).get("general.architecture") == "qwen35": args.dflash, auto_dflash = draft_path, True
   if args.dflash is not None:
     if args.eagle3 is not None: ap.error("--dflash and --eagle3 are mutually exclusive")
     if args.benchmark is not None: ap.error("use benchmarks/dflash.py for matched DFlash measurements")
@@ -353,6 +375,7 @@ def main() -> int:
     if args.nv_fused_attention is not None: kwargs["nv_fused_attention"] = args.nv_fused_attention
     model, tokenizer = _build(args.model, args.max_context, args.device, args.nv_quant, **kwargs)
     load_seconds = time.perf_counter()-start
+    if auto_dflash and model.device.split(':')[0] != 'NV': args.dflash = None  # the CPU reference verifier is slower than plain decoding
     if args.benchmark is not None:
       text = args.benchmark_prompt_file.read_text(encoding="utf-8") if args.benchmark_prompt_file is not None else None
       if args.benchmark_format == "text":
@@ -383,7 +406,8 @@ def main() -> int:
       if verifier == 'parallel' and block < 2: raise ValueError("parallel DFlash verification needs --dflash-block-size of at least 2")
       dflash = DFlashGenerator(model, draft, verifier=verifier)
       stream_options = {'dflash': dflash, 'dflash_block_size': block}
-      print(f"DFlash experimental: tinygrad {verifier} verification, block {block}; first capture can take minutes. "
+      print(f"DFlash{' (automatic; --no-dflash disables)' if auto_dflash else ''}: tinygrad {verifier} verification, block {block}; "
+            "first capture can take minutes. "
             "Draft attention: "
             f"{'legacy all-noncausal' if args.dflash_legacy_noncausal else 'metadata/upstream layer defaults'}.",
             file=sys.stderr, flush=True)

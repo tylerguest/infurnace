@@ -4,10 +4,12 @@
 verification in tinygrad. The target is the **unmodified upstream tinygrad**
 Qwen3.5 GGUF model. No PyTorch or llama.cpp model runtime is used.
 
+`infurnace` alone uses DFlash when the target is Qwen3.5 on NV and the draft
+(`qwen35-4b-dflash-Q4_K_M.gguf`) is installed; `--no-dflash` turns it off. Explicitly:
+
 ```sh
-infurnace --device NV --model models/qwen35-validation/Qwen3.5-4B-Q4_K_M.gguf \
+infurnace --model models/qwen35-validation/Qwen3.5-4B-Q4_K_M.gguf \
   --dflash models/dflash-qwen35/qwen35-4b-dflash-Q4_K_M.gguf \
-  --max-context 512 --no-warmup \
   --prompt 'Write a Python function that returns the n-th Fibonacci number.' --max-tokens 64
 ```
 

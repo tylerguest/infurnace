@@ -55,4 +55,32 @@ def test_cli_builds_reference_engine(monkeypatch, tmp_path, capsys, block, verif
   assert engine.calls[0][1]['max_new_tokens'] == 5
   default = 16 if verifier is None and device == 'NV' else 4
   assert engine.calls[0][1]['block_size'] == (default if block is None else block)
-  assert engine.closed and 'DFlash experimental' in capsys.readouterr().err
+  assert engine.closed and 'DFlash' in capsys.readouterr().err
+
+
+@pytest.mark.parametrize('device,flags,enabled', [('NV', [], True), ('CPU', [], False), ('NV', ['--no-dflash'], False),
+                                                  ('NV', ['--serve'], False)])
+def test_cli_enables_installed_dflash_draft_automatically(monkeypatch, tmp_path, device, flags, enabled):
+  import infurnace.dflash as dflash
+  target, draft = tmp_path / 'target.gguf', tmp_path / 'draft.gguf'
+  target.touch()
+  draft.touch()
+  monkeypatch.setenv('INFURNACE_DFLASH_DRAFT', str(draft))
+  monkeypatch.setattr('infurnace.gguf.read_gguf_metadata', lambda path: {'general.architecture': 'qwen35'})
+  run = ['--prompt', 'hello', '--max-tokens', '5'] if '--serve' not in flags else []
+  monkeypatch.setattr('sys.argv', ['infurnace', '--model', str(target), *run, *flags])
+  model = SimpleNamespace(config=SimpleNamespace(context_length=16), device=device)
+  monkeypatch.setattr(cli, '_build', lambda *a, **kw: (model, Tokenizer()))
+  loaded = []
+  def load(checkpoint, target_model, **options):
+    loaded.append(checkpoint)
+    return SimpleNamespace(config=SimpleNamespace(block_size=16))
+  monkeypatch.setattr(dflash.DFlashDraft, 'from_gguf', load)
+  monkeypatch.setattr(dflash, 'DFlashGenerator', lambda target_model, draft_model, **options: Engine())
+  runs = []
+  monkeypatch.setattr(cli, '_run_single_shot', lambda *a, **options: runs.append(options) or 0)
+  monkeypatch.setattr(cli, '_warmup', lambda model: None)
+  monkeypatch.setattr('infurnace.serve.serve', lambda *a, **kw: runs.append({}))
+  assert cli.main() == 0
+  assert loaded == ([draft] if enabled else [])
+  assert ('dflash' in runs[0]) == enabled

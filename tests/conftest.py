@@ -24,3 +24,9 @@ def pytest_collection_modifyitems(config, items):
   skip = pytest.mark.skip(reason='set INFURNACE_TEST_NV=1 on an NV GPU')
   for item in items:
     if 'nv' in item.keywords: item.add_marker(skip)
+
+
+@pytest.fixture(autouse=True)
+def _no_installed_dflash_draft(monkeypatch, tmp_path):
+  # The CLI enables an installed DFlash draft automatically; tests opt in explicitly.
+  monkeypatch.setenv('INFURNACE_DFLASH_DRAFT', str(tmp_path / 'no-draft.gguf'))

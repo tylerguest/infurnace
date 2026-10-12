@@ -29,18 +29,23 @@ Then run `infurnace` from any directory while the environment is active.
 For development/tests, install with `pip install -e '.[dev]'` instead.
 The runtime dependency is a pinned tinygrad commit.
 
-Model weights are **not shipped or downloaded automatically**. Place the tested
-GGUF in the checkout's `models/` directory, or in user storage:
+Model weights are **not shipped or downloaded automatically**. Place the GGUFs in
+the checkout's `models/` directory, or in user storage:
 
 ```sh
+pip install -e '.[qwen35]'   # Qwen3.5 tokenizer
 mkdir -p ~/.local/share/infurnace/models
-cp /path/to/Qwen3-4B-Q4_K_M.gguf ~/.local/share/infurnace/models/
+cp /path/to/Qwen3.5-4B-Q4_K_M.gguf /path/to/qwen35-4b-dflash-Q4_K_M.gguf ~/.local/share/infurnace/models/
 infurnace
 ```
 
-Model lookup: `INFURNACE_MODEL` → user data directory → checkout `models/`.
-User storage respects `XDG_DATA_HOME`. Override with
-`infurnace --model /absolute/path/to/model.gguf`.
+Bare `infurnace` chats with Qwen3.5-4B and, on NV, its [DFlash](docs/dflash.md) draft;
+`--no-dflash` decodes without it. Without a Qwen3.5 GGUF it falls back to Qwen3-4B
+(`Qwen3-4B-Q4_K_M.gguf`).
+
+Model lookup: `INFURNACE_MODEL` → user data directory → checkout `models/`; the draft
+is found the same way (`INFURNACE_DFLASH_DRAFT`). User storage respects
+`XDG_DATA_HOME`. Override with `infurnace --model /absolute/path/to/model.gguf`.
 
 After pulling changes, rerun `pip install -e .`. If the tinygrad pin changes,
 force reinstall that exact dependency: pip can retain an older same-version
