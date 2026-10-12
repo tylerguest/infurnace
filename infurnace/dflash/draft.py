@@ -5,7 +5,7 @@ from dataclasses import dataclass, replace
 import math
 from pathlib import Path
 
-from tinygrad import Context, Tensor, TinyJit, UOp, nn, dtypes
+from tinygrad import Context, Tensor, UOp, nn, dtypes
 from tinygrad.llm.model import apply_rope, precompute_freqs_cis
 from tinygrad.nn.state import get_state_dict, load_state_dict
 from infurnace.gguf import parse_gguf
@@ -13,6 +13,7 @@ from infurnace.models.qwen3 import _NVLinear
 from infurnace.kernels.quant_gemv import QUANT_SIZES
 from infurnace.kernels.quant_gemm import nv_prefill_supported
 from infurnace.models.qwen35 import Qwen35Model
+from infurnace.dflash.jit import captured
 
 
 @dataclass(frozen=True)
@@ -125,7 +126,7 @@ class DFlashDraft:
                                 device=self.device).contiguous().realize() for _ in range(config.layers)]
       self.frequencies = precompute_freqs_cis(config.head_dim, self.cache_length, config.theta, device=self.device).realize()
       self._start = UOp.variable('dflash_context_start', 0, self.capacity - 1)
-      self._absorb_jit = TinyJit(self._absorb)
+      self._absorb_jit = captured(self._absorb)
       self._noise_inputs: dict[int, Tensor] = {}
       # Fixed-shape staging for observed rows; stores use a variable offset, so
       # only the row count (1..block) selects a kernel, never the history shape.
@@ -270,7 +271,7 @@ class DFlashDraft:
       noise = self._noise_inputs[count]
       embedded = self.target.embed([anchor] + [c.mask_token] * count)
       Tensor(noise.uop.after(noise.uop.store(embedded.uop))).realize()
-      if count not in self._jits: self._jits[count] = TinyJit(self._forward)
+      if count not in self._jits: self._jits[count] = captured(self._forward)
       pos = UOp.variable('dflash_position', 1, self.capacity - count - 1).bind(position)
       decisions = self._jits[count](noise, pos).realize()
       output = [int(v) for v in Tensor(decisions.uop.buf_uop).reshape(count).tolist()]

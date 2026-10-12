@@ -19,7 +19,7 @@ class TargetObserver:
     # The input token is a bound variable patched into the captured graph's
     # kernel arguments: no host-to-device upload or store kernel per step.
     self._token = UOp.variable('dflash_token', 0, model.config.vocab_size - 1)
-    self._jit = TinyJit(self._forward)
+    self._jit = TinyJit(self._forward)  # eager first: its RNG advance must match upstream sampling
     self._temperature = None
 
   def _realize_state(self):
@@ -33,7 +33,7 @@ class TargetObserver:
       states = []
       for block in target.blk:
         block._init_state(x)
-        states += [getattr(block, name) for name in ('cache_kv', 'conv_state', 'recurrent_state') if hasattr(block, name)]
+        states += [getattr(block, name) for name in ('cache_kv', 'freqs_cis', 'conv_state', 'recurrent_state') if hasattr(block, name)]
       if pending := [t for t in states if not t.uop.is_realized]: Tensor.realize(*pending)
 
   def __enter__(self):

@@ -16,8 +16,9 @@ Decisions are greedy argmax over multirow logits. They match one-row decoding
 up to floating-point reduction order; no RNG is consumed.
 """
 import functools
-from tinygrad import Context, Tensor, TinyJit, UOp, dtypes
+from tinygrad import Context, Tensor, UOp, dtypes
 from tinygrad.llm.model import GatedDeltaNetBlock, apply_rope
+from infurnace.dflash.jit import captured
 from infurnace.dflash.target import TargetObserver
 from infurnace.kernels.gdn import gdn_chunk
 from infurnace.kernels.embedding import packed_gather
@@ -77,7 +78,7 @@ class ParallelVerifier:
     # one graph, so the committed block's start needs its own variable.
     self._commit_position = UOp.variable('dflash_commit_pos', 0, model.config.context_length - rows)
     self._count = UOp.variable('dflash_commit_rows', 1, rows)
-    self._forward_jit, self._commit_jit = TinyJit(self._forward_store), TinyJit(self._commit)
+    self._forward_jit, self._commit_jit = captured(self._forward_store), captured(self._commit)
     self._round_jit = None
     self._fused = rows == 16 and self.device.split(':')[0] == 'NV' and all(
       b.head_k_dim == 128 and b.head_v_dim == 128 for b in model.transformer.blk if isinstance(b, GatedDeltaNetBlock))
@@ -210,13 +211,13 @@ class ParallelVerifier:
         # tinygrad's NV fix (GPPut read back before the doorbell); without it the
         # GPU can miss the last submission and the readback never completes.
         if self._round_jit is None:
-          self._round_jit = (TinyJit(functools.partial(self._pick, mask=draft.config.mask_token)), TinyJit(self._ids),
-                             TinyJit(self._pack))
+          self._round_jit = (captured(functools.partial(self._pick, mask=draft.config.mask_token)), captured(self._ids),
+                             captured(self._pack))
           self._draft_position = UOp.variable('dflash_position', 1, draft.capacity - self.rows)
           # Dedicated graphs for the fused round, never shared with the unfused
           # path: every captured graph always sees the same input buffers, so no
           # replay has to re-patch input addresses (see `run`).
-          self._fused_absorb, self._fused_draft = TinyJit(draft._absorb), TinyJit(draft._forward)
+          self._fused_absorb, self._fused_draft = captured(draft._absorb), captured(draft._forward)
         pick, ids, pack = self._round_jit
         self._commit_jit(self._count.bind(count), self._position.bind(previous))
         self._fused_absorb(_raw(self._features), draft._start.bind(previous))
