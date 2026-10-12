@@ -103,3 +103,63 @@ def gdn_chunk(q: Tensor, k: Tensor, v: Tensor, beta: Tensor, g: Tensor, state: T
                                                                          keep.float().contiguous()]
   z, u = Tensor.custom_kernel(z, u, *inputs, fxn=functools.partial(_gdn_chunk_kernel, heads=heads, rows=rows, eps=eps))[:2]
   return z, u
+
+
+@functools.cache
+def _gdn_step_kernel(z: UOp, state: UOp, q: UOp, k: UOp, v: UOp, beta: UOp, alpha: UOp, gate: UOp, weight: UOp, keep: UOp,
+                     *, heads: int, eps: float) -> UOp:
+  D = 128
+  head = UOp.range(heads, 0, axis_type=AxisType.GLOBAL)
+  warp = UOp.range(4, 1, axis_type=AxisType.LOCAL)
+  lane = UOp.range(32, -1, axis_type=AxisType.WARP)
+  col = warp*32+lane
+
+  # Stage this head's K and Q; each lane then works on four adjacent columns.
+  ksh = UOp.placeholder((D,), dtypes.float32, slot=0, addrspace=AddrSpace.LOCAL)
+  qsh = UOp.placeholder((D,), dtypes.float32, slot=1, addrspace=AddrSpace.LOCAL)
+  staged = UOp.group(ksh[col].store(k[head, col].load()), qsh[col].store(q[head, col].load())).barrier()
+  ksh, qsh = ksh.after(staged), qsh.after(staged)
+  cols = [lane*4+c for c in range(4)]
+  kc, qc = [ksh[c].load() for c in cols], [qsh[c].load() for c in cols]
+  kq = warp_reduce(sum((kc[i]*qc[i] for i in range(1, 4)), kc[0]*qc[0]), full_wave=True)
+  decay = alpha[head].load()*keep[0].load()  # keep=0 at sequence start: the old state is ignored
+  b = beta[head].load()
+
+  # Each warp streams 32 value rows: one coalesced read and write of the state per row.
+  # s = decay*S[row]; delta = b(v_row - s·k); S[row] = s + delta*k; out_row = s·q + delta(k·q)
+  outsh = UOp.placeholder((D,), dtypes.float32, slot=2, addrspace=AddrSpace.LOCAL)
+  i = UOp.range(32, 2, axis_type=AxisType.LOOP)
+  row = warp*32+i
+  s = [state[head, row, c].load()*decay for c in cols]
+  sk = warp_reduce(sum((s[n]*kc[n] for n in range(1, 4)), s[0]*kc[0]), full_wave=True)
+  sq = warp_reduce(sum((s[n]*qc[n] for n in range(1, 4)), s[0]*qc[0]), full_wave=True)
+  delta = b*(v[head, row].load()-sk)
+  rows_done = UOp.group(*(state[head, row, c].store(s[n]+delta*kc[n]) for n, c in enumerate(cols)),
+                        outsh[row].store(sq+delta*kq)).end(i).barrier()
+  outsh = outsh.after(rows_done)
+
+  # RMSNorm over the head's 128 outputs, times silu(gate), as FP16.
+  out = outsh[col].load()
+  partial = UOp.placeholder((4,), dtypes.float32, slot=3, addrspace=AddrSpace.LOCAL)
+  partial = partial.after(partial[warp].store(warp_reduce(out*out, full_wave=True)).barrier())
+  mean = sum((partial[w].load() for w in range(1, 4)), partial[0].load())/D
+  scale = (mean+eps).sqrt().reciprocal()*weight[col].load()
+  store = z[head, col].store((out*scale*_silu(gate[head, col].load().float())).cast(dtypes.float16))
+  return store.end(head, warp, lane).sink(arg=KernelInfo(name="gdn_step", opts_to_apply=()))
+
+
+def gdn_step(q: Tensor, k: Tensor, v: Tensor, beta: Tensor, alpha: Tensor, state: Tensor, gate: Tensor,
+             weight: Tensor, keep: Tensor, eps: float) -> tuple[Tensor, Tensor]:
+  """One gated delta-net decode row, updating `state` in place.
+
+  q, k, v: (H, 128) FP32 (q pre-scaled, q/k normalized); beta, alpha: (H,) (alpha = per-head
+  decay, not its log); state: (H, 128, 128) FP32 as (V, K), realized; gate: (H, 128);
+  weight: (128,); keep: (1,) 0/1 multiplier on the old state. Returns z (H, 128) FP16 and the
+  state after the update."""
+  heads, dim = q.shape
+  if dim != 128 or state.shape != (heads, 128, 128): raise ValueError("fused GDN step requires 128-dimensional heads")
+  z = Tensor.empty(heads, dim, dtype=dtypes.float16, device=q.device)
+  inputs = [t.float().contiguous() for t in (q, k, v, beta, alpha)] + [gate.contiguous(), weight.float().contiguous(),
+                                                                      keep.float().contiguous()]
+  z, state = Tensor.custom_kernel(z, state, *inputs, fxn=functools.partial(_gdn_step_kernel, heads=heads, eps=eps))[:2]
+  return z, state

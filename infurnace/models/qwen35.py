@@ -6,17 +6,19 @@ quantized projection weights for Infurnace's packed tinygrad UOp kernels (the
 same `_NVLinear` adapter the Qwen3 path uses). Block math is never replaced.
 """
 import contextlib
+import functools
 import hashlib
 import math
 import os
 from pathlib import Path
-from tinygrad import Context, Tensor
+from tinygrad import Context, Tensor, UOp
 import tinygrad.llm.model as upstream_model
 from tinygrad.llm.gguf import ggml_data_to_tensor
-from tinygrad.llm.model import Transformer
+from tinygrad.llm.model import GatedDeltaNetBlock, Transformer
 from tinygrad.nn.state import get_state_dict
 from infurnace import disk_cache
 from infurnace.gguf import parse_gguf, read_gguf_metadata
+from infurnace.kernels.gdn import gdn_step
 from infurnace.kernels.quant_gemm import nv_prefill_supported
 from infurnace.models.qwen3 import Qwen3Config, Qwen3Model, _NVLinear
 
@@ -35,6 +37,37 @@ class _PackedLinear(_NVLinear):
   def __call__(self, x):
     if self.prefill: return super().__call__(x)
     return self.decode(x)
+
+
+def _fused_gdn_decode(block: GatedDeltaNetBlock):
+  """Upstream GatedDeltaNetBlock._attention for one-row decoding, with the recurrence,
+  RMSNorm and gate in one NV kernel (upstream fuses this only on AMD; elsewhere the
+  per-step scan is dozens of small kernels). Other shapes use upstream's path."""
+  upstream_attention = block._attention
+  H, K, V = block.num_v_heads, block.head_k_dim, block.head_v_dim
+  def attention(x: Tensor, start_pos):
+    B, T, _ = x.shape
+    if B != 1 or T != 1: return upstream_attention(x, start_pos)
+    if not isinstance(start_pos, UOp): start_pos = UOp.variable('start_pos', 0, block.config.max_context - 1).bind(start_pos)
+    initial = Tensor(start_pos).eq(0)
+    x = x.half()
+    out_gate = block.attn_gate(x).reshape(H, V)
+    beta = block.ssm_beta(x).sigmoid().reshape(H)
+    log_alpha = ((block.ssm_alpha(x).float() + block.ssm_dt['bias']).softplus().reshape(H, -1) * block.ssm_a.reshape(H, -1)).reshape(H)
+    # conv over [conv_state | this row]; the last conv_kernel-1 rows become the next conv state
+    conv_state = initial.where(0, block.conv_state)
+    window = conv_state.cat(block.attn_qkv(x).cast(conv_state.dtype), dim=1).contiguous()
+    conv_store = block.conv_state.uop.store(window[:, 1:].cast(block.conv_state.dtype).uop)
+    conv_out = functools.reduce(lambda a, b: a + b, (window[:, i:i+1] * block.ssm_conv1d['weight'][:, i]
+                                                     for i in range(block.ssm_conv_kernel))).silu()
+    q, k, v = conv_out.split([block.q_dim, block.q_dim, block.conv_channels - 2*block.q_dim], dim=-1)
+    q, k = (z.reshape(block.num_k_heads, K).normalize(dim=-1, eps=1e-6).repeat(H // block.num_k_heads, 1) for z in (q, k))
+    # Like upstream: the conv write rides on the recurrent state, which the step reads and updates.
+    state = Tensor(block.recurrent_state.uop.buf_uop.after(conv_store)).reshape(H, V, K)
+    z, _ = gdn_step(q * K**-0.5, k, v.reshape(H, V), beta, log_alpha.exp(), state, out_gate, block.ssm_norm.weight,
+                    (1 - initial.float()).reshape(1), block.ssm_norm.eps)
+    return block.ssm_out(z.reshape(1, 1, H * V))
+  return attention
 
 
 @contextlib.contextmanager
@@ -125,6 +158,15 @@ class Qwen35Model(Qwen3Model):
     result = cls(transformer, metadata, device)
     result._path = Path(path)
     result._enable_packed(path, nv_prefill_supported(device) if nv_prefill is None else nv_prefill)
+    if os.environ.get('INFURNACE_FUSED_GDN', '1') != '0':
+      for block in transformer.blk:
+        if (isinstance(block, GatedDeltaNetBlock) and getattr(block, 'ssm_g_a', None) is None
+            and block.head_k_dim == 128 and block.head_v_dim == 128):
+          block._attention = _fused_gdn_decode(block)
+          # The fused step updates the recurrent state in place, so it must be a real buffer.
+          with Context(DEV=device):
+            block._init_state(Tensor.empty(1, 1, result.config.embedding_length))
+            Tensor.realize(block.conv_state, block.recurrent_state)
     # Placeholder initialization leaves an unrealized host RNG update chain that
     # every later realize would walk. Swap in a fresh counter rather than realize
     # it (that would materialize the placeholders); host sampling is unused.

@@ -66,3 +66,25 @@ def test_packed_gather_decodes_only_requested_rows(typ, swizzled):
       options = dict(q4_swizzled=swizzled)
     got = packed_gather(Tensor(ids, dtype=dtypes.int32), packed, width=width, ggml_type=typ, **options).tolist()
   for i, row in zip(ids, got): assert row == table[i]
+
+
+def test_gdn_step_matches_tensor_recurrence_and_updates_state_in_place():
+  from infurnace.kernels.gdn import gdn_step
+  H, D, eps = 32, 128, 1e-6
+  with Context(DEV='NV'):
+    Tensor.manual_seed(3)
+    k, q = Tensor.randn(H, D).normalize(dim=-1).realize(), (Tensor.randn(H, D).normalize(dim=-1) * D**-0.5).realize()
+    v, beta, alpha = Tensor.randn(H, D).realize(), Tensor.rand(H).realize(), (0.5 + Tensor.rand(H) * 0.5).realize()
+    gate, weight = Tensor.randn(H, D).half().realize(), (Tensor.rand(D) + 0.5).realize()
+    for keep in (1.0, 0.0):  # 0 = sequence start: the old state is ignored
+      S0 = (Tensor.randn(H, D, D) * 0.1).contiguous().realize()
+      before = S0.tolist()
+      s1 = Tensor(before) * keep * alpha.reshape(H, 1, 1)
+      delta = beta.reshape(H, 1) * (v - (s1 * k.reshape(H, 1, D)).sum(-1))
+      S_ref = s1 + delta.reshape(H, D, 1) * k.reshape(H, 1, D)
+      out = (S_ref * q.reshape(H, 1, D)).sum(-1)
+      z_ref = out * (out.square().mean(-1, keepdim=True) + eps).rsqrt() * weight * gate.float().silu()
+      z, state = gdn_step(q, k, v, beta, alpha, S0, gate, weight, Tensor([keep]), eps)
+      z.realize()
+      assert ((S0 - S_ref).abs().max() / S_ref.abs().max()).item() < 1e-5  # S0's own buffer was updated
+      assert ((z.float() - z_ref).abs().max() / z_ref.abs().max()).item() < 2e-3
