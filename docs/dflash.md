@@ -39,33 +39,41 @@ The draft runs as two fixed-shape captures: `absorb` writes context K/V in 16-ro
 chunks, and `denoise` predicts the block, so neither recompiles per prompt length.
 
 Measured on an RTX 5060 (8 GB), Qwen3.5-4B Q4_K_M target, Q4_K_M DFlash draft, block 16,
-chat-formatted prompts, 128 output tokens, warm captures (third repeat), prefill included:
+fused rounds (`INFURNACE_DFLASH_FUSED=1`), chat-formatted prompts with thinking off,
+512 output tokens, **decode only** (prompt prefill excluded: plain decoding prefills
+one row at a time, DFlash 16), warm, median of the last two of five requests:
 
-| Prompt | Thinking | Baseline | DFlash | Speedup | Tokens/round | Output |
-|---|---|---|---|---|---|---|
-| Fibonacci function (code) | off | 81 tok/s | **348 tok/s** | 4.30× | 9.85 | diverges at 69* |
-| Fibonacci function (code) | on | 82 tok/s | 152 tok/s | 1.85× | 3.88 | identical |
-| Pros/cons of remote work | off | 82 tok/s | 109 tok/s | 1.33× | 2.70 | diverges at 47* |
-| Pros/cons of remote work | on | 83 tok/s | **189 tok/s** | 2.28× | 4.92 | diverges at 87* |
+| Prompt | Plain | Always draft | Adaptive (default) | Tokens/round (always draft) |
+|---|---|---|---|---|
+| Red-black tree with tests (code) | 84.5 tok/s | 124.5 tok/s | **123.3 tok/s** (1.46×) | 4.65 |
+| Printing press essay (English) | 88.8 tok/s | 68.9 tok/s | **84.0 tok/s** (0.95×) | 2.43 |
 
-Steady state, each round is two captured graphs launched back to back with one
-small readback: (A) commit the previously verified rows, absorb their features into
-the draft, select the anchor on device and draft the next block; (B) gather the
-block's embeddings from the packed head and run the 16-row target forward. A single
-graph holding both deadlocked on NV replay (HCQ graph batches); splitting at this
-boundary removed it (89 back-to-back requests without a hang). Rounds use about
-22 ms. The generator falls back to ordinary one-row decoding while measured wall time
-per emitted token is worse than a one-row step, backing off exponentially.
+Short, highly predictable prompts do much better (a 128-token Fibonacci answer
+drafts ~9.9 tokens/round), and open-ended prose does worse; the adaptive policy keeps
+the loss on unpredictable text to the cost of its periodic probes (~5%). The desktop
+GPU's clocks vary by a few percent between runs.
+
+Each fused round is a chain of small captured graphs launched back to back with one
+readback: commit the previously verified rows, absorb their features into the draft,
+select the anchor on device, draft, gather the block's embeddings from the packed
+head, run the 16-row target forward, and pack decisions and proposals. Back-to-back
+submissions need the pinned tinygrad fork, which reads GPPut back before ringing the
+GPFIFO doorbell; without it the GPU can miss the last submission and the readback
+never completes. A round takes about 35 ms.
 
 \* Multirow and one-row kernels reduce in different orders; near-ties can flip a
-greedy choice (an earlier run of this prompt diverged at token 27). Treat outputs as
-equivalent up to floating-point ties, not bitwise identical to one-row decoding.
+greedy choice. Treat outputs as equivalent up to floating-point ties, not bitwise
+identical to one-row decoding.
 
-Acceptance is content dependent. A parallel round costs about 3.2 ordinary decode
-steps, so it only pays off above that many tokens per round. The generator tracks a
-moving average and, below 3.5, decodes ordinary rows for 8 steps before probing the
-draft again; this limits but does not remove the loss on poorly predicted text. The
-first request compiles the 16-row captures, which takes minutes. Greedy only.
+**Adaptive fallback.** The generator compares wall time per emitted token over recent
+parallel rounds (a ratio of running sums, so one empty round cannot decide) with the
+measured time of a one-row step. When drafting loses it decodes ordinary rows for 8
+steps, doubling up to 128 while probes keep losing. Samples taken while a graph is
+compiling or capturing are not timed; until a one-row step has been timed, a
+tokens-per-round threshold (3.5) decides. During fallback the target's feature rows
+are copied into the draft's fixed-shape 16-row staging buffer as they are produced
+and absorbed in full chunks, so returning to drafting never recompiles. The first
+request compiles the captures, which takes minutes. Greedy only.
 
 ## Draft identity and metadata
 
