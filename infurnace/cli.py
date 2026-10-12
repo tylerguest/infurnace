@@ -260,6 +260,8 @@ def main() -> int:
   mode = ap.add_mutually_exclusive_group()
   mode.add_argument("--prompt", help="raw single-shot prompt (not chat formatted)")
   mode.add_argument("--chat", action="store_true", help="interactive chat (default)")
+  mode.add_argument("--serve", nargs="?", type=int, const=8000, metavar="PORT", help="OpenAI-compatible HTTP server (default port: 8000)")
+  ap.add_argument("--host", default="127.0.0.1", help="HTTP bind address (default: loopback)")
   mode.add_argument("--benchmark", nargs="?", type=_benchmark_spec, const=(None, 20), metavar="[PROMPT,]COUNT",
                     help="per-step benchmark; default 20 outputs and 512 prompt tokens")
   ap.add_argument("--benchmark-format", choices=("text", "json"), default="text", help="benchmark output (default: text)")
@@ -303,6 +305,10 @@ def main() -> int:
   ap.add_argument("--no-warmup", action="store_true", help="skip automatic startup warmup for interactive chat")
   ap.add_argument("--no-thinking", action="store_true", help="disable thinking in chat formatting")
   args = ap.parse_args()
+  if args.serve is not None:
+    if not 1 <= args.serve <= 65535: ap.error("--serve port must be between 1 and 65535")
+    if args.eagle3 is not None or args.dflash is not None: ap.error("--serve currently supports ordinary decoding only")
+    if args.max_tokens is not None: ap.error("--serve uses request-level max_tokens, not --max-tokens")
   if args.benchmark is not None:
     inline_prompt, args.benchmark = args.benchmark
     if inline_prompt is not None:
@@ -381,6 +387,11 @@ def main() -> int:
             "Draft attention: "
             f"{'legacy all-noncausal' if args.dflash_legacy_noncausal else 'metadata/upstream layer defaults'}.",
             file=sys.stderr, flush=True)
+    if args.serve is not None:
+      from infurnace.serve import serve
+      if not args.no_warmup: _warmup(model)
+      serve(model, tokenizer, args.serve, args.host, enable_thinking=not args.no_thinking)
+      return 0
     if args.prompt is not None:
       return _run_single_shot(model, tokenizer, args.prompt, args.max_tokens or _SINGLE_SHOT_MAX_TOKENS, **stream_options)
     if not args.no_warmup: _warmup(model)

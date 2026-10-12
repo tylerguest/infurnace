@@ -12,6 +12,7 @@ dependencies = ["tinygrad @ git+https://github.com/tylerguest/tinygrad@61e7cb08f
 
 [project.optional-dependencies]
 qwen35 = ["tokenizers>=0.22,<0.23"]
+server = ["jinja2>=3.1,<4"]
 dev = ["ruff==0.14.10", "pytest", "jinja2"]
 
 [project.scripts]

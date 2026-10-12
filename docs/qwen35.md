@@ -38,7 +38,9 @@ a one-hot gather over the packed 248k-row table scans the whole vocabulary on GP
 The Qwen3.5 text codec remains separate: GGUF vocab/merges, NFC normalization,
 Qwen3.5 pretokenization, byte streaming and basic text chat. The optional
 `tokenizers` dependency is a text codec, not a model/inference runtime. Tools and
-multimodal messages are not supported. There is no local safetensors model path.
+multimodal messages are not supported by this basic chat formatter. HTTP serving
+uses the embedded GGUF template and upstream tool parser instead; see [Pi setup](serve.md).
+There is no local safetensors model path.
 
 Our own [DFlash reference](dflash.md) observes upstream block outputs. Default
 sequential verification never executes rejected inputs. Opt-in layer-major block

@@ -1,7 +1,7 @@
 # infurnace
 
 A small, single-user **local Qwen3 runner on tinygrad**. Load one GGUF, warm up
-and chat—no server, batching or scheduler.
+and chat, or serve a single-user OpenAI-compatible API—no batching or scheduler.
 
 Tinygrad provides the transformer, tokenizer, KV cache and JIT. Infurnace adds
 strict GGUF validation, a local chat CLI and custom NVIDIA quantized decode
@@ -139,7 +139,7 @@ notes for settings and limitations.
 Acceleration remains **experimental**: isolated kernel/JIT tests and real-model
 smoke tests pass, but full-model quality comparisons and long-session memory/
 reliability testing remain open. Use `--no-nv-quant` for the generic baseline.
-No HTTP API or tool calling yet.
+HTTP serving and template-based tool calling reuse tinygrad's server; real-model tool-use reliability remains unvalidated. See [Pi setup](docs/serve.md).
 
 Next: full-model quality checks, prefill tuning and long-context attention—not a
 second inference engine.
