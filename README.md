@@ -27,23 +27,24 @@ Then run `infurnace` from any directory while the environment is active.
 For development/tests, install with `pip install -e '.[dev]'` instead.
 The runtime dependency is a pinned tinygrad commit.
 
-Model weights are **not shipped or downloaded automatically**. Place the GGUFs in
-the checkout's `models/` directory, or in user storage:
+Choose a model with `--model` / `-m`: a name from the list below, or a path to a local GGUF file.
+A named model is downloaded on first use into `~/.local/share/infurnace/models/`
+(`XDG_DATA_HOME` respected) and reused after that, like tinygrad's `--model`.
+
+| Name | Files |
+|---|---|
+| `qwen3.5:4b` (default) | [Unsloth Qwen3.5-4B Q4_K_M](https://huggingface.co/unsloth/Qwen3.5-4B-GGUF), 2.7 GB, plus its [DFlash draft](https://huggingface.co/Anbeeld/Qwen3.5-4B-DFlash-GGUF), 0.4 GB (downloaded only when DFlash runs, i.e. on NV) |
+| `qwen3:4b` | [Qwen3-4B Q4_K_M](https://huggingface.co/Qwen/Qwen3-4B-GGUF), 2.5 GB |
 
 ```sh
 pip install -e '.[qwen35]'   # Qwen3.5 tokenizer
-mkdir -p ~/.local/share/infurnace/models
-cp /path/to/Qwen3.5-4B-Q4_K_M.gguf /path/to/qwen35-4b-dflash-Q4_K_M.gguf ~/.local/share/infurnace/models/
-infurnace
+infurnace                    # downloads qwen3.5:4b on first run, then chats
+infurnace -m qwen3:4b
+infurnace -m /path/to/model.gguf
 ```
 
-Bare `infurnace` chats with Qwen3.5-4B and, on NV, its [DFlash](docs/dflash.md) draft;
-`--no-dflash` decodes without it. Without a Qwen3.5 GGUF it falls back to Qwen3-4B
-(`Qwen3-4B-Q4_K_M.gguf`).
-
-Model lookup: `INFURNACE_MODEL` → user data directory → checkout `models/`; the draft
-is found the same way (`INFURNACE_DFLASH_DRAFT`). User storage respects
-`XDG_DATA_HOME`. Override with `infurnace --model /absolute/path/to/model.gguf`.
+`--no-dflash` decodes without the draft. A local Qwen3.5 file uses the Qwen3.5-4B draft only if
+it is already installed; `--dflash PATH` or `INFURNACE_DFLASH_DRAFT` names one explicitly.
 
 After pulling changes, rerun `pip install -e .`. If the tinygrad pin changes,
 force reinstall that exact dependency: pip can retain an older same-version
@@ -52,7 +53,7 @@ wheel. Uninstall with `pip uninstall infurnace`; model files are retained.
 ## Run
 
 ```sh
-infurnace                                   # warm up and chat (DFlash on when its draft is installed)
+infurnace                                   # warm up and chat (DFlash on for qwen3.5:4b on NV)
 infurnace --no-thinking                     # chat without thinking
 infurnace --prompt "Hello" --max-tokens 64  # one raw prompt, no chat template
 infurnace --serve                           # OpenAI-compatible server on 127.0.0.1:8000

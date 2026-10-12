@@ -1,39 +1,47 @@
-"""Finding and loading models: the target GGUF, its tokenizer, and optional speculative drafts.
+"""Choosing and loading models: the target GGUF, its tokenizer, and optional speculative drafts.
 
-Model files are looked up in `INFURNACE_MODEL` / `INFURNACE_DFLASH_DRAFT`, then user storage
-($XDG_DATA_HOME/infurnace/models), then an editable checkout's models/ directory. The default
-target is Qwen3.5-4B (with its DFlash draft), else Qwen3-4B.
+`--model` takes a name from MODELS or a path to a local GGUF file. A named model and its DFlash
+draft are downloaded into user storage ($XDG_DATA_HOME/infurnace/models) on first use; a copy
+already there, or in an editable checkout's models/ directory, is used as is.
 """
 from __future__ import annotations
 import os
 from pathlib import Path
+from tinygrad.helpers import fetch
 from infurnace.device import select_device, supports_nv_quant
 from infurnace.kernels.quant_gemm import nv_prefill_supported
 from infurnace.models.qwen3 import Qwen3Model
 from infurnace.tokenizer import Tokenizer
 
-# (file name, subdirectories of a checkout's models/ to look in)
-TARGETS = (("Qwen3.5-4B-Q4_K_M.gguf", ("", "qwen35-validation")), ("Qwen3-4B-Q4_K_M.gguf", ("",)))
-DFLASH_DRAFT = ("qwen35-4b-dflash-Q4_K_M.gguf", ("", "dflash-qwen35"))
+# name: (model URL, DFlash draft URL or None). The first entry is the default.
+MODELS = {
+  "qwen3.5:4b": ("https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/e87f176479d0855a907a41277aca2f8ee7a09523/Qwen3.5-4B-Q4_K_M.gguf",
+                 "https://huggingface.co/Anbeeld/Qwen3.5-4B-DFlash-GGUF/resolve/a79bafa7f383f8627f925250f547fe1ebbc43ff6/qwen35-4b-dflash-Q4_K_M.gguf"),
+  "qwen3:4b": ("https://huggingface.co/Qwen/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf", None),
+}
 
 def _user_models() -> Path:
   return Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local/share"))).expanduser() / "infurnace/models"
 
-def _find(candidates: tuple[tuple[str, tuple[str, ...]], ...]) -> Path | None:
-  """User storage first (every candidate), then an editable checkout's models/."""
-  checkout = Path(__file__).resolve().parent.parent / "models"
-  for path in [_user_models() / name for name, _ in candidates] + [checkout / sub / name for name, subs in candidates for sub in subs]:
+def _local(url: str) -> Path | None:
+  """An existing copy of a download: user storage first, then an editable checkout's models/."""
+  name, checkout = url.rsplit("/", 1)[1], Path(__file__).resolve().parent.parent / "models"
+  for path in (_user_models() / name, *(checkout / sub / name for sub in ("", "qwen35-validation", "dflash-qwen35"))):
     if path.is_file(): return path
   return None
 
-def default_model() -> str:
-  if path := os.environ.get("INFURNACE_MODEL"): return str(Path(path).expanduser())
-  if found := _find(TARGETS): return str(found)
-  return str(_user_models() / TARGETS[-1][0])
+def fetch_model(model: str | Path) -> Path:
+  """A MODELS name or download URL as a local file, downloaded on first use; a path is returned as is."""
+  url = MODELS[model][0] if model in MODELS else str(model)
+  if not url.startswith("https://"): return Path(url).expanduser()
+  return _local(url) or fetch(url, name=_user_models() / url.rsplit("/", 1)[1])
 
-def default_dflash_draft() -> Path | None:
+def dflash_draft(model: str) -> str | Path | None:
+  """The DFlash draft for `model`: INFURNACE_DFLASH_DRAFT, a named model's draft (downloaded when
+  used), or for a local Qwen3.5 file the Qwen3.5-4B draft if it is already installed."""
   if path := os.environ.get("INFURNACE_DFLASH_DRAFT"): return Path(path).expanduser()
-  return _find((DFLASH_DRAFT,))
+  if model in MODELS: return MODELS[model][1]
+  return _local(MODELS["qwen3.5:4b"][1]) if is_qwen35(model) else None
 
 def is_qwen35(path: str | Path) -> bool:
   from infurnace.gguf import read_gguf_metadata

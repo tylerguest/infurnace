@@ -102,8 +102,8 @@ against greedy decoding in thinking mode because it tends to repeat itself.
 ## 6. Install and getting models
 
 - [ ] Make `tokenizers` a base dependency (the default model needs it)
-- [ ] Add a model download path (`--download` or a first-run prompt) using `tinygrad.helpers.fetch` with SHA-256
-- [ ] Say in the README where the DFlash draft GGUF comes from
+- [x] Add a model download path: `--model NAME` downloads on first use via `tinygrad.helpers.fetch`, tinygrad-style
+- [x] Say in the README where the DFlash draft GGUF comes from
 
 **Problem.** A plain `pip install -e .` lacks the `qwen35` extra, so bare `infurnace` stops with
 "install infurnace[qwen35]". Model files must be found and copied by hand under exact filenames.

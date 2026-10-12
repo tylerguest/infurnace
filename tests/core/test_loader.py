@@ -1,22 +1,39 @@
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from infurnace import loader
 
-def test_default_model_environment(monkeypatch):
-  monkeypatch.setenv("INFURNACE_MODEL", "~/custom.gguf")
-  from pathlib import Path
-  assert loader.default_model() == str(Path.home() / "custom.gguf")
-
-def test_default_model_user_storage(monkeypatch, tmp_path):
-  monkeypatch.delenv("INFURNACE_MODEL", raising=False)
+@pytest.fixture
+def tiny_models(monkeypatch, tmp_path):
   monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
-  path = tmp_path / "infurnace/models/Qwen3-4B-Q4_K_M.gguf"
-  path.parent.mkdir(parents=True)
-  path.touch()
-  monkeypatch.chdir(tmp_path)
-  assert loader.default_model() == str(path)
+  monkeypatch.setattr(loader, "MODELS", {"tiny:1b": ("https://example.com/m/tiny.gguf", "https://example.com/m/tiny-draft.gguf")})
+  fetched = []
+  monkeypatch.setattr(loader, "fetch", lambda url, name: fetched.append((url, name)) or name)
+  return tmp_path / "infurnace/models", fetched
+
+def test_name_downloads_into_user_storage(tiny_models):
+  storage, fetched = tiny_models
+  assert loader.fetch_model("tiny:1b") == storage / "tiny.gguf"
+  assert fetched == [("https://example.com/m/tiny.gguf", storage / "tiny.gguf")]
+
+def test_name_reuses_existing_download(tiny_models):
+  storage, fetched = tiny_models
+  storage.mkdir(parents=True)
+  (storage / "tiny.gguf").touch()
+  assert loader.fetch_model("tiny:1b") == storage / "tiny.gguf" and not fetched
+
+def test_path_is_used_as_is(tiny_models):
+  _, fetched = tiny_models
+  assert loader.fetch_model("~/custom.gguf") == Path.home() / "custom.gguf" and not fetched
+
+def test_dflash_draft_for_names_and_paths(tiny_models, monkeypatch, tmp_path):
+  monkeypatch.delenv("INFURNACE_DFLASH_DRAFT")
+  assert loader.dflash_draft("tiny:1b") == "https://example.com/m/tiny-draft.gguf"  # downloaded only when used
+  assert loader.dflash_draft(str(tmp_path / "missing.gguf")) is None
+  monkeypatch.setenv("INFURNACE_DFLASH_DRAFT", "~/draft.gguf")
+  assert loader.dflash_draft("tiny:1b") == Path.home() / "draft.gguf"
 
 def test_build_uses_loaded_metadata(monkeypatch):
   metadata = {"test": True}

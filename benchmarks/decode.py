@@ -85,7 +85,7 @@ def report(model, tokenizer, count: int, load_seconds: float, prompt_tokens: int
 def main() -> int:
   from infurnace import loader
   ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-  ap.add_argument("--model", default=loader.default_model())
+  ap.add_argument("--model", default=next(iter(loader.MODELS)), help="model name or GGUF path")
   ap.add_argument("--tokens", type=int, default=20, help="output tokens per run (default 20)")
   prompt = ap.add_mutually_exclusive_group()
   prompt.add_argument("--prompt-tokens", type=int, default=DEFAULT_PROMPT_TOKENS, help="synthetic prompt length including BOS")
@@ -94,7 +94,7 @@ def main() -> int:
   ap.add_argument("--device")
   args = ap.parse_args()
   start = time.perf_counter()
-  model, tokenizer = loader.load_model(args.model, args.max_context, args.device)
+  model, tokenizer = loader.load_model(loader.fetch_model(args.model), args.max_context, args.device)
   text = args.prompt_file.read_text(encoding="utf-8") if args.prompt_file is not None else None
   print(json.dumps(report(model, tokenizer, args.tokens, time.perf_counter() - start, args.prompt_tokens, text), indent=2))
   return 0

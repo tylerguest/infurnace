@@ -18,7 +18,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
   mode.add_argument("--serve", nargs="?", type=int, const=8000, metavar="PORT", help="OpenAI-compatible HTTP server (default port 8000)")
   mode.add_argument("--benchmark", nargs="?", type=_benchmark_spec, const=(512, 20), metavar="[PROMPT,]COUNT",
                     help="time plain decoding per step: COUNT outputs (default 20) after a PROMPT-token prompt (default 512)")
-  ap.add_argument("--model", default=loader.default_model(), help="GGUF model file (default: Qwen3.5-4B, else Qwen3-4B; or INFURNACE_MODEL)")
+  ap.add_argument("--model", "-m", default=next(iter(loader.MODELS)),
+                  help=f"model name ({', '.join(loader.MODELS)}; downloaded on first use) or a path to a local GGUF file")
   ap.add_argument("--max-tokens", type=_positive, help="reply length cap, including thinking (default: chat uses the remaining "
                                                        f"context, --prompt {PROMPT_MAX_TOKENS})")
   ap.add_argument("--max-context", type=_positive, default=2048, help="context window in tokens (default 2048)")
@@ -79,8 +80,8 @@ def _dflash_draft(args: argparse.Namespace) -> tuple[Path | None, bool]:
   Qwen3.5 model use an installed draft unless told otherwise."""
   if args.dflash is not None: return args.dflash, False
   if args.no_dflash or args.serve is not None or args.benchmark is not None: return None, False
-  draft = loader.default_dflash_draft()
-  return (draft, True) if draft is not None and draft.is_file() and loader.is_qwen35(args.model) else (None, False)
+  draft = loader.dflash_draft(args.model)  # a download URL for named models
+  return (draft, True) if isinstance(draft, str) or (draft is not None and draft.is_file()) else (None, False)
 
 def _dflash_block(dflash) -> int:
   # Parallel verification checks a whole trained block; the sequential reference checks 4 rows.
@@ -147,12 +148,12 @@ def chat(generate, tokenizer, context: int, max_tokens: int | None, thinking: bo
 
 def run(args: argparse.Namespace) -> int:
   draft, automatic = _dflash_draft(args)
-  model, tokenizer = loader.load_model(args.model, args.max_context, args.device)
+  model, tokenizer = loader.load_model(loader.fetch_model(args.model), args.max_context, args.device)
   if args.benchmark is not None: return benchmark(model, tokenizer, *args.benchmark, warmup=not args.no_warmup)
 
   dflash = None
   if draft is not None and not (automatic and model.device.split(':')[0] != 'NV'):  # the CPU reference is slower than plain
-    dflash = loader.load_dflash(model, draft)
+    dflash = loader.load_dflash(model, loader.fetch_model(draft))
     print(f"DFlash speculative decoding{' on (--no-dflash turns it off)' if automatic else ''}.", file=sys.stderr, flush=True)
   generate, context = generator(model, tokenizer, dflash), model.config.context_length
 
@@ -181,7 +182,7 @@ def main(argv: list[str] | None = None) -> int:
     print("infurnace: out of memory. Stop other model processes or reduce --max-context.", file=sys.stderr)
     return 1
   except FileNotFoundError as exc:
-    print(f"infurnace: file not found: {exc.filename}\nPlace a model at {loader.default_model()} or pass --model /path/to/model.gguf.",
+    print(f"infurnace: file not found: {exc.filename}\nPass --model with a name ({', '.join(loader.MODELS)}) or a path to a GGUF file.",
           file=sys.stderr)
     return 1
   except (ValueError, OSError) as exc:
