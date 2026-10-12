@@ -6,7 +6,6 @@ quantized projection weights for Infurnace's packed tinygrad UOp kernels (the
 same `_NVLinear` adapter the Qwen3 path uses). Block math is never replaced.
 """
 import contextlib
-import functools
 import hashlib
 import math
 import os
@@ -18,7 +17,7 @@ from tinygrad.llm.model import GatedDeltaNetBlock, Transformer
 from tinygrad.nn.state import get_state_dict
 from infurnace import disk_cache
 from infurnace.gguf import parse_gguf, read_gguf_metadata
-from infurnace.kernels.gdn import gdn_step
+from infurnace.kernels.gdn import gdn_decode
 from infurnace.kernels.quant_gemm import nv_prefill_supported
 from infurnace.models.qwen3 import Qwen3Config, Qwen3Model, _NVLinear
 
@@ -40,9 +39,9 @@ class _PackedLinear(_NVLinear):
 
 
 def _fused_gdn_decode(block: GatedDeltaNetBlock):
-  """Upstream GatedDeltaNetBlock._attention for one-row decoding, with the recurrence,
-  RMSNorm and gate in one NV kernel (upstream fuses this only on AMD; elsewhere the
-  per-step scan is dozens of small kernels). Other shapes use upstream's path."""
+  """Upstream GatedDeltaNetBlock._attention for one-row decoding, with the conv, q/k norms,
+  recurrence, RMSNorm and gate in one NV kernel (upstream fuses the recurrence only on AMD;
+  elsewhere the step is dozens of small kernels). Other shapes use upstream's path."""
   upstream_attention = block._attention
   H, K, V = block.num_v_heads, block.head_k_dim, block.head_v_dim
   def attention(x: Tensor, start_pos):
@@ -52,20 +51,13 @@ def _fused_gdn_decode(block: GatedDeltaNetBlock):
     initial = Tensor(start_pos).eq(0)
     x = x.half()
     out_gate = block.attn_gate(x).reshape(H, V)
-    beta = block.ssm_beta(x).sigmoid().reshape(H)
-    log_alpha = ((block.ssm_alpha(x).float() + block.ssm_dt['bias']).softplus().reshape(H, -1) * block.ssm_a.reshape(H, -1)).reshape(H)
-    # conv over [conv_state | this row]; the last conv_kernel-1 rows become the next conv state
-    conv_state = initial.where(0, block.conv_state)
-    window = conv_state.cat(block.attn_qkv(x).cast(conv_state.dtype), dim=1).contiguous()
-    conv_store = block.conv_state.uop.store(window[:, 1:].cast(block.conv_state.dtype).uop)
-    conv_out = functools.reduce(lambda a, b: a + b, (window[:, i:i+1] * block.ssm_conv1d['weight'][:, i]
-                                                     for i in range(block.ssm_conv_kernel))).silu()
-    q, k, v = conv_out.split([block.q_dim, block.q_dim, block.conv_channels - 2*block.q_dim], dim=-1)
-    q, k = (z.reshape(block.num_k_heads, K).normalize(dim=-1, eps=1e-6).repeat(H // block.num_k_heads, 1) for z in (q, k))
-    # Like upstream: the conv write rides on the recurrent state, which the step reads and updates.
-    state = Tensor(block.recurrent_state.uop.buf_uop.after(conv_store)).reshape(H, V, K)
-    z, _ = gdn_step(q * K**-0.5, k, v.reshape(H, V), beta, log_alpha.exp(), state, out_gate, block.ssm_norm.weight,
-                    (1 - initial.float()).reshape(1), block.ssm_norm.eps)
+    # beta/decay projections, conv, q/k norms, recurrence, RMSNorm and gate in one kernel; then the conv shift
+    qkv = block.attn_qkv(x).cast(block.conv_state.dtype).reshape(-1)
+    conv_state = Tensor(block.conv_state.uop.buf_uop).reshape(block.ssm_conv_kernel - 1, block.conv_channels)
+    state = Tensor(block.recurrent_state.uop.buf_uop).reshape(H, V, K)
+    z = gdn_decode(qkv, conv_state, block.ssm_conv1d['weight'], x.reshape(-1), block.ssm_beta.weight, block.ssm_alpha.weight,
+                   block.ssm_dt['bias'], block.ssm_a, state, out_gate, block.ssm_norm.weight, (1 - initial.float()).reshape(1),
+                   block.ssm_norm.eps, kheads=block.num_k_heads)
     return block.ssm_out(z.reshape(1, 1, H * V))
   return attention
 

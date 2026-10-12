@@ -106,60 +106,110 @@ def gdn_chunk(q: Tensor, k: Tensor, v: Tensor, beta: Tensor, g: Tensor, state: T
 
 
 @functools.cache
-def _gdn_step_kernel(z: UOp, state: UOp, q: UOp, k: UOp, v: UOp, beta: UOp, alpha: UOp, gate: UOp, weight: UOp, keep: UOp,
-                     *, heads: int, eps: float) -> UOp:
+def _gdn_decode_kernel(z: UOp, state: UOp, qkv: UOp, conv: UOp, conv_w: UOp, x: UOp, w_beta: UOp, w_alpha: UOp, dt_bias: UOp,
+                       a: UOp, gate: UOp, weight: UOp, keep: UOp, *, heads: int, kheads: int, width: int, eps: float) -> UOp:
   D = 128
   head = UOp.range(heads, 0, axis_type=AxisType.GLOBAL)
   warp = UOp.range(4, 1, axis_type=AxisType.LOCAL)
   lane = UOp.range(32, -1, axis_type=AxisType.WARP)
   col = warp*32+lane
+  kept = keep[0].load()
 
-  # Stage this head's K and Q; each lane then works on four adjacent columns.
-  ksh = UOp.placeholder((D,), dtypes.float32, slot=0, addrspace=AddrSpace.LOCAL)
-  qsh = UOp.placeholder((D,), dtypes.float32, slot=1, addrspace=AddrSpace.LOCAL)
-  staged = UOp.group(ksh[col].store(k[head, col].load()), qsh[col].store(q[head, col].load())).barrier()
-  ksh, qsh = ksh.after(staged), qsh.after(staged)
+  # Causal conv over [conv state | this row] and silu, for this thread's q, k and v channels.
+  # Value heads tile the key heads (upstream repeats them), so head h reads key head h % kheads.
+  def conv_silu(channel: UOp) -> UOp:
+    terms = [conv[i, channel].load()*kept*conv_w[channel, i].load() for i in range(3)] + [qkv[channel].load()*conv_w[channel, 3].load()]
+    total = ((terms[0]+terms[1])+terms[2])+terms[3]
+    return total*(UOp.const(1.0, dtypes.float32) + (-total).exp()).reciprocal()
+  kh = head % kheads
+  qv, kv, vv = conv_silu(kh*D+col), conv_silu(kheads*D+kh*D+col), conv_silu(2*kheads*D+head*D+col)
+
+  # This head's beta and decay projections (rows of 2560-wide weights; the threads split the width).
+  def project(w: UOp) -> UOp:
+    return sum((x[d*D+col].load().float()*w[head, d*D+col].load().float() for d in range(1, width//D)),
+               x[col].load().float()*w[head, col].load().float())
+
+  # Block sums: q², k² (L2 norms) and the two projections.
+  sums = UOp.placeholder((4, 4), dtypes.float32, slot=0, addrspace=AddrSpace.LOCAL)
+  sums = sums.after(UOp.group(*(sums[i, warp].store(warp_reduce(value, full_wave=True))
+                                for i, value in enumerate((qv*qv, kv*kv, project(w_beta), project(w_alpha))))).barrier())
+  def total(i: int) -> UOp: return sum((sums[i, w].load() for w in range(1, 4)), sums[i, 0].load())
+  def norm(i: int) -> UOp: return total(i).sqrt().maximum(UOp.const(1e-6, dtypes.float32))
+  one, zero = UOp.const(1.0, dtypes.float32), UOp.const(0.0, dtypes.float32)
+  def half(value: UOp) -> UOp: return value.cast(dtypes.float16).cast(dtypes.float32)  # upstream rounds these to FP16
+  b = half((one + (-half(total(2))).exp()).reciprocal())                      # sigmoid, in FP16 like upstream
+  pre = half(total(3)) + dt_bias[head].load().float()
+  softplus = pre.maximum(zero) + (one + (-(pre.maximum(-pre))).exp()).log()  # log(1 + e^pre), stable
+  log_alpha = softplus*a[head].load().float()
+  ksh = UOp.placeholder((D,), dtypes.float32, slot=1, addrspace=AddrSpace.LOCAL)
+  qsh = UOp.placeholder((D,), dtypes.float32, slot=2, addrspace=AddrSpace.LOCAL)
+  vsh = UOp.placeholder((D,), dtypes.float32, slot=3, addrspace=AddrSpace.LOCAL)
+  staged = UOp.group(qsh[col].store(qv/norm(0)*D**-0.5), ksh[col].store(kv/norm(1)), vsh[col].store(vv)).barrier()
+  ksh, qsh, vsh = ksh.after(staged), qsh.after(staged), vsh.after(staged)
+
+  # Recurrence: each warp streams 32 value rows, one coalesced read and write per row.
+  # s = decay*S[row]; delta = b(v_row - s·k); S[row] = s + delta*k; out_row = s·q + delta(k·q)
   cols = [lane*4+c for c in range(4)]
   kc, qc = [ksh[c].load() for c in cols], [qsh[c].load() for c in cols]
   kq = warp_reduce(sum((kc[i]*qc[i] for i in range(1, 4)), kc[0]*qc[0]), full_wave=True)
-  decay = alpha[head].load()*keep[0].load()  # keep=0 at sequence start: the old state is ignored
-  b = beta[head].load()
-
-  # Each warp streams 32 value rows: one coalesced read and write of the state per row.
-  # s = decay*S[row]; delta = b(v_row - s·k); S[row] = s + delta*k; out_row = s·q + delta(k·q)
-  outsh = UOp.placeholder((D,), dtypes.float32, slot=2, addrspace=AddrSpace.LOCAL)
+  decay = log_alpha.exp()*kept  # keep=0 at sequence start: the old state is ignored
+  outsh = UOp.placeholder((D,), dtypes.float32, slot=4, addrspace=AddrSpace.LOCAL)
   i = UOp.range(32, 2, axis_type=AxisType.LOOP)
   row = warp*32+i
   s = [state[head, row, c].load()*decay for c in cols]
   sk = warp_reduce(sum((s[n]*kc[n] for n in range(1, 4)), s[0]*kc[0]), full_wave=True)
   sq = warp_reduce(sum((s[n]*qc[n] for n in range(1, 4)), s[0]*qc[0]), full_wave=True)
-  delta = b*(v[head, row].load()-sk)
+  delta = b*(vsh[row].load()-sk)
   rows_done = UOp.group(*(state[head, row, c].store(s[n]+delta*kc[n]) for n, c in enumerate(cols)),
                         outsh[row].store(sq+delta*kq)).end(i).barrier()
   outsh = outsh.after(rows_done)
 
   # RMSNorm over the head's 128 outputs, times silu(gate), as FP16.
   out = outsh[col].load()
-  partial = UOp.placeholder((4,), dtypes.float32, slot=3, addrspace=AddrSpace.LOCAL)
+  partial = UOp.placeholder((4,), dtypes.float32, slot=5, addrspace=AddrSpace.LOCAL)
   partial = partial.after(partial[warp].store(warp_reduce(out*out, full_wave=True)).barrier())
   mean = sum((partial[w].load() for w in range(1, 4)), partial[0].load())/D
   scale = (mean+eps).sqrt().reciprocal()*weight[col].load()
   store = z[head, col].store((out*scale*_silu(gate[head, col].load().float())).cast(dtypes.float16))
-  return store.end(head, warp, lane).sink(arg=KernelInfo(name="gdn_step", opts_to_apply=()))
+  return store.end(head, warp, lane).sink(arg=KernelInfo(name="gdn_decode", opts_to_apply=()))
 
 
-def gdn_step(q: Tensor, k: Tensor, v: Tensor, beta: Tensor, alpha: Tensor, state: Tensor, gate: Tensor,
-             weight: Tensor, keep: Tensor, eps: float) -> tuple[Tensor, Tensor]:
-  """One gated delta-net decode row, updating `state` in place.
+@functools.cache
+def _conv_shift_kernel(out: UOp, conv: UOp, qkv: UOp, keep: UOp, z: UOp, *, channels: int, size: int) -> UOp:
+  # Runs after gdn_decode (it consumes its output): pass z through and shift the conv window in place.
+  # One thread per output value; each also shifts channels//size conv channels.
+  block = UOp.range(size//128, 0, axis_type=AxisType.GLOBAL)
+  lane = UOp.range(128, 1, axis_type=AxisType.LOCAL)
+  t = block*128+lane
+  kept = keep[0].load()
+  stores = [out[block, lane].store(z[block, lane].load())]  # out, z: (heads, 128)
+  for j in range(channels//size):
+    c = t+j*size
+    r1, r2 = conv[1, c].load(), conv[2, c].load()
+    after = conv.after(r1, r2)
+    stores += [after[0, c].store(r1*kept), after[1, c].store(r2*kept), after[2, c].store(qkv[c].load())]
+  return UOp.group(*stores).end(block, lane).sink(arg=KernelInfo(name="gdn_conv_shift", opts_to_apply=()))
 
-  q, k, v: (H, 128) FP32 (q pre-scaled, q/k normalized); beta, alpha: (H,) (alpha = per-head
-  decay, not its log); state: (H, 128, 128) FP32 as (V, K), realized; gate: (H, 128);
-  weight: (128,); keep: (1,) 0/1 multiplier on the old state. Returns z (H, 128) FP16 and the
-  state after the update."""
-  heads, dim = q.shape
-  if dim != 128 or state.shape != (heads, 128, 128): raise ValueError("fused GDN step requires 128-dimensional heads")
-  z = Tensor.empty(heads, dim, dtype=dtypes.float16, device=q.device)
-  inputs = [t.float().contiguous() for t in (q, k, v, beta, alpha)] + [gate.contiguous(), weight.float().contiguous(),
-                                                                      keep.float().contiguous()]
-  z, state = Tensor.custom_kernel(z, state, *inputs, fxn=functools.partial(_gdn_step_kernel, heads=heads, eps=eps))[:2]
-  return z, state
+
+def gdn_decode(qkv: Tensor, conv_state: Tensor, conv_w: Tensor, x: Tensor, w_beta: Tensor, w_alpha: Tensor, dt_bias: Tensor,
+               a: Tensor, state: Tensor, gate: Tensor, weight: Tensor, keep: Tensor, eps: float, kheads: int) -> Tensor:
+  """One gated delta-net decode row from the raw qkv projection, in two kernels.
+
+  qkv: (C,) projection output; conv_state: (3, C) FP32 realized; conv_w: (C, 4); x: (width,) layer
+  input; w_beta, w_alpha: (H, width) projection weights (beta = sigmoid(x·w_beta), log decay =
+  softplus(x·w_alpha + dt_bias)*a); state: (H, 128, 128) FP32 as (V, K), realized; gate: (H, 128);
+  weight: (128,); keep: (1,) 0/1 multiplier on the old conv and recurrent state.
+  The recurrent and conv states are updated in place; returns z (H, 128) FP16."""
+  heads, channels, width = w_beta.shape[0], qkv.shape[0], x.shape[0]
+  if (state.shape != (heads, 128, 128) or conv_state.shape != (3, channels) or channels != 2*kheads*128 + heads*128
+      or channels % (heads*128) or width % 128 or w_beta.shape != (heads, width) or w_alpha.shape != (heads, width)):
+    raise ValueError("fused GDN decode requires 128-dimensional heads and a 4-tap conv")
+  qkv, keep = qkv.float().contiguous(), keep.float().contiguous()
+  z = Tensor.empty(heads, 128, dtype=dtypes.float16, device=qkv.device)
+  z = Tensor.custom_kernel(z, state, qkv, conv_state, conv_w.float().contiguous(), x.contiguous(), w_beta.contiguous(),
+                           w_alpha.contiguous(), dt_bias.contiguous(), a.contiguous(), gate.contiguous(),
+                           weight.float().contiguous(), keep,
+                           fxn=functools.partial(_gdn_decode_kernel, heads=heads, kheads=kheads, width=width, eps=eps))[0]
+  out = Tensor.empty(heads, 128, dtype=dtypes.float16, device=qkv.device)
+  return Tensor.custom_kernel(out, conv_state, qkv, keep, z, fxn=functools.partial(
+    _conv_shift_kernel, channels=channels, size=heads*128))[0]

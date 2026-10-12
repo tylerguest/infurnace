@@ -68,23 +68,35 @@ def test_packed_gather_decodes_only_requested_rows(typ, swizzled):
   for i, row in zip(ids, got): assert row == table[i]
 
 
-def test_gdn_step_matches_tensor_recurrence_and_updates_state_in_place():
-  from infurnace.kernels.gdn import gdn_step
-  H, D, eps = 32, 128, 1e-6
+def test_gdn_decode_matches_upstream_math_and_updates_states_in_place():
+  from infurnace.kernels.gdn import gdn_decode
+  H, NK, D, W, eps = 32, 16, 128, 2560, 1e-6
+  C = 2*NK*D + H*D
   with Context(DEV='NV'):
-    Tensor.manual_seed(3)
-    k, q = Tensor.randn(H, D).normalize(dim=-1).realize(), (Tensor.randn(H, D).normalize(dim=-1) * D**-0.5).realize()
-    v, beta, alpha = Tensor.randn(H, D).realize(), Tensor.rand(H).realize(), (0.5 + Tensor.rand(H) * 0.5).realize()
+    Tensor.manual_seed(5)
+    qkv, conv_w = Tensor.randn(C).realize(), (Tensor.randn(C, 4) * 0.5).half().realize()
+    x = (Tensor.randn(W) * 0.5).half().realize()
+    w_beta, w_alpha = (Tensor.randn(H, W) * 0.02).half().realize(), (Tensor.randn(H, W) * 0.02).half().realize()
+    dt_bias, a = Tensor.randn(H).half().realize(), (-Tensor.rand(H) * 2).half().realize()
     gate, weight = Tensor.randn(H, D).half().realize(), (Tensor.rand(D) + 0.5).realize()
-    for keep in (1.0, 0.0):  # 0 = sequence start: the old state is ignored
-      S0 = (Tensor.randn(H, D, D) * 0.1).contiguous().realize()
-      before = S0.tolist()
-      s1 = Tensor(before) * keep * alpha.reshape(H, 1, 1)
+    for keep in (1.0, 0.0):  # 0 = sequence start: old conv and recurrent state are ignored
+      conv0, S0 = Tensor.randn(3, C).contiguous().realize(), (Tensor.randn(H, D, D) * 0.1).contiguous().realize()
+      conv_before, S_before = Tensor(conv0.tolist()), Tensor(S0.tolist())
+      # Reference: upstream GatedDeltaNetBlock._attention for one row.
+      window = (conv_before * keep).cat(qkv.reshape(1, C), dim=0)
+      conv = sum(window[i] * conv_w[:, i].float() for i in range(4)).silu()
+      q = conv[:NK*D].reshape(NK, D).normalize(dim=-1, eps=1e-6).repeat(H // NK, 1) * D**-0.5
+      k = conv[NK*D:2*NK*D].reshape(NK, D).normalize(dim=-1, eps=1e-6).repeat(H // NK, 1)
+      v = conv[2*NK*D:].reshape(H, D)
+      beta = (x.float() @ w_beta.float().T).half().float().sigmoid().half().float()  # FP16 like upstream
+      alpha = (((x.float() @ w_alpha.float().T).half().float() + dt_bias.float()).softplus() * a.float()).exp()
+      s1 = S_before * keep * alpha.reshape(H, 1, 1)
       delta = beta.reshape(H, 1) * (v - (s1 * k.reshape(H, 1, D)).sum(-1))
       S_ref = s1 + delta.reshape(H, D, 1) * k.reshape(H, 1, D)
       out = (S_ref * q.reshape(H, 1, D)).sum(-1)
       z_ref = out * (out.square().mean(-1, keepdim=True) + eps).rsqrt() * weight * gate.float().silu()
-      z, state = gdn_step(q, k, v, beta, alpha, S0, gate, weight, Tensor([keep]), eps)
+      z = gdn_decode(qkv, conv0, conv_w, x, w_beta, w_alpha, dt_bias, a, S0, gate, weight, Tensor([keep]), eps, kheads=NK).float()
       z.realize()
-      assert ((S0 - S_ref).abs().max() / S_ref.abs().max()).item() < 1e-5  # S0's own buffer was updated
-      assert ((z.float() - z_ref).abs().max() / z_ref.abs().max()).item() < 2e-3
+      assert ((z - z_ref).abs().max() / z_ref.abs().max()).item() < 2e-3
+      assert ((S0 - S_ref).abs().max() / S_ref.abs().max()).item() < 1e-4   # updated in place
+      assert conv0.tolist() == window[1:].tolist()                          # conv window shifted in place
