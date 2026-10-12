@@ -229,6 +229,20 @@ class Qwen35Model:
     finally:
       self.reset()  # No dummy tokens become conversation history or reusable prefix.
 
+  def realize_state(self) -> None:
+    """Create upstream's lazily initialized state as real buffers: KV caches, RoPE tables, conv and
+    recurrent states, and the device RNG (created without advancing its stream). Upstream otherwise
+    creates them inside its first call, and a graph captured before that would re-create them,
+    zeroed, on every replay."""
+    with Context(DEV=self.device):
+      x, states = Tensor.empty(1, 1, self.config.embedding_length), []
+      for block in self.transformer.blk:
+        block._init_state(x)
+        states += [getattr(block, name) for name in ('cache_kv', 'freqs_cis', 'conv_state', 'recurrent_state') if hasattr(block, name)]
+      if self.device not in Tensor._device_seeds: Tensor._next_counter(self.device, 0)
+      states += [Tensor._device_seeds[self.device], Tensor._device_rng_counters[self.device]]
+      if pending := [t for t in states if not t.uop.is_realized]: Tensor.realize(*pending)
+
   def reset(self) -> None:
     """Invalidate prefix reuse without reallocating tinygrad's cache or JIT."""
     if self._generating: raise RuntimeError("cannot reset during generation")
@@ -273,6 +287,11 @@ class Qwen35Model:
     t = self.transformer
     start, end = t.get_start_pos(tokens), len(tokens) - 1
     if not self._multirow_prefill or end <= start: return
+    if t.prefill_jit.cnt == 0:
+      # Skip TinyJit's eager first call (~19 s scheduling the 16-row graph) and capture right away:
+      # with every state buffer already real, the eager call has nothing left to set up.
+      self.realize_state()
+      t.prefill_jit.cnt = 1
     v_start = UOp.variable('start_pos', 0, t.max_context - 1)
     v_rows = UOp.variable('toks', 1, PREFILL_ROWS)
     ids = Tensor(tokens + [0] * (t.max_context - len(tokens)), dtype='int32').reshape(1, t.max_context)

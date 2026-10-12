@@ -22,23 +22,13 @@ class TargetObserver:
     self._temperature = None
 
   def _realize_state(self):
-    # Upstream creates KV caches and recurrent states lazily (unrealized zeros)
-    # and realizes them on its own first call. DFlash's verifier stores into them
-    # directly, so they must be real buffers before any DFlash work: otherwise a
-    # cold first request writes K/V into a temporary and attends over zeros.
-    target = self.model.transformer
-    with Context(DEV=self.model.device):
-      x = Tensor.empty(1, 1, self.model.config.embedding_length)
-      states = []
-      for block in target.blk:
-        block._init_state(x)
-        states += [getattr(block, name) for name in ('cache_kv', 'freqs_cis', 'conv_state', 'recurrent_state') if hasattr(block, name)]
-      # The step's sampling reads the device RNG; create it without advancing the stream.
-      if self.model.device not in Tensor._device_seeds: Tensor._next_counter(self.model.device, 0)
-      states += [Tensor._device_seeds[self.model.device], Tensor._device_rng_counters[self.model.device]]
-      if pending := [t for t in states if not t.uop.is_realized]: Tensor.realize(*pending)
-      # A persistent temperature buffer: the captured step always sees the same address.
-      if self._temperature is None: self._temperature = Tensor([0.0], device=self.model.device).realize()
+    # DFlash's verifier stores into the target's caches and states directly, so they must be
+    # real buffers before any DFlash work: otherwise a cold first request writes K/V into a
+    # temporary and attends over zeros.
+    self.model.realize_state()
+    # A persistent temperature buffer: the captured step always sees the same address.
+    if self._temperature is None:
+      with Context(DEV=self.model.device): self._temperature = Tensor([0.0], device=self.model.device).realize()
 
   def __enter__(self):
     if self.active or self.model._generating: raise RuntimeError('only one generation may run at a time')

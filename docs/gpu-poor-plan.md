@@ -38,7 +38,7 @@ Tensor-core GEMM also needs an `(8,16,16)` FP16 tensor core, so older cards that
 ## 2. Plain decoding reads prompts one token at a time
 
 - [x] Read prompts in 16-row chunks through a fused NV kernel (`gdn_prefill`)
-- [ ] Cut the extra warmup it adds (see below)
+- [x] Cut the extra warmup it adds: skip TinyJit's eager pass (45 s → 31 s)
 
 **Problem.** Upstream `Transformer.generate` (`tinygrad/llm/model.py`) does:
 ```python
@@ -69,9 +69,11 @@ activations to 8 bits, the 16-row GEMM multiplies in FP16, so logits agree to ~1
 Tests: `tests/dflash/test_nv_dflash_kernels.py` (kernel vs one-row scan, padding, reset) and
 `tests/core/test_nv_qwen35_prefill.py` (logits tolerance, generate, prefix reuse).
 
-**Open: warmup cost.** Plain-decoding warmup went from 12 s to 45 s. The first 16-row chunk
-costs 19 s eagerly plus 14 s to capture; replays are free. Realizing the KV caches first and
-skipping the eager pass (as DFlash's `captured()` does) should save part of that, unmeasured.
+**Warmup cost.** Capturing the 16-row graph made plain-decoding warmup 12 s → 45 s: the first
+chunk ran 19 s eagerly, then 14 s to capture. `_prefill` now realizes every state buffer first
+(`Qwen35Model.realize_state`, shared with DFlash) and starts the JIT at its capture pass, as
+DFlash's `captured()` does: warmup is **31 s**, output unchanged. The remaining ~19 s over the
+one-row baseline is the capture itself, scheduling and compiling the 16-row graph.
 
 ## 3. DFlash chat re-reads the whole conversation every turn
 
