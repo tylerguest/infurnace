@@ -36,6 +36,10 @@ class DFlashGenerator:
     # Break-even tokens/round for parallel verification vs one-row decode on
     # the 5060 (one round ~= 3.2 ordinary steps), and the fallback length.
     self.min_tau, self.cooldown_steps, self.max_backoff = 3.5, 8, 16
+    # Decide on a long horizon (~20 rounds) and only after 4 timed rounds since a probe: thinking text dips
+    # below break-even for a few rounds while averaging well above it, and plain prose stays below it.
+    self.spec_memory = 0.95  # weight of history in the round time/token averages
+    self.min_timed_rounds = 4  # timed rounds after a probe before deciding
     self.plain_cost = None  # measured seconds per one-row target step (kept across requests)
     # Timing samples seen per kind ('plain', 'fused'): the first calls of a
     # captured graph run eagerly and then capture, so they are not timed.
@@ -105,12 +109,14 @@ class DFlashGenerator:
           nonlocal spec_time, spec_tokens, timed_rounds, tau, probing, cooldown, backoff
           elapsed = time.perf_counter() - started
           if spec_time is None or probing: spec_time, spec_tokens, timed_rounds = elapsed, accepted + 1, 0
-          else: spec_time, spec_tokens = 0.7 * spec_time + 0.3 * elapsed, 0.7 * spec_tokens + 0.3 * (accepted + 1)
+          else:
+            m = self.spec_memory
+            spec_time, spec_tokens = m * spec_time + (1 - m) * elapsed, m * spec_tokens + (1 - m) * (accepted + 1)
           tau, probing, timed_rounds = 0.5 * tau + 0.5 * (accepted + 1), False, timed_rounds + 1
-          if self.plain_cost is not None: losing = timed_rounds >= 2 and spec_time / spec_tokens > self.plain_cost
+          if self.plain_cost is not None: losing = timed_rounds >= self.min_timed_rounds and spec_time / spec_tokens > self.plain_cost
           else: losing = tau < self.min_tau
           if losing: tau, cooldown, backoff = float(block), self.cooldown_steps * backoff, min(backoff * 2, self.max_backoff)
-          elif timed_rounds >= 2: backoff = 1
+          elif timed_rounds >= self.min_timed_rounds: backoff = 1
         def account_untimed(accepted):
           # A round whose wall time is not representative (a capture, or the
           # unfused probe that re-enters fused rounds) only updates the

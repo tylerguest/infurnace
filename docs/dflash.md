@@ -67,9 +67,9 @@ never completes. A round takes about 35 ms.
 greedy choice. Treat outputs as equivalent up to floating-point ties, not bitwise
 identical to one-row decoding.
 
-**Adaptive fallback.** The generator compares wall time per emitted token over recent
-parallel rounds (a ratio of running sums, so one empty round cannot decide) with the
-measured time of a one-row step. When drafting loses it decodes ordinary rows for 8
+**Adaptive fallback.** The generator compares wall time per emitted token over the last
+~20 parallel rounds (a ratio of running sums, so a short dip cannot decide; at least 4
+timed rounds after each probe) with the measured time of a one-row step. When drafting loses it decodes ordinary rows for 8
 steps, doubling up to 128 while probes keep losing. Samples taken while a graph is
 compiling or capturing are not timed; until a one-row step has been timed, a
 tokens-per-round threshold (3.5) decides. During fallback the target's feature rows

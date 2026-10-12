@@ -64,5 +64,5 @@ def test_timing_fallback_decodes_plain_rows_when_drafting_loses(tmp_path):
     generator = DFlashGenerator(model, RecordedDraft(model, prompt, expected, wrong=True), verifier='parallel')
     generator.plain_cost = 0.0  # any drafting round is slower than a measured plain step
     assert list(generator.stream(list(prompt), max_new_tokens=9, block_size=4)) == expected
-    # After the first losing round the generator decodes ordinary rows.
-    assert generator.stats.proposed <= 2 * 3  # at most the losing round and one probe drafted
+    # Once enough timed rounds show drafting losing, the generator decodes ordinary rows.
+    assert generator.stats.proposed <= generator.min_timed_rounds * 3
