@@ -129,10 +129,12 @@ def _run_single_shot(model: Qwen3Model, tokenizer: Tokenizer, prompt: str, max_t
   return 0
 
 
-def _warmup(model: Qwen3Model) -> None:
+def _warmup(model: Qwen3Model, dflash=None, dflash_block_size: int | None = None) -> None:
   print(f"Warming up {model.device} (first startup may take a while)...", file=sys.stderr, flush=True)
   start = time.perf_counter()
-  model.warmup()
+  # DFlash requests never use plain generation's graphs; capture DFlash's own instead.
+  if dflash is not None: dflash.warmup(dflash_block_size)
+  else: model.warmup()
   print(f"Ready in {time.perf_counter()-start:.1f}s.", file=sys.stderr, flush=True)
 
 
@@ -418,7 +420,7 @@ def main() -> int:
       return 0
     if args.prompt is not None:
       return _run_single_shot(model, tokenizer, args.prompt, args.max_tokens or _SINGLE_SHOT_MAX_TOKENS, **stream_options)
-    if not args.no_warmup: _warmup(model)
+    if not args.no_warmup: _warmup(model, stream_options.get('dflash'), stream_options.get('dflash_block_size'))
     return _run_chat(model, tokenizer, args.max_tokens, args.max_context, not args.no_thinking, **stream_options)
   except KeyboardInterrupt:
     print("\nInterrupted.", file=sys.stderr)

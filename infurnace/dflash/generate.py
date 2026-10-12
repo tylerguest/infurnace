@@ -200,6 +200,19 @@ class DFlashGenerator:
       finally:
         self.draft.reset()
 
+  def warmup(self, block_size: int | None = None):
+    """Capture the graphs a request uses before the first one: drafting rounds
+    (fused when enabled) and the plain-step fallback. Leaves no request state."""
+    saved = self.min_tau, self.plain_cost
+    prompt = [0] * min(16, self.model.config.context_length // 4)
+    try:
+      for plain_cost in (float('inf'), 0.0):  # always draft, then always fall back
+        self.min_tau, self.plain_cost = 0.0, plain_cost
+        for _ in range(2): list(self.stream(list(prompt), max_new_tokens=48, block_size=block_size))
+    finally:
+      self.min_tau, self.plain_cost = saved
+      self.stats = DFlashStats()
+
   def _parallel_verifier(self, block):
     from infurnace.dflash.parallel import ParallelVerifier
     if block not in self._parallel: self._parallel[block] = ParallelVerifier(self.observer, block)
