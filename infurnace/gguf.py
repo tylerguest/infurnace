@@ -26,10 +26,26 @@ def _read_str(handle) -> str:
   try: return _read_exact(handle, length).decode("utf-8")
   except UnicodeDecodeError as exc: raise ValueError("invalid GGUF UTF-8 string") from exc
 
+_ARRAY_FORMATS = {0: "B", 1: "b", 2: "H", 3: "h", 4: "I", 5: "i", 6: "f", 7: "?", 10: "Q", 11: "q", 12: "d"}
+
 def _read_arr(handle) -> list[Any]:
   value_type = _read_unpack("<i", 4, handle)
   reader = _value_reader(value_type)
-  return [reader(handle) for _ in range(_read_unpack("<Q", 8, handle))]
+  count = _read_unpack("<Q", 8, handle)
+  # Vocabularies are ~250k entries: numeric arrays in one read, strings in a tight loop.
+  if (fmt := _ARRAY_FORMATS.get(value_type)) is not None:
+    return list(struct.unpack(f"<{count}{fmt}", _read_exact(handle, count * struct.calcsize(fmt))))
+  if value_type != 8: return [reader(handle) for _ in range(count)]
+  read, strings = handle.read, []
+  for _ in range(count):
+    size = read(8)
+    if len(size) != 8: raise ValueError(f"truncated GGUF at byte {handle.tell() - len(size)}: expected 8 bytes, got {len(size)}")
+    length = int.from_bytes(size, "little")
+    data = read(length)
+    if len(data) != length: raise ValueError(f"truncated GGUF at byte {handle.tell() - len(data)}: expected {length} bytes, got {len(data)}")
+    try: strings.append(data.decode("utf-8"))
+    except UnicodeDecodeError as exc: raise ValueError("invalid GGUF UTF-8 string") from exc
+  return strings
 
 _READERS = {
   0: functools.partial(_read_unpack, "<B", 1),  # uint8
@@ -245,7 +261,7 @@ def _validate_tensor_infos(infos, metadata: dict[str, Any], data_start: int, fil
 def _read_gguf(path: Path, file_size: int, mtime_ns: int) -> tuple[dict[str, Any], list, int]:
   # Metadata holds the whole vocabulary and merges (~0.5M strings for Qwen3.5); one
   # load reads it from several places, so parse each file version once.
-  with path.open("rb") as handle:
+  with path.open("rb", buffering=1 << 20) as handle:  # ~0.5M small reads: a large buffer halves the parse
     _, tensor_count, metadata_count = _read_header(handle)
     metadata = _read_metadata(handle, metadata_count)
     infos = _read_multi_tensor_info(handle, tensor_count)

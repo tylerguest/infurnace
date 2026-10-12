@@ -145,7 +145,8 @@ class DFlashDraft:
     if set(entries) != set(expected): raise ValueError('DFlash GGUF weight keys mismatch')
     for name, entry in entries.items():
       if entry.shape != expected[name].shape: raise ValueError(f'invalid DFlash shape: {name}, {entry.shape}')
-    resident = {name: entry.to(target.device) for name, entry in entries.items()}
+    # Lazy copies: everything is realized in one schedule at the end.
+    resident = {name: entry.to(target.device, realize=False) for name, entry in entries.items()}
     result = cls(config, target, {name: entry.decode() for name, entry in resident.items()})
     result.metadata, result.path = metadata, Path(path)
     result.packed_linears = 0
@@ -158,13 +159,13 @@ class DFlashDraft:
         elif name == 'fc.weight': owner, attr = result.weights, 'fc'
         else: continue
         adapter = _NVLinear(getattr(owner, attr), entry, q6_aligned=True,
-                            prefill=entry.ggml_type in (12, 13, 14) and nv_prefill_supported(target.device))
+                            prefill=entry.ggml_type in (12, 13, 14) and nv_prefill_supported(target.device), realize=False)
         # projection() always uses the packed GEMV; keep no dense decode graph alive.
         adapter.weight = adapter.original.weight = None
         setattr(owner, attr, adapter)
         result.packed_linears += 1
-    # Realize what stays dense (norms, small projections): captured graphs then
-    # read real buffers instead of recomputing the casts on every replay.
+    # Realize the packed projections and what stays dense (norms, small projections)
+    # together: captured graphs then read real buffers instead of recomputing casts.
     with Context(DEV=result.device):
       if lazy := [t for t in get_parameters(result.weights) if not t.uop.is_realized]: Tensor.realize(*lazy)
     return result
