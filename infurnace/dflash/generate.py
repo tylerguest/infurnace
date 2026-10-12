@@ -203,49 +203,12 @@ class DFlashGenerator:
       finally:
         self.draft.reset()
 
-  def _graphs(self, block: int) -> dict:
-    """Every captured graph a parallel request can use, created up front with the
-    buffers they touch, by a stable name."""
-    self.observer._realize_state()
-    verifier = self._parallel_verifier(block)
-    verifier._allocate()
-    graphs = {'observer': self.observer._jit, 'verify': verifier._forward_jit, 'commit': verifier._commit_jit,
-              'absorb': self.draft._absorb_jit}
-    if self.fused and verifier.fused_eligible(self.draft):
-      pick, ids, pack = verifier._round_graphs(self.draft)
-      graphs |= {'pick': pick, 'ids': ids, 'pack': pack, 'fused_absorb': verifier._fused_absorb, 'fused_draft': verifier._fused_draft}
-    for count in range(1, block): graphs[f'denoise{count}'] = self.draft._denoise_graph(count)
-    return graphs
-
-  def _graph_cache_path(self, block: int):
-    # Opt-in: a cached entry has been seen to hang its first replay in later processes (cause not yet found).
-    if os.environ.get('INFURNACE_GRAPH_CACHE', '0') != '1' or self.verifier != 'parallel': return None
-    if self.model.device.split(':')[0] != 'NV' or getattr(self.model, '_path', None) is None: return None
-    from infurnace.dflash import graph_cache
-    return graph_cache.cache_dir() / f'{graph_cache.key(self, block)}.pkl'
-
-  def warmup(self, block_size: int | None = None) -> str:
+  def warmup(self, block_size: int | None = None) -> None:
     """Capture the graphs a request uses before the first one: drafting rounds
-    (fused when enabled) and the plain-step fallback. Leaves no request state.
-    Graphs come from the on-disk cache when it matches (returns 'cached'); otherwise
-    they are captured (returns 'captured') and saved for the next process."""
-    from infurnace.dflash import graph_cache
-    block = self.draft.config.block_size if block_size is None else block_size
-    path = self._graph_cache_path(block)
-    if path is not None and path.is_file():
-      graphs = self._graphs(block)
-      loaded = graph_cache.load(path, graph_cache.named_buffers(self))
-      if loaded is not None and set(loaded) <= set(graphs):
-        for name, captured in loaded.items():
-          graphs[name].captured, graphs[name].cnt = captured, 2
-        # Replays the cached graphs once each and schedules the eager glue around them.
-        self._capture(block_size, requests=1)
-        return 'cached'
+    (fused when enabled) and the plain-step fallback. Leaves no request state."""
     self._capture(block_size)
-    if path is not None: graph_cache.save(path, self._graphs(block), graph_cache.named_buffers(self))
-    return 'captured'
 
-  def _capture(self, block_size: int | None, requests: int = 2):
+  def _capture(self, block_size: int | None):
     saved = self.min_tau, self.plain_cost
     prompt = [0] * min(16, self.model.config.context_length // 4)
     try:
@@ -253,7 +216,7 @@ class DFlashGenerator:
       # rule decides while no plain step is timed) so plain steps are captured too.
       for min_tau, plain_cost in ((0.0, float('inf')), (float('inf'), None)):
         self.min_tau, self.plain_cost = min_tau, plain_cost
-        for _ in range(requests): list(self.stream(list(prompt), max_new_tokens=48, block_size=block_size))
+        for _ in range(2): list(self.stream(list(prompt), max_new_tokens=48, block_size=block_size))
     finally:
       self.min_tau, self.plain_cost = saved
       self.stats = DFlashStats()

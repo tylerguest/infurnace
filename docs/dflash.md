@@ -76,18 +76,11 @@ tokens-per-round threshold (3.5) decides. During fallback the target's feature r
 are copied into the draft's fixed-shape 16-row staging buffer as they are produced
 and absorbed in full chunks, so returning to drafting never recompiles. Greedy only.
 
-**Startup and graph cache.** Chat warms DFlash's captured graphs before the first
-prompt (~45 s). With `INFURNACE_GRAPH_CACHE=1` (opt-in: an entry has been seen to hang
-its first replay in a later process; under investigation) they are saved to
-`~/.cache/infurnace/dflash-graphs/` (`XDG_CACHE_HOME` respected, ~130 MB, newest four
-kept), and later launches load them in ~7 s. Weights and caches are not written:
-buffers owned by the model, draft and verifier are stored by name and re-bound on load.
-Any change to tinygrad or infurnace sources, either GGUF file, the context length,
-block size, fused rounds, device or compile flags selects a new entry.
+**Startup.** Chat warms DFlash's captured graphs before the first prompt (~45 s).
 The target's small prepared
 parameters (norms, gates; ~10 MB that otherwise take ~2 s of kernel scheduling) are
 cached alongside in `~/.cache/infurnace/params/`; `INFURNACE_PARAM_CACHE=0` disables
-that. With both caches warm, chat is ready ~16 s after launch; without the graph cache, ~55 s.
+that. With it warm, chat is ready about a minute after launch.
 
 ## Draft identity and metadata
 

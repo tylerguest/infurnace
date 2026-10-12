@@ -18,8 +18,8 @@ def test_submission_link_reinitializes_reused_signal_storage():
   from tinygrad.device import Buffer
   from tinygrad.runtime.support.hcq2 import fold_binary
   from tinygrad.uop.ops import Ops
-  storage = Buffer('CPU', 4, dtypes.uint64).ensure_allocated()
-  view, initial = UOp.from_buffer(storage, 'CPU'), UOp(Ops.BINARY, arg=bytes(32))
+  storage = Buffer('CPU', 32).ensure_allocated()  # four uint64 signal words
+  view, initial = UOp.from_buffer(storage, dtypes.uint64, 'CPU'), UOp(Ops.BINARY, arg=bytes(32))
   fold_binary(view, initial)
   for repeat in range(4):
     storage.host.view(fmt='Q')[repeat] = 999999999  # Simulated queue/timeline signal.

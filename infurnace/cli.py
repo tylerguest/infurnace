@@ -96,9 +96,9 @@ def warmup(model, dflash=None) -> None:
   print(f"Warming up {model.device} (first startup may take a while)...", file=sys.stderr, flush=True)
   start = time.perf_counter()
   # DFlash requests never use plain generation's graphs, so it captures its own.
-  how = dflash.warmup(_dflash_block(dflash)) if dflash is not None else model.warmup()
-  note = {'cached': ' (DFlash graphs from cache)', 'captured': ' (DFlash graphs cached for next time)'}.get(how, '')
-  print(f"Ready in {time.perf_counter() - start:.1f}s{note}.", file=sys.stderr, flush=True)
+  if dflash is not None: dflash.warmup(_dflash_block(dflash))
+  else: model.warmup()
+  print(f"Ready in {time.perf_counter() - start:.1f}s.", file=sys.stderr, flush=True)
 
 def encode(tokenizer, text: str) -> list[int]:
   return ([tokenizer.bos_id] if tokenizer.bos_id is not None else []) + tokenizer.encode(text)

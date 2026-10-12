@@ -24,8 +24,8 @@ from infurnace.kernels.gdn import gdn_decode
 from infurnace.kernels.quant_gemm import nv_prefill_supported
 from infurnace.models.qwen3 import Qwen3Config, Qwen3Model, _NVLinear
 
-# On-disk caches (this file's parameters, DFlash's graphs) live under $XDG_CACHE_HOME/infurnace and are
-# keyed on everything that changes what they hold. A key mismatch, missing file or read error is a miss.
+# The parameter cache lives under $XDG_CACHE_HOME/infurnace/params and is
+# keyed on everything that changes what it holds. A key mismatch, missing file or read error is a miss.
 def cache_root() -> Path:
   return Path(os.environ.get('XDG_CACHE_HOME', str(Path.home() / '.cache'))).expanduser() / 'infurnace'
 
