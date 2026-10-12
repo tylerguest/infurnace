@@ -5,7 +5,6 @@ from tinygrad import Tensor, UOp, dtypes
 from tinygrad.dtype import AddrSpace
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops
 
-
 def _reduce(values_out, ids_out, values, ids, *, count, vocabulary, tile, indexed):
   blocks = (count+tile-1)//tile
   block = UOp.range(blocks, 0, axis_type=AxisType.GLOBAL)
@@ -38,12 +37,10 @@ def _reduce(values_out, ids_out, values, ids, *, count, vocabulary, tile, indexe
                    ids_out[block.valid(lane.eq(0))].store(index)).end(block, lane).sink(
                      arg=KernelInfo(name='eagle_parallel_argmax_merge' if indexed else 'eagle_parallel_argmax', opts_to_apply=()))
 
-
 def parallel_score_argmax(row, temperature, random, *, materialize_scores=False):
   if type(materialize_scores) is not bool: raise ValueError('materialize_scores must be boolean')
   scores = row/temperature.maximum(1e-12) - (random.maximum(1e-12).log().neg()).log()
   return parallel_argmax(scores.contiguous())
-
 
 def parallel_argmax(scores):
   if scores.device.split(':')[0] != 'NV' or scores.dtype != dtypes.float32 or len(scores.shape) != 2 or scores.shape[0] != 1:

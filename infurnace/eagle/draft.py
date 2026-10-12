@@ -12,7 +12,6 @@ from tinygrad.nn.state import safe_load
 from infurnace.eagle.io import mapped_tensor, mapped_output, upload_tokens
 from infurnace.kernels.dense_gemv import bf16_gemv
 
-
 class EagleDraft:
   def __init__(self, config: dict, weights: dict[str, Tensor], embedding, *, capacity: int, device: str):
     integer_fields = ('hidden_size', 'intermediate_size', 'num_attention_heads', 'num_key_value_heads',

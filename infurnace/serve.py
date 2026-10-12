@@ -4,7 +4,6 @@ import time
 
 from tinygrad.llm.serve import LLMServer
 
-
 class ServerModel:
   """Preserve Infurnace's device contexts and bounded generation lifecycle."""
   def __init__(self, model):
@@ -20,7 +19,6 @@ class ServerModel:
       yield from stream
     finally:
       stream.close()
-
 
 class ChatTemplate:
   def __init__(self, metadata, tokenizer, enable_thinking=True):
@@ -42,7 +40,6 @@ class ChatTemplate:
 
   def render(self, **kwargs):
     return self.template.render(**kwargs, enable_thinking=self.enable_thinking)
-
 
 def serve(model, tokenizer, port=8000, host='127.0.0.1', *, enable_thinking=True):
   template = ChatTemplate(model.metadata, tokenizer, enable_thinking)

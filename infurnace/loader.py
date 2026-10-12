@@ -16,10 +16,8 @@ from infurnace.tokenizer import Tokenizer
 TARGETS = (("Qwen3.5-4B-Q4_K_M.gguf", ("", "qwen35-validation")), ("Qwen3-4B-Q4_K_M.gguf", ("",)))
 DFLASH_DRAFT = ("qwen35-4b-dflash-Q4_K_M.gguf", ("", "dflash-qwen35"))
 
-
 def _user_models() -> Path:
   return Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local/share"))).expanduser() / "infurnace/models"
-
 
 def _find(candidates: tuple[tuple[str, tuple[str, ...]], ...]) -> Path | None:
   """User storage first (every candidate), then an editable checkout's models/."""
@@ -28,22 +26,18 @@ def _find(candidates: tuple[tuple[str, tuple[str, ...]], ...]) -> Path | None:
     if path.is_file(): return path
   return None
 
-
 def default_model() -> str:
   if path := os.environ.get("INFURNACE_MODEL"): return str(Path(path).expanduser())
   if found := _find(TARGETS): return str(found)
   return str(_user_models() / TARGETS[-1][0])
 
-
 def default_dflash_draft() -> Path | None:
   if path := os.environ.get("INFURNACE_DFLASH_DRAFT"): return Path(path).expanduser()
   return _find((DFLASH_DRAFT,))
 
-
 def is_qwen35(path: str | Path) -> bool:
   from infurnace.gguf import read_gguf_metadata
   return Path(path).is_file() and read_gguf_metadata(path).get("general.architecture") == "qwen35"
-
 
 def load_model(path: str, max_context: int, device: str | None = None, nv_quant: bool | None = None, *,
                nv_prefill: bool | None = None, nv_attention: bool = False, nv_fused_attention: bool | None = None,
@@ -86,13 +80,11 @@ def load_model(path: str, max_context: int, device: str | None = None, nv_quant:
   model = Qwen3Model.from_gguf(path, **options)
   return model, Tokenizer.from_gguf(model.metadata)
 
-
 def load_dflash(model, draft_path: str | Path):
   """DFlash generator for a Qwen3.5 target: parallel multirow verification on NV, else sequential."""
   from infurnace.dflash import DFlashDraft, DFlashGenerator
   verifier = 'parallel' if model.device.split(':')[0] == 'NV' else 'sequential'
   return DFlashGenerator(model, DFlashDraft.from_gguf(draft_path, model), verifier=verifier)
-
 
 def load_eagle(model, checkpoint: Path):
   """EAGLE-3 generator for a Qwen3 target on NV (experimental)."""

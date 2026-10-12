@@ -6,7 +6,6 @@ from tinygrad import Context, Tensor, TinyJit, UOp, dtypes
 
 from infurnace.eagle import EagleDraft
 
-
 def draft_fixture(device='CPU'):
   config = dict(hidden_size=64, intermediate_size=128, num_attention_heads=2,
                 num_key_value_heads=1, head_dim=64, vocab_size=32, draft_vocab_size=16,
@@ -31,11 +30,9 @@ def draft_fixture(device='CPU'):
     embedding = (Tensor.randn(32, 64, device=device)*0.1).bfloat16().realize()
   return config, weights, lambda ids: embedding[ids]
 
-
 def make_draft(device='CPU'):
   config, weights, embedding = draft_fixture(device)
   return EagleDraft(config, weights, embedding, capacity=32, device=device)
-
 
 def test_vocabulary_and_strict_loading():
   config, weights, embedding = draft_fixture()
@@ -47,7 +44,6 @@ def test_vocabulary_and_strict_loading():
     EagleDraft(config, weights | {'fc.weight': weights['fc.weight'].float()}, embedding, capacity=32, device='CPU')
   with pytest.raises(ValueError, match='vocabulary'):
     EagleDraft(config, weights | {'d2t': Tensor.zeros(16, dtype=dtypes.int64)}, embedding, capacity=32, device='CPU')
-
 
 @pytest.mark.parametrize('device', ['CPU', 'NV'])
 def test_chain_replay_matches_reference_and_preserves_prefix(device):
@@ -73,7 +69,6 @@ def test_chain_replay_matches_reference_and_preserves_prefix(device):
     draft.observe(features, [2, 4, 6])
     assert draft.propose(4, fast_loop=True) == draft.propose(4, fast_loop=False)
 
-
 @pytest.mark.parametrize('device', ['CPU', 'NV'])
 @pytest.mark.parametrize('count', [1, 2, 4, 8])
 def test_last_query_observation_matches_full_rows_and_kv_on_replay(device, count):
@@ -90,7 +85,6 @@ def test_last_query_observation_matches_full_rows_and_kv_on_replay(device, count
       actual = last(features, ids, position).clone().realize()
       assert (actual-expected).float().abs().max().item() == 0
       assert (draft.cache-cache).float().abs().max().item() == 0
-
 
 @pytest.mark.parametrize('device', ['CPU', 'NV'])
 @pytest.mark.parametrize('count', [1, 2, 4, 7])
@@ -113,7 +107,6 @@ def test_combined_observation_proposal_matches_separate_captures(device, count):
       with pytest.raises(ValueError): fused.observe_propose(features, ids, invalid)
     assert fused.length == 0
 
-
 @pytest.mark.parametrize('device', ['CPU', 'NV'])
 @pytest.mark.parametrize('count', [1, 2])
 def test_scored_capture_preserves_proposals_and_replay(device, count):
@@ -128,7 +121,6 @@ def test_scored_capture_preserves_proposals_and_replay(device, count):
       assert actual == expected and len(margins) == count and all(m >= 0 for m in margins)
       assert (scored.last_hidden-reference.last_hidden).float().abs().max().item() == 0
       assert (scored.cache[:, :, :, :scored.length]-reference.cache[:, :, :, :reference.length]).float().abs().max().item() == 0
-
 
 def test_observe_and_proposal_validation():
   draft = make_draft()

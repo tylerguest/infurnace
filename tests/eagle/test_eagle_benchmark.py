@@ -9,7 +9,6 @@ spec = importlib.util.spec_from_file_location('eagle_benchmark', Path(__file__).
 benchmark = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(benchmark)
 
-
 @pytest.mark.parametrize('phase', ['target', 'draft'])
 def test_loading_failure_is_checkpointed(monkeypatch, tmp_path, phase):
   def fail(*args): raise RuntimeError('injected loading failure')
@@ -22,7 +21,6 @@ def test_loading_failure_is_checkpointed(monkeypatch, tmp_path, phase):
   assert report['status'] == 'aborted' and report['stage'] == 'loading'
   assert report['error'] and not report['records'] and not report['comparisons']
   assert report['runtime']['rtalloc_pool_bytes'] > 0
-
 
 @pytest.mark.parametrize('failure', [None, 'mismatch', 'missing_bracket', 'late_failure'])
 def test_matched_report_rejects_mismatch_and_incomplete_bracket(monkeypatch, tmp_path, failure):

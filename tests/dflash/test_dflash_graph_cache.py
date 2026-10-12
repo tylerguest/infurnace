@@ -3,10 +3,8 @@ from tinygrad.engine.jit import _TinyJit
 from infurnace.dflash import graph_cache
 from infurnace.dflash.parallel import _stored
 
-
 def owned(weight):
   return {'weight': Tensor(weight).contiguous().realize(), 'out': Tensor.empty(3).realize()}
-
 
 def test_cached_graph_rebinds_named_buffers_in_a_new_process_state(tmp_path):
   with Context(DEV='CPU'):
@@ -25,7 +23,6 @@ def test_cached_graph_rebinds_named_buffers_in_a_new_process_state(tmp_path):
     replay(Tensor([2.0, 2.0, 2.0]).contiguous().realize())
     assert second['out'].tolist() == [20.0, 40.0, 60.0]
     assert first['out'].tolist() == [1.0, 2.0, 3.0]
-
 
 def test_missing_named_buffer_is_a_cache_miss(tmp_path):
   with Context(DEV='CPU'):

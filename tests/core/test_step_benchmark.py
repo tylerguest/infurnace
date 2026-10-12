@@ -5,16 +5,13 @@ import pytest
 
 from infurnace import benchmark, cli
 
-
 @pytest.mark.parametrize("value,expected", [("32", (None, 32)), ("1000,50", (1000, 50))])
 def test_benchmark_spec(value, expected):
   assert cli._benchmark_spec(value) == expected
 
-
 @pytest.mark.parametrize("value", ["0", "-1", "0,5", "5,-1", "1,2,3", "x", "5,"])
 def test_invalid_benchmark_spec(value):
   with pytest.raises(argparse.ArgumentTypeError): cli._benchmark_spec(value)
-
 
 def test_per_step_output_and_cleanup(monkeypatch, capsys):
   class Model:

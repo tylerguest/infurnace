@@ -15,7 +15,6 @@ _PROSE = (
   "and records its model, hardware, input length, and output length.\n\n"
 )
 
-
 def benchmark_prompt_ids(tokenizer, prompt_tokens: int = DEFAULT_PROMPT_TOKENS, prompt_text: str | None = None) -> list[int]:
   """Exact-length repeated prose, or an unmodified raw-text prompt (no chat template).
 
@@ -32,13 +31,11 @@ def benchmark_prompt_ids(tokenizer, prompt_tokens: int = DEFAULT_PROMPT_TOKENS, 
   length = prompt_tokens-len(prefix)
   return prefix + (encoded*((length+len(encoded)-1)//len(encoded)))[:length]
 
-
 def validate_benchmark_context(prompt_tokens: int, output_tokens: int, context: int) -> None:
   if prompt_tokens <= 0 or output_tokens <= 0: raise ValueError("benchmark prompt and output must be nonempty")
   if prompt_tokens + output_tokens > context:
     raise ValueError(f"benchmark needs {prompt_tokens + output_tokens} context tokens "
                      f"({prompt_tokens} prompt + {output_tokens} output), but capacity is {context}")
-
 
 def parse_spec(value: str) -> tuple[int | None, int]:
   """`COUNT` or `PROMPT,COUNT` (prompt tokens, output tokens), both positive."""
@@ -46,7 +43,6 @@ def parse_spec(value: str) -> tuple[int | None, int]:
   if len(parts) not in (1, 2) or not all(p.strip().isdigit() and int(p) > 0 for p in parts):
     raise ValueError("benchmark must be COUNT or PROMPT,COUNT with positive integers")
   return (None, int(parts[0])) if len(parts) == 1 else (int(parts[0]), int(parts[1]))
-
 
 def _measure(model, ids: list[int], count: int) -> dict:
   model.reset()  # include full prefill, not a cached prompt
@@ -62,7 +58,6 @@ def _measure(model, ids: list[int], count: int) -> dict:
   return {"prompt_tokens": len(ids), "generated_tokens": generated, "ttft_seconds": ttft, "total_seconds": end - start,
           "prefill_tokens_per_second": len(ids) / ttft if ttft else None,
           "decode_tokens_per_second": (generated - 1) / decode if generated > 1 and decode > 0 else None}
-
 
 def run_steps(model, tokenizer, count: int, prompt_tokens: int = DEFAULT_PROMPT_TOKENS, prompt_text: str | None = None) -> int:
   """Warm up, then print every prefill/decode step's time and tinygrad's traffic estimate."""
@@ -91,7 +86,6 @@ def run_steps(model, tokenizer, count: int, prompt_tokens: int = DEFAULT_PROMPT_
   finally: stream.close()
   if decoded: print(f"decode aggregate: {decoded / decode_seconds:.2f} tok/s ({decoded} steps, excluding prefill)")
   return 0
-
 
 def run_json(model, tokenizer, count: int, load_seconds: float, prompt_tokens: int = DEFAULT_PROMPT_TOKENS,
              prompt_text: str | None = None) -> int:

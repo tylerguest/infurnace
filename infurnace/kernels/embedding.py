@@ -11,7 +11,6 @@ from tinygrad.uop.ops import AxisType, KernelInfo
 
 from infurnace.kernels.quant_gemm import _weight
 
-
 @functools.cache
 def _gather_kernel(out: UOp, raw: UOp, ids: UOp, *, count: int, width: int, typ: int, q6_aligned: bool, q6_swizzled: bool,
                    q4_swizzled: bool) -> UOp:
@@ -21,7 +20,6 @@ def _gather_kernel(out: UOp, raw: UOp, ids: UOp, *, count: int, width: int, typ:
   row = ids[index].load().cast(dtypes.int32)
   value = _weight(raw, row, column, width, typ, q6_aligned, q6_swizzled, q4_swizzled)
   return out[index, column].store(value.float()).end(block, lane).sink(arg=KernelInfo(name="packed_gather", opts_to_apply=()))
-
 
 def packed_gather(ids: Tensor, packed: Tensor, *, width: int, ggml_type: int, q6_aligned: bool = False,
                   q6_swizzled: bool = False, q4_swizzled: bool = False) -> Tensor:

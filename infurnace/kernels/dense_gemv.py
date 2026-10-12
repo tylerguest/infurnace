@@ -7,7 +7,6 @@ from tinygrad.uop.ops import AxisType, KernelInfo
 
 from infurnace.kernels.quant_gemv import warp_reduce
 
-
 def _bf16_gemv(out, raw, x, *, rows, width, tokens):
   block = UOp.range(tokens*(rows//4), 0, axis_type=AxisType.GLOBAL)
   warp = UOp.range(4, 1, axis_type=AxisType.LOCAL)
@@ -28,7 +27,6 @@ def _bf16_gemv(out, raw, x, *, rows, width, tokens):
   value = warp_reduce(acc[0].load(), full_wave=True)
   return out[token, row.valid(lane.eq(0))].store(value.cast(out.dtype)).end(block, warp, lane).sink(
     arg=KernelInfo(name='draft_bf16_gemv', opts_to_apply=()))
-
 
 def bf16_gemv(x: Tensor, weight: Tensor) -> Tensor:
   rows, width = weight.shape

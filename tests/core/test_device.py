@@ -3,7 +3,6 @@ import pytest
 from infurnace import device
 from infurnace import loader
 
-
 def test_prefer_gpu(monkeypatch):
   monkeypatch.delenv("DEV", raising=False)
   attempts = []
@@ -14,7 +13,6 @@ def test_prefer_gpu(monkeypatch):
   assert device.select_device() == "AMD"
   assert attempts == ["NV", "AMD"]
 
-
 def test_cpu_fallback(monkeypatch):
   monkeypatch.delenv("DEV", raising=False)
   def probe(name):
@@ -22,12 +20,10 @@ def test_cpu_fallback(monkeypatch):
   monkeypatch.setattr(device, "_probe", probe)
   assert device.select_device() == "CPU"
 
-
 def test_explicit_override(monkeypatch):
   def probe(name): pytest.fail("explicit device must not trigger auto probing")
   monkeypatch.setattr(device, "_probe", probe)
   assert device.select_device("CPU") == "CPU"
-
 
 def test_auto_acceleration(monkeypatch):
   monkeypatch.setattr(loader, "select_device", lambda requested: "NV")

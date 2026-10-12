@@ -12,13 +12,11 @@ from tinygrad import Context, Tensor, TinyJit, UOp, dtypes
 if TYPE_CHECKING:
   from infurnace.models.qwen3 import Qwen3Model
 
-
 @dataclass(frozen=True)
 class TargetStep:
   next_token: int
   logits: Tensor  # [1, vocabulary]; independent snapshot, not a JIT output alias
   features: Tensor  # [1, consumed tokens, 3*dim], before the selected blocks
-
 
 @dataclass(frozen=True)
 class VerifiedChain:
@@ -27,7 +25,6 @@ class VerifiedChain:
   steps: tuple[TargetStep, ...]  # matching target features for every committed token
   next_token: int | None  # target-selected next root; not yet written into KV
   stop_reason: str  # proposals, mismatch, limit, eos or context
-
 
 class SequentialVerifier:
   """Context-managed target reference for greedy EAGLE chains.

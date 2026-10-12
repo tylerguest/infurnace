@@ -21,7 +21,6 @@ from infurnace.kernels.gdn import gdn_decode
 from infurnace.kernels.quant_gemm import nv_prefill_supported
 from infurnace.models.qwen3 import Qwen3Config, Qwen3Model, _NVLinear
 
-
 class _PackedLinear(_NVLinear):
   """Packed projection that keeps no dense decode graph alive.
 
@@ -36,7 +35,6 @@ class _PackedLinear(_NVLinear):
   def __call__(self, x):
     if self.prefill: return super().__call__(x)
     return self.decode(x)
-
 
 def _fused_gdn_decode(block: GatedDeltaNetBlock):
   """Upstream GatedDeltaNetBlock._attention for one-row decoding, with the conv, q/k norms,
@@ -61,7 +59,6 @@ def _fused_gdn_decode(block: GatedDeltaNetBlock):
     return block.ssm_out(z.reshape(1, 1, H * V))
   return attention
 
-
 @contextlib.contextmanager
 def _lazy_upstream_weights(path):
   """Build upstream's Transformer without reading its weights into host memory.
@@ -82,7 +79,6 @@ def _lazy_upstream_weights(path):
   upstream_model.gguf_parse, upstream_model.gguf_shard = cached_parse, lazy_shard
   try: yield
   finally: upstream_model.gguf_parse, upstream_model.gguf_shard = parse, shard
-
 
 class Qwen35Model(Qwen3Model):
   def __init__(self, transformer: Transformer, metadata: dict, device: str | None = None):

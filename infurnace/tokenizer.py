@@ -8,7 +8,6 @@ from __future__ import annotations
 from typing import Callable, Mapping
 from tinygrad.llm.cli import SimpleTokenizer
 
-
 class Tokenizer:
   def __init__(self, normal_tokens: dict[str, int], special_tokens: dict[str, int],
                preset: str = "qwen2", bos_id: int | None = None, eos_id: int = 0, eot_id: int | None = None):

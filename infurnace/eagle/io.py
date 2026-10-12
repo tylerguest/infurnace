@@ -10,12 +10,10 @@ import math
 from tinygrad import Device, Tensor, UOp, dtypes
 from tinygrad.device import Buffer, BufferSpec
 
-
 def mapped_tensor(shape, dtype, device):
   if device.split(':')[0] != 'NV': raise ValueError('mapped EAGLE scratch requires NV')
   storage = Buffer(device, math.prod(shape), dtype, options=BufferSpec(host=True, cpu_access=True), preallocate=True)
   return Tensor(UOp.from_buffer(storage, device)).reshape(shape)
-
 
 def upload_tokens(tensor, values, *, mapped=False):
   words = array('i', values)
@@ -30,7 +28,6 @@ def upload_tokens(tensor, values, *, mapped=False):
     destination.host[:] = source
   else:
     destination.copy_from(Buffer('PYTHON', len(values), dtypes.int32, opaque=source))
-
 
 def mapped_output(outputs, key, value):
   if key not in outputs: outputs[key] = mapped_tensor(value.shape, value.dtype, value.device)

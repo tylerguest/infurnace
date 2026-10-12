@@ -6,7 +6,6 @@ from tinygrad import Tensor, TinyJit, dtypes
 
 from infurnace.kernels.quant_gemv import q8_quantize
 
-
 @pytest.mark.skipif(not os.environ.get("INFURNACE_TEST_NV"), reason="set INFURNACE_TEST_NV=1 on an NV GPU")
 @pytest.mark.parametrize("width", [32, 256, 1280])
 @pytest.mark.parametrize("dtype", [dtypes.float32, dtypes.float16])

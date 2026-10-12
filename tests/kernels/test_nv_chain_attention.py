@@ -6,7 +6,6 @@ from infurnace.kernels.attention import fused_chain_attention, fused_decode_atte
 
 pytestmark = pytest.mark.nv
 
-
 @pytest.mark.parametrize('count', [2, 3, 4, 8])
 def test_chain_attention_exact_replay_boundaries_and_future_mask(count):
   capacity = 256

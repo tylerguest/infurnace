@@ -4,12 +4,10 @@ import pytest
 
 from infurnace import loader
 
-
 def test_default_model_environment(monkeypatch):
   monkeypatch.setenv("INFURNACE_MODEL", "~/custom.gguf")
   from pathlib import Path
   assert loader.default_model() == str(Path.home() / "custom.gguf")
-
 
 def test_default_model_user_storage(monkeypatch, tmp_path):
   monkeypatch.delenv("INFURNACE_MODEL", raising=False)
@@ -19,7 +17,6 @@ def test_default_model_user_storage(monkeypatch, tmp_path):
   path.touch()
   monkeypatch.chdir(tmp_path)
   assert loader.default_model() == str(path)
-
 
 def test_build_uses_loaded_metadata(monkeypatch):
   metadata = {"test": True}
@@ -33,7 +30,6 @@ def test_build_uses_loaded_metadata(monkeypatch):
   result, tokenizer = loader.load_model("model", 16, "CPU")
   assert result is model and tokenizer is metadata
   assert calls == [("model", {"max_context": 16, "device": "CPU"})]
-
 
 def test_build_prefill_forwarding_and_backend_gate(monkeypatch):
   monkeypatch.setattr(loader, "select_device", lambda device: device)
@@ -52,7 +48,6 @@ def test_build_prefill_forwarding_and_backend_gate(monkeypatch):
   with pytest.raises(ValueError, match="requires NV quantized"):
     loader.load_model("model", 64, "CPU", nv_quant=False, nv_prefill=True)
   assert len(calls) == 1
-
 
 @pytest.mark.parametrize("quant_supported,prefill_supported,quant_override,prefill_override,expected", [
   (True, True, None, None, {"nv_quant": True, "nv_prefill": True, "nv_prepared_weights": True, "nv_fused_attention": True}),
@@ -74,7 +69,6 @@ def test_build_automatic_prefill(monkeypatch, quant_supported, prefill_supported
   loader.load_model("model", 64, "test-device", quant_override, nv_prefill=prefill_override)
   assert calls == [{"max_context": 64, "device": "test-device", **expected}]
 
-
 @pytest.mark.parametrize("fused", [False, True])
 def test_build_attention_forwarding_and_gate(monkeypatch, fused):
   monkeypatch.setattr(loader, "select_device", lambda device: device)
@@ -92,7 +86,6 @@ def test_build_attention_forwarding_and_gate(monkeypatch, fused):
   with pytest.raises(ValueError, match="requires NV quantized"):
     loader.load_model("model", 64, "CPU", **option)
   assert len(calls) == 1
-
 
 def test_build_explicit_prefill_rejects_unsupported_tensor_cores(monkeypatch):
   monkeypatch.setattr(loader, "select_device", lambda device: device)

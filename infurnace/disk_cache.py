@@ -13,10 +13,8 @@ from tinygrad.uop.ops import UOp
 _ALIGN = 256
 _MAGIC = b'INFTENS1'
 
-
 def root() -> Path:
   return Path(os.environ.get('XDG_CACHE_HOME', str(Path.home() / '.cache'))).expanduser() / 'infurnace'
-
 
 @functools.cache
 def sources() -> str:
@@ -30,15 +28,12 @@ def sources() -> str:
       digest.update(path.read_bytes())
   return digest.hexdigest()
 
-
 def file_identity(path: str | Path) -> str:
   stat = Path(path).stat()
   return f'{Path(path).resolve()} {stat.st_size} {stat.st_mtime_ns}'
 
-
 def prune(directory: Path, keep: int) -> None:
   for old in sorted(directory.glob('*'), key=lambda p: p.stat().st_mtime)[:-keep]: old.unlink(missing_ok=True)
-
 
 def save_tensors(path: Path, tensors: dict[str, Tensor]) -> None:
   """Realized tensors as one aligned blob plus a name/dtype/shape/offset index."""
@@ -56,7 +51,6 @@ def save_tensors(path: Path, tensors: dict[str, Tensor]) -> None:
     f.write(bytes(-f.tell() % _ALIGN))
     for chunk in chunks: f.write(chunk)
   partial.replace(path)
-
 
 def load_tensors(path: Path, device: str) -> dict[str, Tensor] | None:
   """One host read and one copy to `device`; each tensor is a view into that buffer."""

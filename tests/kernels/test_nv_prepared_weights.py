@@ -8,13 +8,11 @@ from infurnace.gguf import _dequant_q6_k
 from infurnace.kernels.quant_gemv import prepare_q6, quant_gemv, Q6_PREPARED_BYTES
 from infurnace.kernels.quant_gemm import quant_gemm
 
-
 def data(rows, width):
   rng = random.Random(43)
   raw = bytearray(rng.getrandbits(8) for _ in range(rows*width//256*210))
   for offset in range(0, len(raw), 210): raw[offset+208:offset+210] = struct.pack('<e', 0.001)
   return bytes(raw)
-
 
 @pytest.mark.parametrize('rows,width', [(1, 256), (1, 768), (16, 1280), (2, 2560)])
 @pytest.mark.parametrize('swizzled', [False, True])
@@ -44,7 +42,6 @@ def test_q6_preparation_preserves_blocks(rows, width, swizzled):
                           swizzled_width=width//256 if swizzled else 0)
   assert (native-prepared).abs().max().item() == 0
 
-
 @pytest.mark.nv
 @pytest.mark.parametrize('width', [256, 1280, 2560, 9728])
 @pytest.mark.parametrize('swizzled', [False, True])
@@ -71,7 +68,6 @@ def test_q6_prepared_decode_and_prefill(width, swizzled, warps, monkeypatch):
   # Prepared Q6 uses the paired kernel, which sums the same products in a
   # permuted k order: compare relative to the output scale, not bitwise.
   assert ((baseline-actual).abs().max()/baseline.abs().max().maximum(1)).item() < 1e-5
-
 
 @pytest.mark.parametrize('override,expected', [(None, True), (True, True), (False, False)])
 def test_cli_prepared_default_and_override(monkeypatch, override, expected):

@@ -6,7 +6,6 @@ from infurnace.models.qwen35 import Qwen35Model
 from test_dflash import RecordedDraft, tiny_draft
 from test_qwen35 import checkpoint
 
-
 def test_closed_form_gated_delta_matches_recurrence_and_every_prefix_state():
   B, H, T, K, V = 1, 3, 16, 8, 6
   with Context(DEV='CPU'):
@@ -36,7 +35,6 @@ def test_closed_form_gated_delta_matches_recurrence_and_every_prefix_state():
       committed = last.exp().unsqueeze(-1) * S0 + (u * weight.unsqueeze(-1)).transpose(-1, -2) @ k
       assert (committed - states[m-1]).abs().max().item() < 1e-5, m
 
-
 @pytest.mark.parametrize('kind', ['random', 'perfect', 'wrong'])
 @pytest.mark.parametrize('block', [2, 4])
 def test_parallel_verifier_reproduces_greedy_decoding(tmp_path, kind, block):
@@ -54,7 +52,6 @@ def test_parallel_verifier_reproduces_greedy_decoding(tmp_path, kind, block):
       assert not model._generating
       if kind == 'perfect': assert generator.stats.accepted == generator.stats.proposed > 0
       if kind == 'wrong': assert generator.stats.accepted < generator.stats.proposed
-
 
 def test_timing_fallback_decodes_plain_rows_when_drafting_loses(tmp_path):
   with Context(DEV='CPU'):

@@ -1,7 +1,6 @@
 """Captured graphs for DFlash."""
 from tinygrad import TinyJit
 
-
 def captured(fn) -> TinyJit:
   """A TinyJit that captures on its first call.
 

@@ -6,7 +6,6 @@ from tinygrad import Context, Tensor, TinyJit, dtypes
 from infurnace.eagle.verify import BatchedVerifier
 from infurnace.eagle.sampling import sample_chain, score_argmax
 
-
 @pytest.mark.parametrize('device', ['CPU', 'NV'])
 @pytest.mark.parametrize('size', [1, 2, 4, 8])
 @pytest.mark.parametrize('stop', ['accept', 'reject', 'eos'])
@@ -46,7 +45,6 @@ def test_prefix_sampling_preserves_decisions_and_rng_on_replay(device, size, sto
       Tensor._device_rng_counters[device] = counter
       assert Tensor.rand(32, device=device).tolist() == expected_random
 
-
 @pytest.mark.parametrize('device', ['CPU', 'NV'])
 @pytest.mark.parametrize('temperature_value', [0.0, 0.7])
 @pytest.mark.parametrize('vocabulary', [32, 1024, 151936])
@@ -64,7 +62,6 @@ def test_score_materialization_preserves_decisions_and_tie_order(device, tempera
       materialized = score_argmax(row, temperature, random, materialize_scores=True)
       assert materialized.item() == original.item()
 
-
 @pytest.mark.parametrize('device', ['CPU', 'NV'])
 @pytest.mark.parametrize('value', [float('nan'), float('inf'), float('-inf')])
 def test_score_materialization_preserves_nonfinite_behavior(device, value):
@@ -77,7 +74,6 @@ def test_score_materialization_preserves_nonfinite_behavior(device, value):
       values[position] = value
       row = Tensor([values], device=device).realize()
       assert score_argmax(row, temperature, random, materialize_scores=True).item() == score_argmax(row, temperature, random).item()
-
 
 def test_score_materialization_rejects_invalid_flags_before_rng_mutation():
   row, temperature, random = Tensor([[1.0]]), Tensor([0.0]), Tensor([[0.5]])

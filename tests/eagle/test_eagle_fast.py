@@ -6,7 +6,6 @@ from tinygrad import Context, Tensor, dtypes
 from infurnace.eagle.generate import EagleGenerator
 from infurnace.eagle.io import mapped_tensor, upload_tokens
 
-
 def test_fast_profile_and_explicit_overrides(monkeypatch):
   import infurnace.eagle.generate as generation
   layer = SimpleNamespace(in_features=2560)
@@ -26,19 +25,16 @@ def test_fast_profile_and_explicit_overrides(monkeypatch):
   assert EagleGenerator(model, draft, fast=True).generate([1])['fused_projections'] is False
   assert EagleGenerator(model, draft).generate([1]) == {'kernel_cache': {}}
 
-
 def test_fast_profile_rejects_non_nv_and_non_boolean():
   model, draft = SimpleNamespace(device='CPU'), SimpleNamespace(device='CPU')
   with pytest.raises(ValueError, match='NV'): EagleGenerator(model, draft, fast=True)
   with pytest.raises(ValueError, match='boolean'): EagleGenerator(model, draft, fast=1)
   with pytest.raises(ValueError, match='NV'): mapped_tensor((1, 2), dtypes.int32, 'CPU')
 
-
 def test_token_scratch_rejects_mismatched_size():
   with Context(DEV='CPU'):
     tensor = Tensor.empty(1, 2, dtype=dtypes.int32, device='CPU').realize()
     with pytest.raises(ValueError, match='shape/dtype'): upload_tokens(tensor, [1])
-
 
 @pytest.mark.nv
 @pytest.mark.parametrize('scored', [False, True])
@@ -60,7 +56,6 @@ def test_fast_draft_io_matches_reference_reset_and_replay(scored):
     with pytest.raises(ValueError, match='before first use'): reference.enable_fast_io()
     assert all(t.uop.buffer.get_storage().host is not None for t in fast._token_inputs.values())
     assert all(t.uop.buffer.get_storage().host is not None for t in fast._proposal_outputs.values())
-
 
 @pytest.mark.nv
 def test_verifier_cache_invalidates_when_io_and_sampling_mode_changes():

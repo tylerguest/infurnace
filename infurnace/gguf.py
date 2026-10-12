@@ -176,12 +176,10 @@ def _dequant_q5_k(data: Tensor) -> Tensor:
   q = low.bitwise_or(high.bitwise_and(1).lshift(4))
   return (d.unsqueeze(-1) * scales.unsqueeze(-1) * q - dmin.unsqueeze(-1) * minimums.unsqueeze(-1)).flatten()
 
-
 def _dequant_q8_0(data: Tensor) -> Tensor:
   blocks = data.reshape(-1, 34).contiguous()
   d = blocks[:, :2].bitcast(dtypes.float16).float()
   return (d * blocks[:, 2:].bitcast(dtypes.int8).float()).flatten()
-
 
 def _dequant_q6_k(data: Tensor, *, block_bytes: int = 210, swizzled_width: int = 0) -> Tensor:
   # Internal prepared NV storage may add alignment bytes per block.
@@ -269,18 +267,15 @@ def _read_gguf(path: Path, file_size: int, mtime_ns: int) -> tuple[dict[str, Any
   _validate_tensor_infos(infos, metadata, data_start, file_size)
   return metadata, infos, data_start
 
-
 def _cached_gguf(path: str | Path) -> tuple[Path, int, dict[str, Any], list, int]:
   path = Path(path).resolve()
   stat = path.stat()
   metadata, infos, data_start = _read_gguf(path, stat.st_size, stat.st_mtime_ns)
   return path, stat.st_size, dict(metadata), infos, data_start  # a fresh dict: callers may add keys
 
-
 def read_gguf_metadata(path: str | Path) -> dict[str, Any]:
   """Read metadata only, for architecture dispatch before weight allocation."""
   return _cached_gguf(path)[2]
-
 
 def parse_gguf(path: str | Path) -> tuple[dict[str, Any], dict[str, PackedTensor]]:
   """Validate a single GGUF and return bounded DISK views without transferring weights."""

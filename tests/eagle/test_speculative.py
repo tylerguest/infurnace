@@ -8,7 +8,6 @@ from tinygrad import Context, Tensor, UOp, dtypes
 from infurnace.models.qwen3 import Qwen3Config, Qwen3Model, expected_weight_shapes
 from infurnace.eagle.reference import SequentialVerifier
 
-
 def tiny_model():
   config = Qwen3Config(8, 8, 16, 2, 1, 4, 4, 4, 10000.0, 1e-6, 32, 16)
   rng, weights = random.Random(12), {}
@@ -19,7 +18,6 @@ def tiny_model():
     weights[name] = Tensor(values, device='CPU').reshape(shape)
   weights['output.weight'] = weights['token_embd.weight']
   return Qwen3Model(config, weights), weights
-
 
 def reference_step(model, tokens, position, layers, consumed=1):
   with Context(DEV=model.device):
@@ -32,7 +30,6 @@ def reference_step(model, tokens, position, layers, consumed=1):
       x = block(x, position)
     logits = model.transformer.output(model.transformer.output_norm(x[:, -1:]))[:, -1, :]
     return logits.tolist(), features[0].cat(*features[1:], dim=-1).tolist()
-
 
 def test_prefill_taps_match_target_and_snapshots_survive_replay():
   model, weights = tiny_model()
@@ -64,7 +61,6 @@ def test_prefill_taps_match_target_and_snapshots_survive_replay():
   assert prompt == [1, 2, 3, 4, 5]
   assert model.transformer.output.weight.uop is model.transformer.token_embd.weight.uop
 
-
 def test_upstream_zero_temperature_decisions_including_exact_ties():
   model, weights = tiny_model()
   weights['token_embd.weight'] = Tensor.zeros(32, 8, device='CPU')
@@ -79,12 +75,10 @@ def test_upstream_zero_temperature_decisions_including_exact_ties():
     actual = [verifier.verify_chain([]).tokens[0] for _ in range(5)]
   assert actual == expected
 
-
 def continuation(model, prompt, count):
   with SequentialVerifier(model, chunk_size=3) as verifier:
     verifier.prefill(prompt)
     return [verifier.verify_chain([]).tokens[0] for _ in range(count)]
-
 
 def test_chain_acceptance_mismatch_and_pending_root():
   model, _ = tiny_model()
@@ -106,7 +100,6 @@ def test_chain_acceptance_mismatch_and_pending_root():
     assert result.stop_reason == 'mismatch'
     # The mismatch was not written. Reusing its slot processes the correct root.
     assert verifier.verify_chain([]).tokens == (expected[5],)
-
 
 def test_eos_context_and_round_budget():
   model, _ = tiny_model()
@@ -130,7 +123,6 @@ def test_eos_context_and_round_budget():
     assert verifier.committed_length == 16
     assert result.next_token is None and result.stop_reason == 'context'
 
-
 def test_exclusive_ownership_close_and_normal_generation_resume():
   model, _ = tiny_model()
   expected = list(model.generate([1, 2, 3], 4, chunk_size=3, reuse_cache=False))
@@ -149,7 +141,6 @@ def test_exclusive_ownership_close_and_normal_generation_resume():
     with verifier: pass
   with pytest.raises(RuntimeError, match='context manager'): verifier.verify_chain([])
 
-
 def test_exception_invalidates_partial_kv_and_releases_owner(monkeypatch):
   model, _ = tiny_model()
   with SequentialVerifier(model, chunk_size=3) as verifier:
@@ -161,12 +152,10 @@ def test_exception_invalidates_partial_kv_and_releases_owner(monkeypatch):
     with pytest.raises(RuntimeError, match='context manager'): verifier.verify_chain([])
   assert len(list(model.generate([1, 2], 1, chunk_size=3))) == 1
 
-
 @pytest.mark.parametrize('layers', [(2, 2, 3), (3, 2, 4), (0, 1, 8), (False, 1, 3), (0, 1)])
 def test_invalid_feature_layers(layers):
   model, _ = tiny_model()
   with pytest.raises(ValueError, match='feature_layers'): SequentialVerifier(model, feature_layers=layers)
-
 
 def test_invalid_inputs_and_lifecycle():
   model, _ = tiny_model()
@@ -182,7 +171,6 @@ def test_invalid_inputs_and_lifecycle():
       with pytest.raises(ValueError): verifier.verify_chain(draft)
     for budget in (0, -1, True, 1.5):
       with pytest.raises(ValueError): verifier.verify_chain([], max_tokens=budget)
-
 
 def nv_model():
   from infurnace.gguf import PackedTensor
@@ -204,7 +192,6 @@ def nv_model():
   model._enable_nv_quant(entries, nv_prefill=True, nv_prepared_weights=True)
   assert enable_decode_attention(model.transformer.blk, fused=True) == 4
   return model
-
 
 @pytest.mark.nv
 def test_nv_packed_target_features_jit_and_stale_tail():
@@ -237,7 +224,6 @@ def test_nv_packed_target_features_jit_and_stale_tail():
         assert step.logits.tolist() == logits
         assert step.features.tolist() == features
   assert model.transformer.output.weight.uop is model.transformer.token_embd.weight.uop
-
 
 @pytest.mark.skipif(not (os.environ.get('INFURNACE_TEST_NV') and os.environ.get('INFURNACE_TEST_MODEL')),
                     reason='set INFURNACE_TEST_NV=1 and INFURNACE_TEST_MODEL for real NV target')

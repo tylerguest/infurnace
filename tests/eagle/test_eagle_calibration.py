@@ -11,13 +11,11 @@ from tinygrad.nn.state import safe_save
 
 TOOLS = Path(__file__).resolve().parents[2]/'benchmarks'/'experiments'/'eagle3'
 
-
 def load_tool(name):
   spec = importlib.util.spec_from_file_location(name, TOOLS/f'{name}.py')
   module = importlib.util.module_from_spec(spec)
   spec.loader.exec_module(module)
   return module
-
 
 def test_calibration_hashes_stream_file_bytes(tmp_path):
   path = tmp_path/'payload'
@@ -25,7 +23,6 @@ def test_calibration_hashes_stream_file_bytes(tmp_path):
   expected = hashlib.sha256(path.read_bytes()).hexdigest()
   assert load_tool('calibrate_head').file_hash(path) == expected
   assert load_tool('calibrated_benchmark').file_hash(path) == expected
-
 
 @pytest.mark.parametrize('shape,dtype', [((3, 4), dtypes.bfloat16), ((2, 4), dtypes.float32)])
 def test_calibrated_head_rejects_wrong_shape_or_dtype(tmp_path, shape, dtype):
@@ -35,7 +32,6 @@ def test_calibrated_head_rejects_wrong_shape_or_dtype(tmp_path, shape, dtype):
   draft = SimpleNamespace(device='CPU', draft_vocab=2, dim=4, weights={'lm_head.weight': original})
   with pytest.raises(ValueError, match='shape/dtype'): load_tool('calibrated_benchmark').load_head(draft, head)
   assert draft.weights['lm_head.weight'] is original
-
 
 def test_calibrated_head_only_replaces_draft_weight(tmp_path):
   head = tmp_path/'head.safetensors'
@@ -47,13 +43,11 @@ def test_calibrated_head_only_replaces_draft_weight(tmp_path):
   assert draft.weights['other'] is original
   assert original.float().tolist() == [[0.]*4]*2
 
-
 def test_calibrated_head_rejects_extra_tensors(tmp_path):
   head = tmp_path/'head.safetensors'
   safe_save({'extra': Tensor.zeros(1, device='CPU').realize()}, head)
   with pytest.raises(ValueError, match='only lm_head.weight'):
     load_tool('calibrated_benchmark').load_head(SimpleNamespace(), head)
-
 
 def test_calibration_cli_cannot_replace_original_checkpoint(tmp_path, monkeypatch):
   module = load_tool('calibrate_head')

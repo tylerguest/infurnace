@@ -7,7 +7,6 @@ from test_nv_shared_q8 import packed
 
 pytestmark = pytest.mark.nv
 
-
 @pytest.mark.parametrize('typ', [12, 14])
 @pytest.mark.parametrize('count', [2, 3, 4, 8])
 @pytest.mark.parametrize('width', [2560, 9728])

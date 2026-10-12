@@ -11,11 +11,9 @@ from tinygrad import Context, Tensor, dtypes
 
 from infurnace.eagle import EagleDraft
 
-
 def bf(value):
   bits = struct.unpack('<I', struct.pack('<f', value))[0]
   return struct.unpack('<f', struct.pack('<I', ((bits+0x7fff+((bits >> 16) & 1)) >> 16) << 16))[0]
-
 
 def test_scalar_checkpoint_architecture():
   dim, width = 4, 8

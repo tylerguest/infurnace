@@ -7,7 +7,6 @@ from tinygrad import Tensor
 import infurnace.models.qwen3 as model
 from infurnace.gguf import parse_gguf
 
-
 @pytest.fixture
 def metadata():
   return {
@@ -19,7 +18,6 @@ def metadata():
     "qwen3.attention.layer_norm_rms_epsilon": 1e-6,
     "tokenizer.ggml.tokens": [f"token{i}" for i in range(24)],
   }
-
 
 def test_explicit_head_size(metadata):
   config = model.config_from_gguf(metadata, max_context=16)
@@ -33,11 +31,9 @@ def test_explicit_head_size(metadata):
   assert shapes["blk.0.attn_k.weight"] == (8, 8)
   assert shapes["blk.1.attn_q_norm.weight"] == (4,)
 
-
 def test_context_cap(metadata):
   assert model.config_from_gguf(metadata).context_length == 32
   assert model.config_from_gguf(metadata, 64).context_length == 32
-
 
 def test_head_size_fallback(metadata):
   del metadata["qwen3.attention.key_length"]
@@ -47,11 +43,9 @@ def test_head_size_fallback(metadata):
   metadata["qwen3.embedding_length"] = 9
   with pytest.raises(ValueError, match="integral"): model.config_from_gguf(metadata)
 
-
 @pytest.mark.parametrize("value", [0, -1, True, 1.5, "16"])
 def test_invalid_context_cap(metadata, value):
   with pytest.raises(ValueError, match="max_context"): model.config_from_gguf(metadata, value)
-
 
 @pytest.mark.parametrize("key,value,error", [
   ("general.architecture", "llama", "dense Qwen3"),
@@ -78,16 +72,13 @@ def test_invalid_metadata(metadata, key, value, error):
   metadata[key] = value
   with pytest.raises(ValueError, match=error): model.config_from_gguf(metadata)
 
-
 @pytest.mark.parametrize("key", ["qwen3.block_count", "qwen3.feed_forward_length", "qwen3.rope.freq_base", "tokenizer.ggml.tokens"])
 def test_missing_metadata(metadata, key):
   del metadata[key]
   with pytest.raises(ValueError): model.config_from_gguf(metadata)
 
-
 def weights_for(config):
   return {name: Tensor.empty(*shape, device="CPU") for name, shape in model.expected_weight_shapes(config).items()}
-
 
 def test_tied_weights_do_not_mutate_input(metadata):
   config = model.config_from_gguf(metadata)
@@ -97,12 +88,10 @@ def test_tied_weights_do_not_mutate_input(metadata):
   assert "output.weight" not in weights
   assert prepared["output.weight"] is prepared["token_embd.weight"]
 
-
 def test_separate_output_preserved(metadata):
   config = model.config_from_gguf(metadata)
   weights = weights_for(config)
   assert model.prepare_weights(config, weights)["output.weight"] is weights["output.weight"]
-
 
 @pytest.mark.parametrize("mode,error", [("missing", "missing required"), ("shape", "expected"), ("bias", "unsupported")])
 def test_invalid_weights(metadata, mode, error):
@@ -112,7 +101,6 @@ def test_invalid_weights(metadata, mode, error):
   elif mode == "shape": weights["blk.0.attn_q.weight"] = Tensor.empty(8, 8, device="CPU")
   else: weights["blk.0.attn_q.bias"] = Tensor.empty(16, device="CPU")
   with pytest.raises(ValueError, match=error): model.prepare_weights(config, weights)
-
 
 def test_model_factory_caps_context_and_shares_weights(metadata, monkeypatch):
   config = model.config_from_gguf(metadata)
@@ -130,14 +118,12 @@ def test_model_factory_caps_context_and_shares_weights(metadata, monkeypatch):
   assert result.config.context_length == 8
   assert result.weights["output.weight"] is result.weights["token_embd.weight"]
 
-
 def test_factory_validates_before_staging(metadata, monkeypatch):
   class InvalidEntry:
     shape = (1,)
     def to(self): pytest.fail("staged bytes before validating shapes")
   monkeypatch.setattr(model, "parse_gguf", lambda path: (metadata, {"token_embd.weight": InvalidEntry()}))
   with pytest.raises(ValueError, match="expected"): model.Qwen3Model.from_gguf("unused")
-
 
 @pytest.mark.skipif(not os.environ.get("INFURNACE_TEST_MODEL"), reason="set INFURNACE_TEST_MODEL to a local GGUF path")
 def test_local_qwen3_contract():

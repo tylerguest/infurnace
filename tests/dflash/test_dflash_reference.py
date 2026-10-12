@@ -10,14 +10,12 @@ from tinygrad import Context, Tensor, UOp
 from tinygrad.nn.state import get_state_dict
 from test_dflash import tiny_target, tiny_draft
 
-
 def linear(x, weight): return [sum(a*b for a, b in zip(x, row)) for row in weight]
 def norm(x, weight, epsilon):
   scale = 1 / math.sqrt(sum(v*v for v in x)/len(x) + epsilon)
   return [a*scale*b for a, b in zip(x, weight)]
 def half(x): return struct.unpack('<e', struct.pack('<e', x))[0]
 def silu(x): return x / (1 + math.exp(-x))
-
 
 class ScalarDraft:
   def __init__(self, config, weights):
@@ -78,7 +76,6 @@ class ScalarDraft:
         next_x.append([a+b for a, b in zip(row, update)])
       x = next_x
     return [norm(row, w['output_norm.weight'], c.epsilon) for row in x[1:]]
-
 
 def test_nonuniform_forward_and_cache_against_upstream_scalar_contract(tmp_path):
   import pytest

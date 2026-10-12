@@ -15,7 +15,6 @@ from infurnace.kernels.quant_gemm import nv_prefill_supported
 from infurnace.models.qwen35 import Qwen35Model
 from infurnace.dflash.jit import captured
 
-
 @dataclass(frozen=True)
 class DFlashConfig:
   layers: int
@@ -74,13 +73,11 @@ class DFlashConfig:
     return cls(layers, dim, integer('feed_forward_length'), heads, kv_heads, hd, epsilon, theta,
                integer('block_size'), mask, tuple(features), tuple(pattern), window, causal)
 
-
 def projection(layer, x):
   # Draft rows are simultaneous. Multirow packed GEMM reads weights once;
   # otherwise use the packed GEMV rather than materializing a dense head.
   if not isinstance(layer, _NVLinear): return layer(x)
   return layer(x) if layer.prefill and x.numel() != layer.in_features else layer.decode(x)
-
 
 class DraftBlock:
   def __init__(self, config: DFlashConfig):
@@ -92,14 +89,12 @@ class DraftBlock:
     self.ffn_gate, self.ffn_up = (nn.Linear(c.dim, c.hidden, bias=False) for _ in range(2))
     self.ffn_down = nn.Linear(c.hidden, c.dim, bias=False)
 
-
 class DraftWeights:
   def __init__(self, config):
     self.fc = nn.Linear(config.dim * len(config.feature_layers), config.dim, bias=False)
     self.enc = {'output_norm': nn.RMSNorm(config.dim, config.epsilon)}
     self.output_norm = nn.RMSNorm(config.dim, config.epsilon)
     self.blk = [DraftBlock(config) for _ in range(config.layers)]
-
 
 class DFlashDraft:
   def __init__(self, config: DFlashConfig, target: Qwen35Model, weights: dict[str, Tensor]):

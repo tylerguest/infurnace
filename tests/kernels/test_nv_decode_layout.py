@@ -9,14 +9,12 @@ from tinygrad import Tensor, TinyJit, dtypes
 from infurnace.gguf import _dequant
 kernels = importlib.import_module("infurnace.kernels.quant_gemv")
 
-
 @pytest.mark.parametrize("typ,width,rows,expected", [
   (12, 2560, 9728, 4), (14, 2560, 151936, 8), (14, 9728, 2560, 1),
   (14, 2560, 1024, 1), (14, 2560, 65536, 1),
 ])
 def test_shape_specific_warp_selection(typ, width, rows, expected):
   assert kernels._decode_warps(typ, width, rows) == expected
-
 
 @pytest.mark.skipif(not os.environ.get("INFURNACE_TEST_NV"), reason="set INFURNACE_TEST_NV=1 on an NV GPU")
 @pytest.mark.parametrize("typ,size,dtype,warps", [(12, 144, dtypes.uint32, 4), (14, 210, dtypes.uint16, 8)])

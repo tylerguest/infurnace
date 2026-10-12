@@ -17,17 +17,14 @@ from infurnace.kernels.quant_gemv import q8_quantize, quant_gemv
 from infurnace.models.qwen3 import _NVAttentionBlock, _NVLinear, apply_rope
 from infurnace.eagle.reference import SequentialVerifier
 
-
 def norm_rows(norm, x):
   # Row-independent reduction over the hidden axis; validated against the
   # one-token path on the real target, not just a small synthetic block.
   return norm(x)
 
-
 def norm_head_rows(norm, x, heads):
   # Cut the projection sum before its nested RMSNorm reduction is scheduled.
   return norm(x.contiguous().reshape(x.shape[0], x.shape[1], heads, 128).transpose(1, 2))
-
 
 class _ChainBlock(_NVAttentionBlock):
   reuse_weights = False
@@ -99,7 +96,6 @@ class _ChainBlock(_NVAttentionBlock):
     gated = self.linear(x, 'ffn_gate', q8).silu().contiguous()*self.linear(x, 'ffn_up', q8)
     return self.linear(gated, 'ffn_down', return_parts=residual is None, residual=residual)
 
-
 @dataclass(frozen=True)
 class BatchChain:
   tokens: tuple[int, ...]
@@ -107,7 +103,6 @@ class BatchChain:
   features: Tensor
   next_token: int | None
   stop_reason: str
-
 
 class BatchedVerifier(SequentialVerifier):
   reuse_weights = False

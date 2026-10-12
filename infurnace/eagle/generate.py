@@ -12,14 +12,12 @@ from tinygrad import Tensor
 from infurnace.eagle import EagleDraft
 from infurnace.eagle.reference import SequentialVerifier
 
-
 @dataclass(frozen=True)
 class EagleRound:
   tokens: tuple[int, ...]
   proposed: int
   accepted: int
   stop_reason: str
-
 
 class EagleGenerator:
   """Explicit reusable generation session; no batching or concurrent ownership.
@@ -55,7 +53,6 @@ class EagleGenerator:
         yield from result.tokens
     finally:
       rounds.close()
-
 
 def generate_eagle(model, draft: EagleDraft, tokens: list[int], *, draft_tokens: int = 2,
                    max_new_tokens: int | None = None, eos_token_ids: tuple[int, ...] = (),

@@ -23,16 +23,13 @@ from infurnace.dflash.target import TargetObserver
 from infurnace.kernels.gdn import gdn_chunk
 from infurnace.kernels.embedding import packed_gather
 
-
 def _raw(tensor):
   return Tensor(tensor.uop.buf_uop).reshape(tensor.shape)
-
 
 def _stored(destination, source):
   # Lazy in-place store into an owned buffer; reading the result orders the
   # write inside the same graph (no extra schedule break).
   return Tensor(destination.uop.after(destination.uop.store(source.cast(destination.dtype).uop)))
-
 
 def _decays(g: Tensor, rows: int) -> tuple[Tensor, Tensor]:
   """exp(g_t - g_j) for j<t (strict) and j<=t (inclusive); zero elsewhere."""
@@ -41,7 +38,6 @@ def _decays(g: Tensor, rows: int) -> tuple[Tensor, Tensor]:
   strict = (index.reshape(rows, 1) > index.reshape(1, rows)).where(diff, float('-inf')).exp()
   inclusive = (index.reshape(rows, 1) >= index.reshape(1, rows)).where(diff, float('-inf')).exp()
   return strict, inclusive
-
 
 def _unit_lower_inverse(A: Tensor, rows: int) -> Tensor:
   """(I + A)^-1 for strictly lower-triangular A: A is nilpotent, so
@@ -54,7 +50,6 @@ def _unit_lower_inverse(A: Tensor, rows: int) -> Tensor:
     n *= 2
   return result
 
-
 class _Operands:
   """Per-GDN-layer scratch for one verification block."""
   def __init__(self, block: GatedDeltaNetBlock, rows: int, device: str):
@@ -63,7 +58,6 @@ class _Operands:
     self.k = Tensor.empty(1, heads, rows, kd, device=device).realize()
     self.u = Tensor.empty(1, heads, rows, vd, device=device).realize()
     self.g = Tensor.empty(1, heads, rows, device=device).realize()
-
 
 class ParallelVerifier:
   def __init__(self, observer: TargetObserver, rows: int):

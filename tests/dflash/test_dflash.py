@@ -10,17 +10,14 @@ from infurnace.dflash.target import TargetObserver
 from infurnace.models.qwen35 import Qwen35Model
 from test_qwen35 import checkpoint
 
-
 def tiny_target(path):
   checkpoint(path)
   return Qwen35Model.from_gguf(path / 'model.gguf', device='CPU')
-
 
 def tiny_draft(model):
   config = DFlashConfig(2, 8, 12, 2, 1, 4, 1e-6, 10000000, 4, 15, (1,), (True, False), 8)
   state = {k: Tensor.randn(*v.shape) * 0.05 for k, v in get_state_dict(DraftWeights(config)).items()}
   return DFlashDraft(config, model, state)
-
 
 class RecordedDraft:
   def __init__(self, model, prompt, expected, wrong=False):
@@ -47,7 +44,6 @@ class RecordedDraft:
     if self.wrong: values = [(values[0]+1) % self.target.config.vocab_size] + values[1:]
     return values
 
-
 @pytest.mark.parametrize('wrong', [False, True])
 @pytest.mark.parametrize('budget', [1, 2, 7, 13])
 def test_exact_output_rng_and_terminal_row(tmp_path, wrong, budget, verifier='sequential'):
@@ -69,7 +65,6 @@ def test_exact_output_rng_and_terminal_row(tmp_path, wrong, budget, verifier='se
     if wrong: assert generator.stats.accepted == 0
     elif budget > 1: assert generator.stats.accepted > 0
 
-
 def test_observation_alignment_and_snapshot_lifetime(tmp_path, verifier='sequential'):
   with Context(DEV='CPU'):
     model = tiny_target(tmp_path)
@@ -90,7 +85,6 @@ def test_observation_alignment_and_snapshot_lifetime(tmp_path, verifier='sequent
         assert anchor == expected[position-len(prompt)]
       assert snapshots[0].tolist() != snapshots[-1].tolist()
 
-
 def test_cancellation_eos_and_replay(tmp_path, verifier='sequential'):
   with Context(DEV='CPU'):
     model = tiny_target(tmp_path)
@@ -107,7 +101,6 @@ def test_cancellation_eos_and_replay(tmp_path, verifier='sequential'):
     for _ in range(3): assert list(generator.stream(prompt, max_new_tokens=7)) == expected
     assert list(generator.stream(prompt, max_new_tokens=7, eos_token_ids=(expected[0],))) == expected[:1]
     assert generator.stats.target_steps == len(prompt)
-
 
 def test_real_draft_determinism_and_transient_cache(tmp_path):
   with Context(DEV='CPU'):
@@ -129,7 +122,6 @@ def test_real_draft_determinism_and_transient_cache(tmp_path):
     draft.observe(features)
     with pytest.raises(ValueError): draft.propose(2, 2, 3)
     with pytest.raises(ValueError): draft.propose(2, 3, 4)  # count must stay below the block size
-
 
 def test_observing_rows_in_pieces_matches_one_observation(tmp_path):
   # Staging splits rows at chunk boundaries; any split must absorb identically.
@@ -155,7 +147,6 @@ def test_real_tiny_draft_verified_output(tmp_path, verifier='sequential'):
     generator = DFlashGenerator(model, draft, verifier=verifier)
     for _ in range(3): assert list(generator.stream([1, 2, 3], max_new_tokens=7)) == expected
 
-
 def test_zero_budget_and_invalid_options(tmp_path):
   with Context(DEV='CPU'):
     model = tiny_target(tmp_path)
@@ -165,7 +156,6 @@ def test_zero_budget_and_invalid_options(tmp_path):
     for options in ({'temperature': 0.1}, {'block_size': 0}, {'block_size': 5}, {'eos_token_ids': (16,)}):
       with pytest.raises(ValueError): list(generator.stream([1], max_new_tokens=2, **options))
     assert not model._generating
-
 
 @pytest.mark.parametrize('causal', [None, False, True])
 @pytest.mark.parametrize('sliding', [False, True])
@@ -195,7 +185,6 @@ def test_attention_mask_against_uniform_scalar_oracle(tmp_path, causal, sliding)
       draft.cache[0].assign(Tensor.full(draft.cache[0].shape, future_value, dtype=dtypes.float16)).realize()
       actual = draft._observe(features, ids, position).tolist()[0]
       for got, wanted in zip(actual, expected): assert got == pytest.approx(wanted, abs=2e-5)
-
 
 def test_gguf_metadata_not_stale_sidecar():
   model = SimpleNamespace(config=SimpleNamespace(embedding_length=8, block_count=32, vocab_size=16),

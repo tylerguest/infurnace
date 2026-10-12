@@ -24,10 +24,8 @@ from infurnace import disk_cache
 FORMAT = 1
 _FLAGS = ('BEAM', 'JITBEAM', 'NOOPT', 'PROFILE', 'DEBUG', 'JIT', 'IMAGE', 'HCQ_CACHE_THRESH', 'VALIDATE_WITH_CPU')
 
-
 def cache_dir() -> Path:
   return disk_cache.root() / 'dflash-graphs'
-
 
 def key(generator, block: int) -> str:
   digest = hashlib.sha256(f'format {FORMAT} python {sys.version_info[:2]} {disk_cache.sources()}'.encode())
@@ -36,7 +34,6 @@ def key(generator, block: int) -> str:
   digest.update(f'{generator.model.config.context_length} {block} {generator.fused} {device.device} {getattr(device, "arch", "")}'.encode())
   digest.update(repr([(flag, os.environ.get(flag)) for flag in _FLAGS]).encode())
   return digest.hexdigest()[:32]
-
 
 def named_buffers(generator) -> dict[str, Buffer]:
   """Every realized buffer reachable from the generator and tinygrad's RNG state,
@@ -66,14 +63,12 @@ def named_buffers(generator) -> dict[str, Buffer]:
   visit(Tensor._device_rng_counters, 'rng.counters', depth)
   return {name: buffer for buffer, name in names.items()}
 
-
 class _Pickler(pickle.Pickler):
   def __init__(self, file, by_buffer: dict[Buffer, str]):
     super().__init__(file, protocol=5)
     self.by_buffer = by_buffer
   def persistent_id(self, obj):
     return self.by_buffer.get(obj) if isinstance(obj, Buffer) else None
-
 
 class _Unpickler(pickle.Unpickler):
   def __init__(self, file, by_name: dict[str, Buffer]):
@@ -82,7 +77,6 @@ class _Unpickler(pickle.Unpickler):
   def persistent_load(self, name):
     return self.by_name[name].ensure_allocated()  # KeyError: a buffer this process does not have, so a cache miss
 
-
 def save(path: Path, graphs: dict[str, _TinyJit], buffers: dict[str, Buffer]) -> None:
   captured = {name: jit.captured for name, jit in graphs.items() if jit.captured is not None}
   path.parent.mkdir(parents=True, exist_ok=True)
@@ -90,7 +84,6 @@ def save(path: Path, graphs: dict[str, _TinyJit], buffers: dict[str, Buffer]) ->
   with partial.open('wb') as f: _Pickler(f, {buffer: name for name, buffer in buffers.items()}).dump({'format': FORMAT, 'graphs': captured})
   partial.replace(path)
   disk_cache.prune(path.parent, keep=4)  # each entry holds only graph-private buffers
-
 
 def load(path: Path, buffers: dict[str, Buffer]) -> dict[str, CapturedJit] | None:
   try:

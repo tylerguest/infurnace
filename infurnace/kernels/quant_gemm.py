@@ -16,16 +16,13 @@ from tinygrad.uop.ops import AxisType, KernelInfo
 
 from infurnace.kernels.quant_gemv import Q4_K, Q5_K, Q6_K, Q6_PREPARED_BYTES, QUANT_SIZES, _half, _q4_scales, _q6_swizzled_index, _q4_word
 
-
 class QuantGemmError(ValueError):
   """Inputs/backend do not satisfy the first prefill kernel contract."""
-
 
 def _q6_byte(raw: UOp, base: UOp, offset: UOp, blocks_per_row: int = 0) -> UOp:
   size = raw.dtype.itemsize
   index = _q6_swizzled_index(base, offset//size, blocks_per_row) if blocks_per_row else base+offset//size
   return (raw[index].load().cast(dtypes.uint32) >> ((offset%size)*8).cast(dtypes.uint32)) & 255
-
 
 def _weight(raw: UOp, row: UOp, col: UOp, width: int, typ: int, q6_aligned: bool = False,
             q6_swizzled: bool = False, q4_swizzled: bool = False) -> UOp:
@@ -57,7 +54,6 @@ def _weight(raw: UOp, row: UOp, col: UOp, width: int, typ: int, q6_aligned: bool
   scale = _q6_byte(raw, base, 192+within//16, swizzle_width).cast(dtypes.uint8).bitcast(dtypes.int8).float()
   d_index = _q6_swizzled_index(logical, 52, width//256) if q6_swizzled else base+(52 if q6_aligned else 104)
   return (_half(raw[d_index].load())*quant.float()*scale).cast(dtypes.float16)
-
 
 @functools.cache
 def _prefill_q4_paired(out: UOp, raw: UOp, x: UOp, *, tokens: int, width: int, rows: int, q4_swizzled: bool = False,
@@ -121,7 +117,6 @@ def _prefill_q4_paired(out: UOp, raw: UOp, x: UOp, *, tokens: int, width: int, r
             for t, acc in enumerate(accs) for i, (row, col) in enumerate(((0, 0), (0, 1), (8, 0), (8, 1)))]
   return UOp.group(*stores).end(block, warp, lane).sink(arg=KernelInfo(name=f"prefill_q{5 if q5 else 4}_k_paired", opts_to_apply=()))
 
-
 @functools.cache
 def _prefill_q6_paired(out: UOp, raw: UOp, x: UOp, *, tokens: int, width: int, rows: int, q6_swizzled: bool = False,
                        tiles: int = 4, splits: int = 1) -> UOp:
@@ -180,7 +175,6 @@ def _prefill_q6_paired(out: UOp, raw: UOp, x: UOp, *, tokens: int, width: int, r
             for t, acc in enumerate(accs) for i, (row, col) in enumerate(((0, 0), (0, 1), (8, 0), (8, 1)))]
   return UOp.group(*stores).end(block, warp, lane).sink(arg=KernelInfo(name="prefill_q6_k_paired", opts_to_apply=()))
 
-
 @functools.cache
 def _prefill_kernel(out: UOp, raw: UOp, x: UOp, *, tokens: int, width: int, rows: int, typ: int,
                     q6_aligned: bool = False, q6_swizzled: bool = False, q4_swizzled: bool = False,
@@ -225,7 +219,6 @@ def _prefill_kernel(out: UOp, raw: UOp, x: UOp, *, tokens: int, width: int, rows
   return UOp.group(*stores).end(block, warp, lane).sink(
     arg=KernelInfo(name=f"prefill_q{ {Q4_K: 4, Q5_K: 5}.get(typ, 6)}_k_mma", opts_to_apply=()))
 
-
 def _schedule(rows: int, width: int, tokens: int) -> tuple[int, int, int]:
   """(tiles per warp, K splits, k unroll), tuned on an RTX 5060 from profiler GPU
   times: four tiles always win; split K only until there are ~64 blocks (each
@@ -237,14 +230,12 @@ def _schedule(rows: int, width: int, tokens: int) -> tuple[int, int, int]:
   steps = width//16//splits
   return tiles, splits, next(u for u in (4, 2, 1) if steps % u == 0)
 
-
 @functools.cache
 def nv_prefill_supported(device: str) -> bool:
   if not isinstance(device, str) or device.split(":")[0] != "NV": return False
   with Context(ALLOW_DEVICE_USAGE=1): renderer = Device[device].renderer
   return isinstance(renderer, CUDARenderer) and any(
     tc.dims == (8, 16, 16) and tc.dtype_in == dtypes.float16 and tc.dtype_out == dtypes.float32 for tc in renderer.tensor_cores)
-
 
 def quant_gemm(x: Tensor, packed: Tensor, *, out_features: int, in_features: int, ggml_type: int,
                q6_aligned: bool = False, q6_swizzled: bool = False, q4_swizzled: bool = False) -> Tensor:

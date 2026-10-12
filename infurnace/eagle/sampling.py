@@ -1,18 +1,15 @@
 """GPU prefix commitment with the target's exact zero-temperature RNG semantics."""
 from tinygrad import Tensor, dtypes
 
-
 def advance_counter(counter, amount):
   low = counter[:1]+amount.cast(dtypes.uint32)
   return low.cat(counter[1:]+(low < counter[:1]).cast(dtypes.uint32))
-
 
 def score_argmax(row, temperature, random, *, materialize_scores=False):
   """Preserve the target score; optionally prevent expensive reduction recomputation."""
   if type(materialize_scores) is not bool: raise ValueError('materialize_scores must be boolean')
   scores = row/temperature.maximum(1e-12) - (random.maximum(1e-12).log().neg()).log()
   return (scores.contiguous() if materialize_scores else scores).argmax(-1, keepdim=True)
-
 
 def sample_chain(logits, candidates, temperature, key, counter, *, eos_token_ids=(), materialize_scores=False):
   """Return [row decisions..., committed count]; advance RNG for committed rows only.

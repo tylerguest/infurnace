@@ -10,7 +10,6 @@ DRAFT = Path('models/dflash-qwen35/qwen35-4b-dflash-Q4_K_M.gguf')
 pytestmark = [pytest.mark.nv, pytest.mark.skipif(not (TARGET.is_file() and DRAFT.is_file()),
                                                   reason='needs the Qwen3.5-4B target and DFlash draft under models/')]
 
-
 @pytest.fixture(scope='module')
 def loaded():
   # One generator for the module, as in real use: each generator owns its own
@@ -21,15 +20,12 @@ def loaded():
   draft = DFlashDraft.from_gguf(DRAFT, model)
   return model, tokenizer, DFlashGenerator(model, draft, verifier='parallel')
 
-
 def configure(generator, *, fused=True, plain_cost=float('inf')):
   generator.min_tau, generator.plain_cost, generator.fused = 0.0, plain_cost, fused  # inf: always draft
   return generator
 
-
 def prompt(tokenizer, text, thinking=False):
   return tokenizer.encode(tokenizer.render_chat([{'role': 'user', 'content': text}], enable_thinking=thinking))
-
 
 def test_cold_first_request_matches_plain_decoding_prefix(loaded):
   # Must run first in this module: DFlash is the model's first work, as for a
@@ -42,7 +38,6 @@ def test_cold_first_request_matches_plain_decoding_prefix(loaded):
   got = list(generator.stream(list(ids), max_new_tokens=32, block_size=16))
   assert got == list(model.generate(list(ids), 32, reuse_cache=False))
 
-
 def test_fused_rounds_match_unfused_rounds(loaded):
   model, tokenizer, generator = loaded
   ids = prompt(tokenizer, 'Write a Python function that returns the n-th Fibonacci number.')
@@ -53,7 +48,6 @@ def test_fused_rounds_match_unfused_rounds(loaded):
     assert list(generator.stream(list(ids), max_new_tokens=48, block_size=16)) == expected
     assert (generator.stats.rounds, generator.stats.accepted) == rounds
   assert generator._parallel_verifier(16)._round_jit is not None
-
 
 def test_fused_device_anchor_and_replay_without_deadlock(loaded):
   # This flow deterministically deadlocked NV graph replay when commit, draft
@@ -75,14 +69,12 @@ def test_fused_device_anchor_and_replay_without_deadlock(loaded):
   assert len(checked) > 40 and all(checked)
   assert not model._generating
 
-
 def test_unfused_path_matches_plain_decoding_prefix(loaded):
   model, tokenizer, generator = loaded
   ids = prompt(tokenizer, 'Write a Python function that returns the n-th Fibonacci number.')
   plain = list(model.generate(list(ids), 48, reuse_cache=False))
   for _ in range(3):
     assert list(configure(generator, fused=False).stream(list(ids), max_new_tokens=48, block_size=16)) == plain
-
 
 def test_timing_fallback_matches_plain_decoding_prefix(loaded):
   # Losing rounds flush the held block and decode plain rows; probes re-enter

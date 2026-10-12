@@ -7,7 +7,6 @@ from benchmarks.experiments.eagle3.parallel_argmax import parallel_argmax
 
 pytestmark = pytest.mark.nv
 
-
 @pytest.mark.parametrize('size', [1, 32, 511, 512, 513, 151936])
 def test_parallel_argmax_random_and_replay(size):
   with Context(DEV='NV'):
@@ -17,7 +16,6 @@ def test_parallel_argmax_random_and_replay(size):
       scores = Tensor.randn(1, size, device='NV').realize()
       expected = scores.argmax(-1, keepdim=True).item()
       assert jit(scores).item() == expected
-
 
 @pytest.mark.parametrize('size', [32, 513, 151936])
 @pytest.mark.parametrize('kind', ['ties', 'nan', 'allnan', 'inf', 'neginf', 'zero'])
@@ -36,7 +34,6 @@ def test_parallel_argmax_special_values(size, kind):
     scores = Tensor([values], device='NV').realize()
     expected = scores.argmax(-1, keepdim=True).item()
     assert parallel_argmax(scores).item() == expected
-
 
 @pytest.mark.parametrize('size', [1, 2, 4, 8])
 @pytest.mark.parametrize('stop', ['accept', 'reject', 'eos'])

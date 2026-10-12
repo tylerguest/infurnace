@@ -25,12 +25,10 @@ plain = list(model.generate(list(ids), 32, reuse_cache=False))
 print(json.dumps({{'how': how, 'got': got, 'plain': plain}}))
 '''
 
-
 def run(cache):
   env = dict(os.environ, XDG_CACHE_HOME=str(cache), INFURNACE_GRAPH_CACHE='1')
   result = subprocess.run([sys.executable, '-c', RUN], env=env, capture_output=True, text=True, timeout=280, check=True)
   return json.loads(result.stdout.strip().splitlines()[-1])
-
 
 def test_second_process_loads_cached_graphs_and_decodes_identically(tmp_path):
   first, second = run(tmp_path), run(tmp_path)

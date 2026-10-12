@@ -7,7 +7,6 @@ from infurnace.eagle.generate import EagleGenerator, generate_eagle
 from infurnace.eagle.reference import SequentialVerifier
 from test_speculative import tiny_model
 
-
 class RecordedDraft:
   def __init__(self, model, expected, *, wrong=False):
     self.device, self.capacity = model.device, model.config.context_length
@@ -34,7 +33,6 @@ class RecordedDraft:
 
   def observe_propose_scored(self, features, paired_ids, count):
     return self.observe_propose(features, paired_ids, count), [2.0]*count
-
 
 @pytest.mark.parametrize('wrong', [False, True])
 @pytest.mark.parametrize('fused', [False, True])
@@ -63,7 +61,6 @@ def test_verified_generation_alignment_and_budget(wrong, fused):
     assert features == expected.tolist()
   assert not model._generating and model.transformer._cached_tokens == []
 
-
 @pytest.mark.parametrize('margin', [0.0, 3.0])
 def test_confidence_gating_is_exact_and_can_skip_proposals(margin):
   model, _ = tiny_model()
@@ -78,7 +75,6 @@ def test_confidence_gating_is_exact_and_can_skip_proposals(margin):
   if margin > 2: assert all(result.proposed == 0 for result in rounds)
   assert draft.resets == 2 and not model._generating
 
-
 @pytest.mark.parametrize('fused', [False, True])
 def test_cancellation_releases_target_and_draft(fused):
   model, _ = tiny_model()
@@ -88,7 +84,6 @@ def test_cancellation_releases_target_and_draft(fused):
   assert model._generating
   stream.close()
   assert not model._generating and draft.length == 0 and draft.resets == 2
-
 
 def test_token_stream_close_mid_accepted_round_and_device_context():
   model, _ = tiny_model()
@@ -107,7 +102,6 @@ def test_token_stream_close_mid_accepted_round_and_device_context():
     assert DEV.value == outside_device and not model._generating
   assert draft.resets == 2 and draft.length == 0
 
-
 @pytest.mark.parametrize('flag', [True, 1])
 def test_cta_local_candidate_requires_explicit_batched_boolean_flag(flag):
   model, _ = tiny_model()
@@ -115,7 +109,6 @@ def test_cta_local_candidate_requires_explicit_batched_boolean_flag(flag):
   with pytest.raises(ValueError, match='local_ffn_down requires'):
     list(generate_eagle(model, draft, [1, 2, 3], local_ffn_down=flag))
   assert not model._generating and draft.resets == 0
-
 
 @pytest.mark.parametrize('eos', [False, True])
 @pytest.mark.parametrize('fused', [False, True])
@@ -130,7 +123,6 @@ def test_last_pending_root_needs_no_drafting_or_verification(monkeypatch, eos, f
   rounds = list(generate_eagle(model, draft, prompt, max_new_tokens=1, eos_token_ids=(root,) if eos else (), fused_draft=fused))
   assert rounds[0].tokens == (root,) and rounds[0].stop_reason == ('eos' if eos else 'limit')
   assert draft.resets == 2 and not model._generating
-
 
 def test_eos_and_context_boundaries():
   model, _ = tiny_model()

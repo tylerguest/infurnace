@@ -4,7 +4,6 @@ import sys
 import time
 from typing import Iterator
 
-
 class Decoder:
   """How replies are generated: plain decoding, or a DFlash / EAGLE-3 speculative generator."""
   def __init__(self, model, tokenizer, *, dflash=None, eagle=None):
@@ -28,10 +27,8 @@ class Decoder:
     note = {'cached': ' (DFlash graphs from cache)', 'captured': ' (DFlash graphs cached for next time)'}.get(how, '')
     print(f"Ready in {time.perf_counter() - start:.1f}s{note}.", file=sys.stderr, flush=True)
 
-
 def prompt_ids(tokenizer, text: str) -> list[int]:
   return ([tokenizer.bos_id] if tokenizer.bos_id is not None else []) + tokenizer.encode(text)
-
 
 def stream_reply(decoder: Decoder, tokenizer, ids: list[int], max_tokens: int | None) -> str:
   """Print a reply as it is generated and return its text."""
@@ -60,11 +57,9 @@ def stream_reply(decoder: Decoder, tokenizer, ids: list[int], max_tokens: int | 
             file=sys.stderr)
   return "".join(pieces)
 
-
 def run_prompt(decoder: Decoder, tokenizer, prompt: str, max_tokens: int) -> int:
   stream_reply(decoder, tokenizer, prompt_ids(tokenizer, prompt), max_tokens)
   return 0
-
 
 def run_chat(decoder: Decoder, tokenizer, max_tokens: int | None, max_context: int, thinking: bool = True) -> int:
   """Interactive chat. When a new message would not fit, the oldest turns are dropped."""

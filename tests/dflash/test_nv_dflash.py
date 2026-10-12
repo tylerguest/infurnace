@@ -8,7 +8,6 @@ from test_qwen35 import checkpoint
 
 pytestmark = pytest.mark.nv
 
-
 @pytest.mark.parametrize('block', [1, 4])
 def test_nv_verified_output_rng_and_replay(tmp_path, block, verifier='sequential'):
   with Context(DEV='CPU'): checkpoint(tmp_path)
@@ -26,7 +25,6 @@ def test_nv_verified_output_rng_and_replay(tmp_path, block, verifier='sequential
       assert list(generator.stream([1, 2, 3], max_new_tokens=7, block_size=block)) == expected
       assert generator.stats.target_steps == 9
       assert not model._generating and draft.length == 0
-
 
 def test_nv_denoise_matches_cpu_hidden_and_transient_cache(tmp_path):
   with Context(DEV='CPU'):

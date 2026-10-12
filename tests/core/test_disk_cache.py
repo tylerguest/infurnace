@@ -1,7 +1,6 @@
 from tinygrad import Context, Tensor, dtypes
 from infurnace import disk_cache
 
-
 def test_tensors_round_trip_as_views_of_one_buffer(tmp_path):
   with Context(DEV='CPU'):
     tensors = {'a': Tensor([1.5, -2.0, 3.25]).half().contiguous().realize(),
@@ -16,7 +15,6 @@ def test_tensors_round_trip_as_views_of_one_buffer(tmp_path):
       assert loaded[name].tolist() == tensor.tolist()
     bases = {loaded[name].uop.base.buffer._base for name in loaded}
     assert len(bases) == 1 and None not in bases  # one copy in, every tensor a view
-
 
 def test_damaged_tensor_file_is_a_miss(tmp_path):
   path = tmp_path / 'params.bin'

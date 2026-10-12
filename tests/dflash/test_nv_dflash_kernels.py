@@ -10,7 +10,6 @@ from infurnace.kernels.quant_gemv import prepare_q4, prepare_q6
 
 pytestmark = pytest.mark.nv
 
-
 def test_gdn_chunk_matches_tensor_closed_form():
   H, T, D, eps = 32, 16, 128, 1e-6
   with Context(DEV='NV'):
@@ -34,20 +33,17 @@ def test_gdn_chunk_matches_tensor_closed_form():
       # z is stored as FP16 for the output projection.
       assert ((z.float() - z_ref).abs().max() / z_ref.abs().max()).item() < 2e-3
 
-
 def _q6_rows(rows, width):
   rng = random.Random(7)
   raw = bytearray(rng.getrandbits(8) for _ in range(rows*width//256*210))
   for offset in range(0, len(raw), 210): raw[offset+208:offset+210] = struct.pack('<e', 0.001)
   return bytes(raw)
 
-
 def _q4_rows(rows, width):
   rng = random.Random(9)
   raw = bytearray(rng.getrandbits(8) for _ in range(rows*width//256*144))
   for offset in range(0, len(raw), 144): raw[offset:offset+4] = struct.pack('<ee', 0.002, 0.0004)
   return bytes(raw)
-
 
 @pytest.mark.parametrize('typ,swizzled', [(14, False), (14, True), (12, True), (12, False)])
 def test_packed_gather_decodes_only_requested_rows(typ, swizzled):
@@ -66,7 +62,6 @@ def test_packed_gather_decodes_only_requested_rows(typ, swizzled):
       options = dict(q4_swizzled=swizzled)
     got = packed_gather(Tensor(ids, dtype=dtypes.int32), packed, width=width, ggml_type=typ, **options).tolist()
   for i, row in zip(ids, got): assert row == table[i]
-
 
 def test_gdn_decode_matches_upstream_math_and_updates_states_in_place():
   from infurnace.kernels.gdn import gdn_decode

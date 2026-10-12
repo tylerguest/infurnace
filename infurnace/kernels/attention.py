@@ -15,17 +15,14 @@ from tinygrad.dtype import AddrSpace
 from tinygrad.uop.ops import AxisType, KernelInfo
 from infurnace.kernels.quant_gemv import warp_reduce
 
-
 class AttentionError(ValueError):
   """Inputs do not satisfy the initial NV decode attention contract."""
-
 
 @functools.cache
 def nv_attention_supported(device: str) -> bool:
   if not isinstance(device, str) or device.split(":")[0] != "NV": return False
   with Context(ALLOW_DEVICE_USAGE=1): renderer = Device[device].renderer
   return isinstance(renderer, CUDARenderer)
-
 
 def _validate_attention(q: Tensor, assigned_kv: Tensor, active_tokens: int | UOp) -> tuple[int, int, int]:
   if len(q.shape) != 4 or q.shape[0] != 1 or q.shape[2:] != (1, 128) or q.dtype != dtypes.float32:
@@ -46,7 +43,6 @@ def _validate_attention(q: Tensor, assigned_kv: Tensor, active_tokens: int | UOp
 
   return heads, kv_heads, capacity
 
-
 def decode_attention(q: Tensor, assigned_kv: Tensor, active_tokens: int | UOp) -> Tensor:
   """Parallel-softmax reference path, preserving FP32 Q and native FP16 KV."""
   heads, kv_heads, capacity = _validate_attention(q, assigned_kv, active_tokens)
@@ -61,7 +57,6 @@ def decode_attention(q: Tensor, assigned_kv: Tensor, active_tokens: int | UOp) -
   probabilities = valid.where(scores, float("-inf")).softmax(-1)
   probabilities = probabilities[:, :, :, :active_tokens]
   return probabilities @ v
-
 
 def fused_chain_attention(q: Tensor, assigned_kv: Tensor, start_pos: int | UOp) -> Tensor:
   """Short causal chain using exactly the existing per-query fused arithmetic.
@@ -84,16 +79,13 @@ def fused_chain_attention(q: Tensor, assigned_kv: Tensor, start_pos: int | UOp) 
   return _launch_attention(out, partial, scalar=active,
     fxn=functools.partial(_fused_merge, heads=heads, live=(active+63)//64, queries=size, active=active))
 
-
 _VARIABLE_PARAM = {'param': True} if 'param' in inspect.signature(UOp.variable).parameters else {}
-
 
 def _kernel_scalar(value: int | UOp) -> int | UOp:
   if not isinstance(value, UOp): return value
   value = value.unbind_all()[0]
   return value.substitute({v: UOp.variable(v.expr, v.vmin, v.vmax, dtype=v.dtype,
                           multiple_of=v.arg.multiple_of, **_VARIABLE_PARAM) for v in value.toposort() if v.is_variable})
-
 
 def _launch_attention(out: Tensor, *inputs: Tensor, scalar: int | UOp, fxn) -> Tensor:
   sources = (out.uop, *(t.uop for t in inputs))
@@ -103,7 +95,6 @@ def _launch_attention(out: Tensor, *inputs: Tensor, scalar: int | UOp, fxn) -> T
   scalar_args = tuple(v.cast(dtypes.int32) for v in scalar.toposort() if v.is_bound_var) if isinstance(scalar, UOp) else ()
   call = fxn(*params).call(*sources, *scalar_args)
   return Tensor(out.uop.after(call))
-
 
 def _fused_partial(out: UOp, q: UOp, kv: UOp, *, active: int | UOp, heads: int, capacity: int, partition: int,
                    queries: int = 1) -> UOp:
@@ -159,7 +150,6 @@ def _fused_partial(out: UOp, q: UOp, kv: UOp, *, active: int | UOp, heads: int, 
   axes = (block, warp, lane, query_index) if queries > 1 else (block, warp, lane)
   return UOp.group(*stores).end(*axes).sink(arg=KernelInfo(name="attention_fused_partial", opts_to_apply=()))
 
-
 def _fused_merge(out: UOp, partial: UOp, *, heads: int, live: int | UOp,
                  queries: int = 1, active: int | UOp | None = None) -> UOp:
   live = _kernel_scalar(live)
@@ -182,7 +172,6 @@ def _fused_merge(out: UOp, partial: UOp, *, heads: int, live: int | UOp,
   axes = (head, lane, query_index) if queries > 1 else (head, lane)
   return UOp.group(*(out[0, head, query_index, lane+i*32].store(done[1+i].load()/done[0].load()) for i in range(4))).end(*axes).sink(
     arg=KernelInfo(name="attention_fused_merge", opts_to_apply=()))
-
 
 def fused_decode_attention(q: Tensor, assigned_kv: Tensor, active_tokens: int | UOp, *, partition: int = 64) -> Tensor:
   """FP32 online-softmax decode with native FP16 KV, shared GQA tiles and merge.

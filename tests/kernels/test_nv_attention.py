@@ -7,25 +7,21 @@ from infurnace.kernels.attention import decode_attention, fused_decode_attention
 
 NV = pytest.mark.skipif(not os.environ.get("INFURNACE_TEST_NV"), reason="set INFURNACE_TEST_NV=1 on an NV GPU")
 
-
 @pytest.mark.parametrize("active", [0, 17, True])
 def test_invalid_active_length(active):
   with pytest.raises(AttentionError, match="active length"):
     decode_attention(Tensor.empty(1, 4, 1, 128, device="CPU"),
                      Tensor.empty(2, 1, 1, 16, 128, dtype=dtypes.float16, device="CPU"), active)
 
-
 def test_symbolic_length_bounds():
   with pytest.raises(AttentionError, match="symbolic active length"):
     decode_attention(Tensor.empty(1, 4, 1, 128, device="CPU"),
                      Tensor.empty(2, 1, 1, 16, 128, dtype=dtypes.float16, device="CPU"), UOp.variable("length", 0, 16))
 
-
 def test_attention_requires_nv_quant_before_loading():
   from infurnace.models.qwen3 import Qwen3Model
   with pytest.raises(ValueError, match="requires NV quantized"):
     Qwen3Model.from_gguf("does-not-exist.gguf", nv_attention=True)
-
 
 def test_fused_graph_has_shared_kv_and_bounded_partials():
   from tinygrad.dtype import AddrSpace
@@ -46,7 +42,6 @@ def test_fused_graph_has_shared_kv_and_bounded_partials():
   merged = _fused_merge(result, partial, heads=32, live=(active+127)//128)
   assert not any(u.op is Ops.BUFFER and u.addrspace == AddrSpace.LOCAL for u in merged.toposort())
 
-
 @pytest.mark.parametrize("partition", [0, 128.0, True])
 def test_fused_rejects_invalid_partitions(monkeypatch, partition):
   import infurnace.kernels.attention as attention
@@ -55,14 +50,12 @@ def test_fused_rejects_invalid_partitions(monkeypatch, partition):
     fused_decode_attention(Tensor.empty(1, 4, 1, 128, device="CPU"),
                            Tensor.empty(2, 1, 1, 128, 128, dtype=dtypes.float16, device="CPU"), 1, partition=partition)
 
-
 def test_fused_rejects_noncontiguous_cache(monkeypatch):
   import infurnace.kernels.attention as attention
   monkeypatch.setattr(attention, "nv_attention_supported", lambda device: True)
   kv = Tensor.empty(2, 1, 1, 128, 128, dtype=dtypes.float16, device="CPU").transpose(-1, -2)
   with pytest.raises(AttentionError, match="contiguous native KV"):
     fused_decode_attention(Tensor.empty(1, 4, 1, 128, device="CPU"), kv, 1)
-
 
 def reference(q, cache, length):
   # Snapshot mutable/JIT-reused buffers before building CPU reference operations.
@@ -72,7 +65,6 @@ def reference(q, cache, length):
   k = snapshot[0, :, :, :length, :]
   v = snapshot[1, :, :, :length, :]
   return q.scaled_dot_product_attention(k, v, enable_gqa=True)
-
 
 @NV
 @pytest.mark.parametrize("capacity,length", [(33, 1), (33, 31), (33, 32), (33, 33), (256, 127),
@@ -87,7 +79,6 @@ def test_attention_reference_and_poisoned_future(capacity, length, fused):
   result = (fused_decode_attention if fused else decode_attention)(q, cache, length).to("CPU").double()
   assert result.shape == q.shape
   assert (result-expected).abs().max().item() < 3e-5
-
 
 @NV
 @pytest.mark.parametrize("scale", [0.0, 1.0, 20.0])
@@ -111,7 +102,6 @@ def test_dynamic_jit_cache_writes_and_reset(scale, fused):
     snapshot = Tensor(actual.tolist(), device="CPU", dtype=dtypes.float64)
     assert (snapshot-expected).abs().max().item() < 2e-4, (iteration, length, scale, fused)
 
-
 @NV
 @pytest.mark.parametrize("partition", [64, 128, 256])
 def test_fused_standalone_binding_gqa_partitions_and_reset(partition):
@@ -128,7 +118,6 @@ def test_fused_standalone_binding_gqa_partitions_and_reset(partition):
     result = jit(q, cache, sp.bind(count-1)).tolist()[0]
     for head, vector in enumerate(result):
       assert vector[0] == pytest.approx([1.0 if head < 4 else -3.0]*128, abs=1e-6)
-
 
 @NV
 @pytest.mark.parametrize("fused", [False, True])
@@ -159,7 +148,6 @@ def test_decode_block_matches_upstream_and_retains_state(fused):
   expected = TransformerBlock._attention(block, prefill, 0).realize()
   actual = block._attention(prefill, 0).realize()
   assert (actual-expected).abs().max().item() < 1e-6
-
 
 @pytest.mark.skipif(not (os.environ.get("INFURNACE_TEST_MODEL") and
                         (os.environ.get("INFURNACE_TEST_NV_ATTENTION") or os.environ.get("INFURNACE_TEST_NV_FUSED_ATTENTION"))),

@@ -9,7 +9,6 @@ from infurnace.gguf import _dequant, PackedTensor
 from infurnace.models.qwen3 import _NVLinear, Qwen3Model
 from infurnace.kernels.quant_gemv import quant_gemv, QuantGemvError
 
-
 def test_submission_link_reinitializes_reused_signal_storage():
   # Eager HCQ submissions borrow ring storage that the hardware mutates. A
   # cached "already wrote this blob" marker must not skip zeroing on reuse.
@@ -26,7 +25,6 @@ def test_submission_link_reinitializes_reused_signal_storage():
     fold_binary(view, initial)
     assert list(storage.host.view(fmt='Q')[:]) == [0]*4
 
-
 def test_llm_imports():
   # This failed in the old wheel because tinygrad.llm.kernels was omitted.
   from tinygrad.llm.cli import SimpleTokenizer
@@ -34,25 +32,21 @@ def test_llm_imports():
   assert callable(SimpleTokenizer.from_gguf_kv)
   assert callable(Transformer.from_gguf)
 
-
 @pytest.mark.parametrize("width,rows,typ", [(32, 16, 12), (256, 1, 12), (256, 16, 99)])
 def test_kernel_invalid_geometry(width, rows, typ):
   with pytest.raises(QuantGemvError):
     quant_gemv(Tensor.ones(1, width, device="CPU"), Tensor.empty(1, dtype=dtypes.uint32, device="CPU"),
                out_features=rows, in_features=width, ggml_type=typ)
 
-
 def test_q6_rejects_byte_storage():
   with pytest.raises(QuantGemvError, match="dtype/size"):
     quant_gemv(Tensor.ones(1, 256, device="CPU"), Tensor.empty(16*210, dtype=dtypes.uint8, device="CPU"),
                out_features=16, in_features=256, ggml_type=14)
 
-
 def test_kernel_rejects_packed_size():
   with pytest.raises(QuantGemvError, match="dtype/size"):
     quant_gemv(Tensor.ones(1, 256, device="CPU"), Tensor.empty(1, dtype=dtypes.uint32, device="CPU"),
                out_features=16, in_features=256, ggml_type=12)
-
 
 @pytest.mark.skipif(not os.environ.get("INFURNACE_TEST_NV"), reason="set INFURNACE_TEST_NV=1 on an NV GPU")
 @pytest.mark.parametrize("typ,size", [(12, 144), (14, 210)])
@@ -82,7 +76,6 @@ def test_nv_adapter_preserves_embedding_ties(typ, size, tied):
   else:
     assert embedding.weight is old_embedding
     assert embedding.weight.uop is not adapter.weight.uop
-
 
 @pytest.mark.skipif(not os.environ.get("INFURNACE_TEST_NV"), reason="set INFURNACE_TEST_NV=1 on an NV GPU")
 @pytest.mark.parametrize("typ,size", [(12, 144), (14, 210)])

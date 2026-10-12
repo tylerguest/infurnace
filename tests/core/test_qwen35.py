@@ -6,7 +6,6 @@ from tinygrad.llm.model import Transformer, TransformerConfig, SSMConfig, GatedD
 from tinygrad.nn.state import get_state_dict
 from infurnace.models.qwen35 import Qwen35Model
 
-
 def checkpoint(path, *, permuted_head=False):
   """Small native GGUF fixture using upstream block/tensor names, no HF adapter."""
   c = TransformerConfig(num_blocks=2, dim=8, hidden_dim=12, n_heads=2, n_kv_heads=1, norm_eps=1e-6, vocab_size=16,
@@ -55,7 +54,6 @@ def checkpoint(path, *, permuted_head=False):
   file.write_bytes(header + payload)
   return file
 
-
 def test_upstream_loader_and_exact_block_types(tmp_path):
   with Context(DEV='CPU'):
     path = checkpoint(tmp_path)
@@ -68,7 +66,6 @@ def test_upstream_loader_and_exact_block_types(tmp_path):
     assert model.transformer.output.weight.uop.key == model.transformer.token_embd.weight.uop.key
     for cap in (0, -1, True):
       with pytest.raises(ValueError): Qwen35Model.from_gguf(path, max_context=cap)
-
 
 def test_bounded_wrapper_matches_direct_upstream_rng_and_cache(tmp_path):
   with Context(DEV='CPU'):
@@ -92,7 +89,6 @@ def test_bounded_wrapper_matches_direct_upstream_rng_and_cache(tmp_path):
     model.reset()
     assert model.transformer._cached_tokens == []
 
-
 @pytest.mark.parametrize('flag', ['nv_attention', 'nv_fused_attention', 'nv_prepared_weights'])
 def test_cli_rejects_attention_overrides_before_loading(tmp_path, monkeypatch, flag):
   from infurnace import loader
@@ -103,7 +99,6 @@ def test_cli_rejects_attention_overrides_before_loading(tmp_path, monkeypatch, f
   with pytest.raises(ValueError, match='upstream tinygrad owns attention'):
     loader.load_model(str(path), 16, 'CPU', **{flag: True})
 
-
 @pytest.mark.parametrize('flag', ['nv_quant', 'nv_prefill'])
 def test_cli_packed_projection_flags_require_nv_before_loading(tmp_path, monkeypatch, flag):
   from infurnace import loader
@@ -113,7 +108,6 @@ def test_cli_packed_projection_flags_require_nv_before_loading(tmp_path, monkeyp
   monkeypatch.setattr(Qwen35Model, 'from_gguf', lambda *a, **kw: pytest.fail('loaded target without NV packed support'))
   with pytest.raises(ValueError, match='requires NV'):
     loader.load_model(str(path), 16, 'CPU', **{flag: True})
-
 
 def test_tokenizer_reference(tmp_path):
   tokenizers = pytest.importorskip('tokenizers')

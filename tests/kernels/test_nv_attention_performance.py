@@ -12,7 +12,6 @@ from tinygrad import Device, Tensor, TinyJit, UOp, function
 
 from infurnace.kernels.attention import decode_attention, fused_decode_attention
 
-
 @pytest.mark.skipif(not os.environ.get("INFURNACE_TEST_NV_PERF"), reason="set INFURNACE_TEST_NV_PERF=1 on an idle NV GPU")
 @pytest.mark.parametrize("mode", ["parallel", "fused"])
 def test_attention_relative_latency(mode):

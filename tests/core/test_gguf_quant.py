@@ -11,7 +11,6 @@ from tinygrad.uop.ops import Ops
 
 import infurnace.gguf as gguf
 
-
 def random_blocks(typ, count=3):
   rng = random.Random(42)
   size = gguf.QUANT_BLOCK_BYTES[typ]
@@ -20,7 +19,6 @@ def random_blocks(typ, count=3):
     if typ == gguf.Q4_K: data[start:start+4] = struct.pack("<ee", 0.01, 0.002)
     else: data[start+208:start+210] = struct.pack("<e", 0.01)
   return bytes(data)
-
 
 def scalar_decode(data, typ):
   """Independent scalar interpretation in logical weight order."""
@@ -47,7 +45,6 @@ def scalar_decode(data, typ):
         result.append(d * scales[index//16] * ((low | (high << 4)) - 32))
   return result
 
-
 @pytest.mark.parametrize("typ", [gguf.Q4_K, gguf.Q6_K])
 @pytest.mark.parametrize("offset", [0, 4, 32])
 def test_quant_scalar_and_tinygrad_parity(typ, offset):
@@ -60,13 +57,11 @@ def test_quant_scalar_and_tinygrad_parity(typ, offset):
   reference = ggml_data_to_tensor(raw, 768, typ).flatten().tolist()
   assert actual.tolist() == pytest.approx(reference, rel=1e-5, abs=1e-6)
 
-
 def test_q4_known_groups():
   scales = bytes([1, 2, 3, 4] + [1]*4 + [0x15, 0x16, 0x17, 0x18])
   qs = b"".join(bytes([low | high << 4])*32 for low, high in [(1, 2), (3, 4), (5, 6), (7, 8)])
   raw = Tensor(struct.pack("<ee", 1, 0.5) + scales + qs, dtype=dtypes.uint8, device="CPU")
   assert gguf._dequant(raw, 256, gguf.Q4_K).tolist() == [float(g*g)-0.5 for g in range(1, 9) for _ in range(32)]
-
 
 def test_q6_signed_scales():
   scales = [1, -1]*8
@@ -74,23 +69,19 @@ def test_q6_signed_scales():
   raw = Tensor(data, dtype=dtypes.uint8, device="CPU")
   assert gguf._dequant(raw, 256, gguf.Q6_K).tolist() == [-16.0*s for s in scales for _ in range(16)]
 
-
 @pytest.mark.parametrize("typ", [gguf.Q4_K, gguf.Q6_K])
 def test_zero_blocks(typ):
   raw = Tensor(bytes(gguf.QUANT_BLOCK_BYTES[typ]), dtype=dtypes.uint8, device="CPU")
   assert gguf._dequant(raw, 256, typ).tolist() == [0.0]*256
-
 
 @pytest.mark.parametrize("typ", [0, gguf.Q4_K, gguf.Q6_K])
 def test_reject_wrong_packed_size(typ):
   raw = Tensor(bytes(3), dtype=dtypes.uint8, device="CPU")
   with pytest.raises(ValueError, match="packed bytes"): gguf._dequant(raw, 256, typ)
 
-
 def test_reject_wrong_dtype():
   with pytest.raises(ValueError, match="uint8"):
     gguf._dequant(Tensor([1.0], device="CPU"), 1, 0)
-
 
 def build_file(path):
   def string(s): return struct.pack("<Q", len(s)) + s.encode()
@@ -105,7 +96,6 @@ def build_file(path):
   payload += bytes(offset32-len(payload)) + struct.pack("<ff", 1.5, -2.0)
   path.write_bytes(header + bytes(-len(header) % 32) + payload)
   return {"q4": data4, "q6": data6, "f32": struct.pack("<ff", 1.5, -2.0)}
-
 
 def test_parse_stage_and_decode(tmp_path):
   path = tmp_path / "mixed.gguf"
@@ -141,7 +131,6 @@ def test_parse_stage_and_decode(tmp_path):
     assert tensors[name].device == "CPU"
     assert tensors[name].flatten().tolist() == pytest.approx(scalar_decode(expected[name], entries[name].ggml_type), rel=1e-5, abs=1e-6)
 
-
 def test_decode_consumer(tmp_path):
   path = tmp_path / "mixed.gguf"
   expected = build_file(path)
@@ -150,7 +139,6 @@ def test_decode_consumer(tmp_path):
   rows = scalar_decode(expected["q4"], gguf.Q4_K)
   assert (tensors["q4"] @ x).tolist() == pytest.approx([sum(rows[:512]), sum(rows[512:])], rel=1e-5, abs=1e-5)
   assert math.isfinite(tensors["q6"][1, :16].sum().item())
-
 
 @pytest.mark.skipif(not os.environ.get("INFURNACE_TEST_MODEL"), reason="set INFURNACE_TEST_MODEL to a local GGUF path")
 def test_local_model():

@@ -6,7 +6,6 @@ from types import SimpleNamespace
 from infurnace.serve import ChatTemplate, ServerModel
 from tinygrad.llm.serve import LLMServer
 
-
 class Tokenizer:
   bos_id = None
   eos_id = 999
@@ -24,7 +23,6 @@ class Tokenizer:
   def stream_decoder(self):
     return lambda token=None: chr(token) if token is not None else ''
 
-
 class Model:
   config = SimpleNamespace(context_length=1024)
   transformer = SimpleNamespace(get_start_pos=lambda ids: 0)
@@ -40,7 +38,6 @@ class Model:
     finally:
       self.closed = True
 
-
 def test_adapter_close_and_bound():
   model = Model()
   stream = ServerModel(model).generate([1, 2])
@@ -48,7 +45,6 @@ def test_adapter_close_and_bound():
   stream.close()
   assert model.closed
   assert model.limit == 1022
-
 
 def test_http_tool_round_trip():
   model, tok = Model(), Tokenizer()

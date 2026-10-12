@@ -163,7 +163,6 @@ class _NVAttentionBlock(TransformerBlock):
     attn = attention(q, assigned_kv, start_pos+1)
     return self.attn_output(attn.transpose(1, 2).reshape(1, 1, -1))
 
-
 def enable_decode_attention(blocks, *, fused: bool = False) -> int:
   """Adapt existing supported blocks in place, preserving weights/state identities."""
   count = 0
@@ -177,7 +176,6 @@ def enable_decode_attention(blocks, *, fused: bool = False) -> int:
     block.fused_attention = fused
     count += 1
   return count
-
 
 class _NVLinear:
   """Single-token fast path using explicit GGUF identity, never graph-size guessing."""

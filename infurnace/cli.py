@@ -9,7 +9,6 @@ from infurnace.chat import Decoder, run_chat, run_prompt
 
 PROMPT_MAX_TOKENS = 64
 
-
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
   ap = argparse.ArgumentParser(prog="infurnace", description="Run one local LLM fast on your GPU with tinygrad.")
   mode = ap.add_mutually_exclusive_group()
@@ -48,16 +47,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.device is not None and args.device.split(':')[0] != 'NV': ap.error("--eagle3 requires an NV device")
   return args
 
-
 def _positive(value: str) -> int:
   if not value.isdigit() or int(value) <= 0: raise argparse.ArgumentTypeError("must be a positive integer")
   return int(value)
 
-
 def _benchmark_spec(value: str) -> tuple[int | None, int]:
   try: return benchmark.parse_spec(value)
   except ValueError as exc: raise argparse.ArgumentTypeError(str(exc)) from None
-
 
 def _dflash_draft(args: argparse.Namespace) -> tuple[Path | None, bool]:
   """The DFlash draft to use and whether it was picked automatically. Chat and --prompt on a
@@ -66,7 +62,6 @@ def _dflash_draft(args: argparse.Namespace) -> tuple[Path | None, bool]:
   if args.no_dflash or args.eagle3 or args.serve is not None or args.benchmark is not None: return None, False
   draft = loader.default_dflash_draft()
   return (draft, True) if draft is not None and draft.is_file() and loader.is_qwen35(args.model) else (None, False)
-
 
 def run(args: argparse.Namespace) -> int:
   draft, automatic = _dflash_draft(args)
@@ -98,7 +93,6 @@ def run(args: argparse.Namespace) -> int:
   if not args.no_warmup: decoder.warmup()
   return run_chat(decoder, tokenizer, args.max_tokens, args.max_context, thinking=not args.no_thinking)
 
-
 def main(argv: list[str] | None = None) -> int:
   args = parse_args(argv)
   try:
@@ -120,7 +114,6 @@ def main(argv: list[str] | None = None) -> int:
   except (ValueError, OSError) as exc:
     print(f"infurnace: {exc}", file=sys.stderr)
     return 1
-
 
 if __name__ == "__main__":
   raise SystemExit(main())

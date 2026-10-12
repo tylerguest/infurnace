@@ -8,13 +8,11 @@ from infurnace.gguf import _dequant_q4_k
 from infurnace.kernels.quant_gemv import prepare_q4, quant_gemv
 from infurnace.kernels.quant_gemm import quant_gemm
 
-
 def data(rows, width):
   rng = random.Random(71)
   raw = bytearray(rng.getrandbits(8) for _ in range(rows*width//256*144))
   for offset in range(0, len(raw), 144): raw[offset:offset+4] = struct.pack('<ee', 0.001, 0.0002)
   return bytes(raw)
-
 
 @pytest.mark.parametrize('width', [256, 768, 1280, 2560])
 def test_q4_swizzle_bytes_and_generic_decode(width):
@@ -34,7 +32,6 @@ def test_q4_swizzle_bytes_and_generic_decode(width):
         assert actual[physical] == expected[(row*(width//256)+block)*36+word]
   decoded = _dequant_q4_k(packed.bitcast(dtypes.uint8), swizzled_width=width//256)
   assert (decoded-_dequant_q4_k(native)).abs().max().item() == 0
-
 
 @pytest.mark.nv
 @pytest.mark.parametrize('width', [1280, 2560, 9728])

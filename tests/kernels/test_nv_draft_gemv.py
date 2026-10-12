@@ -4,7 +4,6 @@ from tinygrad import Tensor, TinyJit, dtypes
 
 from infurnace.kernels.dense_gemv import bf16_gemv
 
-
 @pytest.mark.nv
 @pytest.mark.parametrize('width', [128, 2560, 9728])
 @pytest.mark.parametrize('count', [1, 2, 3, 8])

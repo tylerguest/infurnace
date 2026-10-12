@@ -7,7 +7,6 @@ from tinygrad.uop.ops import AxisType, Ops
 
 kernels = importlib.import_module("infurnace.kernels.quant_gemv")
 
-
 def decode_graph(typ, rows, width):
   chunks = (width+1023)//1024
   dtype = dtypes.uint32 if typ == 12 else dtypes.uint16
@@ -20,7 +19,6 @@ def decode_graph(typ, rows, width):
   )
   params = [UOp.placeholder_like(t.uop, slot=i) for i, t in enumerate(tensors)]
   return kernels._quant_decode_kernel(*params, out_features=rows, in_features=width, ggml_type=typ)
-
 
 @pytest.mark.parametrize("typ,rows,width,warps", [(12, 2560, 9728, 4), (14, 151936, 2560, 8), (14, 2560, 9728, 1)])
 def test_decode_graph_keeps_warps_separate_and_eight_integer_dots(typ, rows, width, warps):

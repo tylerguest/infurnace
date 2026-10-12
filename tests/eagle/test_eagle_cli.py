@@ -5,7 +5,6 @@ import pytest
 from infurnace import cli, loader
 from infurnace.chat import Decoder, stream_reply
 
-
 class Tokenizer:
   bos_id = None
   eos_id, eot_id = 9, 10
@@ -13,7 +12,6 @@ class Tokenizer:
   def render_chat(self, messages, **kwargs): return 'chat'
   def is_end(self, token): return token in (9, 10)
   def stream_decoder(self): return lambda token: '!' if token is None else str(token)
-
 
 class Engine:
   def __init__(self, verifier='parallel', block_size=16):
@@ -26,7 +24,6 @@ class Engine:
     finally:
       self.closed = True
 
-
 def test_eagle_stream_eos_budget_and_cancellation(capsys):
   model = SimpleNamespace(config=SimpleNamespace(context_length=16))
   engine = Engine()
@@ -35,14 +32,12 @@ def test_eagle_stream_eos_budget_and_cancellation(capsys):
   assert engine.calls == [([1, 2], dict(max_new_tokens=14, draft_tokens=1, eos_token_ids=(9, 10), batched=True))]
   assert capsys.readouterr().out == '3!\n'
 
-
 @pytest.mark.parametrize('args', [['--eagle3', 'draft', '--benchmark', '8'], ['--eagle3', 'draft', '--device', 'CPU'],
                                   ['--eagle3', 'missing-checkpoint'], ['--eagle3', 'draft', '--serve']])
 def test_invalid_eagle_flags_before_model_loading(monkeypatch, args):
   monkeypatch.setattr(loader, 'load_model', lambda *a, **kw: pytest.fail('loaded target for invalid flags'))
   with pytest.raises(SystemExit) as exc: cli.main(args)
   assert exc.value.code == 2
-
 
 @pytest.mark.parametrize('message', ['NV signal wait timed out', 'PYTHON hang detected', 'unrelated bug'])
 def test_cli_device_timeout_diagnostic_does_not_swallow_other_errors(monkeypatch, capsys, message):
@@ -55,7 +50,6 @@ def test_cli_device_timeout_diagnostic_does_not_swallow_other_errors(monkeypatch
   else:
     assert cli.main(['--prompt', 'hello', '--no-dflash']) == 1
     assert 'the GPU stopped responding' in capsys.readouterr().err
-
 
 def test_cli_builds_eagle_engine(monkeypatch, tmp_path, capsys):
   (tmp_path / 'config.json').write_text('{}')

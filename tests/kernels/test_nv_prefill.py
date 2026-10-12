@@ -12,13 +12,11 @@ from infurnace.kernels.quant_gemm import quant_gemm, QuantGemmError, _prefill_ke
 from tinygrad.dtype import AddrSpace
 from tinygrad.uop.ops import Ops
 
-
 @pytest.mark.parametrize("width,rows,typ", [(32, 16, 12), (256, 3, 12), (256, 16, 99)])
 def test_invalid_gemm_geometry(width, rows, typ):
   with pytest.raises(QuantGemmError):
     quant_gemm(Tensor.ones(2, width, device="CPU"), Tensor.empty(1, dtype=dtypes.uint32, device="CPU"),
                in_features=width, out_features=rows, ggml_type=typ)
-
 
 @pytest.mark.parametrize("tiles,splits,unroll", [(1, 1, 1), (4, 2, 2)])
 @pytest.mark.parametrize("typ,size,dtype", [(12, 144, dtypes.uint32), (13, 176, dtypes.uint32), (14, 210, dtypes.uint16)])
@@ -35,7 +33,6 @@ def test_prefill_graph_uses_tensor_cores_without_dense_weights(typ, size, dtype,
   assert [s.shape for s in mma[0].src] == [(8,), (4,), (4,)]
   assert len([u for u in ops if u.op is Ops.PARAM and u.addrspace == AddrSpace.GLOBAL]) == 3
 
-
 @pytest.mark.parametrize("typ,words", [(12, 36), (13, 44), (14, 54)])
 def test_paired_prefill_graph_issues_one_mma_per_tile_step(typ, words):
   from infurnace.kernels.quant_gemm import _prefill_q4_paired, _prefill_q6_paired
@@ -48,12 +45,10 @@ def test_paired_prefill_graph_issues_one_mma_per_tile_step(typ, words):
   assert len([u for u in ops if u.op is Ops.WMMA]) == 4*16
   assert len([u for u in ops if u.op is Ops.PARAM and u.addrspace == AddrSpace.GLOBAL]) == 3
 
-
 def test_prefill_requires_nv_quant_before_loading():
   from infurnace.models.qwen3 import Qwen3Model
   with pytest.raises(ValueError, match="requires NV quantized"):
     Qwen3Model.from_gguf("does-not-exist.gguf", nv_prefill=True)
-
 
 def test_prefill_rejects_single_token_and_bad_packed_storage():
   with pytest.raises(QuantGemmError, match="multi-token"):
@@ -62,7 +57,6 @@ def test_prefill_rejects_single_token_and_bad_packed_storage():
   with pytest.raises(QuantGemmError, match="dtype/size"):
     quant_gemm(Tensor.ones(2, 256, device="CPU"), Tensor.empty(16*210, dtype=dtypes.uint8, device="CPU"),
                in_features=256, out_features=16, ggml_type=14)
-
 
 @pytest.mark.skipif(not os.environ.get("INFURNACE_TEST_NV"), reason="set INFURNACE_TEST_NV=1 on an NV GPU")
 @pytest.mark.parametrize("typ,size", [(12, 144), (14, 210)])
@@ -88,7 +82,6 @@ def test_packed_prefill_fp16_reference_eager_jit(typ, size, tokens, width, rows)
       assert result.dtype == dtypes.float32
       for actual, reference in zip(result.tolist(), expected):
         assert actual == pytest.approx(reference, rel=3e-3, abs=2e-2)
-
 
 @pytest.mark.skipif(not os.environ.get("INFURNACE_TEST_NV"), reason="set INFURNACE_TEST_NV=1 on an NV GPU")
 @pytest.mark.parametrize("typ,size", [(12, 144), (14, 210)])

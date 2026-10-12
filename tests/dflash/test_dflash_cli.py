@@ -4,7 +4,6 @@ from infurnace import cli, loader
 from infurnace.chat import Decoder, stream_reply
 from test_eagle_cli import Engine, Tokenizer
 
-
 @pytest.mark.parametrize('verifier,block', [('parallel', 16), ('sequential', 4)])
 def test_dflash_stream_block_eos_and_close(capsys, verifier, block):
   model = SimpleNamespace(config=SimpleNamespace(context_length=16))
@@ -14,7 +13,6 @@ def test_dflash_stream_block_eos_and_close(capsys, verifier, block):
   assert engine.calls == [([1, 2], {'max_new_tokens': 14, 'block_size': block, 'eos_token_ids': (9, 10)})]
   assert capsys.readouterr().out == '3!\n'
 
-
 @pytest.mark.parametrize('extra', [['--dflash', 'missing.gguf'], ['--dflash', 'draft.gguf', '--benchmark', '8'],
                                    ['--dflash', 'draft.gguf', '--eagle3', 'eagle'], ['--dflash', 'draft.gguf', '--no-dflash'],
                                    ['--dflash-block-size', '4']])
@@ -22,7 +20,6 @@ def test_invalid_flags_before_loading(monkeypatch, extra):
   monkeypatch.setattr(loader, 'load_model', lambda *a, **kw: pytest.fail('loaded model for invalid flags'))
   with pytest.raises(SystemExit) as exc: cli.main(extra)
   assert exc.value.code == 2
-
 
 @pytest.mark.parametrize('device', ['CPU', 'NV'])
 def test_explicit_draft_is_used_on_any_device(monkeypatch, tmp_path, capsys, device):
@@ -33,7 +30,6 @@ def test_explicit_draft_is_used_on_any_device(monkeypatch, tmp_path, capsys, dev
   monkeypatch.setattr(loader, 'load_dflash', lambda target, draft: engine if (target, draft) == (model, path) else None)
   assert cli.main(['--dflash', str(path), '--prompt', 'hello', '--max-tokens', '5']) == 0
   assert engine.calls[0][1]['max_new_tokens'] == 5 and engine.closed and 'DFlash' in capsys.readouterr().err
-
 
 @pytest.mark.parametrize('device,flags,enabled', [('NV', [], True), ('CPU', [], False), ('NV', ['--no-dflash'], False),
                                                   ('NV', ['--serve'], False)])

@@ -9,7 +9,6 @@ from tinygrad.nn.state import load_state_dict
 
 from infurnace.models.qwen3 import Qwen3Config, Qwen3Model, expected_weight_shapes, transformer_config
 
-
 def tiny_model():
   config = Qwen3Config(1, 8, 16, 2, 1, 4, 4, 4, 10000.0, 1e-6, 32, 16)
   rng = random.Random(4)
@@ -20,7 +19,6 @@ def tiny_model():
     weights[name] = Tensor([rng.uniform(-0.2, 0.2) for _ in range(n)], device="CPU").reshape(shape)
   weights["output.weight"] = weights["token_embd.weight"]
   return Qwen3Model(config, weights), weights
-
 
 def test_reference_generation_and_tied_storage():
   runner, weights = tiny_model()
@@ -35,7 +33,6 @@ def test_reference_generation_and_tied_storage():
   assert prompt == [1, 2, 3]
   assert runner.transformer.output.weight.uop is runner.transformer.token_embd.weight.uop
 
-
 def test_chunks_reset_and_divergence():
   runner, _ = tiny_model()
   prompt = [1, 2, 3, 4, 5]
@@ -45,7 +42,6 @@ def test_chunks_reset_and_divergence():
   actual = list(runner.generate(changed, 3, chunk_size=4))
   assert list(runner.generate(changed, 3, chunk_size=4, reuse_cache=False)) == actual
 
-
 def test_warmup_then_generation():
   runner, _ = tiny_model()
   runner.warmup()
@@ -53,7 +49,6 @@ def test_warmup_then_generation():
   assert not runner._generating
   result = list(runner.generate([1, 2, 3], 3))
   assert list(runner.generate([1, 2, 3], 3, reuse_cache=False)) == result
-
 
 def test_limits_and_abandoned_stream():
   runner, _ = tiny_model()
@@ -68,7 +63,6 @@ def test_limits_and_abandoned_stream():
   assert list(runner.generate(prompt, 2, chunk_size=4, reuse_cache=False)) == resumed
   assert len(list(runner.generate([1]*15, 4, chunk_size=4, reuse_cache=False))) == 1
 
-
 @pytest.mark.parametrize("tokens,count,kwargs", [([], 1, {}), ([32], 1, {}), ([True], 1, {}), ([1]*16, 1, {}),
                                                    ([1], -1, {}), ([1], 1, {"chunk_size": 0}),
                                                    ([1], 1, {"temperature": float("nan")})])
@@ -76,12 +70,10 @@ def test_invalid_generation(tokens, count, kwargs):
   runner, _ = tiny_model()
   with pytest.raises(ValueError): list(runner.generate(tokens, count, **kwargs))
 
-
 def test_mixed_devices_rejected():
   runner, weights = tiny_model()
   weights["output_norm.weight"] = Tensor.empty(8, device="PYTHON")
   with pytest.raises(ValueError, match="same compute device"): Qwen3Model(runner.config, weights)
-
 
 def test_config_mapping():
   runner, _ = tiny_model()
@@ -90,7 +82,6 @@ def test_config_mapping():
   assert upstream.qk_norm == 4
   assert upstream.n_kv_heads == 1
   assert runner.transformer.token_embd.weight.dtype == dtypes.float16
-
 
 @pytest.mark.skipif(not (os.environ.get("INFURNACE_TEST_MODEL") and os.environ.get("INFURNACE_TEST_GENERATION")),
                     reason="set INFURNACE_TEST_MODEL and INFURNACE_TEST_GENERATION=1 for real-model generation")

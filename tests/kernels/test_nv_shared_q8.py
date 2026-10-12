@@ -7,7 +7,6 @@ from tinygrad.uop.ops import Ops
 
 from infurnace.kernels.quant_gemv import QuantGemvError, q8_quantize, quant_gemv
 
-
 def packed(typ, rows, width, device):
   size = 144 if typ == 12 else 210
   rng = random.Random(53)
@@ -17,7 +16,6 @@ def packed(typ, rows, width, device):
     else: raw[i+208:i+210] = struct.pack('<e', 0.001)
   return Tensor(bytes(raw), dtype=dtypes.uint8, device=device).bitcast(dtypes.uint32 if typ == 12 else dtypes.uint16).realize()
 
-
 def test_invalid_shared_q8_contract():
   x = Tensor.zeros(1, 256, device='CPU')
   w = Tensor.zeros(16*36, dtype=dtypes.uint32, device='CPU')
@@ -25,7 +23,6 @@ def test_invalid_shared_q8_contract():
            Tensor.zeros(1, 8, device='CPU'), Tensor.zeros(1, 8, 2, dtype=dtypes.int32, device='CPU'))
   with pytest.raises(QuantGemvError, match='shared Q8'):
     quant_gemv(x, w, out_features=16, in_features=256, ggml_type=12, q8=wrong)
-
 
 @pytest.mark.nv
 @pytest.mark.parametrize('typ', [12, 14])
@@ -46,7 +43,6 @@ def test_shared_q8_projection_parity_and_graph(typ):
     reference = quant_gemv(x, w, out_features=rows, in_features=width, ggml_type=typ)
     for actual in jit(x):
       assert (actual-reference).abs().max().item() == 0
-
 
 @pytest.mark.nv
 def test_block_shared_packing_prefill_jit_and_reset():

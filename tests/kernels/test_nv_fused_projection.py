@@ -7,7 +7,6 @@ from test_nv_shared_q8 import packed
 
 pytestmark = pytest.mark.nv
 
-
 @pytest.mark.parametrize('typ', [12, 14])
 @pytest.mark.parametrize('width', [2560, 4096, 9728])
 def test_fused_residual_keeps_residual_first_rounding(typ, width):
@@ -25,7 +24,6 @@ def test_fused_residual_keeps_residual_first_rounding(typ, width):
     expected = reference(x, h)
     expected = Tensor(expected.uop.buf_uop).reshape(expected.shape)
     assert (actual-expected).abs().max().item() == 0
-
 
 @pytest.mark.parametrize('typ', [12, 14])
 @pytest.mark.parametrize('count', [1, 2, 3, 4])

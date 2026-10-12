@@ -10,9 +10,7 @@ from infurnace.kernels.quant_gemv import quant_gemv
 from test_nv_shared_q8 import packed
 from test_speculative import nv_model, reference_step
 
-
 pytestmark = pytest.mark.nv
-
 
 @pytest.mark.parametrize('typ', [12, 14])
 @pytest.mark.parametrize('count', [2, 3, 4])
@@ -27,7 +25,6 @@ def test_interleaved_q8_projection_matches_single_rows(typ, count, reuse):
     expected = Tensor.cat(*(quant_gemv(x[:, i:i+1], weight, out_features=16, in_features=2560, ggml_type=typ)
                             for i in range(count)), dim=1)
     assert (actual-expected).abs().max().item() == 0
-
 
 @pytest.mark.parametrize('compact', [False, True])
 def test_batched_target_logits_features_and_rejected_tail(compact):
@@ -58,7 +55,6 @@ def test_batched_target_logits_features_and_rejected_tail(compact):
             assert result.features[:, index:index+1, :].tolist() == expected_features
           assert len(result.tokens) >= 1
 
-
 @pytest.mark.parametrize('size', [1, 2, 3])
 def test_sampling_selects_live_row_on_replay(size):
   jit = TinyJit(BatchedVerifier._sample)
@@ -69,7 +65,6 @@ def test_sampling_selects_live_row_on_replay(size):
                       for i in range(size)]], device='NV').realize()
     for row in range(size):
       assert jit(logits, temperature, index.bind(row)).item() == (row+repeat)%8
-
 
 @pytest.mark.parametrize('transient', [False, True])
 @pytest.mark.parametrize('fused', [False, True])
@@ -100,7 +95,6 @@ def test_accepted_chain_continuation_matches_sequential(transient, fused, zero_c
         shared = result.features.uop.buffer.base is capture.ret[1].uop.buffer.base
         assert shared == (transient and zero_copy)
 
-
 def test_failed_verification_invalidates_cache_and_releases_ownership():
   model, cache = nv_model(), {}
   with BatchedVerifier(model, feature_layers=(0, 1, 3), kernel_cache=cache) as verifier:
@@ -112,7 +106,6 @@ def test_failed_verification_invalidates_cache_and_releases_ownership():
       verifier.verify_chain([6, 7])
     assert cache == {} and not model._generating
   assert model.transformer._cached_tokens == []
-
 
 @pytest.mark.parametrize('compact,fast', [(False, False), (True, False), (False, True)])
 def test_kernel_cache_reuses_captures_without_reusing_session_state(compact, fast):
@@ -137,7 +130,6 @@ def test_kernel_cache_reuses_captures_without_reusing_session_state(compact, fas
   with BatchedVerifier(model, feature_layers=(0, 2, 3), kernel_cache=cache) as verifier:
     verifier.prefill(prompt)
     assert cache['_batch_jits'] == {}
-
 
 @pytest.mark.skipif(not os.environ.get('INFURNACE_TEST_MODEL'), reason='set INFURNACE_TEST_MODEL')
 def test_local_nv_batched_logits_and_features_exact():

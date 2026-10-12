@@ -8,7 +8,6 @@ import pytest
 from infurnace.gguf import parse_gguf
 from infurnace.tokenizer import Tokenizer
 
-
 @pytest.fixture
 def metadata():
   # GPT-2's reversible mapping from every byte to a vocabulary character.
@@ -23,7 +22,6 @@ def metadata():
     "tokenizer.ggml.add_bos_token": False,
   }
 
-
 @pytest.mark.parametrize("text", ["", "Hello 123456!", "你好 café é 👩🏽‍💻", " \t\r\n", "<|im_start|>user\nhello<|im_end|>"])
 def test_roundtrip_and_streaming(metadata, text):
   tokenizer = Tokenizer.from_gguf(metadata)
@@ -31,7 +29,6 @@ def test_roundtrip_and_streaming(metadata, text):
   assert tokenizer.decode(ids) == text
   decoder = tokenizer.stream_decoder()
   assert "".join(decoder(i) for i in ids) + decoder(None) == text
-
 
 def test_streams_are_independent_and_flush(metadata):
   tokenizer = Tokenizer.from_gguf(metadata)
@@ -45,7 +42,6 @@ def test_streams_are_independent_and_flush(metadata):
   assert incomplete(emoji[0]) == ""
   assert incomplete(None) == "�"
 
-
 def test_bos_and_stop_policy(metadata):
   tokenizer = Tokenizer.from_gguf(metadata)
   assert tokenizer.bos_id is None
@@ -57,7 +53,6 @@ def test_bos_and_stop_policy(metadata):
   tokenizer = Tokenizer.from_gguf(metadata)
   assert tokenizer.bos_id == 258
   assert tokenizer.encode("a") == [97]  # Raw encoding never silently prepends BOS.
-
 
 @pytest.mark.parametrize("key,value,error", [
   ("tokenizer.ggml.model", "llama", "GPT-2"),
@@ -74,12 +69,10 @@ def test_invalid_metadata(metadata, key, value, error):
   metadata[key] = value
   with pytest.raises(ValueError, match=error): Tokenizer.from_gguf(metadata)
 
-
 def test_missing_enabled_bos(metadata):
   metadata["tokenizer.ggml.add_bos_token"] = True
   del metadata["tokenizer.ggml.bos_token_id"]
   with pytest.raises(ValueError, match="BOS"): Tokenizer.from_gguf(metadata)
-
 
 def test_chat_single_turn(metadata):
   tokenizer = Tokenizer.from_gguf(metadata)
@@ -89,7 +82,6 @@ def test_chat_single_turn(metadata):
   assert tokenizer.render_chat(messages, enable_thinking=False) == expected + "<|im_start|>assistant\n<think>\n\n</think>\n\n"
   assert tokenizer.render_chat(messages, add_generation_prompt=False) == expected
   assert messages[0]["content"] == "Be concise."
-
 
 def test_chat_historical_reasoning(metadata):
   tokenizer = Tokenizer.from_gguf(metadata)
@@ -102,7 +94,6 @@ def test_chat_historical_reasoning(metadata):
   messages.append({"role": "assistant", "content": "\nnew answer", "reasoning_content": "\nnew thought\n"})
   assert "<think>\nnew thought\n</think>\n\nnew answer<|im_end|>" in tokenizer.render_chat(messages)
 
-
 @pytest.mark.parametrize("messages", [[], [None], [{"role": "tool", "content": "x"}],
                                       [{"role": "user", "content": ["x"]}], [{"role": "user", "content": None}],
                                       [{"role": "assistant", "content": "x", "tool_calls": [{"name": "foo"}]}],
@@ -111,11 +102,9 @@ def test_chat_historical_reasoning(metadata):
 def test_invalid_chat(metadata, messages):
   with pytest.raises(ValueError): Tokenizer.from_gguf(metadata).render_chat(messages)
 
-
 def test_invalid_chat_flags(metadata):
   with pytest.raises(ValueError, match="boolean"):
     Tokenizer.from_gguf(metadata).render_chat([{"role": "user", "content": "x"}], enable_thinking=0)
-
 
 CHAT_CASES = [
   [{"role": "user", "content": "Hello"}],
@@ -128,7 +117,6 @@ CHAT_CASES = [
   [{"role": "user", "content": ""}, {"role": "assistant", "content": "<think>a</think>\n\nb</think>\nc"},
    {"role": "system", "content": "later system"}, {"role": "user", "content": "next"}],
 ]
-
 
 @pytest.mark.skipif(not os.environ.get("INFURNACE_TEST_MODEL"), reason="set INFURNACE_TEST_MODEL for bundled-template parity")
 def test_bundled_chat_template_parity():
@@ -147,7 +135,6 @@ def test_bundled_chat_template_parity():
         assert tokenizer.encode(actual) == tokenizer.encode(expected)
   ids = tokenizer.encode(tokenizer.render_chat([{"role": "user", "content": "Hello"}]))
   assert ids == [151644, 872, 198, 9707, 151645, 198, 151644, 77091, 198]
-
 
 # Recorded using llama.cpp llama-tokenize against the bundled Qwen3 GGUF,
 # --stdin --ids --no-bos (special token parsing enabled). No network required.
@@ -168,7 +155,6 @@ QWEN_CASES = [
   ("<think>reason</think>\n\nanswer", [151667, 19895, 151668, 271, 9217]),
 ]
 
-
 @pytest.mark.skipif(not os.environ.get("INFURNACE_TEST_MODEL"), reason="set INFURNACE_TEST_MODEL to the bundled Qwen3 GGUF")
 def test_qwen_reference_ids():
   metadata, _ = parse_gguf(Path(os.environ["INFURNACE_TEST_MODEL"]))
@@ -179,7 +165,6 @@ def test_qwen_reference_ids():
     assert tokenizer.decode(ids) == text
     decoder = tokenizer.stream_decoder()
     assert "".join(decoder(i) for i in ids) + decoder(None) == text
-
 
 @pytest.mark.skipif(not (os.environ.get("INFURNACE_TEST_MODEL") and os.environ.get("INFURNACE_LLAMA_TOKENIZE")),
                     reason="set INFURNACE_TEST_MODEL and INFURNACE_LLAMA_TOKENIZE for live reference parity")

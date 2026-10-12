@@ -7,7 +7,6 @@ from test_nv_shared_q8 import packed
 
 pytestmark = pytest.mark.nv
 
-
 @pytest.mark.parametrize('typ', [12, 14])
 @pytest.mark.parametrize('count', [2, 3, 4, 8])
 @pytest.mark.parametrize('width', [2560, 9728])
@@ -24,7 +23,6 @@ def test_cta_local_tokens_exact_prepared_projection_and_replay(typ, count, width
     actual = Tensor(result.uop.buf_uop).reshape(result.shape).clone().realize()
     expected = Tensor.cat(*(quant_gemv(x[:, i:i+1], weight, **settings) for i in range(count)), dim=1)
     assert (actual-expected).abs().max().item() == 0
-
 
 def test_local_token_contract_rejects_oversized_or_combined_reuse():
   weight = packed(14, 16, 2560, 'NV')

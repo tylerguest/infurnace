@@ -16,7 +16,6 @@ from infurnace.gguf import parse_gguf
 
 kernels = importlib.import_module("infurnace.kernels.quant_gemv")
 
-
 def legacy_q6_kernel(out, raw, xq, xd, xs, out_features, in_features):
   """Frozen pre-optimization arithmetic + one-warp layout. Test oracle only.
 
@@ -51,7 +50,6 @@ def legacy_q6_kernel(out, raw, xq, xd, xs, out_features, in_features):
   return out[0, output, chunk.valid(lane.eq(0))].store(total).end(block, lane).sink(
     arg=KernelInfo(name="legacy_q6_regression", opts_to_apply=()))
 
-
 def legacy_q6(x, packed, rows, width):
   xq, xd, xs = kernels.q8_quantize(x, 1, width)
   out = Tensor.empty(1, rows, (width+1023)//1024, dtype=dtypes.float32, device=x.device).uop
@@ -60,14 +58,12 @@ def legacy_q6(x, packed, rows, width):
   call = legacy_q6_kernel(*params, out_features=rows, in_features=width).call(*sources)
   return Tensor(out.after(call)).sum(-1)
 
-
 def batch_ms(jit, x, repeats=10):
   Device["NV"].synchronize()
   start = time.perf_counter_ns()
   for _ in range(repeats): jit(x)
   Device["NV"].synchronize()
   return (time.perf_counter_ns()-start)/1e6/repeats
-
 
 @pytest.mark.skipif(not (os.environ.get("INFURNACE_TEST_NV_PERF") and os.environ.get("INFURNACE_TEST_MODEL")),
                     reason="set INFURNACE_TEST_NV_PERF=1 and INFURNACE_TEST_MODEL on an idle RTX 5060")

@@ -40,7 +40,6 @@ def _q4_word(raw: UOp, base: UOp, word: UOp | int, swizzle_width: int = 0) -> UO
   index = _swizzled_index(base, word, swizzle_width, Q4_WORDS, 4) if swizzle_width else base+word
   return raw[index].load()
 
-
 def _load_byte(raw:UOp, base:UOp, offset:UOp, swizzle_width: int = 0) -> UOp:
   return (_q4_word(raw, base, offset//4, swizzle_width) >> ((offset & 3)*8).cast(dtypes.uint32)) & 255
 
@@ -49,7 +48,6 @@ def _half(value:UOp) -> UOp:
 
 Q6_PREPARED_BYTES = 216
 
-
 def _swizzled_index(linear_block: UOp, word: UOp | int, blocks_per_row: int, block_words: int, group_words: int = 2) -> UOp:
   """Row-local tiles of four blocks, [word-group, block, group-element]."""
   row, block = linear_block//blocks_per_row, linear_block%blocks_per_row
@@ -57,10 +55,8 @@ def _swizzled_index(linear_block: UOp, word: UOp | int, blocks_per_row: int, blo
   live = (blocks_per_row-tile*4).minimum(4)
   return row*blocks_per_row*block_words+tile*4*block_words+(word//group_words)*live*group_words+within*group_words+word%group_words
 
-
 def _q6_swizzled_index(linear_block: UOp, word: UOp | int, blocks_per_row: int) -> UOp:
   return _swizzled_index(linear_block, word, blocks_per_row, Q6_PREPARED_BYTES//4)
-
 
 def _prepare_q4_kernel(out: UOp, raw: UOp, *, blocks_per_row: int, gpu: bool = True) -> UOp:
   block = UOp.range((out.shape[0]+127)//128, 0, axis_type=AxisType.GLOBAL if gpu else AxisType.LOOP)
@@ -77,7 +73,6 @@ def _prepare_q4_kernel(out: UOp, raw: UOp, *, blocks_per_row: int, gpu: bool = T
   return out[index.valid(index < out.shape[0])].store(value).end(block, lane).sink(
     arg=KernelInfo(name="prepare_q4_swizzled", opts_to_apply=()))
 
-
 def prepare_q4(raw: Tensor, *, in_features: int, realize: bool = True) -> Tensor:
   if (raw.dtype != dtypes.uint8 or raw.numel() <= 0 or in_features <= 0 or in_features%256
       or raw.numel()%(in_features//256*144)):
@@ -86,7 +81,6 @@ def prepare_q4(raw: Tensor, *, in_features: int, realize: bool = True) -> Tensor
   fxn = functools.partial(_prepare_q4_kernel, blocks_per_row=in_features//256, gpu=raw.device.split(':')[0] == 'NV')
   result = Tensor(UOp.custom_kernel(out.uop, raw.uop.flatten(), fxn=fxn)[0])
   return result.realize() if realize else result
-
 
 def _prepare_q6_kernel(out: UOp, raw: UOp, *, gpu: bool = True, blocks_per_row: int = 0) -> UOp:
   block = UOp.range((out.shape[0]+127)//128, 0, axis_type=AxisType.GLOBAL if gpu else AxisType.LOOP)
@@ -106,7 +100,6 @@ def _prepare_q6_kernel(out: UOp, raw: UOp, *, gpu: bool = True, blocks_per_row: 
   return out[index.valid(index < out.shape[0])].store(value).end(block, lane).sink(
     arg=KernelInfo(name="prepare_q6_aligned", opts_to_apply=()))
 
-
 def prepare_q6(raw: Tensor, *, in_features: int | None = None, swizzled: bool = False, realize: bool = True) -> Tensor:
   """Value-preserving 210->216 byte blocks; UOp packing, one resident output."""
   if raw.dtype != dtypes.uint8 or raw.numel() <= 0 or raw.numel()%Q6_BYTES:
@@ -118,7 +111,6 @@ def prepare_q6(raw: Tensor, *, in_features: int | None = None, swizzled: bool = 
                          blocks_per_row=in_features//256 if swizzled else 0)
   result = Tensor(UOp.custom_kernel(out.uop, raw.uop.flatten(), fxn=fxn)[0])
   return result.realize() if realize else result
-
 
 def _q6_word(raw:UOp, base:UOp, byte_offset:UOp) -> UOp:
   # Q6 blocks are 210 bytes: every other block is only halfword-aligned.

@@ -10,7 +10,6 @@ import os
 import time
 from infurnace.dflash.target import TargetObserver
 
-
 @dataclass
 class DFlashStats:
   rounds: int = 0
@@ -18,11 +17,9 @@ class DFlashStats:
   accepted: int = 0
   target_steps: int = 0
 
-
 def _raw_features(verifier):
   from infurnace.dflash.parallel import _raw
   return _raw(verifier._features)
-
 
 class DFlashGenerator:
   def __init__(self, model, draft, *, verifier: str = 'sequential'):

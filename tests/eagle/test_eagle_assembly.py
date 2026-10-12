@@ -5,7 +5,6 @@ from types import SimpleNamespace
 
 import pytest
 
-
 @pytest.fixture
 def inspection():
   path = Path(__file__).resolve().parents[2]/'benchmarks/experiments/eagle3/inspect_verification.py'
@@ -14,14 +13,12 @@ def inspection():
   spec.loader.exec_module(module)
   return module
 
-
 def test_assembly_checkpoint_marks_diagnostic_and_failure(tmp_path, inspection):
   args = SimpleNamespace(output_dir=tmp_path/'assembly')
   inspection.checkpoint(args, 'aborted', [{'exact_error': 0}], RuntimeError('failed'))
   report = json.loads((args.output_dir/'report.json').read_text())
   assert report == {'status': 'aborted', 'diagnostic_only': True,
                     'records': [{'exact_error': 0}], 'error': 'RuntimeError: failed'}
-
 
 @pytest.mark.parametrize('failure', [None, RuntimeError('compile failed')])
 def test_assembly_main_records_completion_or_abort(tmp_path, monkeypatch, inspection, failure):
@@ -36,7 +33,6 @@ def test_assembly_main_records_completion_or_abort(tmp_path, monkeypatch, inspec
   report = json.loads((tmp_path/'report.json').read_text())
   assert report['status'] == ('complete' if failure is None else 'aborted')
   assert report['diagnostic_only'] and report['records'] == [{'exact_error': 0}]
-
 
 @pytest.mark.parametrize('materialize_scores,parallel_scores', [(False, False), (True, False), (True, True)])
 @pytest.mark.parametrize('mapped_draft_output,fused_root', [(False, False), (True, False), (True, True)])
@@ -66,7 +62,6 @@ def test_mapped_io_scope_preserves_baseline_and_restores_descriptors(materialize
   assert EagleDraft.__dict__['_observe_and_chain'] is old_draft_chain
   assert BatchedVerifier.__dict__['__init__'] is old_init
 
-
 def test_mapped_io_does_not_bypass_unowned_buffer_copies(monkeypatch):
   from tinygrad.device import Buffer
   path = Path(__file__).resolve().parents[2]/'benchmarks/experiments/eagle3/mapped_io_benchmark.py'
@@ -81,7 +76,6 @@ def test_mapped_io_does_not_bypass_unowned_buffer_copies(monkeypatch):
   dest, src = object(), object()
   with module.mapped_io(): assert Buffer.copy_from(dest, src) is dest
   assert copies == [(dest, src)]
-
 
 def test_sampling_beam_scope_and_exception_restoration(monkeypatch):
   from tinygrad.helpers import BEAM

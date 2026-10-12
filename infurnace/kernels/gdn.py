@@ -17,10 +17,8 @@ from tinygrad.uop.ops import AxisType, KernelInfo
 
 from infurnace.kernels.quant_gemv import warp_reduce
 
-
 def _silu(x: UOp) -> UOp:
   return x / (UOp.const(1.0, dtypes.float32) + (-x).exp())
-
 
 @functools.cache
 def _gdn_chunk_kernel(z: UOp, u: UOp, q: UOp, k: UOp, v: UOp, beta: UOp, g: UOp, state: UOp, gate: UOp,
@@ -89,7 +87,6 @@ def _gdn_chunk_kernel(z: UOp, u: UOp, q: UOp, k: UOp, v: UOp, beta: UOp, g: UOp,
     stores.append(u[head, t, col].store(us[t]))
   return UOp.group(*stores).end(head, warp, lane).sink(arg=KernelInfo(name="gdn_chunk", opts_to_apply=()))
 
-
 def gdn_chunk(q: Tensor, k: Tensor, v: Tensor, beta: Tensor, g: Tensor, state: Tensor, gate: Tensor,
               weight: Tensor, keep: Tensor, eps: float) -> tuple[Tensor, Tensor]:
   """q, k, v: (H, T, 128) FP32 (q pre-scaled); beta, g: (H, T); state: (H, 128, 128)
@@ -103,7 +100,6 @@ def gdn_chunk(q: Tensor, k: Tensor, v: Tensor, beta: Tensor, g: Tensor, state: T
                                                                          keep.float().contiguous()]
   z, u = Tensor.custom_kernel(z, u, *inputs, fxn=functools.partial(_gdn_chunk_kernel, heads=heads, rows=rows, eps=eps))[:2]
   return z, u
-
 
 @functools.cache
 def _gdn_decode_kernel(z: UOp, state: UOp, qkv: UOp, conv: UOp, conv_w: UOp, x: UOp, w_beta: UOp, w_alpha: UOp, dt_bias: UOp,
@@ -173,7 +169,6 @@ def _gdn_decode_kernel(z: UOp, state: UOp, qkv: UOp, conv: UOp, conv_w: UOp, x: 
   store = z[head, col].store((out*scale*_silu(gate[head, col].load().float())).cast(dtypes.float16))
   return store.end(head, warp, lane).sink(arg=KernelInfo(name="gdn_decode", opts_to_apply=()))
 
-
 @functools.cache
 def _conv_shift_kernel(out: UOp, conv: UOp, qkv: UOp, keep: UOp, z: UOp, *, channels: int, size: int) -> UOp:
   # Runs after gdn_decode (it consumes its output): pass z through and shift the conv window in place.
@@ -189,7 +184,6 @@ def _conv_shift_kernel(out: UOp, conv: UOp, qkv: UOp, keep: UOp, z: UOp, *, chan
     after = conv.after(r1, r2)
     stores += [after[0, c].store(r1*kept), after[1, c].store(r2*kept), after[2, c].store(qkv[c].load())]
   return UOp.group(*stores).end(block, lane).sink(arg=KernelInfo(name="gdn_conv_shift", opts_to_apply=()))
-
 
 def gdn_decode(qkv: Tensor, conv_state: Tensor, conv_w: Tensor, x: Tensor, w_beta: Tensor, w_alpha: Tensor, dt_bias: Tensor,
                a: Tensor, state: Tensor, gate: Tensor, weight: Tensor, keep: Tensor, eps: float, kheads: int) -> Tensor:

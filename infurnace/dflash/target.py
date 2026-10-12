@@ -3,7 +3,6 @@ from tinygrad import Context, Tensor, TinyJit, UOp, dtypes
 from tinygrad.uop.ops import Ops
 from infurnace.models.qwen35 import Qwen35Model
 
-
 class TargetObserver:
   def __init__(self, model: Qwen35Model, feature_layers: tuple[int, ...]):
     if not isinstance(model, Qwen35Model): raise ValueError('DFlash requires Qwen3.5 target support')
