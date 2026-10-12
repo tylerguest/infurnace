@@ -2,9 +2,9 @@
 from __future__ import annotations
 import argparse
 import sys
-import time
 from pathlib import Path
-from infurnace import benchmark, loader
+from tinygrad.helpers import GlobalCounters, Timing, profile_marker
+from infurnace import loader
 from infurnace.chat import Decoder, run_chat, run_prompt
 
 PROMPT_MAX_TOKENS = 64
@@ -15,8 +15,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
   mode.add_argument("--chat", action="store_true", help="interactive chat (default)")
   mode.add_argument("--prompt", help="generate from one raw prompt (no chat template)")
   mode.add_argument("--serve", nargs="?", type=int, const=8000, metavar="PORT", help="OpenAI-compatible HTTP server (default port 8000)")
-  mode.add_argument("--benchmark", nargs="?", type=_benchmark_spec, const=(None, 20), metavar="[PROMPT,]COUNT",
-                    help="time plain decoding: COUNT outputs (default 20) after a PROMPT-token prompt (default 512)")
+  mode.add_argument("--benchmark", nargs="?", type=_benchmark_spec, const=(512, 20), metavar="[PROMPT,]COUNT",
+                    help="time plain decoding per step: COUNT outputs (default 20) after a PROMPT-token prompt (default 512)")
   ap.add_argument("--model", default=loader.default_model(), help="GGUF model file (default: Qwen3.5-4B, else Qwen3-4B; or INFURNACE_MODEL)")
   ap.add_argument("--max-tokens", type=_positive, help="reply length cap, including thinking (default: chat uses the remaining "
                                                        f"context, --prompt {PROMPT_MAX_TOKENS})")
@@ -25,7 +25,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
   ap.add_argument("--no-warmup", action="store_true", help="skip the startup warmup (the first reply is then slower)")
   ap.add_argument("--device", help="override automatic device selection, e.g. NV or CPU")
   ap.add_argument("--host", default="127.0.0.1", help="HTTP bind address for --serve (default: loopback)")
-  ap.add_argument("--benchmark-format", choices=("text", "json"), default="text", help="per-step text or a JSON summary")
   speculation = ap.add_mutually_exclusive_group()
   speculation.add_argument("--dflash", type=Path, metavar="GGUF", help="DFlash draft for a Qwen3.5 model "
                                                                        "(used automatically when installed; or INFURNACE_DFLASH_DRAFT)")
@@ -37,8 +36,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if not 1 <= args.serve <= 65535: ap.error("--serve port must be between 1 and 65535")
     if args.dflash or args.eagle3: ap.error("--serve supports plain decoding only")
     if args.max_tokens is not None: ap.error("--serve takes max_tokens per request, not --max-tokens")
-  if args.benchmark is not None and (args.dflash or args.eagle3):
-    ap.error("--benchmark measures plain decoding; use benchmarks/dflash.py or benchmarks/eagle.py for drafts")
+  if args.benchmark is not None:
+    if args.dflash or args.eagle3: ap.error("--benchmark measures plain decoding; use benchmarks/dflash.py or benchmarks/eagle.py for drafts")
+    args.max_context = max(args.max_context, sum(args.benchmark))  # room for the whole benchmark
   if args.no_thinking and (args.prompt is not None or args.benchmark is not None): ap.error("--no-thinking applies only to chat")
   if args.dflash is not None and not args.dflash.is_file(): ap.error("--dflash must name a local draft GGUF file")
   if args.eagle3 is not None:
@@ -51,9 +51,32 @@ def _positive(value: str) -> int:
   if not value.isdigit() or int(value) <= 0: raise argparse.ArgumentTypeError("must be a positive integer")
   return int(value)
 
-def _benchmark_spec(value: str) -> tuple[int | None, int]:
-  try: return benchmark.parse_spec(value)
-  except ValueError as exc: raise argparse.ArgumentTypeError(str(exc)) from None
+def _benchmark_spec(value: str) -> tuple[int, int]:
+  parts = value.split(",")
+  if len(parts) > 2 or not all(p.isdigit() and int(p) > 0 for p in parts):
+    raise argparse.ArgumentTypeError("benchmark must be COUNT or PROMPT,COUNT with positive integers")
+  return (int(parts[0]), int(parts[1])) if len(parts) == 2 else (512, int(parts[0]))
+
+def benchmark(model, tokenizer, prompt_tokens: int, count: int, warmup: bool = True) -> int:
+  """Per-step timing like tinygrad's --benchmark: the prefill step, then each decode step, with
+  tinygrad's traffic estimate; long runs show only the first and last 20 steps."""
+  ids = tokenizer.encode(" ".join(map(str, range(prompt_tokens))))[:prompt_tokens]
+  if warmup: model.warmup()
+  model.reset()
+  keep, decode, text = 20, tokenizer.stream_decoder(), [""]
+  stream = model.generate(ids, count)
+  try:
+    for i in range(count):
+      profile_marker(f"decode @ {i-1}" if i else "prefill")
+      if i == keep + 1 and count > 2 * keep: print("...")
+      GlobalCounters.reset()
+      with Timing(prefix=f"prefill {len(ids):5d}: " if i == 0 else f"decode {i-1:6d}: ", enabled=i <= keep or i >= count - keep,
+                  on_exit=lambda ns: f", {(len(ids) if i == 0 else 1) * 1e9 / ns:8.2f} tok/s, {GlobalCounters.global_mem / ns:7.2f} GB/s, "
+                                     f"{GlobalCounters.global_mem // 1000000}/{GlobalCounters.mem_used // 1000000} MB  --  "
+                                     + text[0].replace("\n", "\\n")):
+        text[0] += decode(next(stream))  # upstream .item() synchronizes each step
+  finally: stream.close()
+  return 0
 
 def _dflash_draft(args: argparse.Namespace) -> tuple[Path | None, bool]:
   """The DFlash draft to use and whether it was picked automatically. Chat and --prompt on a
@@ -65,15 +88,8 @@ def _dflash_draft(args: argparse.Namespace) -> tuple[Path | None, bool]:
 
 def run(args: argparse.Namespace) -> int:
   draft, automatic = _dflash_draft(args)
-  start = time.perf_counter()
   model, tokenizer = loader.load_model(args.model, args.max_context, args.device)
-  load_seconds = time.perf_counter() - start
-
-  if args.benchmark is not None:
-    prompt_tokens, count = args.benchmark
-    prompt_tokens = prompt_tokens or benchmark.DEFAULT_PROMPT_TOKENS
-    if args.benchmark_format == "json": return benchmark.run_json(model, tokenizer, count, load_seconds, prompt_tokens=prompt_tokens)
-    return benchmark.run_steps(model, tokenizer, count, prompt_tokens=prompt_tokens)
+  if args.benchmark is not None: return benchmark(model, tokenizer, *args.benchmark, warmup=not args.no_warmup)
 
   dflash = eagle = None
   if draft is not None and not (automatic and model.device.split(':')[0] != 'NV'):  # the CPU reference is slower than plain

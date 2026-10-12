@@ -1,6 +1,14 @@
+import importlib.util
+import sys
+from pathlib import Path
+
 import pytest
 
-from infurnace.benchmark import benchmark_prompt_ids, validate_benchmark_context
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]/"benchmarks"))  # decode.py, imported as compare.py does
+spec = importlib.util.spec_from_file_location("decode", Path(__file__).resolve().parents[2]/"benchmarks/decode.py")
+decode = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(decode)
+benchmark_prompt_ids, validate_benchmark_context = decode.benchmark_prompt_ids, decode.validate_benchmark_context
 
 class Tokenizer:
   bos_id = None
@@ -33,3 +41,16 @@ def test_context_includes_requested_answer():
   validate_benchmark_context(512, 32, 544)
   with pytest.raises(ValueError, match="544"): validate_benchmark_context(512, 32, 543)
   with pytest.raises(ValueError): validate_benchmark_context(0, 32, 512)
+
+def test_measure_counts_and_reset():
+  class Model:
+    resets = 0
+    def reset(self): self.resets += 1
+    def generate(self, ids, count): yield from range(count)
+  model = Model()
+  result = decode.measure(model, [1, 2], 3)
+  assert model.resets == 1
+  assert result["generated_tokens"] == 3  # Includes EOS intentionally.
+  assert result["prompt_tokens"] == 2
+  assert result["ttft_seconds"] >= 0
+  assert result["decode_tokens_per_second"] > 0

@@ -1,6 +1,5 @@
 from types import SimpleNamespace
 
-from infurnace import benchmark
 from infurnace.chat import Decoder, run_chat, run_prompt, stream_reply
 
 class Tokenizer:
@@ -94,12 +93,3 @@ def test_warmup_status(capsys):
   output = capsys.readouterr()
   assert not output.out
   assert "Warming up CPU" in output.err and "Ready" in output.err
-
-def test_benchmark_counts_and_reset():
-  model = Model()
-  result = benchmark._measure(model, [1, 2], 3)
-  assert model.resets == 1
-  assert result["generated_tokens"] == 3  # Includes EOS intentionally.
-  assert result["prompt_tokens"] == 2
-  assert result["ttft_seconds"] >= 0
-  assert result["decode_tokens_per_second"] > 0

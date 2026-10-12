@@ -15,8 +15,8 @@ Vector image: `qwen3-4b-rtx5060-1k-output.svg`. Raw reports:
 Both modes use the same bundled Qwen3-4B Q4_K_M GGUF on an RTX 5060 8 GB,
 253 packed NV linears, packed tensor-core prefill, FP16 KV cache, capacity 4096,
 temperature zero, 32-token prefill chunks and 1024 generated outputs.
-Input IDs come from `benchmark_prompt_ids()`. After `model.warmup()`,
-`_measure()` resets history and runs full generation once per prompt length.
+Input IDs come from `benchmarks/decode.py`'s `benchmark_prompt_ids()`. After `model.warmup()`,
+`measure()` resets history and runs full generation once per prompt length.
 Decode throughput is 1023 synchronized steps divided by time from first output
 to generation completion; prefill/first-token work is excluded. Context grows
 throughout generation, so these are sustained averages, not fixed-context rates.

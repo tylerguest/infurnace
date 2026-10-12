@@ -11,7 +11,7 @@ def test_invalid_flags_before_loading(monkeypatch, args):
   with pytest.raises(SystemExit) as error: cli.main(args)
   assert error.value.code == 2
 
-@pytest.mark.parametrize("value,expected", [("32", (None, 32)), ("1000,50", (1000, 50))])
+@pytest.mark.parametrize("value,expected", [("32", (512, 32)), ("1000,50", (1000, 50))])
 def test_benchmark_spec(value, expected):
   assert cli.parse_args(["--benchmark", value]).benchmark == expected
-  assert cli.parse_args(["--benchmark"]).benchmark == (None, 20)
+  assert cli.parse_args(["--benchmark"]).benchmark == (512, 20)

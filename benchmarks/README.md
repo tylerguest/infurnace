@@ -143,20 +143,16 @@ load includes tokenizer construction for both runners.
 
 ## Other measurements
 
-`infurnace --benchmark 32` defaults to 512 prompt tokens and readable per-step
-output using tinygrad's `Timing`, `GlobalCounters.reset()` and profile markers.
-The first line measures prefill plus first-token work; subsequent lines measure
-synchronized decode steps and show ms/token, tok/s, estimated traffic GB/s,
-traffic/current allocation MB, active length and generated text. Formatting and
-printing are outside the timed region. The final aggregate excludes prefill but
-excludes compilation/capture: the run warms up first.
-Traffic is a compiler estimate, not measured DRAM bandwidth; allocation is not
-GPU peak. Text output is one generation, not three warm repetitions.
+`infurnace --benchmark [PROMPT,]COUNT` is tinygrad's per-step benchmark: after warmup it
+times prefill of a PROMPT-token numbers prompt (default 512), then each of COUNT synchronized
+decode steps (default 20), printing ms, tok/s, tinygrad's estimated traffic GB/s, traffic/allocated
+MB and the text so far. Runs longer than 40 steps show only the first and last 20. Traffic is a
+compiler estimate, not measured DRAM bandwidth; allocation is not GPU peak.
 
-`--benchmark PROMPT,COUNT` sets the prompt length, e.g. `infurnace --benchmark 1000,50`
-(raise `--max-context` for long prompts). Use `--benchmark-format json` for the
-cold/capture/three-warm-run machine-readable report. Raw-text prompts are available
-programmatically (`infurnace.benchmark.run_steps(..., prompt_text=...)`).
+`benchmarks/decode.py --tokens 32` is the machine-readable report: one cold run, two capture
+passes and three warm runs as JSON (`--prompt-tokens N` for repeated prose, or `--prompt-file`
+for an untruncated raw-text prompt). `compare.py` and `wrapper.py` share its prompt and
+measurement helpers.
 
 Commands further down this file record the flags of the time; the `--nv-*`,
 `--warmup` and `--benchmark-prompt-*` CLI flags have since been removed (NV

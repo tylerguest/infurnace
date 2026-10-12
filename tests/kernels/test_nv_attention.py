@@ -155,12 +155,11 @@ def test_decode_block_matches_upstream_and_retains_state(fused):
 def test_local_model_teacher_forced_attention_logits():
   from infurnace.models.qwen3 import Qwen3Model
   from infurnace.tokenizer import Tokenizer
-  from infurnace.benchmark import benchmark_prompt_ids
   from infurnace.models.qwen3 import enable_decode_attention
   model = Qwen3Model.from_gguf(os.environ["INFURNACE_TEST_MODEL"], max_context=2048,
                               device="NV", nv_quant=True, nv_prefill=True)
   transformer = model.transformer
-  ids = benchmark_prompt_ids(Tokenizer.from_gguf(model.metadata), 40)
+  ids = Tokenizer.from_gguf(model.metadata).encode(" ".join(map(str, range(40))))[:40]
   # Reuse upstream embedding, blocks, norms and head; omit only the sampler to
   # expose teacher-forced logits. Both paths use the same weights and token IDs.
   def logits(tokens, position):

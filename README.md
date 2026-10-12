@@ -58,9 +58,10 @@ infurnace --prompt "Hello" --max-tokens 64  # one raw prompt, no chat template
 infurnace --serve                           # OpenAI-compatible server on 127.0.0.1:8000
 infurnace --no-dflash                       # plain decoding
 infurnace --benchmark 512,32                # per-step timing: 512-token prompt, 32 outputs
-infurnace --benchmark 32 --benchmark-format json  # cold/warm JSON report
 infurnace --device CPU                      # explicit device override
 ```
+
+For a cold/warm JSON report: `.venv/bin/python benchmarks/decode.py --tokens 32`.
 
 `infurnace --help` lists every option.
 
