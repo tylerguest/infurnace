@@ -2,7 +2,6 @@
 
 Marked nv (INFURNACE_TEST_NV=1); needs the model files below; loads ~3 GB once.
 """
-import os
 from pathlib import Path
 import pytest
 
@@ -24,8 +23,6 @@ def loaded():
 
 
 def configure(generator, *, fused=True, plain_cost=float('inf')):
-  """`fused` only takes effect when fused rounds are enabled for the session."""
-  fused = fused and os.environ.get('INFURNACE_DFLASH_FUSED') == '1'
   generator.min_tau, generator.plain_cost, generator.fused = 0.0, plain_cost, fused  # inf: always draft
   return generator
 
@@ -34,11 +31,6 @@ def prompt(tokenizer, text, thinking=False):
   return tokenizer.encode(tokenizer.render_chat([{'role': 'user', 'content': text}], enable_thinking=thinking))
 
 
-fused_only = pytest.mark.skipif(os.environ.get('INFURNACE_DFLASH_FUSED') != '1',
-  reason='fused rounds are opt-in: set INFURNACE_DFLASH_FUSED=1')
-
-
-@fused_only
 def test_fused_rounds_match_unfused_rounds(loaded):
   model, tokenizer, generator = loaded
   ids = prompt(tokenizer, 'Write a Python function that returns the n-th Fibonacci number.')
@@ -51,7 +43,6 @@ def test_fused_rounds_match_unfused_rounds(loaded):
   assert generator._parallel_verifier(16)._round_jit is not None
 
 
-@fused_only
 def test_fused_device_anchor_and_replay_without_deadlock(loaded):
   # This flow deterministically deadlocked NV graph replay when commit, draft
   # and verify were captured together in one (or two) graphs.
@@ -73,7 +64,7 @@ def test_fused_device_anchor_and_replay_without_deadlock(loaded):
   assert not model._generating
 
 
-def test_default_path_matches_plain_decoding_prefix(loaded):
+def test_unfused_path_matches_plain_decoding_prefix(loaded):
   model, tokenizer, generator = loaded
   ids = prompt(tokenizer, 'Write a Python function that returns the n-th Fibonacci number.')
   plain = list(model.generate(list(ids), 48, reuse_cache=False))
@@ -88,6 +79,6 @@ def test_timing_fallback_matches_plain_decoding_prefix(loaded):
   model, tokenizer, generator = loaded
   ids = prompt(tokenizer, 'What are the pros and cons of remote work?')
   plain = list(model.generate(list(ids), 32, reuse_cache=False))
-  got = list(configure(generator, fused=generator.fused, plain_cost=0.0).stream(list(ids), max_new_tokens=32, block_size=16))
+  got = list(configure(generator, plain_cost=0.0).stream(list(ids), max_new_tokens=32, block_size=16))
   assert got == plain
   assert generator.stats.proposed < generator.stats.rounds * 15  # most rounds were plain steps

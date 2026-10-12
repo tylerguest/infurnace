@@ -40,9 +40,8 @@ class DFlashGenerator:
     # Timing samples seen per kind ('plain', 'fused'): the first calls of a
     # captured graph run eagerly and then capture, so they are not timed.
     self._samples = collections.Counter()
-    # Device-side fused rounds are opt-in (INFURNACE_DFLASH_FUSED=1) until the
-    # timing fallback also covers them (see parallel.py for the tinygrad fix).
-    self.fused = os.environ.get('INFURNACE_DFLASH_FUSED', '0') == '1'
+    # Device-side fused rounds (NV, block 16) unless INFURNACE_DFLASH_FUSED=0.
+    self.fused = os.environ.get('INFURNACE_DFLASH_FUSED', '1') != '0'
     self.stats = DFlashStats()
 
   def stream(self, tokens: list[int], *, max_new_tokens: int, block_size: int | None = None,

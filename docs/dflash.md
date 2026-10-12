@@ -39,7 +39,7 @@ The draft runs as two fixed-shape captures: `absorb` writes context K/V in 16-ro
 chunks, and `denoise` predicts the block, so neither recompiles per prompt length.
 
 Measured on an RTX 5060 (8 GB), Qwen3.5-4B Q4_K_M target, Q4_K_M DFlash draft, block 16,
-fused rounds (`INFURNACE_DFLASH_FUSED=1`), chat-formatted prompts with thinking off,
+fused rounds (the default; `INFURNACE_DFLASH_FUSED=0` disables them), chat-formatted prompts with thinking off,
 512 output tokens, **decode only** (prompt prefill excluded: plain decoding prefills
 one row at a time, DFlash 16), warm, median of the last two of five requests:
 

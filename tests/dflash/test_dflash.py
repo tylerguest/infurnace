@@ -131,7 +131,6 @@ def test_real_draft_determinism_and_transient_cache(tmp_path):
     with pytest.raises(ValueError): draft.propose(2, 3, 4)  # count must stay below the block size
 
 
-
 def test_observing_rows_in_pieces_matches_one_observation(tmp_path):
   # Staging splits rows at chunk boundaries; any split must absorb identically.
   with Context(DEV='CPU'):
