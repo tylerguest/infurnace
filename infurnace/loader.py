@@ -85,11 +85,3 @@ def load_dflash(model, draft_path: str | Path):
   from infurnace.dflash import DFlashDraft, DFlashGenerator
   verifier = 'parallel' if model.device.split(':')[0] == 'NV' else 'sequential'
   return DFlashGenerator(model, DFlashDraft.from_gguf(draft_path, model), verifier=verifier)
-
-def load_eagle(model, checkpoint: Path):
-  """EAGLE-3 generator for a Qwen3 target on NV (experimental)."""
-  from infurnace.eagle import EagleDraft
-  from infurnace.eagle.generate import EagleGenerator
-  from infurnace.eagle.verify import BatchedVerifier
-  BatchedVerifier(model)  # fail eligibility checks before loading draft weights
-  return EagleGenerator(model, EagleDraft.from_checkpoint(checkpoint, model), fast=True)

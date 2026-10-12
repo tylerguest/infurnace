@@ -15,8 +15,8 @@ infurnace --device NV --model models/qwen35-validation/Qwen3.5-4B-Q4_K_M.gguf \
 The context size above is illustrative: validate memory and reliability on your
 GPU. Startup warms up unless `--no-warmup` is supplied. `--no-thinking` sets the
 embedded template's `enable_thinking` flag. Request-level `max_tokens` or
-`max_completion_tokens` controls output length. EAGLE and DFlash are not yet
-supported in server mode.
+`max_completion_tokens` controls output length. DFlash is not yet supported in
+server mode.
 
 The default bind address is `127.0.0.1`. This upstream server has no authentication;
 do not expose it to untrusted networks. Requests are processed serially.

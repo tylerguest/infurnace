@@ -18,8 +18,8 @@ dev = ["ruff==0.14.10", "pytest", "jinja2"]
 [project.scripts]
 infurnace = "infurnace.cli:main"
 
-[tool.setuptools]
-packages = ["infurnace", "infurnace.eagle", "infurnace.dflash", "infurnace.kernels"]
+[tool.setuptools.packages.find]
+include = ["infurnace*"]
 
 [tool.ruff]
 preview = true

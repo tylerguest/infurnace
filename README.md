@@ -81,37 +81,6 @@ For a cold/warm JSON report: `.venv/bin/python benchmarks/decode.py --tokens 32`
   `--max-tokens` sets a cap including thinking; raw single-shot defaults to 64.
   Token/context stops are reported. Oversized individual messages are rejected.
 
-## Experimental EAGLE-3
-
-The local AngelSlim Qwen3-4B EAGLE-3 checkpoint can now be used in chat or raw
-single-shot generation:
-
-```sh
-infurnace --model models/Qwen3-4B-Q4_K_M.gguf --eagle3 models/eagle3-qwen3-4b
-```
-
-Requires the matching checkpoint directory (`config.json`, `model.safetensors`),
-NV packed linears and fused attention. The CLI never downloads or substitutes a
-target model automatically. Only target-verified greedy tokens are streamed; EOS, response
-limits and cancellation release both target and draft state. Kernel captures
-are reused across requests, but speculative chat currently repeats prefill
-rather than reusing conversation prefixes. First-request compilation/capture
-can take a minute or more; ordinary warmup does not prime all EAGLE shapes.
-
-`--eagle3` drafts **one token per round with the fast profile**: fused draft
-observation/proposal, owned host-mapped token/decision/proposal buffers, parallel
-exact-score sampling, zero-copy feature handoff, and looped projections with exact
-fused reductions on validated shapes. Ordinary generation without `--eagle3` is unchanged.
-
-**This remains experimental, not a guaranteed speedup or reliability fix.**
-The calibrated-head experimental combination reached about 132 tok/s versus
-107 tok/s baseline on one 256-output request. That head is **not loaded
-automatically**: CLI inference uses the explicitly supplied checkpoint unchanged.
-NV timeouts remain possible, including during model loading. The runtime pin
-includes the upstream submission-signal reinitialization fix, but does not fix
-all observed failures. Benchmark your workload before relying on a speedup. See [implementation notes](docs/eagle3-plan.md)
-and [the EAGLE benchmark](benchmarks/README.md#experimental-eagle-3-comparison).
-
 ## Current status
 
 Local generation, chat, warmup and benchmarks work on the tested model/GPU.

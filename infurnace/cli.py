@@ -30,22 +30,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
   speculation.add_argument("--dflash", type=Path, metavar="GGUF", help="DFlash draft for a Qwen3.5 model "
                                                                        "(used automatically when installed; or INFURNACE_DFLASH_DRAFT)")
   speculation.add_argument("--no-dflash", action="store_true", help="decode without the automatic DFlash draft")
-  speculation.add_argument("--eagle3", type=Path, metavar="DIR", help="experimental EAGLE-3 checkpoint for a Qwen3 model (NV)")
   args = ap.parse_args(argv)
 
   if args.serve is not None:
     if not 1 <= args.serve <= 65535: ap.error("--serve port must be between 1 and 65535")
-    if args.dflash or args.eagle3: ap.error("--serve supports plain decoding only")
+    if args.dflash: ap.error("--serve supports plain decoding only")
     if args.max_tokens is not None: ap.error("--serve takes max_tokens per request, not --max-tokens")
   if args.benchmark is not None:
-    if args.dflash or args.eagle3: ap.error("--benchmark measures plain decoding; use benchmarks/dflash.py or benchmarks/eagle.py for drafts")
+    if args.dflash: ap.error("--benchmark measures plain decoding; use benchmarks/dflash.py for DFlash")
     args.max_context = max(args.max_context, sum(args.benchmark))  # room for the whole benchmark
   if args.no_thinking and (args.prompt is not None or args.benchmark is not None): ap.error("--no-thinking applies only to chat")
   if args.dflash is not None and not args.dflash.is_file(): ap.error("--dflash must name a local draft GGUF file")
-  if args.eagle3 is not None:
-    if not (args.eagle3 / 'config.json').is_file() or not (args.eagle3 / 'model.safetensors').is_file():
-      ap.error("--eagle3 directory must contain config.json and model.safetensors")
-    if args.device is not None and args.device.split(':')[0] != 'NV': ap.error("--eagle3 requires an NV device")
   return args
 
 def _positive(value: str) -> int:
@@ -83,7 +78,7 @@ def _dflash_draft(args: argparse.Namespace) -> tuple[Path | None, bool]:
   """The DFlash draft to use and whether it was picked automatically. Chat and --prompt on a
   Qwen3.5 model use an installed draft unless told otherwise."""
   if args.dflash is not None: return args.dflash, False
-  if args.no_dflash or args.eagle3 or args.serve is not None or args.benchmark is not None: return None, False
+  if args.no_dflash or args.serve is not None or args.benchmark is not None: return None, False
   draft = loader.default_dflash_draft()
   return (draft, True) if draft is not None and draft.is_file() and loader.is_qwen35(args.model) else (None, False)
 
@@ -91,14 +86,11 @@ def _dflash_block(dflash) -> int:
   # Parallel verification checks a whole trained block; the sequential reference checks 4 rows.
   return dflash.draft.config.block_size if dflash.verifier == 'parallel' else 4
 
-def generator(model, tokenizer, dflash=None, eagle=None) -> Callable[[list[int], int], Iterator[int]]:
-  """generate(ids, budget): plain decoding, or a DFlash / EAGLE-3 speculative generator."""
-  eos = tuple(i for i in (tokenizer.eos_id, tokenizer.eot_id) if i is not None)
-  if dflash is not None:
-    block = _dflash_block(dflash)
-    return lambda ids, budget: dflash.stream(ids, max_new_tokens=budget, block_size=block, eos_token_ids=eos)
-  if eagle is not None: return lambda ids, budget: eagle.stream(ids, max_new_tokens=budget, draft_tokens=1, eos_token_ids=eos, batched=True)
-  return model.generate
+def generator(model, tokenizer, dflash=None) -> Callable[[list[int], int], Iterator[int]]:
+  """generate(ids, budget): plain decoding, or DFlash speculative decoding."""
+  if dflash is None: return model.generate
+  eos, block = tuple(i for i in (tokenizer.eos_id, tokenizer.eot_id) if i is not None), _dflash_block(dflash)
+  return lambda ids, budget: dflash.stream(ids, max_new_tokens=budget, block_size=block, eos_token_ids=eos)
 
 def warmup(model, dflash=None) -> None:
   print(f"Warming up {model.device} (first startup may take a while)...", file=sys.stderr, flush=True)
@@ -158,14 +150,11 @@ def run(args: argparse.Namespace) -> int:
   model, tokenizer = loader.load_model(args.model, args.max_context, args.device)
   if args.benchmark is not None: return benchmark(model, tokenizer, *args.benchmark, warmup=not args.no_warmup)
 
-  dflash = eagle = None
+  dflash = None
   if draft is not None and not (automatic and model.device.split(':')[0] != 'NV'):  # the CPU reference is slower than plain
     dflash = loader.load_dflash(model, draft)
     print(f"DFlash speculative decoding{' on (--no-dflash turns it off)' if automatic else ''}.", file=sys.stderr, flush=True)
-  if args.eagle3 is not None:
-    eagle = loader.load_eagle(model, args.eagle3)
-    print("EAGLE-3 speculative decoding (experimental): the first reply captures graphs and can be slow.", file=sys.stderr, flush=True)
-  generate, context = generator(model, tokenizer, dflash, eagle), model.config.context_length
+  generate, context = generator(model, tokenizer, dflash), model.config.context_length
 
   if args.prompt is not None:
     reply(generate, tokenizer, encode(tokenizer, args.prompt), args.max_tokens or PROMPT_MAX_TOKENS, context)

@@ -1,7 +1,25 @@
 from types import SimpleNamespace
 import pytest
 from infurnace import cli, loader
-from test_eagle_cli import Engine, Tokenizer
+
+class Tokenizer:
+  bos_id = None
+  eos_id, eot_id = 9, 10
+  def encode(self, text): return [1, 2]
+  def render_chat(self, messages, **kwargs): return 'chat'
+  def is_end(self, token): return token in (9, 10)
+  def stream_decoder(self): return lambda token: '!' if token is None else str(token)
+
+class Engine:
+  def __init__(self, verifier='parallel', block_size=16):
+    self.closed, self.calls = False, []
+    self.verifier, self.draft = verifier, SimpleNamespace(config=SimpleNamespace(block_size=block_size))  # DFlash-shaped
+  def stream(self, ids, **kwargs):
+    self.calls.append((ids, kwargs))
+    try:
+      yield from (3, 9, 4)
+    finally:
+      self.closed = True
 
 @pytest.mark.parametrize('verifier,block', [('parallel', 16), ('sequential', 4)])
 def test_dflash_stream_block_eos_and_close(capsys, verifier, block):
@@ -13,7 +31,7 @@ def test_dflash_stream_block_eos_and_close(capsys, verifier, block):
   assert capsys.readouterr().out == '3!\n'
 
 @pytest.mark.parametrize('extra', [['--dflash', 'missing.gguf'], ['--dflash', 'draft.gguf', '--benchmark', '8'],
-                                   ['--dflash', 'draft.gguf', '--eagle3', 'eagle'], ['--dflash', 'draft.gguf', '--no-dflash'],
+                                   ['--dflash', 'draft.gguf', '--no-dflash'],
                                    ['--dflash-block-size', '4']])
 def test_invalid_flags_before_loading(monkeypatch, extra):
   monkeypatch.setattr(loader, 'load_model', lambda *a, **kw: pytest.fail('loaded model for invalid flags'))

@@ -1,11 +1,12 @@
+from types import SimpleNamespace
 import pytest
 
 from infurnace import cli, loader
 
 @pytest.mark.parametrize("args", [["--prompt", "hi", "--chat"], ["--max-tokens", "0"], ["--benchmark", "-1"],
                                   ["--max-context", "0"], ["--prompt", "hi", "--no-thinking"], ["--serve", "0"],
-                                  ["--serve", "--max-tokens", "5"], ["--no-dflash", "--eagle3", "x"],
-                                  ["--dflash", "missing.gguf"], ["--eagle3", "missing-dir"], ["--nv-prefill"]])
+                                  ["--serve", "--max-tokens", "5"],
+                                  ["--dflash", "missing.gguf"], ["--nv-prefill"]])
 def test_invalid_flags_before_loading(monkeypatch, args):
   monkeypatch.setattr(loader, "load_model", lambda *a, **kw: pytest.fail("loaded a model for invalid flags"))
   with pytest.raises(SystemExit) as error: cli.main(args)
@@ -15,3 +16,16 @@ def test_invalid_flags_before_loading(monkeypatch, args):
 def test_benchmark_spec(value, expected):
   assert cli.parse_args(["--benchmark", value]).benchmark == expected
   assert cli.parse_args(["--benchmark"]).benchmark == (512, 20)
+
+@pytest.mark.parametrize('message', ['NV signal wait timed out', 'PYTHON hang detected', 'unrelated bug'])
+def test_cli_device_timeout_diagnostic_does_not_swallow_other_errors(monkeypatch, capsys, message):
+  model = SimpleNamespace(config=SimpleNamespace(context_length=16), device='NV')
+  def fail(*args): raise RuntimeError(message)
+  model.generate = fail
+  tokenizer = SimpleNamespace(bos_id=None, encode=lambda text: [1], stream_decoder=lambda: lambda token: '')
+  monkeypatch.setattr(loader, 'load_model', lambda *a, **kw: (model, tokenizer))
+  if message == 'unrelated bug':
+    with pytest.raises(RuntimeError, match=message): cli.main(['--prompt', 'hello', '--no-dflash'])
+  else:
+    assert cli.main(['--prompt', 'hello', '--no-dflash']) == 1
+    assert 'the GPU stopped responding' in capsys.readouterr().err

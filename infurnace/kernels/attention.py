@@ -58,27 +58,6 @@ def decode_attention(q: Tensor, assigned_kv: Tensor, active_tokens: int | UOp) -
   probabilities = probabilities[:, :, :, :active_tokens]
   return probabilities @ v
 
-def fused_chain_attention(q: Tensor, assigned_kv: Tensor, start_pos: int | UOp) -> Tensor:
-  """Short causal chain using exactly the existing per-query fused arithmetic.
-
-  All candidate KV rows are already stored. Query i masks every position after
-  start_pos+i, so rejected/future candidates cannot affect an accepted prefix.
-  This reference-preserving scaffold does not yet reuse KV tiles across queries.
-  """
-  if len(q.shape) != 4 or not isinstance(q.shape[2], int) or not 1 <= q.shape[2] <= 8:
-    raise AttentionError('chain attention requires one to eight concrete queries')
-  size = q.shape[2]
-  if size == 1: return fused_decode_attention(q, assigned_kv, start_pos+1)
-  heads, kv_heads, capacity = _validate_attention(q[:, :, :1], assigned_kv, start_pos+size)
-  if heads != kv_heads*4: raise AttentionError('chain attention requires four query heads per KV head')
-  active = start_pos+1
-  partial = Tensor.empty(size*heads, (capacity+63)//64, 130, device=q.device, dtype=dtypes.float32)
-  partial = _launch_attention(partial, q.contiguous(), assigned_kv, scalar=active,
-    fxn=functools.partial(_fused_partial, active=active, heads=heads, capacity=capacity, partition=64, queries=size))
-  out = Tensor.empty(*q.shape, device=q.device, dtype=dtypes.float32)
-  return _launch_attention(out, partial, scalar=active,
-    fxn=functools.partial(_fused_merge, heads=heads, live=(active+63)//64, queries=size, active=active))
-
 _VARIABLE_PARAM = {'param': True} if 'param' in inspect.signature(UOp.variable).parameters else {}
 
 def _kernel_scalar(value: int | UOp) -> int | UOp:
