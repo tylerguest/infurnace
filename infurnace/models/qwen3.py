@@ -6,8 +6,10 @@ import math
 from tinygrad import Tensor, Context, dtypes
 from tinygrad.llm.model import Transformer, TransformerConfig, TransformerBlock, apply_rope
 from tinygrad.nn.state import load_state_dict
-from infurnace.gguf import PackedTensor, parse_gguf, _dequant, _dequant_q6_k, _dequant_q4_k
-from infurnace.kernels.quant_gemv import quant_gemv, q8_quantize, prepare_q6, prepare_q4, Q6_PREPARED_BYTES, QUANT_SIZES
+from tinygrad.llm.gguf import ggml_data_to_tensor
+from infurnace.gguf import PackedTensor, parse_gguf
+from infurnace.kernels.quant_gemv import (quant_gemv, q8_quantize, prepare_q6, prepare_q4, dequant_prepared_q4, dequant_prepared_q6,
+                                         QUANT_SIZES)
 from infurnace.kernels.quant_gemm import quant_gemm, nv_prefill_supported
 from infurnace.kernels.attention import decode_attention, fused_decode_attention, nv_attention_supported
 
@@ -201,11 +203,9 @@ class _NVLinear:
     if realize: self.packed.realize()
     # Generic consumers decode fields directly from the same padded allocation.
     # Neither the original GGUF bytes nor a second dense weight copy is retained.
-    raw = self.packed.bitcast(dtypes.uint8)
-    decoded = (_dequant_q4_k(raw, swizzled_width=self.in_features//256) if self.q4_swizzled else
-               _dequant_q6_k(raw, block_bytes=Q6_PREPARED_BYTES,
-                               swizzled_width=self.in_features//256 if self.q6_swizzled else 0) if self.q6_aligned else
-               _dequant(raw, self.in_features * self.out_features, self.ggml_type))
+    decoded = (dequant_prepared_q4(self.packed, in_features=self.in_features) if self.q4_swizzled else
+               dequant_prepared_q6(self.packed, in_features=self.in_features, swizzled=self.q6_swizzled) if self.q6_aligned else
+               ggml_data_to_tensor(self.packed.bitcast(dtypes.uint8), self.in_features * self.out_features, self.ggml_type))
     original.weight = decoded.reshape(entry.shape).cast(dtypes.float16)
     self.weight, self.bias = original.weight, original.bias
 

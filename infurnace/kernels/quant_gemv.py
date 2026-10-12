@@ -112,6 +112,41 @@ def prepare_q6(raw: Tensor, *, in_features: int | None = None, swizzled: bool = 
   result = Tensor(UOp.custom_kernel(out.uop, raw.uop.flatten(), fxn=fxn)[0])
   return result.realize() if realize else result
 
+def _unswizzle(words: Tensor, in_features: int, block_words: int, word_group: int) -> Tensor:
+  # Inverse views of the swizzled [tile, word, block-in-tile, word_group] order; no tight GGUF copy.
+  width = in_features//256
+  words = words.reshape(-1, width*block_words)
+  full, tail, groups = width//4*4, width%4, block_words//word_group
+  parts = []
+  if full: parts.append(words[:, :full*block_words].reshape(-1, full//4, groups, 4, word_group).permute(0, 1, 3, 2, 4).reshape(-1, full, block_words))
+  if tail: parts.append(words[:, full*block_words:].reshape(-1, groups, tail, word_group).permute(0, 2, 1, 3).reshape(-1, tail, block_words))
+  return (parts[0] if len(parts) == 1 else parts[0].cat(parts[1], dim=1)).reshape(-1, block_words).bitcast(dtypes.uint8)
+
+def dequant_prepared_q4(packed: Tensor, *, in_features: int) -> Tensor:
+  """FP32 weights straight from prepare_q4's swizzled words (GGUF Q4_K field math)."""
+  blocks = _unswizzle(packed.bitcast(dtypes.uint32), in_features, Q4_WORDS, 4)
+  d, dmin = (blocks[:, i:i+2].bitcast(dtypes.float16).float().unsqueeze(-1) for i in (0, 2))
+  s = blocks[:, 4:16]
+  scales = s[:, 0:4].bitwise_and(63).cat(s[:, 8:12].bitwise_and(15).bitwise_or(s[:, 0:4].rshift(6).lshift(4)), dim=-1)
+  minimums = s[:, 4:8].bitwise_and(63).cat(s[:, 8:12].rshift(4).bitwise_or(s[:, 4:8].rshift(6).lshift(4)), dim=-1)
+  qs = blocks[:, 16:144].reshape(-1, 4, 32)  # each 32-byte chunk: a low-nibble group, then a high-nibble group
+  q = Tensor.stack(qs.bitwise_and(15), qs.rshift(4), dim=2).reshape(-1, 8, 32)
+  return (d * scales.unsqueeze(-1) * q - dmin * minimums.unsqueeze(-1)).flatten()
+
+def _nibbles(data: Tensor, bits: int) -> Tensor:
+  shifts = Tensor.const(tuple(2**(i*bits) for i in range(8//bits)), dtype=data.dtype)
+  return data.unsqueeze(-1).div(shifts, rounding_mode="trunc").bitwise_and(0xFF >> (8-bits)).transpose(-1, -2).flatten(-2)
+
+def dequant_prepared_q6(packed: Tensor, *, in_features: int = 0, swizzled: bool = False) -> Tensor:
+  """FP32 weights straight from prepare_q6's 216-byte blocks (GGUF Q6_K field math, read in place)."""
+  blocks = (_unswizzle(packed.bitcast(dtypes.uint32), in_features, Q6_PREPARED_BYTES//4, 2) if swizzled else
+            packed.bitcast(dtypes.uint8).reshape(-1, Q6_PREPARED_BYTES).contiguous())
+  low = _nibbles(blocks[:, :128].reshape(-1, 2, 64), 4)
+  high = _nibbles(blocks[:, 128:192].reshape(-1, 2, 32), 2).lshift(4)
+  q = (low.bitwise_or(high).bitcast(dtypes.int8) - 32).reshape(-1, 256)
+  scales = blocks[:, 192:208].bitcast(dtypes.int8).unsqueeze(-1).expand(-1, 16, 16).reshape(-1, 256)
+  return (blocks[:, 208:210].bitcast(dtypes.float16).float() * q * scales).flatten()
+
 def _q6_word(raw:UOp, base:UOp, byte_offset:UOp) -> UOp:
   # Q6 blocks are 210 bytes: every other block is only halfword-aligned.
   # Combine two aligned u16 loads, never reinterpret the address as an aligned u32.

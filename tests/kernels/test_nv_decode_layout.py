@@ -6,7 +6,7 @@ import struct
 import pytest
 from tinygrad import Tensor, TinyJit, dtypes
 
-from infurnace.gguf import _dequant
+from tinygrad.llm.gguf import ggml_data_to_tensor as _dequant
 kernels = importlib.import_module("infurnace.kernels.quant_gemv")
 
 @pytest.mark.parametrize("typ,width,rows,expected", [

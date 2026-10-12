@@ -4,8 +4,8 @@ import struct
 import pytest
 from tinygrad import Tensor, TinyJit, dtypes
 
-from infurnace.gguf import _dequant_q6_k
-from infurnace.kernels.quant_gemv import prepare_q6, quant_gemv, Q6_PREPARED_BYTES
+from tinygrad.llm.gguf import ggml_data_to_tensor
+from infurnace.kernels.quant_gemv import dequant_prepared_q6, prepare_q6, quant_gemv, Q6_PREPARED_BYTES
 from infurnace.kernels.quant_gemm import quant_gemm
 
 def data(rows, width):
@@ -37,9 +37,8 @@ def test_q6_preparation_preserves_blocks(rows, width, swizzled):
   for i, block in enumerate(blocks):
     assert bytes(block[:210]) == raw[i*210:(i+1)*210]
     assert block[210:] == [0]*(Q6_PREPARED_BYTES-210)
-  native = _dequant_q6_k(Tensor(raw, dtype=dtypes.uint8, device='CPU'))
-  prepared = _dequant_q6_k(packed.bitcast(dtypes.uint8), block_bytes=Q6_PREPARED_BYTES,
-                          swizzled_width=width//256 if swizzled else 0)
+  native = ggml_data_to_tensor(Tensor(raw, dtype=dtypes.uint8, device='CPU'), len(raw)//210*256, 14).flatten()
+  prepared = dequant_prepared_q6(packed, in_features=width, swizzled=swizzled)
   assert (native-prepared).abs().max().item() == 0
 
 @pytest.mark.nv

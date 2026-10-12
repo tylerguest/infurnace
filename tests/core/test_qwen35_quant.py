@@ -5,7 +5,8 @@ import struct
 import pytest
 from tinygrad import Tensor, TinyJit, dtypes
 from tinygrad.llm.gguf import ggml_data_to_tensor
-from infurnace.gguf import Q5_K, Q8_0, _dequant, _tensor_nbytes
+from infurnace.gguf import Q5_K, Q8_0
+from tinygrad.llm.gguf import ggml_data_to_tensor as _dequant
 from infurnace.kernels.quant_gemv import q8_quantize, quant_gemv
 
 def blocks(count):
@@ -26,16 +27,13 @@ def blocks(count):
 def test_q5_scalar_and_upstream():
   raw, expected = blocks(3)
   t = Tensor(raw, dtype=dtypes.uint8, device="CPU")
-  assert _dequant(t, 768, Q5_K).tolist() == expected
+  assert _dequant(t, 768, Q5_K).flatten().tolist() == expected
   assert ggml_data_to_tensor(t, 768, Q5_K).flatten().tolist() == expected
-  assert _tensor_nbytes(768, Q5_K) == len(raw)
 
 def test_q8_signed_and_row_block_size():
   values = list(range(-128, -96))
   raw = struct.pack("<e32b", 0.125, *values)
-  assert _dequant(Tensor(raw, dtype=dtypes.uint8, device="CPU"), 32, Q8_0).tolist() == [x * 0.125 for x in values]
-  assert _tensor_nbytes(32, Q8_0) == 34
-  with pytest.raises(ValueError): _tensor_nbytes(33, Q8_0)
+  assert _dequant(Tensor(raw, dtype=dtypes.uint8, device="CPU"), 32, Q8_0).flatten().tolist() == [x * 0.125 for x in values]
 
 @pytest.mark.skipif(not os.environ.get("INFURNACE_TEST_NV"), reason="set INFURNACE_TEST_NV=1 on an NV GPU")
 @pytest.mark.parametrize("width", [256, 768, 2560])

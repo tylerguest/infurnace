@@ -1,239 +1,102 @@
-import io, struct, pytest
+import os
+from pathlib import Path
+import random
+import struct
+
+import pytest
+from tinygrad import dtypes
+from tinygrad.uop.ops import Ops
+
 import infurnace.gguf as gguf
 
-from tinygrad import Tensor, dtypes
+BLOCK_BYTES = {gguf.Q4_K: 144, gguf.Q6_K: 210}
 
-def test_read_unpack_uint32():
-  handle = io.BytesIO(struct.pack("<I", 123))
-  assert gguf._read_unpack("<I", 4, handle) == 123
+def random_blocks(typ, count=3):
+  rng = random.Random(42)
+  size = BLOCK_BYTES[typ]
+  data = bytearray(rng.getrandbits(8) for _ in range(size * count))
+  for start in range(0, len(data), size):
+    if typ == gguf.Q4_K: data[start:start+4] = struct.pack("<ee", 0.01, 0.002)
+    else: data[start+208:start+210] = struct.pack("<e", 0.01)
+  return bytes(data)
 
-def test_read_str():
-  value = "hello GGUF"
-  encoded = value.encode("utf-8")
-  handle = io.BytesIO(struct.pack("<Q", len(encoded)) + encoded)
-  assert gguf._read_str(handle) == value
+def scalar_decode(data, typ):
+  """Independent scalar interpretation in logical weight order."""
+  result = []
+  size = BLOCK_BYTES[typ]
+  for start in range(0, len(data), size):
+    block = data[start:start+size]
+    if typ == gguf.Q4_K:
+      d, dmin = struct.unpack("<ee", block[:4])
+      s = block[4:16]
+      for group in range(8):
+        scale = s[group] & 63 if group < 4 else (s[group+4] & 15) | ((s[group-4] >> 6) << 4)
+        minimum = s[group+4] & 63 if group < 4 else (s[group+4] >> 4) | ((s[group] >> 6) << 4)
+        for lane in range(32):
+          q = (block[16 + (group//2)*32 + lane] >> (4*(group % 2))) & 15
+          result.append(d * scale * q - dmin * minimum)
+    else:
+      d = struct.unpack("<e", block[208:210])[0]
+      scales = struct.unpack("<16b", block[192:208])
+      for index in range(256):
+        half, within = divmod(index, 128)
+        low = (block[half*64 + within % 64] >> (4*(within//64))) & 15
+        high = (block[128 + half*32 + within % 32] >> (2*(within//32))) & 3
+        result.append(d * scales[index//16] * ((low | (high << 4)) - 32))
+  return result
 
-def test_read_arr():
-  data = b"".join([
-    struct.pack("<i", 4),
-    struct.pack("<Q", 3),
-    struct.pack("<III", 10, 20, 30),
-  ])
-  assert gguf._read_arr(io.BytesIO(data)) == [10, 20, 30]
+def build_file(path):
+  def string(s): return struct.pack("<Q", len(s)) + s.encode()
+  data4, data6 = random_blocks(gguf.Q4_K, 4), random_blocks(gguf.Q6_K, 6)
+  offset6 = (len(data4) + 31)//32*32
+  offset32 = (offset6 + len(data6) + 31)//32*32
+  specs = [("q4", (512, 2), gguf.Q4_K, 0), ("q6", (512, 3), gguf.Q6_K, offset6), ("f32", (2,), 0, offset32)]
+  header = b"GGUF" + struct.pack("<IQQ", 3, len(specs), 0)
+  for name, dims, typ, offset in specs:
+    header += string(name) + struct.pack("<I", len(dims)) + struct.pack("<" + "Q"*len(dims), *dims) + struct.pack("<iQ", typ, offset)
+  payload = data4 + bytes(offset6-len(data4)) + data6
+  payload += bytes(offset32-len(payload)) + struct.pack("<ff", 1.5, -2.0)
+  path.write_bytes(header + bytes(-len(header) % 32) + payload)
+  return {"q4": data4, "q6": data6, "f32": struct.pack("<ff", 1.5, -2.0)}
 
-def test_read_value_uint32():
-  handle = io.BytesIO(struct.pack("I", 123))
-  assert gguf._read_value(handle, 4) == 123
+def test_parse_and_decode(tmp_path):
+  path = tmp_path / "mixed.gguf"
+  expected = build_file(path)
+  metadata, entries = gguf.parse_gguf(path)
+  assert metadata == {}
+  assert (entries["q4"].shape, entries["q6"].shape, entries["f32"].shape) == ((2, 512), (3, 512), (2,))
+  for name, entry in entries.items():
+    assert entry.data.device.startswith("DISK:") and entry.data.numel() == len(expected[name])
+    resident = entry.to("CPU")
+    assert bytes(resident.data.tolist()) == expected[name]
+    decoded = resident.decode()
+    if name == "f32": assert decoded.tolist() == [1.5, -2.0]
+    else:
+      # Only packed storage has been realized, not the floating-point output.
+      assert not any(u.op is Ops.BUFFER and u.dtype in dtypes.floats for u in decoded.uop.toposort())
+      assert decoded.flatten().tolist() == pytest.approx(scalar_decode(expected[name], entry.ggml_type), rel=1e-5, abs=1e-6)
 
-def test_read_value_float32():
-  handle = io.BytesIO(struct.pack("<f", 1.25))
-  assert gguf._read_value(handle, 6) == 1.25
+def test_metadata_is_a_fresh_dict(tmp_path):
+  path = tmp_path / "mixed.gguf"
+  build_file(path)
+  gguf.read_gguf_metadata(path)["added"] = 1
+  assert gguf.read_gguf_metadata(path) == {}
 
-def test_read_value_bool():
-  handle = io.BytesIO(struct.pack("<?", True))
-  assert gguf._read_value(handle, 7) is True
+def test_truncated_file_rejected(tmp_path):
+  path = tmp_path / "cut.gguf"
+  build_file(path)
+  path.write_bytes(path.read_bytes()[:-16])
+  with pytest.raises(ValueError, match="truncated"): gguf.parse_gguf(path)
 
-def test_read_value_int32_array():
-  data = b"".join([
-    struct.pack("<i", 5),
-    struct.pack("<Q", 3),
-    struct.pack("<iii", 10, 20, 30),
-  ])
-  assert gguf._read_value(io.BytesIO(data), 9) == [10, 20, 30]
-
-def test_read_value_string_array():
-  values = ["one", "two"]
-  data = b"".join([
-    struct.pack("<i", 8),
-    struct.pack("<Q", len(values)),
-  ])
-  for value in values:
-    encoded = value.encode("utf-8")
-    data += struct.pack("<Q", len(encoded)) + encoded
-  assert gguf._read_value(io.BytesIO(data), 9) == values
-
-def test_read_empty_array():
-  data = struct.pack("<iQ", 4, 0)
-  assert gguf._read_value(io.BytesIO(data), 9) == []
-
-def test_read_header():
-  data = b"".join([
-    b"GGUF",
-    struct.pack("<I", 3),
-    struct.pack("<Q", 12),
-    struct.pack("<Q", 34),
-  ])
-  assert gguf._read_header(io.BytesIO(data)) == (3, 12, 34)
-
-def test_read_metadata():
-  key = "general.architecture"
-  value = "qwen3"
-  data = b"".join([
-    struct.pack("<Q", len(key)),
-    key.encode("utf-8"),
-    struct.pack("<i", 8),
-    struct.pack("<Q", len(value)),
-    value.encode("utf-8"),
-  ])
-  assert gguf._read_metadata(io.BytesIO(data), 1) == { key: value, }
-
-def test_read_tensor_info():
-  name = "test.weight"
-  data = b"".join([
-    struct.pack("Q", len(name)),
-    name.encode("utf-8"),
-    struct.pack("<I", 2),
-    struct.pack("<QQ", 64, 128),
-    struct.pack("<i", 0),
-    struct.pack("<Q", 256),
-  ])
-  assert gguf._read_tensor_info(io.BytesIO(data)) == ("test.weight", (64, 128), 0, 256)
-
-def test_read_multi_tensor_info():
-  def encode_info(name, dims, ggml_type, offset):
-    return b"".join([
-      struct.pack("<Q", len(name)),
-      name.encode("utf-8"),
-      struct.pack("<I", len(dims)),
-      struct.pack("<" + "Q" * len(dims), *dims),
-      struct.pack("<i", ggml_type),
-      struct.pack("<Q", offset),
-    ])
-  data = encode_info("a", (4,), 0, 0) + encode_info("b", (2, 3), 12, 64)
-  assert gguf._read_multi_tensor_info(io.BytesIO(data), 2) == [
-    ("a", (4,), 0, 0),
-    ("b", (2, 3), 12, 64),
-  ]
-
-def test_data_start_uses_default_alignment():
-  handle = io.BytesIO(b"\x00" * 37)
-  handle.seek(37)
-  assert gguf._data_start(handle, {}) == 64
-
-def test_data_start_uses_metadata_alignment():
-  handle = io.BytesIO(b"\x00" * 37)
-  handle.seek(37)
-  assert gguf._data_start(handle, {"general.alignment": 16}) == 48
-
-def encode_string(value: str) -> bytes:
-  encoded = value.encode("utf-8")
-  return struct.pack("<Q", len(encoded)) + encoded
-
-def test_read_gguf_structure():
-  metadata = b"".join([
-    encode_string("general.alignment"),
-    struct.pack("<i", 4),
-    struct.pack("<I", 32),
-    ])
-
-  tensor_info = b"".join([
-    encode_string("test_weight"),
-    struct.pack("<I", 1),
-    struct.pack("<Q", 4),
-    struct.pack("<i", 0),
-    struct.pack("<Q", 0),
-  ])
-
-  header = b"".join([
-    b"GGUF",
-    struct.pack("<I", 3),
-    struct.pack("<Q", 1),
-    struct.pack("<Q", 1),
-  ])
-
-  data = header+metadata+tensor_info
-  data += b"\x00"*((gguf._round_up(len(data), 32)) - len(data))
-  data += struct.pack("<ffff", 1.0, 2.0, 3.0, 4.0)
-  handle = io.BytesIO(data)
-  _, tensor_count, metadata_count = gguf._read_header(handle)
-  parsed_metadata = gguf._read_metadata(handle, metadata_count)
-  infos = gguf._read_multi_tensor_info(handle, tensor_count)
-  data_start = gguf._data_start(handle, parsed_metadata)
-
-  assert parsed_metadata == {"general.alignment": 32}
-  assert infos == [("test_weight", (4,), 0, 0)]
-  assert data_start == 128
-
-def test_tensor_nbytes_f32():
-  assert gguf._tensor_nbytes(4, 0) == 16
-
-def test_tensor_nbytes_q4_k():
-  assert gguf._tensor_nbytes(256, 12) == 144
-  assert gguf._tensor_nbytes(512, 12) == 288
-
-def test_tensor_nbytes_q6_k():
-  assert gguf._tensor_nbytes(256, 14) == 210
-
-def test_tensor_nbytes_rejects_partial_quant_block():
-  with pytest.raises(ValueError, match="whole number"): gguf._tensor_nbytes(255, 12)
-
-def test_tensor_range():
-  info = ("test_weight", (4,), 0, 64)
-  assert gguf._tensor_range(info, data_start=128, file_size=1000) == (192, 208)
-
-def test_tensor_range_rejects_out_of_bounds_tensor():
-  info = ("test_weight", (4,), 0, 64)
-  with pytest.raises(ValueError, match="extends beyond"):
-    gguf._tensor_range(info, data_start=128, file_size=200)
-
-def test_dequant_f32():
-  raw = Tensor(struct.pack("<ffff", 1.0, 2.0, 3.0, 4.0), dtype=dtypes.uint8, device="CPU")
-  result = gguf._dequant(raw, 4, 0)
-  assert result.tolist() == [1.0, 2.0, 3.0, 4.0]
-
-def test_tensor_from_info_f32():
-  raw = Tensor(b"\x00" * 16 + struct.pack("<ffff", 1.0, 2.0, 3.0, 4.0), dtype=dtypes.uint8, device="CPU")
-  info = ("test_weight", (2, 2), 0, 16)
-  result = gguf._tensor_from_info(raw, info, data_start=0)
-  assert result.shape == (2, 2)
-  assert result.tolist() == [[1.0, 2.0], [3.0, 4.0]]
-
-def test_tensor_from_info_f32_square():
-  raw = Tensor(b"\x00"*24 + struct.pack("<ffffff", 1.0, 2.0, 3.0, 4.0, 5.0, 6.0), dtype=dtypes.uint8, device="CPU")
-  info = ("test_weight", (2, 3), 0, 24)
-  result = gguf._tensor_from_info(raw, info, data_start=0)
-  assert result.shape == (3, 2)
-  assert result.tolist() == [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]
-
-def test_load_gguf_f32(tmp_path):
-  metadata = b"".join([
-    encode_string("general.alignment"),
-    struct.pack("<i", 4),
-    struct.pack("<I", 32),
-  ])
-
-  tensor_info = b"".join([
-    encode_string("test_weight"),
-    struct.pack("<I", 1),
-    struct.pack("<Q", 4),
-    struct.pack("<i", 0),
-    struct.pack("<Q", 0),
-  ])
-
-  header = b"".join([
-    b"GGUF",
-    struct.pack("<I", 3),
-    struct.pack("<Q", 1),
-    struct.pack("<Q", 1),
-  ])
-
-  data = header+metadata+tensor_info
-  data += b"\x00" * (gguf._round_up(len(data), 32) - len(data))
-  data += struct.pack("<ffff", 1.0, 2.0, 3.0, 4.0)
-  path = tmp_path / "test.gguf"
-  path.write_bytes(data)
-  metadata, tensors = gguf.load_gguf(path)
-
-  assert metadata == {"general.alignment": 32}
-  assert list(tensors) == ["test_weight"]
-  assert tensors["test_weight"].shape == (4,)
-  assert tensors["test_weight"].tolist() == [1.0, 2.0, 3.0, 4.0]
-
-def test_q_to_uint8_q4():
-  raw = Tensor([0x21], dtype=dtypes.uint8, device="CPU")
-  assert gguf._q_to_uint8(raw, 4).tolist() == [1, 2]
-
-def test_q4_values_unpack():
-  raw = Tensor([0x21, 0x43], dtype=dtypes.uint8, device="CPU")
-  values = gguf._q_to_uint8(raw, 4)
-  assert values.tolist() == [1, 3, 2, 4]
+@pytest.mark.skipif(not os.environ.get("INFURNACE_TEST_MODEL"), reason="set INFURNACE_TEST_MODEL to a local GGUF path")
+def test_local_model_samples_match_scalar_decode():
+  _, entries = gguf.parse_gguf(Path(os.environ["INFURNACE_TEST_MODEL"]))
+  sampled = set()
+  for entry in entries.values():
+    if entry.ggml_type not in (gguf.Q4_K, gguf.Q6_K) or entry.ggml_type in sampled: continue
+    sampled.add(entry.ggml_type)
+    size = BLOCK_BYTES[entry.ggml_type]
+    for offset in (0, entry.data.numel()//size//2*size, entry.data.numel()-size):  # sample blocks, not whole weights
+      packed = gguf.PackedTensor(entry.data[offset:offset+size], (256,), entry.ggml_type).to("CPU")
+      assert packed.decode().tolist() == pytest.approx(scalar_decode(bytes(packed.data.tolist()), entry.ggml_type), rel=1e-5, abs=1e-6)
+  assert sampled == {gguf.Q4_K, gguf.Q6_K}

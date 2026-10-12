@@ -4,8 +4,8 @@ import struct
 import pytest
 from tinygrad import Tensor, TinyJit, dtypes
 
-from infurnace.gguf import _dequant_q4_k
-from infurnace.kernels.quant_gemv import prepare_q4, quant_gemv
+from tinygrad.llm.gguf import ggml_data_to_tensor
+from infurnace.kernels.quant_gemv import dequant_prepared_q4, prepare_q4, quant_gemv
 from infurnace.kernels.quant_gemm import quant_gemm
 
 def data(rows, width):
@@ -30,8 +30,8 @@ def test_q4_swizzle_bytes_and_generic_decode(width):
       for word in range(36):
         physical = row*(width//256)*36+tile*144+(word//4)*live*4+within*4+word%4
         assert actual[physical] == expected[(row*(width//256)+block)*36+word]
-  decoded = _dequant_q4_k(packed.bitcast(dtypes.uint8), swizzled_width=width//256)
-  assert (decoded-_dequant_q4_k(native)).abs().max().item() == 0
+  decoded = dequant_prepared_q4(packed, in_features=width)
+  assert (decoded-ggml_data_to_tensor(native, native.numel()//144*256, 12).flatten()).abs().max().item() == 0
 
 @pytest.mark.nv
 @pytest.mark.parametrize('width', [1280, 2560, 9728])

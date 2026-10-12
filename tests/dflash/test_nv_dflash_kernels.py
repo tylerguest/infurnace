@@ -3,7 +3,7 @@ import struct
 import pytest
 from tinygrad import Context, Tensor, dtypes
 from infurnace.dflash.parallel import _decays, _unit_lower_inverse
-from infurnace.gguf import _dequant
+from tinygrad.llm.gguf import ggml_data_to_tensor as _dequant
 from infurnace.kernels.embedding import packed_gather
 from infurnace.kernels.gdn import gdn_chunk
 from infurnace.kernels.quant_gemv import prepare_q4, prepare_q6
