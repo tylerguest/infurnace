@@ -230,7 +230,7 @@ class ParallelVerifier:
       observer.close()
       raise
     observer.position, observer.next_decision = position, anchor
-    draft.length = position  # transient noise K/V never authorizes prefix reuse
+    draft.synced(position)  # rows up to position absorbed; noise K/V never authorizes reuse
     self.last_device_anchor = values[-1]
     return values[:self.rows], values[self.rows:2*self.rows-1]
 

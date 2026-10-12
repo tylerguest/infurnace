@@ -8,7 +8,6 @@ import collections
 from dataclasses import dataclass
 import os
 import time
-from tinygrad import Context
 from infurnace.dflash.target import TargetObserver
 
 
@@ -61,11 +60,12 @@ class DFlashGenerator:
     with self.observer as observer:
       self.stats = DFlashStats()
       self.draft.reset()
-      pending, emitted = [], 0
+      emitted = 0
+      # Every committed target row's features go to the draft as they are
+      # produced (draft.observe copies them into fixed-shape staging).
       def step(token):
-        decision, features = observer.step(token)
+        decision, _ = observer.step(token, snapshot=False, consume=self.draft.observe)
         self.stats.target_steps += 1
-        pending.append(features)
         return decision
       try:
         if self.verifier == 'parallel' and block > 1:
@@ -77,7 +77,7 @@ class DFlashGenerator:
             decisions, features = verifier.prefill(chunk)
             verifier.commit(len(chunk), decisions)
             self.stats.target_steps += 1
-            with Context(DEV=self.model.device): pending.append(features[:, :len(chunk)].contiguous().realize())
+            self.draft.observe(features[:, :len(chunk)])
             anchor, done = decisions[len(chunk) - 1], done + len(chunk)
           for token in tokens[done:]: anchor = step(token)
         else:
@@ -100,7 +100,7 @@ class DFlashGenerator:
           if held is None: return
           verifier = self._parallel_verifier(block)
           verifier.commit(held, held_decisions)
-          with Context(DEV=self.model.device): pending.append(_raw_features(verifier)[:, :held].contiguous().realize())
+          self.draft.observe(_raw_features(verifier)[:, :held])
           held = None
         def account(accepted):
           nonlocal spec_time, spec_tokens, timed_rounds, tau, probing, cooldown, backoff
@@ -150,12 +150,9 @@ class DFlashGenerator:
               continue
           flush()
           if count:
-            with Context(DEV=self.model.device):
-              features = pending[0].cat(*pending[1:], dim=1).contiguous().realize()
-            proposals = self.draft.propose(features, anchor, observer.position, count)
+            proposals = self.draft.propose(anchor, observer.position, count)
             if len(proposals) != count or any(type(t) is not int or not 0 <= t < self.model.config.vocab_size for t in proposals):
               raise ValueError('invalid DFlash proposals')
-            pending.clear()
           else: proposals = []
           self.stats.rounds += 1
           self.stats.proposed += len(proposals)

@@ -53,7 +53,11 @@ class TargetObserver:
       - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
     return decision, features[0].cat(*features[1:], dim=-1).contiguous()
 
-  def step(self, token: int):
+  def step(self, token: int, *, snapshot: bool = True, consume=None):
+    """One target row. `snapshot=False` returns features that alias capture scratch:
+    the caller must consume them before the next step. `consume(features)` runs
+    right after the step is submitted, before waiting for its decision, so its
+    host work overlaps the GPU."""
     if not self.active: raise RuntimeError('use TargetObserver inside its context manager')
     if self._block_active: raise RuntimeError('target has an active verification transaction')
     if type(token) is not int or not 0 <= token < self.model.config.vocab_size: raise ValueError('invalid target token')
@@ -66,7 +70,9 @@ class TargetObserver:
         Tensor.realize(decision, features)
         # JIT outputs alias capture scratch. Copy only executed storage before
         # another target row overwrites it; detach executed RNG/target graphs.
-        features = Tensor(features.uop.buf_uop).reshape(features.shape).clone().realize()
+        features = Tensor(features.uop.buf_uop).reshape(features.shape)
+        if snapshot: features = features.clone().realize()
+        if consume is not None: consume(features)
         decision = Tensor(decision.uop.buf_uop).reshape(decision.shape)
         selected = int(decision.item())
         # Detach the captured RNG update graph in place (buffer identity kept);

@@ -27,14 +27,21 @@ class RecordedDraft:
     self.target, self.device = model, model.device
     self.config = SimpleNamespace(feature_layers=(1,), block_size=4)
     self.prompt, self.expected, self.wrong = prompt, expected, wrong
-    self.observations = []
+    self.observations, self.rows = [], []
     self.resets = 0
 
   def reset(self):
     self.resets += 1
+    self.rows = []
 
-  def propose(self, features, anchor, position, count):
-    self.observations.append((position, anchor, features.tolist()))
+  def synced(self, position): self.rows = []
+
+  def observe(self, features):
+    self.rows += features.tolist()[0]  # read now: step features alias capture scratch
+
+  def propose(self, anchor, position, count):
+    self.observations.append((position, anchor, [self.rows]))
+    self.rows = []
     index = position - len(self.prompt)
     values = self.expected[index+1:index+1+count]
     if self.wrong: values = [(values[0]+1) % self.target.config.vocab_size] + values[1:]
@@ -107,19 +114,39 @@ def test_real_draft_determinism_and_transient_cache(tmp_path):
     model = tiny_target(tmp_path)
     draft = tiny_draft(model)
     features = Tensor.randn(1, 3, 8).realize()
+    more = Tensor.randn(1, 2, 8).realize()
     results = []
     for _ in range(3):
       draft.reset()
-      results.append(draft.propose(features, 2, 3, 3))
+      draft.observe(features)
+      results.append(draft.propose(2, 3, 3))
       assert draft.length == 3
-      more = Tensor.randn(1, 2, 8).realize()
-      assert len(draft.propose(more, 3, 5, 2)) == 2
+      draft.observe(more)
+      assert len(draft.propose(3, 5, 2)) == 2
     assert results[0] == results[1] == results[2]
-    with pytest.raises(ValueError): draft.propose(features, 2, 3, 3)
+    with pytest.raises(ValueError): draft.propose(2, 3, 3)  # position 3 is no longer the observed prefix
     draft.reset()
-    with pytest.raises(ValueError): draft.propose(features, 2, 2, 3)
-    with pytest.raises(ValueError): draft.propose(features, 2, 3, 4)
+    draft.observe(features)
+    with pytest.raises(ValueError): draft.propose(2, 2, 3)
+    with pytest.raises(ValueError): draft.propose(2, 3, 4)  # count must stay below the block size
 
+
+
+def test_observing_rows_in_pieces_matches_one_observation(tmp_path):
+  # Staging splits rows at chunk boundaries; any split must absorb identically.
+  with Context(DEV='CPU'):
+    model = tiny_target(tmp_path)
+    draft = tiny_draft(model)
+    rows = Tensor.randn(1, 11, 8).realize()  # crosses two 4-row chunks
+    draft.observe(rows)
+    whole = draft.propose(5, 11, 3)
+    for pieces in ([1] * 11, [3, 1, 6, 1], [4, 4, 3], [7, 4]):
+      draft.reset()
+      start = 0
+      for n in pieces:
+        draft.observe(rows[:, start:start + n].contiguous().realize())
+        start += n
+      assert draft.observed == 11 and draft.propose(5, 11, 3) == whole
 
 def test_real_tiny_draft_verified_output(tmp_path, verifier='sequential'):
   with Context(DEV='CPU'):

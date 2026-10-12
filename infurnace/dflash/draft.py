@@ -105,6 +105,10 @@ class DFlashDraft:
     self.config, self.target, self.device = config, target, target.device
     self.capacity = target.config.context_length
     self.length = 0
+    # Target feature rows observed so far (positions 0..observed-1). The last
+    # `_staged` of them sit in the 16-row staging buffer; earlier rows are in
+    # the draft K/V cache.
+    self.observed = self._staged = 0
     self._jits = {}
     with Context(DEV=self.device):
       self.weights = DraftWeights(config)
@@ -123,7 +127,10 @@ class DFlashDraft:
       self._start = UOp.variable('dflash_context_start', 0, self.capacity - 1)
       self._absorb_jit = TinyJit(self._absorb)
       self._noise_inputs: dict[int, Tensor] = {}
+      # Fixed-shape staging for observed rows; stores use a variable offset, so
+      # only the row count (1..block) selects a kernel, never the history shape.
       self._context = Tensor.empty(1, config.block_size, config.dim * len(config.feature_layers), device=self.device).realize()
+      self._offset = UOp.variable('dflash_stage_offset', 0, config.block_size - 1)
 
   @classmethod
   def from_gguf(cls, path: str | Path, target: Qwen35Model, *, packed: bool = True, legacy_noncausal: bool = False):
@@ -160,7 +167,35 @@ class DFlashDraft:
   def reset(self):
     # Old noise/cache rows are masked. Each reused prefix is overwritten by
     # actual target context before it is authorized again.
-    self.length = 0
+    self.length = self.observed = self._staged = 0
+
+  def synced(self, position: int):
+    """Rows up to `position` were absorbed outside `observe` (fused rounds)."""
+    self.length = self.observed = position
+    self._staged = 0
+
+  def observe(self, features: Tensor):
+    """Absorb target feature rows (1, rows, width) for the next positions.
+
+    Rows are copied into the staging buffer before returning, so the caller may
+    overwrite `features` afterwards (e.g. the next captured target step)."""
+    c = self.config
+    width = c.dim * len(c.feature_layers)
+    if len(features.shape) != 3 or features.shape[0] != 1 or features.shape[2] != width or features.device != self.device:
+      raise ValueError('invalid DFlash target feature shape')
+    rows, chunk = features.shape[1], c.block_size
+    if not 0 < rows or self.observed + rows > self.capacity: raise ValueError('DFlash observation exceeds the context')
+    with Context(DEV=self.device):
+      done = 0
+      while done < rows:
+        take = min(chunk - self._staged, rows - done)
+        offset = self._offset.bind(self._staged)
+        part = features[:, done:done + take].float()
+        Tensor(self._context.uop.after(self._context[:, offset:offset + take].uop.store(part.uop))).realize()
+        self._staged, self.observed, done = self._staged + take, self.observed + take, done + take
+        if self._staged == chunk:
+          self._absorb_jit(self._context, self._start.bind(self.observed - chunk))
+          self._staged = 0
 
   def _absorb(self, features: Tensor, start: UOp):
     # Fixed-width context chunk: write draft K/V for observed target rows.
@@ -215,31 +250,19 @@ class DFlashDraft:
     logits = projection(self.target.transformer.output, self._denoise(noise, position))
     return logits.argmax(-1).contiguous()
 
-  def propose(self, features: Tensor, anchor: int, position: int, count: int) -> list[int]:
+  def propose(self, anchor: int, position: int, count: int) -> list[int]:
+    """Draft `count` tokens after `anchor` at `position`; every target row
+    before `position` must have been observed."""
     c = self.config
     if type(count) is not int or not 0 <= count < c.block_size: raise ValueError('invalid DFlash proposal count')
     if type(anchor) is not int or not 0 <= anchor < self.target.config.vocab_size: raise ValueError('invalid DFlash anchor')
-    width = c.dim * len(c.feature_layers)
-    if features.shape[:1] != (1,) or len(features.shape) != 3 or features.shape[2] != width:
-      raise ValueError('invalid DFlash target feature shape')
-    ctx_rows = features.shape[1]
-    if type(position) is not int or position - ctx_rows != self.length or position + count + 1 > self.capacity:
-      raise ValueError('DFlash observation must extend the committed prefix and leave space for the noise block')
-    if ctx_rows <= 0 or features.device != self.device or features.dtype not in dtypes.floats:
-      raise ValueError('invalid DFlash feature dtype/device/rows')
+    if type(position) is not int or position != self.observed or position <= 0 or position + count + 1 > self.capacity:
+      raise ValueError('DFlash proposal must follow the observed prefix and leave space for the noise block')
     if count == 0: return []
-    chunk = c.block_size
     with Context(DEV=self.device):
-      # Context is absorbed in fixed-width chunks so neither capture depends on
-      # prompt length or accepted-row count.
-      start = position - ctx_rows
-      for offset in range(0, ctx_rows, chunk):
-        rows = min(chunk, ctx_rows - offset)
-        # Copy into one owned input buffer: a realized slice can be a view with
-        # an offset, which a captured JIT input cannot follow.
-        part = features[:, offset:offset + rows].float().pad(((0, 0), (0, chunk - rows), (0, 0)))
-        Tensor(self._context.uop.after(self._context.uop.store(part.uop))).realize()
-        self._absorb_jit(self._context, self._start.bind(start + offset))
+      # A partial chunk is absorbed padded; its padding rows land where later
+      # context or this noise block overwrites them, or stay masked.
+      if self._staged: self._absorb_jit(self._context, self._start.bind(self.observed - self._staged))
       # A persistent input buffer per noise shape: captured graphs always see
       # the same input addresses.
       if count not in self._noise_inputs:
