@@ -70,7 +70,7 @@ def test_request_switches_thinking():
     thread.start()
     def rendered(**extra):
       conn = http.client.HTTPConnection(*server.server_address)
-      conn.request('POST', '/v1/chat/completions', json.dumps({'model': 'test', 'messages': [{'role': 'user', 'content': 'hi'}], **extra}))
+      conn.request('POST', '/v1/chat/completions', json.dumps({'model': 'test', 'messages': [{'role': 'user', 'content': 'hi'}]} | extra))
       assert conn.getresponse().status == 200
       conn.close()
       return tok.rendered
@@ -81,6 +81,8 @@ def test_request_switches_thinking():
       assert rendered(enable_thinking=False) == 'plain'
       template.enable_thinking = False
       assert rendered(chat_template_kwargs={'enable_thinking': True}) == 'think'
+      template.template = template.template.environment.from_string('{% for m in messages %}{{ m.role }}{% endfor %}')
+      assert rendered(messages=[{'role': 'developer', 'content': 'be brief'}, {'role': 'user', 'content': 'hi'}]) == 'systemuser'
     finally:
       server.shutdown()
       thread.join()

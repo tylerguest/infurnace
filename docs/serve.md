@@ -47,7 +47,8 @@ Merge into `~/.pi/agent/models.json`:
         "name": "Infurnace Qwen3.5",
         "input": ["text"],
         "reasoning": true,
-        "compat": {"thinkingFormat": "qwen-chat-template"},
+        "compat": {"thinkingFormat": "qwen-chat-template", "supportsDeveloperRole": false,
+                   "supportsReasoningEffort": false},
         "contextWindow": 16384,
         "maxTokens": 4096,
         "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}
@@ -61,7 +62,8 @@ Match `contextWindow` to the server's `--max-context`. The server accepts any
 model ID as a label. With `reasoning: true` and the `qwen-chat-template`
 format, Pi's thinking toggle sends `chat_template_kwargs.enable_thinking`, which
 the server honors per request. With `reasoning: false`, Pi sends nothing and the
-server's default applies.
+server's default applies. `supportsDeveloperRole: false` keeps Pi from sending its system prompt
+as a `developer` message to a reasoning model (the server maps `developer` to `system` anyway).
 
 Measured on an RTX 5060 8 GB (`--max-context 16384`, Pi print mode, read/edit
 tools, thinking on). Agent turns after the first reuse the prompt snapshot and

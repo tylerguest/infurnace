@@ -47,9 +47,11 @@ class ChatTemplate:
     self.enable_thinking = enable_thinking
     self.request_thinking: bool | None = None  # the current request's switch, if it sent one
 
-  def render(self, **kwargs):
+  def render(self, messages, **kwargs):
+    # OpenAI clients send the system prompt as `developer` to reasoning models; Qwen's template only knows `system`.
+    messages = [{**m, 'role': 'system'} if isinstance(m, dict) and m.get('role') == 'developer' else m for m in messages]
     thinking = self.enable_thinking if self.request_thinking is None else self.request_thinking
-    return self.template.render(**kwargs, enable_thinking=thinking)
+    return self.template.render(messages=messages, **kwargs, enable_thinking=thinking)
 
 def request_thinking(body) -> bool | None:
   """A request's thinking switch: `chat_template_kwargs.enable_thinking` (vLLM and sglang's convention,
