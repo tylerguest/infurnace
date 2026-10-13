@@ -73,16 +73,20 @@ def test_unfused_path_matches_plain_decoding_prefix(loaded):
   model, tokenizer, generator = loaded
   ids = prompt(tokenizer, 'Write a Python function that returns the n-th Fibonacci number.')
   plain = list(model.generate(list(ids), 48, reuse_cache=False))
-  for _ in range(3):
-    assert list(configure(generator, fused=False).stream(list(ids), max_new_tokens=48, block_size=16)) == plain
+  runs = [list(configure(generator, fused=False).stream(list(ids), max_new_tokens=48, block_size=16)) for _ in range(3)]
+  assert runs[0] == runs[1] == runs[2]  # repeatable
+  # Multirow and one-row kernels reduce in different orders: at token 28 plain decoding's own
+  # logits put "\n\n" and "\n" 0.08 apart, so compare the prefix before that near-tie.
+  assert runs[0][:28] == plain[:28]
 
 def test_timing_fallback_matches_plain_decoding_prefix(loaded):
   # Losing rounds flush the held block and decode plain rows; probes re-enter
   # the parallel path. Multirow and one-row kernels reduce in different orders,
-  # so compare with plain decoding over a prefix before any near-tie.
+  # so compare with plain decoding over a prefix before any near-tie: at token 17 this prompt
+  # has " new" vs " unique" 0.05 logits apart in plain decoding's own logits.
   model, tokenizer, generator = loaded
   ids = prompt(tokenizer, 'What are the pros and cons of remote work?')
   plain = list(model.generate(list(ids), 32, reuse_cache=False))
   got = list(configure(generator, plain_cost=0.0).stream(list(ids), max_new_tokens=32, block_size=16))
-  assert got == plain
+  assert got[:16] == plain[:16]
   assert generator.stats.proposed < generator.stats.rounds * 15  # most rounds were plain steps

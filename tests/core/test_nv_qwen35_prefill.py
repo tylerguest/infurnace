@@ -48,8 +48,9 @@ def test_multirow_logits_match_one_row(loaded):
 
 def test_multirow_prompt_matches_one_row_prompt(loaded):
   model, tokenizer = loaded
-  # Several full 16-row chunks plus a partial one, through generate; a prompt without a near-tie.
-  tokens = ids(tokenizer, 'Write a Python function that checks whether a string is a palindrome, ignoring case and punctuation, and explain it.')
+  # Several full 16-row chunks plus a partial one, through generate, on a prompt without a near-tie
+  # in these tokens (the palindrome prompt's first token is a 0.006-logit tie, "Here" vs "```").
+  tokens = ids(tokenizer, 'Explain how a refrigerator keeps food cold, in simple terms suitable for a ten year old child, using an analogy.')
   assert len(tokens) > 2 * 16 and (len(tokens) - 1) % 16
   assert run(model, tokens) == run(model, tokens, multirow=False)
 

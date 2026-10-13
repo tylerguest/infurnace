@@ -19,9 +19,10 @@ from tinygrad import Context, Tensor, UOp, dtypes
 from tinygrad.device import Buffer
 import tinygrad.llm.model as upstream_model
 from tinygrad.llm.gguf import ggml_data_to_tensor
-from tinygrad.llm.model import GatedDeltaNetBlock, Transformer
+from tinygrad.llm.model import GatedDeltaNetBlock, Transformer, TransformerBlock, apply_rope
 from tinygrad.nn.state import get_state_dict
 from infurnace.gguf import parse_gguf, read_gguf_metadata
+from infurnace.kernels.attention import attention
 from infurnace.kernels.gdn import gdn_decode, gdn_prefill
 from infurnace.kernels.quant_gemm import nv_prefill_supported
 from infurnace.models.linear import _NVLinear
@@ -177,6 +178,31 @@ def _fused_gdn(block: GatedDeltaNetBlock):
                    block.ssm_norm.eps, kheads=block.num_k_heads)
     return block.ssm_out(z.reshape(1, 1, H * V))
   return attention
+
+def _fused_attention(block: TransformerBlock):
+  """Upstream TransformerBlock._attention for one-row decoding, with the attention itself in
+  kernels/attention.py: upstream's attention over a runtime length slows as the conversation grows
+  (it swaps in its own kernel only on AMD, at this same spot). Other shapes use upstream's path."""
+  upstream_attention, c = block._attention, block.config
+  def attention_step(x: Tensor, start_pos):
+    B, T, _ = x.shape
+    if B != 1 or isinstance(T, UOp) or T != 1: return upstream_attention(x, start_pos)
+    q, k, v = block.attn_q(x), block.attn_k(x), block.attn_v(x)
+    if c.qk_norm and c.qk_norm != c.head_dim: q, k = block.attn_q_norm(q), block.attn_k_norm(k)
+    if c.attn_output_gate:
+      qg = q.reshape(B, T, c.n_heads, 2, c.head_dim)
+      q, gate = qg[:, :, :, 0, :], qg[:, :, :, 1, :].reshape(B, T, c.n_heads * c.head_dim)
+    q = q.reshape(B, T, c.n_heads, c.head_dim).transpose(1, 2)
+    k = k.reshape(B, T, c.n_kv_heads, c.head_dim).transpose(1, 2)
+    v = v.reshape(B, T, c.n_kv_heads, c.head_dim).transpose(1, 2)
+    if c.qk_norm == c.head_dim: q, k = block.attn_q_norm(q), block.attn_k_norm(k)
+    q = apply_rope(q[..., :c.rope_dim], block.freqs_cis[start_pos:start_pos + T]).cat(q[..., c.rope_dim:], dim=-1)
+    k = apply_rope(k[..., :c.rope_dim], block.freqs_cis[start_pos:start_pos + T]).cat(k[..., c.rope_dim:], dim=-1)
+    store = block.cache_kv[:, :, :, start_pos:start_pos + T, :].uop.store(Tensor.stack(k, v).cast(block.cache_kv.dtype).uop)
+    attn = attention(q, Tensor(block.cache_kv.uop.after(store)), start_pos, segment=32)  # one row: smaller segments, more blocks
+    attn = attn.cast(q.dtype).transpose(1, 2).reshape(B, T, -1)
+    return block.attn_output(attn * gate.sigmoid() if c.attn_output_gate else attn)
+  return attention_step
 
 @contextlib.contextmanager
 def _lazy_upstream_weights(path):
@@ -363,6 +389,11 @@ class Qwen35Model:
     result = cls(transformer, metadata, device)
     result._path = Path(path)
     result._enable_packed(path, nv_prefill_supported(device) if nv_prefill is None else nv_prefill)
+    if os.environ.get('INFURNACE_FUSED_ATTENTION', '1') != '0':
+      for block in transformer.blk:
+        if (type(block) is TransformerBlock and not block.config.sliding_window and not hasattr(block, 'attn_sinks')
+            and block.config.head_dim % 32 == 0):
+          block._attention = _fused_attention(block)
     gdn = [block for block in transformer.blk if isinstance(block, GatedDeltaNetBlock)]
     fused = [block for block in gdn if getattr(block, 'ssm_g_a', None) is None and block.head_k_dim == 128 and block.head_v_dim == 128]
     if os.environ.get('INFURNACE_FUSED_GDN', '1') != '0':
