@@ -18,7 +18,7 @@ needs attribution, and vendored parts (e.g. its `vendor/fla`) need their own lic
 | 3 | Shared activation quantization / bundled projections | `modules/gated_delta_net.py` (sliced qkv+z bundle) | Kernel supports a shared `q8`; Qwen3.5 never passes it | **Adopt first: cheap** |
 | 4 | Attention over the active length, split by SM count | `modules/attention_fn/bc_attn.py` | **Done** (`kernels/attention.py`, after vLLM's unified attention) | Split sizes left, under #1 |
 | 5 | Bounded multirow recurrent prefill | `modules/gated_delta_net_fn/gated_delta_rule.py` | **Done** (`gdn_prefill`, 16-row chunks) | Only chunk size left, under #1 |
-| 6 | Paired target/draft state for prompt reuse | `cache/recurrent.py` (`PairedState`) | DFlash re-prefills every turn | Adopt later, minimal version |
+| 6 | Paired target/draft state for prompt reuse | `cache/recurrent.py` (`PairedState`) | **Done** (prompt snapshots, after llama.cpp / Ollama) | — |
 | 7 | Confidence-calibrated draft windows | `generator/draft_confidence.py` | `_DraftPolicy` decides by wall time | Defer: fixed-width verify makes it pointless |
 
 ## 1. Measured, cached per-GPU kernel tuning
@@ -127,23 +127,17 @@ by construction; ExLlamaV3's sub-range limit addresses a problem infurnace doesn
 **Left.** The chunk size (16) is a tunable for #1. Larger chunks would need the kernel extended
 beyond its 16-row specialization.
 
-## 6. Paired target/draft state for prompt reuse
+## 6. Paired target/draft state for prompt reuse (done)
 
 **ExLlamaV3.** `cache/recurrent.py` defines `PairedState`: one sequence's recurrent state across
-the target and the draft, restored or evicted together. Verification advances only the target
-side; a DFlash-family drafter's side is advanced by the rows it writes.
+the target and the draft, restored or evicted together, checkpointed every 2,048 tokens of output
+and the prompt's tail (32,768 during prompt reading) into a host-memory pool.
 
-**infurnace.** `TargetObserver.__enter__` (`dflash/target.py`) resets the position and cached
-tokens every request, so DFlash chat re-prefills the whole conversation each turn (plan item 3).
-
-**Plan.** One reusable committed endpoint, not an LRU cache:
-- associate an exact token prefix with the target's recurrent/conv state, KV validity and the
-  draft's absorbed features/cache;
-- resume only when every component agrees;
-- invalidate on divergence, context rollover, reset or changed settings.
-
-**Measure.** Second-turn time to first token, and correctness after interrupted generation or
-partial acceptance.
+**Done (2026-10-12)** as one snapshot per conversation, the smallest version of what llama.cpp's
+server and Ollama's MLX runner do: saved just before the prompt's last turn header (both of them
+checkpoint a few tokens before the prompt's end), target recurrent/conv state plus the DFlash
+draft's position and staging buffer, restored when the next prompt still matches. Turns 2+ of a
+3k-token chat start in ~0.6 s instead of ~6 s (DFlash). Details in `docs/gpu-poor-plan.md` item 3.
 
 ## 7. Confidence-calibrated draft windows (defer)
 
@@ -181,7 +175,7 @@ block, so this only becomes useful with several verify widths (which #1 could tu
 3. **Tuning tables and script, SM-derived defaults** (#1 + #2): replace hand constants (GEMV warps,
    GEMM tiles/splits, prefill chunk) with measured per-GPU values.
 4. ~~**Active-length DFlash attention** (#4), then raise the default context.~~ Done 2026-10-12.
-5. **Paired prompt-state reuse for DFlash chat** (#6).
+5. ~~**Paired prompt-state reuse for DFlash chat** (#6).~~ Done 2026-10-12.
 6. **Confidence windows** (#7), only once verification has cheaper narrow widths.
 
 Each change needs a correctness check (logits or tokens), an end-to-end speed gain, and a memory

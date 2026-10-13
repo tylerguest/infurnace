@@ -144,21 +144,33 @@ class DFlashGenerator:
     return decision
 
   def _prefill(self, tokens: list[int], block: int) -> int:
-    """Run the prompt through the target; returns its decision for the first output."""
+    """Run the prompt through the target; returns its decision for the first output. Resumes from
+    the model's prompt snapshot when the prompt still matches it (restoring the draft with it), and
+    saves a new one before the prompt's last turn header (see Qwen35Model.save_snapshot)."""
+    done = self.model.restore_snapshot(tokens, 0, draft=self.draft)
+    self.observer.position = done
+    point = self.model.snapshot_point(tokens, done)
+    for stop in ([point] if point is not None else []) + [len(tokens)]:
+      anchor = self._read(tokens, done, stop, block)
+      if stop == point: self.model.save_snapshot(tokens[:point], draft=self.draft)
+      done = stop
+    return anchor
+
+  def _read(self, tokens: list[int], first: int, last: int, block: int) -> int | None:
+    """Prompt rows first..last-1; returns the decision after the last one."""
+    anchor, done = None, first
     if self.verifier == 'parallel' and block > 1:
       # Multirow prompt prefill in fixed-width chunks; the tail falls back
       # to one-row steps only when a chunk would overrun the context.
-      verifier, done = self._parallel_verifier(block), 0
-      while done < len(tokens) and verifier.fits(self.observer.position):
-        chunk = tokens[done:done + verifier.rows]
+      verifier = self._parallel_verifier(block)
+      while done < last and verifier.fits(self.observer.position):
+        chunk = tokens[done:min(done + verifier.rows, last)]
         decisions, features = verifier.prefill(chunk)
         verifier.commit(len(chunk), decisions)
         self.stats.target_steps += 1
         self.draft.observe(features[:, :len(chunk)])
         anchor, done = decisions[len(chunk) - 1], done + len(chunk)
-      for token in tokens[done:]: anchor = self._step(token)
-    else:
-      for token in tokens: anchor = self._step(token)
+    for token in tokens[done:last]: anchor = self._step(token)
     return anchor
 
   def _flush(self, block: int):
@@ -254,6 +266,7 @@ class DFlashGenerator:
     finally:
       self.min_tau, self.plain_cost = saved
       self.stats = DFlashStats()
+      self.model.reset()  # no warmup prompt becomes a reusable prefix or snapshot
 
   def _parallel_verifier(self, block):
     from infurnace.dflash.parallel import ParallelVerifier

@@ -84,20 +84,35 @@ message arrives first. `--serve` still warms up before it listens.
 
 ## 3. DFlash chat re-reads the whole conversation every turn
 
-- [ ] Save the recurrent state after each prompt prefill and reuse it on the next turn
+- [x] Save the recurrent state after each prompt prefill and reuse it on the next turn
 
-**Problem.** `TargetObserver.__enter__` (`dflash/target.py`) clears `_cached_tokens` and resets
-the position to 0, so every chat turn re-prefills the entire history. Replies get slower to start
-as the conversation grows.
+**Problem.** Recurrent (GDN) state can't be rewound, so every chat turn read the whole conversation
+again: DFlash reset to position 0 on every request, and plain decoding reused its cache only when a
+new prompt extended the previous one exactly, which the chat template breaks whenever thinking is on
+(earlier replies are re-rendered without their thinking).
 
-**Fix.** The hard part is the GDN recurrent state, which can't be rewound to an earlier position.
-It's small: 24 GDN layers × 32 heads × 128×128 × 4 bytes ≈ **48 MB**. Save it, plus the conv
-state and draft state, at the end of each prompt prefill. On the next turn, if the new prompt
-extends the saved one, restore it and prefill only the new tokens. The chat template drops
-earlier assistant reasoning, so the reusable prefix ends where the last reply starts.
+**Done: prompt snapshots** (`Qwen35Model.save_snapshot` / `restore_snapshot`), the way llama.cpp's
+server (`--ctx-checkpoints`) and Ollama's MLX runner keep them:
+- One snapshot per conversation, taken just before the prompt's last turn header (`<|im_start|>`;
+  4 tokens from the end for a raw prompt). The next turn re-renders the previous reply without its
+  thinking, so its prompt diverges right after that point.
+- It holds the prompt tokens up to the point, copies of every GDN layer's recurrent and conv state
+  (~48 MB), and for DFlash the draft's position and 16-row staging buffer. Attention KV caches need no
+  copy: they are indexed by position, and later tokens only overwrite what follows the point.
+- A request whose prompt still matches restores it and reads only the rest; one that would overwrite
+  positions the snapshot relies on drops it. DFlash only uses snapshots its own draft saved.
 
-**Check.** Time to first token on turn 5 of a chat, before and after. Output must equal a fresh
-run on the same full prompt.
+Measured on the RTX 5060, three-turn chat, thinking on, ~3.1k-token first message:
+
+| Time to first token | Turn 1 | Turn 2 | Turn 3 |
+|---|---|---|---|
+| DFlash, from scratch (before) | 5.8 s | 6.0 s | 6.4 s |
+| DFlash, with snapshot | 5.8 s | **0.62 s** | **0.56 s** |
+| Plain, from scratch (before) | 9.0 s | 9.8 s | 10.7 s |
+| Plain, with snapshot | 8.9 s | **0.95 s** | **1.0 s** |
+
+Replies identical either way. Tests: `tests/dflash/test_prompt_snapshot.py` (CPU: resume point, output
+equal to reading from scratch, divergence drops the snapshot, DFlash with its draft).
 
 ## 4. Small default context, and DFlash cost grows with it
 

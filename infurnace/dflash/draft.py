@@ -171,6 +171,17 @@ class DFlashDraft:
     # actual target context before it is authorized again.
     self.length = self.observed = self._staged = 0
 
+  def save_state(self):
+    """What restores this draft to its current prompt position: the position and the staged target
+    rows not yet absorbed. Its K/V cache needs no copy: rows before the position stay valid in place."""
+    with Context(DEV=self.device): context = self._context.clone().realize()
+    return self.observed, self._staged, context
+
+  def load_state(self, state):
+    observed, staged, context = state
+    with Context(DEV=self.device): Tensor(self._context.uop.after(self._context.uop.store(context.uop))).realize()
+    self.length, self.observed, self._staged = observed, observed, staged
+
   def synced(self, position: int):
     """Rows up to `position` were absorbed outside `observe` (fused rounds)."""
     self.length = self.observed = position

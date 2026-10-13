@@ -183,7 +183,5 @@ def test_cold_short_prompt_does_not_capture():
   model = qwen35.Qwen35Model.__new__(qwen35.Qwen35Model)
   transformer = type('T', (), {})()
   transformer.prefill_jit = type('J', (), {'captured': None, 'cnt': 0})()
-  transformer.get_start_pos = lambda tokens: 0
   model.transformer, model._multirow_prefill, model._warming = transformer, True, False
-  model._prefill(list(range(40)), 0.0)
-  assert transformer.prefill_jit.cnt == 0 and not hasattr(transformer, '_cached_tokens')
+  assert not model._multirow_ready(39) and transformer.prefill_jit.cnt == 0

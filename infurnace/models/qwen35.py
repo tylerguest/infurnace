@@ -242,6 +242,9 @@ class Qwen35Model:
     self._tied_head = False  # the packed output head is the token embedding table
     self._multirow_prefill = False  # prompts go through the fused 16-row GDN kernel (see _prefill)
     self._warming = False
+    # One saved prompt state for the next turn (see save_snapshot); turn_token marks where turns start.
+    self.turn_token: int | None = None
+    self._snapshot, self._snapshot_buffers = None, None
 
   def warmup(self) -> None:
     """Prime upstream prefill/decode JIT using the same chunk size as normal generation."""
@@ -279,6 +282,49 @@ class Qwen35Model:
     """Invalidate prefix reuse without reallocating tinygrad's cache or JIT."""
     if self._generating: raise RuntimeError("cannot reset during generation")
     self.transformer._cached_tokens = []
+    self._snapshot = None
+
+  # Prompt snapshots, as llama.cpp's server and Ollama's MLX runner keep them. Recurrent state can't
+  # be rewound, so a new prompt that shares only part of the last one would be read from scratch.
+  # Instead the recurrent and conv states (and a DFlash draft's position) are saved at one point of
+  # each prompt, just before its final turn header: the next chat turn re-renders the previous reply
+  # without its thinking, so its prompt diverges right after that point. The attention KV caches need
+  # no copy: they are indexed by position, and later tokens only overwrite what follows the point.
+
+  def _recurrent_states(self) -> list[Tensor]:
+    return [Tensor(getattr(block, name).uop.buf_uop).reshape(getattr(block, name).shape)
+            for block in self.transformer.blk if isinstance(block, GatedDeltaNetBlock) for name in ('conv_state', 'recurrent_state')]
+
+  def snapshot_point(self, tokens: list[int], start: int) -> int | None:
+    """Where to save this prompt's state: before its last turn header, else 4 tokens from the end
+    (a raw prompt). None when the state there is already gone (start is past it)."""
+    marks = [i for i, token in enumerate(tokens) if token == self.turn_token] if self.turn_token is not None else []
+    point = marks[-1] if marks else len(tokens) - 4
+    return point if 0 < point < len(tokens) and point >= start else None
+
+  def save_snapshot(self, prefix: list[int], draft=None) -> None:
+    """Save the current state as the state after `prefix` (and the draft's, if it read the same rows)."""
+    if self._snapshot is not None and self._snapshot[0] == prefix and self._snapshot[1] is draft: return
+    with Context(DEV=self.device):
+      live = self._recurrent_states()
+      if self._snapshot_buffers is None: self._snapshot_buffers = [state.clone().realize() for state in live]
+      else: Tensor.realize(*(Tensor(copy.uop.after(copy.uop.store(state.uop))) for copy, state in zip(self._snapshot_buffers, live)))
+    self._snapshot = (list(prefix), draft, None if draft is None else draft.save_state())
+
+  def restore_snapshot(self, tokens: list[int], start: int, draft=None) -> int:
+    """The position to resume `tokens` from: the snapshot's, after restoring it, when the prompt still
+    matches it and that beats `start`. A request that will overwrite positions the snapshot relies on
+    (starting before it without restoring) drops it."""
+    if self._snapshot is None: return start
+    prefix, owner, draft_state = self._snapshot
+    if (len(prefix) > start and len(tokens) > len(prefix) and tokens[:len(prefix)] == prefix
+        and (draft is None or owner is draft)):
+      with Context(DEV=self.device):
+        Tensor.realize(*(Tensor(state.uop.after(state.uop.store(copy.uop))) for state, copy in zip(self._recurrent_states(), self._snapshot_buffers)))
+      if draft is not None: draft.load_state(draft_state)
+      return len(prefix)
+    if start < len(prefix): self._snapshot = None
+    return start
 
   def generate(self, tokens: list[int], max_new_tokens: int, temperature: float = 0.0, *,
                chunk_size: int = 32, reuse_cache: bool = True) -> Iterator[int]:
@@ -311,30 +357,51 @@ class Qwen35Model:
       if stream is not None: stream.close()
       self._generating = False
 
-  def _prefill(self, tokens: list[int], temperature: float):
-    """Upstream prefills hybrid models one row per step except on AMD (its scan is a row-by-row
-    loop elsewhere). With the fused GDN kernels, run all but the last prompt token through
-    upstream's own forward in 16-row chunks, then record them as the cached prefix: upstream's
-    generate resumes there and processes the last token as an ordinary one-row step."""
+  def _multirow_ready(self, rows: int) -> bool:
+    """Whether to read `rows` prompt tokens 16 at a time (capturing that graph if needed)."""
     t = self.transformer
-    start, end = t.get_start_pos(tokens), len(tokens) - 1
-    if not self._multirow_prefill or end <= start: return
+    if not self._multirow_prefill or rows <= 0: return False
     if t.prefill_jit.captured is None:
       # Not captured yet: worth it during warmup or for a long prompt, otherwise upstream reads
       # this prompt one row at a time (a short cold `--prompt` would wait ~19 s to save ~0.2 s).
-      if not (self._warming or end - start >= PREFILL_CAPTURE_TOKENS): return
+      if not (self._warming or rows >= PREFILL_CAPTURE_TOKENS): return False
       # Skip TinyJit's eager first call and capture right away: with every state buffer already
       # real, the eager call has nothing left to set up.
       self.realize_state()
       t.prefill_jit.cnt = 1
+    return True
+
+  def _prefill(self, tokens: list[int], temperature: float):
+    """Read the prompt up to its last token, then record it as the cached prefix: upstream's generate
+    resumes there and processes the last token as an ordinary one-row step.
+
+    Resumes from the prompt snapshot when the prompt still matches it, and saves a new one on the way.
+    Upstream prefills hybrid models one row per step except on AMD (its scan is a row-by-row loop
+    elsewhere); with the fused GDN kernels, rows go 16 at a time through upstream's own forward."""
+    t = self.transformer
+    end = len(tokens) - 1
+    start = self.restore_snapshot(tokens, t.get_start_pos(tokens))
+    point = self.snapshot_point(tokens, start)
+    multirow = self._multirow_ready(end - start)
     v_start = UOp.variable('start_pos', 0, t.max_context - 1)
-    v_rows = UOp.variable('toks', 1, PREFILL_ROWS)
     ids = Tensor(tokens + [0] * (t.max_context - len(tokens)), dtype='int32').reshape(1, t.max_context)
     temp = Tensor([temperature])
-    for position in range(start, end, PREFILL_ROWS):
-      sp, rows = v_start.bind(position), v_rows.bind(min(PREFILL_ROWS, end - position))
-      t(ids[:, sp:sp + rows], sp, temp).realize()
-    t._cached_tokens = tokens[:end]
+    def read(first: int, last: int):
+      # Same graphs as upstream: 16-row chunks through prefill_jit, or one-row steps through
+      # rollout_jit with upstream's own one-row `toks` variable.
+      size = PREFILL_ROWS if multirow else 1
+      v_rows = UOp.variable('toks', 1, size)
+      for position in range(first, last, size):
+        sp, rows = v_start.bind(position), v_rows.bind(min(size, last - position))
+        t(ids[:, sp:sp + rows], sp, temp).realize()
+    if point is not None:
+      read(start, point)
+      self.save_snapshot(tokens[:point])
+      start = point
+    if multirow and end > start:
+      read(start, end)
+      start = end
+    t._cached_tokens = tokens[:start]
 
   def embed(self, tokens: list[int]) -> Tensor:
     """Embedding rows as a (1, len(tokens), dim) float tensor on the model device.

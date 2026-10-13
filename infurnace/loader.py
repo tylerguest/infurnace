@@ -62,7 +62,10 @@ def load_model(path: str | Path, max_context: int, device: str | None = None, nv
   prefill = packed and nv_prefill_supported(device) if nv_prefill is None else nv_prefill
   if prefill and not nv_prefill_supported(device): raise ValueError("NV prefill requires CUDA-C FP16 tensor cores")
   tokenizer = Qwen35Tokenizer.from_gguf(metadata)
-  return Qwen35Model.from_gguf(path, max_context=max_context, device=device, nv_quant=packed, nv_prefill=prefill), tokenizer
+  model = Qwen35Model.from_gguf(path, max_context=max_context, device=device, nv_quant=packed, nv_prefill=prefill)
+  # Prompt snapshots go just before the last turn header (see Qwen35Model.save_snapshot).
+  if (backend := getattr(tokenizer, "_backend", None)) is not None: model.turn_token = backend._special_tokens.get("<|im_start|>")
+  return model, tokenizer
 
 def load_dflash(model, draft_path: str | Path):
   """Parallel multirow verification on NV, else the sequential CPU reference."""
