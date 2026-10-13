@@ -1,20 +1,28 @@
-"""Single-user HTTP serving using tinygrad's OpenAI-compatible server."""
+"""Single-user HTTP serving on tinygrad's OpenAI-compatible server, with DFlash and per-request thinking."""
+import io
 import json
 import time
 
-from tinygrad.llm.serve import LLMServer
+from tinygrad.llm.serve import Handler, LLMServer
+from tinygrad.viz.serve import TCPServerWithReuse
 
 class ServerModel:
-  """Preserve Infurnace's device contexts and bounded generation lifecycle."""
-  def __init__(self, model):
-    self.model = model
+  """What tinygrad's server generates with: DFlash when a draft is loaded (one generator serves every
+  temperature), else plain decoding, bounded by the context and closed when a client goes away."""
+  def __init__(self, model, dflash=None, *, eos_token_ids: tuple[int, ...] = (), block_size: int = 16):
+    self.model, self.dflash, self.eos, self.block = model, dflash, eos_token_ids, block_size
     self.max_context = model.config.context_length
 
-  def get_start_pos(self, ids):
-    return self.model.transformer.get_start_pos(ids)
+  def get_start_pos(self, ids):  # only for the server's log line: the reused prefix, counting the prompt snapshot
+    start, snapshot = self.model.transformer.get_start_pos(ids), getattr(self.model, '_snapshot', None)
+    if snapshot is not None and list(ids[:len(snapshot[0])]) == snapshot[0]: start = max(start, len(snapshot[0]))
+    return start
 
   def generate(self, ids, temperature=0.0):
-    stream = self.model.generate(ids, self.max_context - len(ids), temperature=temperature)
+    budget = self.max_context - len(ids)
+    if self.dflash is not None:
+      stream = self.dflash.stream(list(ids), max_new_tokens=budget, block_size=self.block, eos_token_ids=self.eos, temperature=temperature)
+    else: stream = self.model.generate(ids, budget, temperature=temperature)
     try:
       yield from stream
     finally:
@@ -37,13 +45,41 @@ class ChatTemplate:
     env.globals['eos_token'] = tokenizer.decode([tokenizer.eos_id])
     self.template = env.from_string(source)
     self.enable_thinking = enable_thinking
+    self.request_thinking: bool | None = None  # the current request's switch, if it sent one
 
   def render(self, **kwargs):
-    return self.template.render(**kwargs, enable_thinking=self.enable_thinking)
+    thinking = self.enable_thinking if self.request_thinking is None else self.request_thinking
+    return self.template.render(**kwargs, enable_thinking=thinking)
 
-def serve(model, tokenizer, port=8000, host='127.0.0.1', *, enable_thinking=True):
+def request_thinking(body) -> bool | None:
+  """A request's thinking switch: `chat_template_kwargs.enable_thinking` (vLLM and sglang's convention,
+  pi's qwen-chat-template format) or a top-level `enable_thinking` (pi's qwen format)."""
+  if not isinstance(body, dict): return None
+  kwargs = body.get('chat_template_kwargs')
+  if isinstance(kwargs, dict) and isinstance(kwargs.get('enable_thinking'), bool): return kwargs['enable_thinking']
+  return body['enable_thinking'] if isinstance(body.get('enable_thinking'), bool) else None
+
+class RequestHandler(Handler):
+  """tinygrad's handler, with the request's thinking switch applied while its prompt is rendered."""
+  def do_POST(self):
+    raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+    try: thinking = request_thinking(json.loads(raw))
+    except ValueError: thinking = None
+    self.rfile = io.BytesIO(raw)  # tinygrad's handler reads the body again
+    template = self.server.template
+    template.request_thinking = thinking
+    try: super().do_POST()
+    finally: template.request_thinking = None
+
+class Server(LLMServer):
+  def __init__(self, server_address: tuple, model, model_name: str, tok, template):
+    self.model, self.model_name, self.tok, self.template = model, model_name, tok, template
+    TCPServerWithReuse.__init__(self, server_address, RequestHandler)
+
+def serve(model, tokenizer, port=8000, host='127.0.0.1', *, enable_thinking=True, dflash=None, block_size=16):
   template = ChatTemplate(model.metadata, tokenizer, enable_thinking)
   name = model.metadata.get('general.name') or 'infurnace'
-  with LLMServer((host, port), ServerModel(model), name, tokenizer, template) as server:
-    print(f"Serving {name} at http://{host}:{server.server_address[1]}/v1", flush=True)
+  eos = tuple(i for i in (tokenizer.eos_id, tokenizer.eot_id) if i is not None)
+  with Server((host, port), ServerModel(model, dflash, eos_token_ids=eos, block_size=block_size), name, tokenizer, template) as server:
+    print(f"Serving {name} at http://{host}:{server.server_address[1]}/v1{' with DFlash' if dflash is not None else ''}", flush=True)
     server.serve_forever()

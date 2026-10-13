@@ -4,24 +4,34 @@ Infurnace reuses `tinygrad.llm.serve.LLMServer`: Chat Completions, SSE,
 reasoning separation, tool-call parsing and usage reporting. Infurnace supplies
 its bounded model adapter, tokenizer and the GGUF's embedded Jinja chat template.
 There is no fallback template in server mode. Tools are executed by the client,
-not the server. Real Qwen3.5 tool-use reliability is not yet validated.
+not the server.
 
 ```sh
 pip install -e '.[qwen35,server]'
-infurnace --device NV --model models/qwen35-validation/Qwen3.5-4B-Q4_K_M.gguf \
-  --serve 8000 --max-context 16384
+infurnace --serve 8000 --max-context 16384
 ```
 
-The context size above is illustrative: validate memory and reliability on your
-GPU. Startup warms up unless `--no-warmup` is supplied. `--no-thinking` sets the
-embedded template's `enable_thinking` flag. Request-level `max_tokens` or
-`max_completion_tokens` controls output length. DFlash is not yet supported in
-server mode.
+Startup warms up before listening unless `--no-warmup` is supplied.
+
+- **DFlash:** generation uses DFlash whenever the chat would: the installed draft
+  on NV, or `--dflash PATH`. `--no-dflash` serves plain decoding. One DFlash
+  generator serves every request temperature, and greedy requests stay exactly
+  greedy.
+- **Prefix reuse:** both paths resume from the previous request's prompt
+  snapshot, so an agent's growing conversation only prefills the new turn.
+- **Thinking:** `--no-thinking` sets the default for the template's
+  `enable_thinking`. A request can override it for itself with
+  `chat_template_kwargs: {"enable_thinking": false}` (the vLLM/sglang convention)
+  or a top-level `enable_thinking`. Thinking text comes back as
+  `reasoning_content`.
+- **Output length:** request-level `max_tokens` or `max_completion_tokens`.
 
 The default bind address is `127.0.0.1`. This upstream server has no authentication;
 do not expose it to untrusted networks. Requests are processed serially.
-Upstream supports temperature; other sampling and tool-choice request controls
-are not guaranteed to be honored. Tool-call deltas are emitted after generation.
+Temperature is honored; other sampling and tool-choice request controls are not.
+Tool-call deltas are emitted after generation.
+
+## Pi
 
 Merge into `~/.pi/agent/models.json`:
 
@@ -36,7 +46,8 @@ Merge into `~/.pi/agent/models.json`:
         "id": "infurnace-qwen35",
         "name": "Infurnace Qwen3.5",
         "input": ["text"],
-        "reasoning": false,
+        "reasoning": true,
+        "compat": {"thinkingFormat": "qwen-chat-template"},
         "contextWindow": 16384,
         "maxTokens": 4096,
         "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}
@@ -46,11 +57,23 @@ Merge into `~/.pi/agent/models.json`:
 }
 ```
 
-Match `contextWindow` to the actual server context. The server currently accepts
-the requested model ID as a label. Select the provider through Pi's `/model`.
-Reasoning-level controls are not integrated; `reasoning: false` avoids advertising
-them, even though the server can separate generated thinking from answer text.
+Match `contextWindow` to the server's `--max-context`. The server accepts any
+model ID as a label. With `reasoning: true` and the `qwen-chat-template`
+format, Pi's thinking toggle sends `chat_template_kwargs.enable_thinking`, which
+the server honors per request. With `reasoning: false`, Pi sends nothing and the
+server's default applies.
 
-Start validation with a harmless read-only request and verify the complete tool
-call/result cycle before allowing edits or shell commands. Automated bridge tests
-use a fake model and do not establish real-model quality or GPU stability.
+Measured on an RTX 5060 8 GB (`--max-context 16384`, Pi print mode, read/edit
+tools, thinking on). Agent turns after the first reuse the prompt snapshot and
+prefill at about 2–3.7k tok/s.
+
+| Pi task | Plain | DFlash |
+|---|---|---|
+| Read a file and answer | 5.1 s | 4.1 s |
+| Read and fix a function (2 tool calls) | 11.5 s | 8.9 s |
+
+Generation in those turns ran at about 135–235 tok/s, against about 100 tok/s
+for plain decoding.
+
+Start with a harmless read-only request and check the whole tool call and result
+cycle before allowing edits or shell commands.

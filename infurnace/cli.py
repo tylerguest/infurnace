@@ -37,7 +37,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
   if args.serve is not None:
     if not 1 <= args.serve <= 65535: ap.error("--serve port must be between 1 and 65535")
-    if args.dflash: ap.error("--serve supports plain decoding only")
     if args.max_tokens is not None: ap.error("--serve takes max_tokens per request, not --max-tokens")
   if args.benchmark is not None:
     if args.dflash: ap.error("--benchmark measures plain decoding; use benchmarks/dflash.py for DFlash")
@@ -87,7 +86,7 @@ def _dflash_draft(args: argparse.Namespace) -> tuple[Path | None, bool]:
   """The DFlash draft to use and whether it was picked automatically. Chat and --prompt on a
   Qwen3.5 model use an installed draft unless told otherwise."""
   if args.dflash is not None: return args.dflash, False
-  if args.no_dflash or args.serve is not None or args.benchmark is not None: return None, False
+  if args.no_dflash or args.benchmark is not None: return None, False
   draft = loader.dflash_draft(args.model)  # a download URL for named models
   return (draft, True) if isinstance(draft, str) or (draft is not None and draft.is_file()) else (None, False)
 
@@ -196,7 +195,8 @@ def run(args: argparse.Namespace) -> int:
   if args.serve is not None:
     from infurnace.serve import serve
     if not args.no_warmup: warmup(model, dflash)  # once per server start, before it listens
-    serve(model, tokenizer, args.serve, args.host, enable_thinking=not args.no_thinking)
+    block = _dflash_block(dflash) if dflash is not None else 16
+    serve(model, tokenizer, args.serve, args.host, enable_thinking=not args.no_thinking, dflash=dflash, block_size=block)
     return 0
   window, thinking = min(args.max_context, context), not args.no_thinking
   if args.no_warmup: return chat(generate, tokenizer, window, args.max_tokens, thinking)

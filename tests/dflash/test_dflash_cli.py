@@ -49,7 +49,8 @@ def test_explicit_draft_is_used_on_any_device(monkeypatch, tmp_path, capsys, dev
   assert engine.calls[0][1]['max_new_tokens'] == 5 and engine.closed and 'DFlash' in capsys.readouterr().err
 
 @pytest.mark.parametrize('device,flags,enabled', [('NV', [], True), ('CPU', [], False), ('NV', ['--no-dflash'], False),
-                                                  ('NV', ['--serve'], False)])
+                                                  ('NV', ['--serve'], True),
+                                                  ('NV', ['--serve', '--no-dflash'], False)])
 def test_installed_draft_is_used_automatically(monkeypatch, tmp_path, device, flags, enabled):
   target, draft = tmp_path / 'target.gguf', tmp_path / 'draft.gguf'
   target.touch()
@@ -63,8 +64,10 @@ def test_installed_draft_is_used_automatically(monkeypatch, tmp_path, device, fl
   loaded, engine = [], Engine()
   monkeypatch.setattr(loader, 'load_dflash', lambda target_model, path, **kw: loaded.append(path) or engine)
   monkeypatch.setattr(cli, 'warmup', lambda *a: None)
-  monkeypatch.setattr('infurnace.serve.serve', lambda model, *a, **kw: None)
+  served = []
+  monkeypatch.setattr('infurnace.serve.serve', lambda model, *a, **kw: served.append(kw['dflash']))
   run = ['--prompt', 'hello'] if '--serve' not in flags else []
   assert cli.main(['--model', str(target), *run, *flags]) == 0
   assert loaded == ([draft] if enabled else [])
-  if '--serve' not in flags: assert (bool(engine.calls), bool(plain)) == (enabled, not enabled)
+  if '--serve' in flags: assert served == [engine if enabled else None]
+  else: assert (bool(engine.calls), bool(plain)) == (enabled, not enabled)

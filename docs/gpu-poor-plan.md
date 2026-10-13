@@ -197,6 +197,10 @@ Greedy DFlash unchanged within noise (343 tok/s on the code prompt; 332–357 ac
 **Open: default.** Chat still defaults to greedy; Qwen's thinking-mode setting would be 0.6 (plus
 top-p 0.95 / top-k 20, which upstream's sampler doesn't have).
 
+**Serving uses it.** `--serve` now generates with DFlash (one generator, every request temperature)
+and honors a per-request thinking switch (`chat_template_kwargs.enable_thinking`). Pi on the RTX 5060:
+read task 5.1 → 4.1 s, read-and-fix 11.5 → 8.9 s; see [serve.md](serve.md).
+
 ## 6. Install and getting models
 
 - [x] Make `tokenizers` a base dependency (the default model needs it): `pip install -e .` is all

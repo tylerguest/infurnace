@@ -3,8 +3,7 @@ import json
 import threading
 from types import SimpleNamespace
 
-from infurnace.serve import ChatTemplate, ServerModel
-from tinygrad.llm.serve import LLMServer
+from infurnace.serve import ChatTemplate, Server, ServerModel
 
 class Tokenizer:
   bos_id = None
@@ -46,12 +45,52 @@ def test_adapter_close_and_bound():
   assert model.closed
   assert model.limit == 1022
 
+class DFlash:
+  def stream(self, ids, **kwargs):
+    self.ids, self.kwargs = ids, kwargs
+    try:
+      yield 7
+    finally:
+      self.closed = True
+
+def test_adapter_uses_dflash_with_request_temperature():
+  dflash = DFlash()
+  stream = ServerModel(Model(), dflash, eos_token_ids=(999,), block_size=16).generate((1, 2), temperature=0.7)
+  assert next(stream) == 7
+  stream.close()
+  assert dflash.closed and dflash.ids == [1, 2]
+  assert dflash.kwargs == {'max_new_tokens': 1022, 'block_size': 16, 'eos_token_ids': (999,), 'temperature': 0.7}
+
+def test_request_switches_thinking():
+  model, tok = Model(), Tokenizer()
+  model.output = 'done'
+  template = ChatTemplate({'tokenizer.chat_template': '{{ "think" if enable_thinking else "plain" }}'}, tok)
+  with Server(('127.0.0.1', 0), ServerModel(model), 'test', tok, template) as server:
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    def rendered(**extra):
+      conn = http.client.HTTPConnection(*server.server_address)
+      conn.request('POST', '/v1/chat/completions', json.dumps({'model': 'test', 'messages': [{'role': 'user', 'content': 'hi'}], **extra}))
+      assert conn.getresponse().status == 200
+      conn.close()
+      return tok.rendered
+    try:
+      assert rendered() == 'think'
+      assert rendered(chat_template_kwargs={'enable_thinking': False}) == 'plain'
+      assert rendered() == 'think'  # the switch lasts one request
+      assert rendered(enable_thinking=False) == 'plain'
+      template.enable_thinking = False
+      assert rendered(chat_template_kwargs={'enable_thinking': True}) == 'think'
+    finally:
+      server.shutdown()
+      thread.join()
+
 def test_http_tool_round_trip():
   model, tok = Model(), Tokenizer()
   template = ChatTemplate({'tokenizer.chat_template':
     '{{ tools | tojson }}{% for m in messages %}{{ m.content }}'
     '{% for tc in m.tool_calls or [] %}{{ tc.function.arguments.path }}{% endfor %}{% endfor %}'}, tok)
-  with LLMServer(('127.0.0.1', 0), ServerModel(model), 'test', tok, template) as server:
+  with Server(('127.0.0.1', 0), ServerModel(model), 'test', tok, template) as server:
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     def request(messages, stream=False):

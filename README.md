@@ -54,7 +54,7 @@ Details and the selected model revision: [Qwen3.5 setup](docs/qwen35.md).
 infurnace --no-thinking
 infurnace --temperature 0.6                  # sample instead of greedy decoding (works with DFlash)
 infurnace --prompt "Hello" --max-tokens 64   # raw text, no chat template
-infurnace --serve                          # 127.0.0.1:8000, plain decoding
+infurnace --serve                          # 127.0.0.1:8000, DFlash when the draft is installed
 infurnace --benchmark 512,32                # per-step timing
 infurnace --device CPU
 ```
