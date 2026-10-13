@@ -1,5 +1,5 @@
 import pytest
-from tinygrad import Context, Tensor, TinyJit, UOp, dtypes
+from tinygrad import Context, Tensor, TinyJit, UOp
 from infurnace.kernels.attention import attention
 
 pytestmark = pytest.mark.nv

@@ -67,8 +67,8 @@ def load_model(path: str | Path, max_context: int, device: str | None = None, nv
   if (backend := getattr(tokenizer, "_backend", None)) is not None: model.turn_token = backend._special_tokens.get("<|im_start|>")
   return model, tokenizer
 
-def load_dflash(model, draft_path: str | Path, temperature: float = 0.0):
+def load_dflash(model, draft_path: str | Path):
   """Parallel multirow verification on NV, else the sequential CPU reference."""
   from infurnace.dflash import DFlashDraft, DFlashGenerator
   verifier = 'parallel' if model.device.split(':')[0] == 'NV' else 'sequential'
-  return DFlashGenerator(model, DFlashDraft.from_gguf(draft_path, model), verifier=verifier, temperature=temperature)
+  return DFlashGenerator(model, DFlashDraft.from_gguf(draft_path, model), verifier=verifier)

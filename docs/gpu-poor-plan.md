@@ -167,23 +167,32 @@ if other apps leave room, so it is not the default.
 any temperature but 0. Qwen advises against greedy decoding in thinking mode because it tends to
 repeat itself.
 
-**Done.** `--temperature T` (default 0, greedy). Plain decoding passes it to upstream's sampler.
-DFlash needed no full rejection sampling: the draft proposes greedily, so its distribution is
+**Done.** `--temperature T` (default 0, greedy), per request. Plain decoding passes it to upstream's
+sampler. DFlash needed no full rejection sampling: the draft proposes greedily, so its distribution is
 one-hot, and for a one-hot draft speculative sampling reduces to sampling the target's token at each
 verified row and accepting the proposal when the sample equals it. That accepts with probability p(x)
 (the optimal rate), and a rejecting row's sample is already distributed as the target excluding x,
-the residual. So the verifier's per-row argmax becomes a Gumbel-max sample (`ParallelVerifier`
-`sampled=True`); host acceptance logic is unchanged. A generator's temperature is fixed at creation,
-because sampling changes the captured verify graph; greedy stays bit-identical.
+the residual. Host acceptance logic is unchanged.
 
-Checks (tiny CPU model, `tests/dflash/test_sampling.py`, seeded): first-token frequencies pass a
-chi-square test against the exact probabilities; at T = 0.02 (98% of proposals accepted) DFlash's
-3-token sequence distribution matches plain sampling. Investigated separately: verifier logits are
-bit-identical to the one-row path; sampling under the verifier's capture passes 8,000 draws; draws
-are uncorrelated.
+**Fused sampler** (`kernels/sampling.py`). The verifier samples every row with one kernel pass:
+score = logit + T·g, g = -ln(-ln u), u from tinygrad's threefry hash of (key, step, element), so the
+noise never leaves registers; a second launch combines per-chunk winners and advances `step`. At
+T = 0 the score is the logit, so greedy is exactly argmax (first maximum on ties) and one captured
+graph serves every temperature; each request writes its temperature into the buffer the graph reads.
+16 rows × 248,320 logits: 127 µs, against 162 µs for argmax alone and 1,094 µs for tensor-op Gumbel
+sampling. (Lesson: gate loads with clamped indices, not lane-dependent `valid`, or tinygrad can shrink
+a warp the shuffles need; that produced token 0 for rows spanning 2–31 chunks.) Surveyed for code to
+port: exllamav3's `gumbel_sample_kernel` (one block per row, cuRAND Philox) is the closest; llama.cpp,
+vLLM and sglang sample with separate noise passes. Kept the split-row design for parallelism.
 
-Measured on the RTX 5060 at T = 0.6, thinking on, 256 tokens: DFlash 143 / 171 / 209 tok/s against
-plain 113 (1.26× history prose, 1.51× explanation, 1.84× code; greedy was 1.49–2.11×).
+Checks: `tests/kernels/test_nv_sampling.py` (T = 0 equals argmax at uneven chunk counts, chi-square
+against softmax inside a captured graph, fresh noise per replay); `tests/dflash/test_sampling.py`
+(tiny CPU model, seeded: first-token chi-square, sequence distribution at 98% acceptance, one generator
+serving every temperature with greedy staying exact).
+
+Measured on the RTX 5060, thinking on, 256 tokens, T = 0.6: DFlash 186 / 176 / 219 tok/s against plain
+110 (1.70× history prose, 1.60× explanation, 2.00× code; 1.26 / 1.51 / 1.84× with tensor-op sampling).
+Greedy DFlash unchanged within noise (343 tok/s on the code prompt; 332–357 across runs).
 
 **Open: default.** Chat still defaults to greedy; Qwen's thinking-mode setting would be 0.6 (plus
 top-p 0.95 / top-k 20, which upstream's sampler doesn't have).

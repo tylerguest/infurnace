@@ -27,7 +27,7 @@ def test_dflash_stream_block_eos_and_close(capsys, verifier, block):
   engine = Engine(verifier=verifier)
   assert cli.reply(cli.generator(model, Tokenizer(), dflash=engine), Tokenizer(), [1, 2], None, 16) == '3!'
   assert engine.closed
-  assert engine.calls == [([1, 2], {'max_new_tokens': 14, 'block_size': block, 'eos_token_ids': (9, 10)})]
+  assert engine.calls == [([1, 2], {'max_new_tokens': 14, 'block_size': block, 'eos_token_ids': (9, 10), 'temperature': 0.0})]
   assert capsys.readouterr().out == '3!\n'
 
 @pytest.mark.parametrize('extra', [['--dflash', 'missing.gguf'], ['--dflash', 'draft.gguf', '--benchmark', '8'],
@@ -57,7 +57,8 @@ def test_installed_draft_is_used_automatically(monkeypatch, tmp_path, device, fl
   monkeypatch.setenv('INFURNACE_DFLASH_DRAFT', str(draft))
   monkeypatch.setattr(loader, 'is_qwen35', lambda path: True)
   plain = []
-  model = SimpleNamespace(config=SimpleNamespace(context_length=16), device=device, generate=lambda ids, n, **kw: (t for t in plain.append(ids) or ()))
+  def generate(ids, n, **kwargs): return (t for t in plain.append(ids) or ())
+  model = SimpleNamespace(config=SimpleNamespace(context_length=16), device=device, generate=generate)
   monkeypatch.setattr(loader, 'load_model', lambda *a, **kw: (model, Tokenizer()))
   loaded, engine = [], Engine()
   monkeypatch.setattr(loader, 'load_dflash', lambda target_model, path, **kw: loaded.append(path) or engine)

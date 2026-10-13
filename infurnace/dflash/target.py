@@ -26,7 +26,6 @@ class TargetObserver:
     self._token = UOp.variable('dflash_token', 0, model.config.vocab_size - 1)
     self._jit = TinyJit(self._forward)  # eager first: its RNG advance must match upstream sampling
     self._temperature = None
-    self.temperature = 0.0  # sampling temperature for every target decision; 0 is greedy
 
   def _realize_state(self):
     # DFlash's verifier stores into the target's caches and states directly, so they must be
@@ -35,7 +34,17 @@ class TargetObserver:
     self.model.realize_state()
     # A persistent temperature buffer: the captured step always sees the same address.
     if self._temperature is None:
-      with Context(DEV=self.model.device): self._temperature = Tensor([float(self.temperature)], device=self.model.device).realize()
+      with Context(DEV=self.model.device): self._temperature = Tensor([0.0], device=self.model.device).realize()
+      self._temperature_value = 0.0
+
+  def set_temperature(self, temperature: float):
+    """The sampling temperature of every following decision (0 is greedy), written into the buffer the
+    captured graphs read, so no graph is captured again."""
+    self._realize_state()
+    if temperature != self._temperature_value:
+      with Context(DEV=self.model.device):
+        Tensor(self._temperature.uop.after(self._temperature.uop.store(Tensor([float(temperature)], device=self.model.device).uop))).realize()
+      self._temperature_value = temperature
 
   def __enter__(self):
     if self.active or self.model._generating: raise RuntimeError('only one generation may run at a time')

@@ -96,10 +96,10 @@ def _dflash_block(dflash) -> int:
   return dflash.draft.config.block_size if dflash.verifier == 'parallel' else 4
 
 def generator(model, tokenizer, dflash=None, temperature: float = 0.0) -> Callable[[list[int], int], Iterator[int]]:
-  """generate(ids, budget): plain decoding, or DFlash speculative decoding (created for `temperature`)."""
+  """generate(ids, budget): plain decoding, or DFlash speculative decoding, at `temperature`."""
   if dflash is None: return lambda ids, budget: model.generate(ids, budget, temperature=temperature)
   eos, block = tuple(i for i in (tokenizer.eos_id, tokenizer.eot_id) if i is not None), _dflash_block(dflash)
-  return lambda ids, budget: dflash.stream(ids, max_new_tokens=budget, block_size=block, eos_token_ids=eos)
+  return lambda ids, budget: dflash.stream(ids, max_new_tokens=budget, block_size=block, eos_token_ids=eos, temperature=temperature)
 
 def _warm(model, dflash=None) -> None:
   # DFlash requests never use plain generation's graphs, so it captures its own.
@@ -186,7 +186,7 @@ def run(args: argparse.Namespace) -> int:
 
   dflash = None
   if draft is not None and not (automatic and model.device.split(':')[0] != 'NV'):  # the CPU reference is slower than plain
-    dflash = loader.load_dflash(model, loader.fetch_model(draft), temperature=args.temperature)
+    dflash = loader.load_dflash(model, loader.fetch_model(draft))
     print(f"DFlash speculative decoding{' on (--no-dflash turns it off)' if automatic else ''}.", file=sys.stderr, flush=True)
   generate, context = generator(model, tokenizer, dflash, args.temperature), model.config.context_length
 

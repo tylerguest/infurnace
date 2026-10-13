@@ -153,7 +153,7 @@ def test_zero_budget_and_invalid_options(tmp_path):
     draft = tiny_draft(model)
     generator = DFlashGenerator(model, draft)
     assert list(generator.stream([1], max_new_tokens=0)) == []
-    for options in ({'temperature': 0.1}, {'block_size': 0}, {'block_size': 5}, {'eos_token_ids': (16,)}):
+    for options in ({'temperature': -0.1}, {'block_size': 0}, {'block_size': 5}, {'eos_token_ids': (16,)}):
       with pytest.raises(ValueError): list(generator.stream([1], max_new_tokens=2, **options))
     assert not model._generating
 

@@ -12,9 +12,9 @@ solved exactly by a nilpotent product. Outputs need no per-row loop, and
 `commit` forms S_m = γ_m S0 + Σ_{j<m} (γ_m/γ_j) u_j k_jᵀ for the accepted
 prefix from stored U, K and log-decays; no per-row state copies are kept.
 
-Greedy decisions are argmax over multirow logits; they match one-row decoding up to
-floating-point reduction order and consume no RNG. With a temperature, each row samples the
-target's token (Gumbel-max, as upstream does). The draft proposes greedily, so its distribution is
+Each row's decision is the target's token, sampled at the request's temperature by the fused
+kernel in kernels/sampling.py (exactly argmax at T = 0, so greedy decisions match one-row decoding up
+to floating-point reduction order). One captured graph serves every temperature. The draft proposes greedily, so its distribution is
 one-hot: accepting a proposal exactly when the row's sample equals it accepts with probability p(x),
 and a rejecting row's sample is already distributed as the target excluding x, which is exactly
 speculative sampling's residual. Output follows the target's sampling distribution.
@@ -26,6 +26,7 @@ from infurnace.dflash.jit import captured
 from infurnace.dflash.target import TargetObserver, detach_rng
 from infurnace.kernels.attention import attention
 from infurnace.kernels.gdn import gdn_chunk
+from infurnace.kernels.sampling import Sampler
 from infurnace.kernels.embedding import packed_gather
 
 def _raw(tensor):
@@ -65,12 +66,13 @@ class _Operands:
     self.g = Tensor.empty(1, heads, rows, device=device).realize()
 
 class ParallelVerifier:
-  def __init__(self, observer: TargetObserver, rows: int, *, sampled: bool = False):
+  def __init__(self, observer: TargetObserver, rows: int):
     if type(rows) is not int or not 2 <= rows <= 16: raise ValueError('parallel verifier supports 2..16 rows')
     model = observer.model
     if any(getattr(b, 'ssm_g_a', None) is not None for b in model.transformer.blk): raise ValueError('KDA blocks are unsupported')
     if model.config.context_length < rows + 1: raise ValueError('context too small for parallel verification')
-    self.observer, self.rows, self.device, self.sampled = observer, rows, model.device, sampled
+    self.observer, self.rows, self.device = observer, rows, model.device
+    self._sampler: Sampler | None = None
     self._operands: dict[int, _Operands] = {}
     self._position = UOp.variable('start_pos', 0, model.config.context_length - rows)
     # The fused round commits the previous block and verifies the next one in
@@ -157,10 +159,9 @@ class ParallelVerifier:
       norm = block.attn_norm(x)
       h = x + (self._gdn(index, block, norm, start_pos) if isinstance(block, GatedDeltaNetBlock) else self._attention(block, norm, start_pos))
       x = (h + block._feed_forward(block.ffn_norm(h))).contiguous()
-    logits = target.output(target.output_norm(x))
-    if self.sampled:  # Gumbel-max sample per row, exactly as upstream and the one-row step sample
-      logits = logits.float() / _raw(self.observer._temperature).maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()
-    return logits.argmax(-1).cast(dtypes.int32).contiguous(), features[0].cat(*features[1:], dim=-1).contiguous()
+    logits = target.output(target.output_norm(x)).reshape(x.shape[1], -1)
+    decisions = self._sampler(logits, _raw(self.observer._temperature)).reshape(1, -1)
+    return decisions.contiguous(), features[0].cat(*features[1:], dim=-1).contiguous()
 
   def _forward_store(self, x: Tensor, start_pos: UOp):
     decisions, features = self._forward(x, start_pos)
@@ -215,7 +216,7 @@ class ParallelVerifier:
         proposals = self._fused_draft(_raw(self._noise), self._draft_position.bind(position))
         ids(proposals)
         self._forward_jit(_raw(self._embeddings), self._position.bind(position))
-        if self.sampled: detach_rng(self.device)
+        detach_rng(self.device)
         pack()
         values = [int(v) for v in _raw(self._readback).tolist()]
     except BaseException:
@@ -262,6 +263,8 @@ class ParallelVerifier:
     if self._operands: return
     observer = self.observer
     with Context(DEV=self.device):
+      # Seeded from tinygrad's seed, so Tensor.manual_seed makes sampled requests reproducible.
+      self._sampler = Sampler(self.device, (Tensor._seed * 0x9E3779B97F4A7C15 + 0x5DF1A5) & (2 ** 64 - 1))
       x = Tensor.empty(1, 1, observer.model.config.embedding_length, device=self.device)
       for index, block in enumerate(observer.model.transformer.blk):
         if isinstance(block, GatedDeltaNetBlock):
@@ -302,7 +305,7 @@ class ParallelVerifier:
         # Always the same persistent input buffer for the captured forward.
         _stored(self._embeddings, observer.model.embed(padded)).realize()
         self._forward_jit(_raw(self._embeddings), self._position.bind(observer.position))
-        if self.sampled: detach_rng(self.device)
+        detach_rng(self.device)  # only the tensor-op fallback (CPU) draws from tinygrad's RNG
         decisions = [int(v) for v in _raw(self._decisions).tolist()[0]]
         features = _raw(self._features)
       return decisions, features
