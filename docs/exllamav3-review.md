@@ -16,7 +16,7 @@ needs attribution, and vendored parts (e.g. its `vendor/fla`) need their own lic
 | 1 | Measured, cached per-GPU kernel tuning | `exllamav3_ext/quant/coop_autotune.cu` | Hand-written constants; custom kernels skip tinygrad's BEAM | **Adopt, as checked-in per-GPU tables** |
 | 2 | Launch geometry derived from SM count | `modules/attention_fn/bc_attn.py`, `exllamav3_ext/quant/exl3_kernel_map.cu` | "~64 blocks" hard-coded for the 5060 | **Adopt with #1** |
 | 3 | Shared activation quantization / bundled projections | `modules/gated_delta_net.py` (sliced qkv+z bundle) | Kernel supports a shared `q8`; Qwen3.5 never passes it | **Adopt first: cheap** |
-| 4 | Attention over the active length, split by SM count | `modules/attention_fn/bc_attn.py` | DFlash attends over the whole allocated context | **Adopt** |
+| 4 | Attention over the active length, split by SM count | `modules/attention_fn/bc_attn.py` | **Done** (`kernels/attention.py`, after vLLM's unified attention) | Split sizes left, under #1 |
 | 5 | Bounded multirow recurrent prefill | `modules/gated_delta_net_fn/gated_delta_rule.py` | **Done** (`gdn_prefill`, 16-row chunks) | Only chunk size left, under #1 |
 | 6 | Paired target/draft state for prompt reuse | `cache/recurrent.py` (`PairedState`) | DFlash re-prefills every turn | Adopt later, minimal version |
 | 7 | Confidence-calibrated draft windows | `generator/draft_confidence.py` | `_DraftPolicy` decides by wall time | Defer: fixed-width verify makes it pointless |
@@ -90,28 +90,28 @@ every projection quantizes its input on its own, including the ones that read th
 **Caution.** Fewer launches can lose to register pressure; require a whole-layer and
 whole-model win.
 
-## 4. Attention over the active length
+## 4. Attention over the active length (done)
 
 **ExLlamaV3.** `bc_attn.py` separates fixed allocations from runtime lengths: the live split count
 and split length are kernel arguments derived from the active sequence, with the number of splits
 tied to the SM count.
 
-**infurnace.** DFlash attends over the whole allocated window with a mask:
-`ParallelVerifier._attention` (`dflash/parallel.py`) uses `length = c.max_context`, and
-`DFlashDraft._denoise` (`dflash/draft.py`) attends over `cache_length`. Masking keeps results
-correct but still computes over invisible positions, so a larger `--max-context` slows every
-DFlash round. This also blocks raising the 2,048-token default (plan item 4).
+**infurnace before.** DFlash attended over the whole allocated window with a mask
+(`ParallelVerifier._attention` used `length = c.max_context`; `DFlashDraft._denoise` attended over
+`cache_length`), so a larger `--max-context` slowed every round. tinygrad's own attention over a
+runtime length was no fix: it scales badly (81.6 ms for a 16-row call at 16k keys).
 
-**Plan.**
-1. Keep KV allocations and buffer identities stable.
-2. First, a few captured active-length buckets.
-3. Later, a custom split-attention UOp kernel with runtime bounds, split count from #2, split
-   size tuned per GPU via #1 for Qwen3.5's head geometry.
+**Done (2026-10-12).** `kernels/attention.py`, a port of vLLM's unified-attention design
+(`triton_unified_attention.py`) rather than ExLlamaV3's paged kernels: rows × grouped heads packed
+per KV head, per-row causal limits and sliding windows, fixed-size key segments where only those
+holding active keys launch, then a merge after llama.cpp's `flash_attn_combine_results`. One
+captured graph serves every length. It serves the DFlash verifier and draft (256-key segments) and
+plain one-row decoding (32-key segments, queries per warp sized to the call). Measured in
+`docs/gpu-poor-plan.md` item 4: DFlash at a 16k window 91 → 332 tok/s; plain decoding at 2.5k
+tokens 74 → 96 tok/s; default context raised to 8,192.
 
-No paged attention or scheduler needed.
-
-**Measure.** Verify latency at several active lengths with allocated capacity held constant;
-scratch memory; logits parity.
+**Left.** Segment sizes are hand-picked for the 5060; they belong in #1's tuning tables, with #2's
+SM-count rule as the default for other cards.
 
 ## 5. Bounded multirow recurrent prefill (done)
 
@@ -180,7 +180,7 @@ block, so this only becomes useful with several verify widths (which #1 could tu
 2. **Re-tune the Q6 output head for Qwen3.5's shape** (#1's stale rule). One manual measurement.
 3. **Tuning tables and script, SM-derived defaults** (#1 + #2): replace hand constants (GEMV warps,
    GEMM tiles/splits, prefill chunk) with measured per-GPU values.
-4. **Active-length DFlash attention** (#4), then raise the default context.
+4. ~~**Active-length DFlash attention** (#4), then raise the default context.~~ Done 2026-10-12.
 5. **Paired prompt-state reuse for DFlash chat** (#6).
 6. **Confidence windows** (#7), only once verification has cheaper narrow widths.
 
