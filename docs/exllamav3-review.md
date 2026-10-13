@@ -15,7 +15,7 @@ needs attribution, and vendored parts (e.g. its `vendor/fla`) need their own lic
 |---|---|---|---|---|
 | 1 | Measured, cached per-GPU kernel tuning | `exllamav3_ext/quant/coop_autotune.cu` | Hand-written constants; custom kernels skip tinygrad's BEAM | **Adopt, as checked-in per-GPU tables** |
 | 2 | Launch geometry derived from SM count | `modules/attention_fn/bc_attn.py`, `exllamav3_ext/quant/exl3_kernel_map.cu` | "~64 blocks" hard-coded for the 5060 | **Adopt with #1** |
-| 3 | Shared activation quantization / bundled projections | `modules/gated_delta_net.py` (sliced qkv+z bundle) | Kernel supports a shared `q8`; Qwen3.5 never passes it | **Adopt first: cheap** |
+| 3 | Shared activation quantization / bundled projections | `modules/gated_delta_net.py` (sliced qkv+z bundle) | **Shared Q8 done**; true bundling not tried | Bundling: measure first |
 | 4 | Attention over the active length, split by SM count | `modules/attention_fn/bc_attn.py` | **Done** (`kernels/attention.py`, after vLLM's unified attention) | Split sizes left, under #1 |
 | 5 | Bounded multirow recurrent prefill | `modules/gated_delta_net_fn/gated_delta_rule.py` | **Done** (`gdn_prefill`, 16-row chunks) | Only chunk size left, under #1 |
 | 6 | Paired target/draft state for prompt reuse | `cache/recurrent.py` (`PairedState`) | **Done** (prompt snapshots, after llama.cpp / Ollama) | — |
@@ -169,9 +169,11 @@ block, so this only becomes useful with several verify widths (which #1 could tu
 
 ## Order of work
 
-1. **Share Q8 activation quantization** in Qwen3.5's GDN inputs and MLP gate/up (#3). Small,
-   immediately measurable.
-2. **Re-tune the Q6 output head for Qwen3.5's shape** (#1's stale rule). One manual measurement.
+1. ~~**Share Q8 activation quantization** in Qwen3.5's GDN inputs and MLP gate/up (#3).~~ Done
+   2026-10-12: `_one_row` in `models/qwen35.py` quantizes once for GDN qkv+gate, attention q/k/v and
+   MLP gate/up; 942 → 870 kernels per decode step, identical tokens, gain within timing noise (~1–2%).
+2. ~~**Re-tune the Q6 output head for Qwen3.5's shape** (#1's stale rule).~~ Done 2026-10-12: the
+   248,320 × 2,560 head GEMV takes 1.31 ms with 8 warps against 1.45–1.48 ms with 1 (~1.7% per token).
 3. **Tuning tables and script, SM-derived defaults** (#1 + #2): replace hand constants (GEMV warps,
    GEMM tiles/splits, prefill chunk) with measured per-GPU values.
 4. ~~**Active-length DFlash attention** (#4), then raise the default context.~~ Done 2026-10-12.

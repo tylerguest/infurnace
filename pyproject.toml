@@ -8,10 +8,10 @@ version = "0.0.0"
 description = "Run a single LLM fast on your GPU with tinygrad"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["tinygrad @ git+https://github.com/tylerguest/tinygrad@61e7cb08f4d5fe6000d4016746e64b6c2900f409",]
+dependencies = ["tinygrad @ git+https://github.com/tylerguest/tinygrad@61e7cb08f4d5fe6000d4016746e64b6c2900f409",
+                "tokenizers>=0.22,<0.23"]  # the Qwen3.5 text codec
 
 [project.optional-dependencies]
-qwen35 = ["tokenizers>=0.22,<0.23"]
 server = ["jinja2>=3.1,<4"]
 dev = ["ruff==0.14.10", "pytest", "jinja2"]
 

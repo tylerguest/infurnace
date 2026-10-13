@@ -1,6 +1,6 @@
 # Qwen3.5 benchmarks
 
-Run from the checkout with `.[qwen35]` installed. Stop other model processes first.
+Run from the checkout after `pip install -e .`. Stop other model processes first.
 The only supported target is Qwen3.5-4B; named targets download on first use.
 
 ## Plain decoding

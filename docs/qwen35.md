@@ -17,7 +17,7 @@ Draft: [Anbeeld Qwen3.5-4B DFlash](https://huggingface.co/Anbeeld/Qwen3.5-4B-DFl
 `qwen35-4b-dflash-Q4_K_M.gguf`; provenance and design in [DFlash](dflash.md).
 
 ```sh
-pip install -e '.[qwen35]'
+pip install -e .
 infurnace -m qwen3.5:4b             # target/draft download on first use
 infurnace --no-dflash --no-thinking
 infurnace -m /path/to/Qwen3.5-4B-Q4_K_M.gguf \

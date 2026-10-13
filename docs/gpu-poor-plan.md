@@ -171,7 +171,7 @@ against greedy decoding in thinking mode because it tends to repeat itself.
 
 ## 6. Install and getting models
 
-- [ ] Make `tokenizers` a base dependency (the default model needs it)
+- [x] Make `tokenizers` a base dependency (the default model needs it): `pip install -e .` is all
 - [x] Add a model download path: `--model NAME` downloads on first use via `tinygrad.helpers.fetch`, tinygrad-style
 - [x] Say in the README where the DFlash draft GGUF comes from
 

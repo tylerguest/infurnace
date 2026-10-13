@@ -20,10 +20,10 @@ Requires Python 3.11+ and Git:
 ```sh
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e '.[qwen35]'
+pip install -e .
 ```
 
-For development/tests, use `pip install -e '.[qwen35,dev]'`. The tinygrad dependency
+For development/tests, use `pip install -e '.[dev]'`. The tinygrad dependency
 is pinned. After pulling changes, reinstall; if the pin changes, force reinstall
 that dependency because pip can retain an older same-version wheel.
 
@@ -69,7 +69,7 @@ infurnace --device CPU
   Chat drops oldest complete turns with a notice and rejects oversized messages.
 - **Replies:** run until EOS or context exhaustion unless capped with
   `--max-tokens` (includes thinking). Raw prompts default to 64 output tokens.
-- **Serving:** install `.[qwen35,server]`; tool formatting/parsing reuses the GGUF
+- **Serving:** install `.[server]`; tool formatting/parsing reuses the GGUF
   template and tinygrad server. Real-model tool-use reliability is unvalidated.
   See [server setup](docs/serve.md).
 

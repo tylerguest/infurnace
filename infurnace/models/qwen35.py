@@ -25,6 +25,7 @@ from infurnace.gguf import parse_gguf, read_gguf_metadata
 from infurnace.kernels.attention import attention
 from infurnace.kernels.gdn import gdn_decode, gdn_prefill
 from infurnace.kernels.quant_gemm import nv_prefill_supported
+from infurnace.kernels.quant_gemv import q8_quantize
 from infurnace.models.linear import _NVLinear
 
 @dataclass(frozen=True)
@@ -121,6 +122,27 @@ PREFILL_ROWS = 16  # prompt chunk for the fused multirow GDN kernel (it is speci
 # it is captured only for a prompt long enough to pay for it.
 PREFILL_CAPTURE_TOKENS = 2048
 
+_SHARED_Q8 = os.environ.get('INFURNACE_SHARED_Q8', '1') != '0'
+
+def _one_row(x: Tensor, *layers) -> tuple[Tensor, ...]:
+  """One-row outputs of projections that read the same input, quantizing it to Q8 once: each packed
+  GEMV would otherwise quantize it again. Other inputs or layers go through their own call."""
+  width = getattr(layers[0], 'in_features', None)
+  if _SHARED_Q8 and all(isinstance(layer, _NVLinear) for layer in layers) and isinstance(x.numel(), int) and x.numel() == width:
+    q8 = q8_quantize(x, 1, width)
+    return tuple(layer.decode(x, q8) for layer in layers)
+  return tuple(layer(x) for layer in layers)
+
+def _fused_feed_forward(block):
+  """Upstream's dense feed-forward, with gate and up sharing one Q8 activation for one row."""
+  upstream_feed_forward = block._feed_forward
+  def feed_forward(x: Tensor) -> Tensor:
+    if hasattr(block, 'ffn_gate_exps') or not isinstance(x.numel(), int) or x.numel() != getattr(block.ffn_gate, 'in_features', None):
+      return upstream_feed_forward(x)
+    gate, up = _one_row(x, block.ffn_gate, block.ffn_up)
+    return block.ffn_down(gate.silu().contiguous() * up)
+  return feed_forward
+
 def _fused_gdn(block: GatedDeltaNetBlock):
   """Upstream GatedDeltaNetBlock._attention with NV kernels where upstream has them only on AMD.
 
@@ -168,9 +190,10 @@ def _fused_gdn(block: GatedDeltaNetBlock):
     if B != 1 or multirow: return upstream_attention(x, start_pos)
     initial = Tensor(start_pos).eq(0)
     x = x.half()
-    out_gate = block.attn_gate(x).reshape(H, V)
+    qkv, out_gate = _one_row(x, block.attn_qkv, block.attn_gate)
+    out_gate = out_gate.reshape(H, V)
     # beta/decay projections, conv, q/k norms, recurrence, RMSNorm and gate in one kernel; then the conv shift
-    qkv = block.attn_qkv(x).cast(block.conv_state.dtype).reshape(-1)
+    qkv = qkv.cast(block.conv_state.dtype).reshape(-1)
     conv_state = Tensor(block.conv_state.uop.buf_uop).reshape(block.ssm_conv_kernel - 1, block.conv_channels)
     state = Tensor(block.recurrent_state.uop.buf_uop).reshape(H, V, K)
     z = gdn_decode(qkv, conv_state, block.ssm_conv1d['weight'], x.reshape(-1), block.ssm_beta.weight, block.ssm_alpha.weight,
@@ -187,7 +210,7 @@ def _fused_attention(block: TransformerBlock):
   def attention_step(x: Tensor, start_pos):
     B, T, _ = x.shape
     if B != 1 or isinstance(T, UOp) or T != 1: return upstream_attention(x, start_pos)
-    q, k, v = block.attn_q(x), block.attn_k(x), block.attn_v(x)
+    q, k, v = _one_row(x, block.attn_q, block.attn_k, block.attn_v)
     if c.qk_norm and c.qk_norm != c.head_dim: q, k = block.attn_q_norm(q), block.attn_k_norm(k)
     if c.attn_output_gate:
       qg = q.reshape(B, T, c.n_heads, 2, c.head_dim)
@@ -461,6 +484,8 @@ class Qwen35Model:
         if (type(block) is TransformerBlock and not block.config.sliding_window and not hasattr(block, 'attn_sinks')
             and block.config.head_dim % 32 == 0):
           block._attention = _fused_attention(block)
+    for block in transformer.blk:
+      if isinstance(getattr(block, 'ffn_gate', None), _NVLinear): block._feed_forward = _fused_feed_forward(block)
     gdn = [block for block in transformer.blk if isinstance(block, GatedDeltaNetBlock)]
     fused = [block for block in gdn if getattr(block, 'ssm_g_a', None) is None and block.head_k_dim == 128 and block.head_v_dim == 128]
     if os.environ.get('INFURNACE_FUSED_GDN', '1') != '0':

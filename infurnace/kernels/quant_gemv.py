@@ -196,8 +196,9 @@ def q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor, 
 
 def _decode_warps(ggml_type: int, in_features: int, out_features: int) -> int:
   if ggml_type == Q4_K: return 4
-  # RTX 5060 screen: larger blocks helped this Q6 output head, not FFN-down.
-  if ggml_type == Q6_K and (out_features, in_features) == (151936, 2560): return 8
+  # RTX 5060: the Qwen3.5-4B Q6 output head (tied to the embedding) takes 1.31 ms with 4 or 8 warps
+  # against 1.45-1.48 ms with 1; FFN-down was screened earlier and stays at 1.
+  if ggml_type == Q6_K and (out_features, in_features) == (248320, 2560): return 8
   return 1
 
 def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot:Callable[[UOp, UOp, UOp], UOp], name:str,

@@ -4,7 +4,7 @@ from typing import Callable, Mapping
 from tinygrad.llm.cli import SimpleTokenizer
 
 class Qwen35Tokenizer:
-  """Qwen3.5 text codec (HF tokenizers BPE); install infurnace[qwen35]."""
+  """Qwen3.5 text codec (HF tokenizers BPE)."""
   def __init__(self, normal_tokens: dict[str, int], special_tokens: dict[str, int], eos_id: int, eot_id: int | None):
     # SimpleTokenizer's byte decoder is shared with Qwen3.5. Its qwen2 encoder
     # is never used: Qwen3.5 needs its own pretokenization and NFC normalization.
@@ -43,7 +43,7 @@ class Qwen35Tokenizer:
     try:
       from tokenizers import Tokenizer as HFTokenizer, Regex, models, normalizers, pre_tokenizers, decoders
     except ImportError as exc:
-      raise ValueError("Qwen3.5 requires tokenizers: install infurnace[qwen35]") from exc
+      raise ValueError("Qwen3.5 requires the tokenizers package: reinstall infurnace (pip install -e .)") from exc
     try:
       result = cls(normal, special, eos, eot)
     except KeyError as exc:

@@ -20,7 +20,7 @@ def decode_graph(typ, rows, width):
   params = [UOp.placeholder_like(t.uop, slot=i) for i, t in enumerate(tensors)]
   return kernels._quant_decode_kernel(*params, out_features=rows, in_features=width, ggml_type=typ)
 
-@pytest.mark.parametrize("typ,rows,width,warps", [(12, 2560, 9728, 4), (14, 151936, 2560, 8), (14, 2560, 9728, 1)])
+@pytest.mark.parametrize("typ,rows,width,warps", [(12, 2560, 9728, 4), (14, 248320, 2560, 8), (14, 2560, 9728, 1)])
 def test_decode_graph_keeps_warps_separate_and_eight_integer_dots(typ, rows, width, warps):
   graph = decode_graph(typ, rows, width)
   nodes = list(graph.toposort())
