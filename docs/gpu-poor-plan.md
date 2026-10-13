@@ -101,22 +101,40 @@ run on the same full prompt.
 
 ## 4. Small default context, and DFlash cost grows with it
 
-- [ ] Attend over the active length (rounded up to a few fixed sizes) in the DFlash verifier and draft
+- [x] Attend over the active length in the DFlash verifier and draft
 - [ ] Then raise the default `--max-context` to 8–16k
 
 **Problem.** The default is 2,048 tokens. A thinking model can use most of that on one answer,
 and then chat starts dropping turns. Qwen3.5's attention cache is cheap: 8 attention layers ×
-K/V × 4 heads × 256 × 2 bytes = **32 KiB per token**, so 16k tokens ≈ 0.5 GB.
+K/V × 4 heads × 256 × 2 bytes = **32 KiB per token**, so 16k tokens ≈ 0.5 GB. But DFlash attended
+over the whole allocated window every round, so a larger `--max-context` slowed every round.
 
-The catch: DFlash attends over the **whole window every round, with a mask**, not only the tokens
-in use:
-- `ParallelVerifier._attention` (`dflash/parallel.py`) uses `length = c.max_context`;
-- `DFlashDraft._denoise` (`dflash/draft.py`) attends over `cache_length`.
+**Done: `kernels/attention.py`.** A port of vLLM's unified-attention design to tinygrad UOps: all
+query rows of the heads sharing a KV head are packed into one block (each key and value read once
+per KV head); each row has its own causal limit (plus sliding windows for the draft); 256-key
+segments are processed in parallel, and only those holding active keys launch; a second kernel
+merges them, after llama.cpp's `flash_attn_combine_results`. One captured graph serves every
+length. Other devices fall back to the old masked tensor ops.
 
-So a larger `--max-context` slows every DFlash round, even early in a conversation.
+Why a custom kernel: tinygrad's own attention over a runtime length scales badly (16-row call at
+16k keys: 81.6 ms with `start_pos+T`, 8.9 ms as 256-key blocks), while its fixed-length kernel
+costs the same at any active length (1.5 ms at a 16k window).
 
-**Check.** DFlash tok/s at `--max-context 2048` and `16384` on the same short chat should be
-about equal after the fix.
+Measured on the RTX 5060 (16-row call, Qwen3.5 shapes): ~0.22 ms up to 1k active keys, 0.40 ms at
+2k, 0.61 ms at 4.3k, 0.92 ms at 8k, 1.68 ms at 16k. End to end, same output and acceptance:
+
+| DFlash, code prompt | Before | After |
+|---|---|---|
+| `--max-context 2048` | 266 tok/s | 346 tok/s |
+| `--max-context 16384` | 91 tok/s | 332 tok/s |
+| 16k context, 4,319-token prompt | 94 tok/s, first token 15.7 s | 276 tok/s, first token 7.7 s |
+
+Memory at 16k with DFlash: 5.1 GB allocated by tinygrad, 6.9 GB peak for the whole card with the
+desktop running. Tests: `tests/kernels/test_nv_attention.py` (against plain softmax, across segment
+boundaries, causal/non-causal/sliding, one graph at every length).
+
+**Next.** Raise the default context, and check plain decoding: upstream's one-row attention also
+slows with length (105 → ~76 tok/s at 2.5k tokens), and this kernel handles one row too.
 
 ## 5. Greedy decoding only
 

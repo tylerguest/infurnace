@@ -14,6 +14,7 @@ from infurnace.kernels.quant_gemv import QUANT_SIZES
 from infurnace.kernels.quant_gemm import nv_prefill_supported
 from infurnace.models.qwen35 import Qwen35Model
 from infurnace.dflash.jit import captured
+from infurnace.kernels.attention import attention
 
 @dataclass(frozen=True)
 class DFlashConfig:
@@ -214,11 +215,8 @@ class DFlashDraft:
     Tensor.realize(*stored)
 
   def _denoise(self, noise: Tensor, position: UOp):
-    c, weights, length = self.config, self.weights, self.cache_length
+    c, weights = self.config, self.weights
     rows, x = noise.shape[1], noise
-    query_pos = Tensor.arange(rows).reshape(rows, 1) + Tensor(position)
-    key_pos = Tensor.arange(length).reshape(1, length)
-    visible = (key_pos < Tensor(position) + rows).expand(rows, length)
     for i, block in enumerate(weights.blk):
       residual, norm = x, block.attn_norm(x)
       q = block.attn_q_norm(projection(block.attn_q, norm).reshape(1, rows, c.heads, c.head_dim)).transpose(1, 2)
@@ -227,14 +225,10 @@ class DFlashDraft:
       q, k = apply_rope(q, self.frequencies[position:position + rows]), apply_rope(k, self.frequencies[position:position + rows])
       store = self.cache[i][:, :, :, position:position + rows].uop.store(Tensor.stack(k, v).half().uop)
       cache = Tensor(self.cache[i].uop.after(store))
-      layer_causal = c.layer_causal(i)
-      layer_visible = visible & (key_pos <= query_pos) if layer_causal else visible
-      if c.sliding[i]:
-        layer_visible = layer_visible & (query_pos - key_pos < c.window)
-        if not layer_causal: layer_visible = layer_visible & (key_pos - query_pos < c.window)
-      mask = layer_visible.where(0.0, float('-inf')).reshape(1, 1, rows, length)
-      attention = q.scaled_dot_product_attention(cache[0], cache[1], attn_mask=mask, enable_gqa=True)
-      x = residual + projection(block.attn_output, attention.transpose(1, 2).reshape(1, rows, -1))
+      # Over the active length only: rows see keys up to position+rows (causal: up to their own),
+      # within the window on sliding layers.
+      attended = attention(q, cache, position, causal=c.layer_causal(i), window=c.window if c.sliding[i] else 0).cast(q.dtype)
+      x = residual + projection(block.attn_output, attended.transpose(1, 2).reshape(1, rows, -1))
       norm = block.ffn_norm(x)
       x = x + projection(block.ffn_down, projection(block.ffn_gate, norm).silu() * projection(block.ffn_up, norm))
     return weights.output_norm(x[:, 1:])

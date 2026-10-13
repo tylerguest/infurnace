@@ -20,6 +20,7 @@ from tinygrad import Context, Tensor, UOp, dtypes
 from tinygrad.llm.model import GatedDeltaNetBlock, apply_rope
 from infurnace.dflash.jit import captured
 from infurnace.dflash.target import TargetObserver
+from infurnace.kernels.attention import attention
 from infurnace.kernels.gdn import gdn_chunk
 from infurnace.kernels.embedding import packed_gather
 
@@ -122,9 +123,9 @@ class ParallelVerifier:
     return block.ssm_out(z.reshape(B, T, -1))
 
   def _attention(self, block, x: Tensor, start_pos: UOp) -> Tensor:
-    # Upstream TransformerBlock._attention, but attending over the fixed-length
-    # cache with a causal mask: symbolic `start_pos+T` key lengths compile to
-    # slow kernels, and masked rows contribute exact zeros.
+    # Upstream TransformerBlock._attention for a concrete row count, with the attention itself in
+    # kernels/attention.py: its cost follows the active length `start_pos+T`, not the allocated
+    # cache (tinygrad's own kernels for a runtime length scale badly).
     c, (B, T, _) = block.config, x.shape
     q, k, v = block.attn_q(x), block.attn_k(x), block.attn_v(x)
     if c.qk_norm and c.qk_norm != c.head_dim: q, k = block.attn_q_norm(q), block.attn_k_norm(k)
@@ -140,10 +141,7 @@ class ParallelVerifier:
     k = apply_rope(k[..., :c.rope_dim], freqs).cat(k[..., c.rope_dim:], dim=-1)
     store = block.cache_kv[:, :, :, start_pos:start_pos + T, :].uop.store(Tensor.stack(k, v).cast(block.cache_kv.dtype).uop)
     cache = Tensor(block.cache_kv.uop.after(store))
-    length = c.max_context
-    visible = Tensor.arange(length).reshape(1, length) <= (Tensor.arange(T).reshape(T, 1) + Tensor(start_pos))
-    mask = visible.where(0.0, float('-inf')).cast(x.dtype).reshape(1, 1, T, length)
-    attn = q.scaled_dot_product_attention(cache[0], cache[1], attn_mask=mask, enable_gqa=True).transpose(1, 2).reshape(B, T, -1)
+    attn = attention(q, cache, start_pos).cast(q.dtype).transpose(1, 2).reshape(B, T, -1)
     return block.attn_output(attn * gate.sigmoid() if c.attn_output_gate else attn)
 
   def _forward(self, x: Tensor, start_pos: UOp):
