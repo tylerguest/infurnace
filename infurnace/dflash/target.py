@@ -3,6 +3,12 @@ from tinygrad import Context, Tensor, TinyJit, UOp, dtypes
 from tinygrad.uop.ops import Ops
 from infurnace.models.qwen35 import Qwen35Model
 
+def detach_rng(device: str):
+  """Detach a captured graph's RNG counter update in place (buffer identity kept): live lazy graphs
+  are walked on every realize."""
+  counter = Tensor._device_rng_counters[device]
+  if counter.uop.op is not Ops.BUFFER: counter.replace(Tensor(counter.uop.buf_uop).reshape(counter.shape))
+
 class TargetObserver:
   def __init__(self, model: Qwen35Model, feature_layers: tuple[int, ...]):
     if not isinstance(model, Qwen35Model): raise ValueError('DFlash requires Qwen3.5 target support')
@@ -20,6 +26,7 @@ class TargetObserver:
     self._token = UOp.variable('dflash_token', 0, model.config.vocab_size - 1)
     self._jit = TinyJit(self._forward)  # eager first: its RNG advance must match upstream sampling
     self._temperature = None
+    self.temperature = 0.0  # sampling temperature for every target decision; 0 is greedy
 
   def _realize_state(self):
     # DFlash's verifier stores into the target's caches and states directly, so they must be
@@ -28,7 +35,7 @@ class TargetObserver:
     self.model.realize_state()
     # A persistent temperature buffer: the captured step always sees the same address.
     if self._temperature is None:
-      with Context(DEV=self.model.device): self._temperature = Tensor([0.0], device=self.model.device).realize()
+      with Context(DEV=self.model.device): self._temperature = Tensor([float(self.temperature)], device=self.model.device).realize()
 
   def __enter__(self):
     if self.active or self.model._generating: raise RuntimeError('only one generation may run at a time')
@@ -84,8 +91,7 @@ class TargetObserver:
         selected = int(decision.item())
         # Detach the captured RNG update graph in place (buffer identity kept);
         # live graphs are walked on every realize.
-        counter = Tensor._device_rng_counters[self.model.device]
-        if counter.uop.op is not Ops.BUFFER: counter.replace(Tensor(counter.uop.buf_uop).reshape(counter.shape))
+        detach_rng(self.model.device)
       self.position += 1
       self.next_decision = selected
       return selected, features

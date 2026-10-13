@@ -160,14 +160,33 @@ if other apps leave room, so it is not the default.
 
 ## 5. Greedy decoding only
 
-- [ ] Add `--temperature` for plain decoding
-- [ ] Later: speculative rejection sampling so DFlash can sample too
+- [x] Add `--temperature` for plain decoding
+- [x] Speculative sampling so DFlash can sample too
 
-**Problem.** `cli.generator` calls `model.generate(ids, budget)` at temperature 0, the CLI has no
-temperature option, and `DFlashGenerator.stream` rejects any temperature but 0. Qwen advises
-against greedy decoding in thinking mode because it tends to repeat itself.
+**Problem.** Everything decoded greedily: no temperature option, and `DFlashGenerator.stream` rejected
+any temperature but 0. Qwen advises against greedy decoding in thinking mode because it tends to
+repeat itself.
 
-**Check.** Long thinking answers stop looping. Upstream `generate` already takes a temperature.
+**Done.** `--temperature T` (default 0, greedy). Plain decoding passes it to upstream's sampler.
+DFlash needed no full rejection sampling: the draft proposes greedily, so its distribution is
+one-hot, and for a one-hot draft speculative sampling reduces to sampling the target's token at each
+verified row and accepting the proposal when the sample equals it. That accepts with probability p(x)
+(the optimal rate), and a rejecting row's sample is already distributed as the target excluding x,
+the residual. So the verifier's per-row argmax becomes a Gumbel-max sample (`ParallelVerifier`
+`sampled=True`); host acceptance logic is unchanged. A generator's temperature is fixed at creation,
+because sampling changes the captured verify graph; greedy stays bit-identical.
+
+Checks (tiny CPU model, `tests/dflash/test_sampling.py`, seeded): first-token frequencies pass a
+chi-square test against the exact probabilities; at T = 0.02 (98% of proposals accepted) DFlash's
+3-token sequence distribution matches plain sampling. Investigated separately: verifier logits are
+bit-identical to the one-row path; sampling under the verifier's capture passes 8,000 draws; draws
+are uncorrelated.
+
+Measured on the RTX 5060 at T = 0.6, thinking on, 256 tokens: DFlash 143 / 171 / 209 tok/s against
+plain 113 (1.26× history prose, 1.51× explanation, 1.84× code; greedy was 1.49–2.11×).
+
+**Open: default.** Chat still defaults to greedy; Qwen's thinking-mode setting would be 0.6 (plus
+top-p 0.95 / top-k 20, which upstream's sampler doesn't have).
 
 ## 6. Install and getting models
 

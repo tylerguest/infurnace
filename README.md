@@ -52,6 +52,7 @@ Details and the selected model revision: [Qwen3.5 setup](docs/qwen35.md).
 
 ```sh
 infurnace --no-thinking
+infurnace --temperature 0.6                  # sample instead of greedy decoding (works with DFlash)
 infurnace --prompt "Hello" --max-tokens 64   # raw text, no chat template
 infurnace --serve                          # 127.0.0.1:8000, plain decoding
 infurnace --benchmark 512,32                # per-step timing
@@ -63,6 +64,9 @@ infurnace --device CPU
 - **Startup:** chat and serving warm up first; `--no-warmup` skips this.
   Single-shot generation skips automatic warmup.
 - **Thinking:** enabled in chat; `--no-thinking` disables it.
+- **Sampling:** greedy by default; `--temperature T` samples, with DFlash too: the draft proposes
+  greedily and a proposal is accepted when the target's own sample matches it, which keeps the
+  target's sampling distribution. Qwen suggests about 0.6 with thinking, where greedy can repeat.
 - **Context:** defaults to 8,192 tokens; `--max-context` changes the window. At the default, infurnace
   uses about 5.3 GB of GPU memory with DFlash (RTX 5060). Each extra 8k tokens adds roughly half a GB
   of cache, so 16,384 fits on an 8 GB card if other apps leave room.

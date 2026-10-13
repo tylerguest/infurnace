@@ -44,7 +44,7 @@ def test_explicit_draft_is_used_on_any_device(monkeypatch, tmp_path, capsys, dev
   path.touch()
   model, engine = SimpleNamespace(config=SimpleNamespace(context_length=16), device=device), Engine()
   monkeypatch.setattr(loader, 'load_model', lambda *a, **kw: (model, Tokenizer()))
-  monkeypatch.setattr(loader, 'load_dflash', lambda target, draft: engine if (target, draft) == (model, path) else None)
+  monkeypatch.setattr(loader, 'load_dflash', lambda target, draft, **kw: engine if (target, draft) == (model, path) else None)
   assert cli.main(['--dflash', str(path), '--prompt', 'hello', '--max-tokens', '5']) == 0
   assert engine.calls[0][1]['max_new_tokens'] == 5 and engine.closed and 'DFlash' in capsys.readouterr().err
 
@@ -57,10 +57,10 @@ def test_installed_draft_is_used_automatically(monkeypatch, tmp_path, device, fl
   monkeypatch.setenv('INFURNACE_DFLASH_DRAFT', str(draft))
   monkeypatch.setattr(loader, 'is_qwen35', lambda path: True)
   plain = []
-  model = SimpleNamespace(config=SimpleNamespace(context_length=16), device=device, generate=lambda ids, n: (t for t in plain.append(ids) or ()))
+  model = SimpleNamespace(config=SimpleNamespace(context_length=16), device=device, generate=lambda ids, n, **kw: (t for t in plain.append(ids) or ()))
   monkeypatch.setattr(loader, 'load_model', lambda *a, **kw: (model, Tokenizer()))
   loaded, engine = [], Engine()
-  monkeypatch.setattr(loader, 'load_dflash', lambda target_model, path: loaded.append(path) or engine)
+  monkeypatch.setattr(loader, 'load_dflash', lambda target_model, path, **kw: loaded.append(path) or engine)
   monkeypatch.setattr(cli, 'warmup', lambda *a: None)
   monkeypatch.setattr('infurnace.serve.serve', lambda model, *a, **kw: None)
   run = ['--prompt', 'hello'] if '--serve' not in flags else []

@@ -24,6 +24,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
   ap.add_argument("--max-tokens", type=_positive, help="reply length cap, including thinking (default: chat uses the remaining "
                                                        f"context, --prompt {PROMPT_MAX_TOKENS})")
   ap.add_argument("--max-context", type=_positive, default=8192, help="context window in tokens (default 8192)")
+  ap.add_argument("--temperature", type=_temperature, default=0.0, help="sampling temperature (default 0: greedy); works with DFlash")
   ap.add_argument("--no-thinking", action="store_true", help="disable thinking in chat formatting")
   ap.add_argument("--no-warmup", action="store_true", help="skip the startup warmup (the first reply is then slower)")
   ap.add_argument("--device", help="override automatic device selection, e.g. NV or CPU")
@@ -44,6 +45,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
   if args.no_thinking and (args.prompt is not None or args.benchmark is not None): ap.error("--no-thinking applies only to chat")
   if args.dflash is not None and not args.dflash.is_file(): ap.error("--dflash must name a local draft GGUF file")
   return args
+
+def _temperature(value: str) -> float:
+  try: temperature = float(value)
+  except ValueError: temperature = -1.0
+  if not 0 <= temperature < float('inf'): raise argparse.ArgumentTypeError("must be a finite number >= 0")
+  return temperature
 
 def _positive(value: str) -> int:
   if not value.isdigit() or int(value) <= 0: raise argparse.ArgumentTypeError("must be a positive integer")
@@ -88,9 +95,9 @@ def _dflash_block(dflash) -> int:
   # Parallel verification checks a whole trained block; the sequential reference checks 4 rows.
   return dflash.draft.config.block_size if dflash.verifier == 'parallel' else 4
 
-def generator(model, tokenizer, dflash=None) -> Callable[[list[int], int], Iterator[int]]:
-  """generate(ids, budget): plain decoding, or DFlash speculative decoding."""
-  if dflash is None: return model.generate
+def generator(model, tokenizer, dflash=None, temperature: float = 0.0) -> Callable[[list[int], int], Iterator[int]]:
+  """generate(ids, budget): plain decoding, or DFlash speculative decoding (created for `temperature`)."""
+  if dflash is None: return lambda ids, budget: model.generate(ids, budget, temperature=temperature)
   eos, block = tuple(i for i in (tokenizer.eos_id, tokenizer.eot_id) if i is not None), _dflash_block(dflash)
   return lambda ids, budget: dflash.stream(ids, max_new_tokens=budget, block_size=block, eos_token_ids=eos)
 
@@ -179,9 +186,9 @@ def run(args: argparse.Namespace) -> int:
 
   dflash = None
   if draft is not None and not (automatic and model.device.split(':')[0] != 'NV'):  # the CPU reference is slower than plain
-    dflash = loader.load_dflash(model, loader.fetch_model(draft))
+    dflash = loader.load_dflash(model, loader.fetch_model(draft), temperature=args.temperature)
     print(f"DFlash speculative decoding{' on (--no-dflash turns it off)' if automatic else ''}.", file=sys.stderr, flush=True)
-  generate, context = generator(model, tokenizer, dflash), model.config.context_length
+  generate, context = generator(model, tokenizer, dflash, args.temperature), model.config.context_length
 
   if args.prompt is not None:
     reply(generate, tokenizer, encode(tokenizer, args.prompt), args.max_tokens or PROMPT_MAX_TOKENS, context)

@@ -20,7 +20,7 @@ def test_benchmark_spec(value, expected):
 @pytest.mark.parametrize('message', ['NV signal wait timed out', 'PYTHON hang detected', 'unrelated bug'])
 def test_cli_device_timeout_diagnostic_does_not_swallow_other_errors(monkeypatch, capsys, message):
   model = SimpleNamespace(config=SimpleNamespace(context_length=16), device='NV')
-  def fail(*args): raise RuntimeError(message)
+  def fail(*args, **kwargs): raise RuntimeError(message)
   model.generate = fail
   tokenizer = SimpleNamespace(bos_id=None, encode=lambda text: [1], stream_decoder=lambda: lambda token: '')
   monkeypatch.setattr(loader, 'load_model', lambda *a, **kw: (model, tokenizer))

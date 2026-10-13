@@ -5,6 +5,7 @@ parallel verification runs the whole draft block through the target at once
 (see parallel.py).
 """
 import collections
+import math
 from dataclasses import dataclass
 import os
 import time
@@ -74,13 +75,18 @@ class _DraftPolicy:
     self.tau, self.cooldown, self.backoff = float(self.block), g.cooldown_steps * self.backoff, min(self.backoff * 2, g.max_backoff)
 
 class DFlashGenerator:
-  def __init__(self, model, draft, *, verifier: str = 'sequential'):
+  def __init__(self, model, draft, *, verifier: str = 'sequential', temperature: float = 0.0):
     if model.device.split(':')[0] not in ('CPU', 'NV'):
       raise ValueError('DFlash reference currently requires CPU/NV one-row upstream prefill')
     if draft.target is not model or draft.device != model.device: raise ValueError('DFlash draft belongs to a different target/device')
     if verifier not in ('sequential', 'parallel'): raise ValueError('invalid DFlash verifier')
+    if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or not math.isfinite(temperature) or temperature < 0:
+      raise ValueError('temperature must be finite and nonnegative')
     self.model, self.draft, self.verifier = model, draft, verifier
+    # Fixed per generator: sampling changes the captured verify graph (argmax vs Gumbel-max).
+    self.temperature = float(temperature)
     self.observer = TargetObserver(model, draft.config.feature_layers)
+    self.observer.temperature = self.temperature
     self._parallel = {}
     # Break-even tokens/round for parallel verification vs one-row decode on
     # the 5060 (one round ~= 3.2 ordinary steps), and the fallback length.
@@ -98,8 +104,9 @@ class DFlashGenerator:
     self.stats = DFlashStats()
 
   def stream(self, tokens: list[int], *, max_new_tokens: int, block_size: int | None = None,
-             eos_token_ids: tuple[int, ...] = (), temperature: float = 0.0):
-    if temperature != 0.0 or isinstance(temperature, bool): raise ValueError('DFlash reference supports greedy temperature=0 only')
+             eos_token_ids: tuple[int, ...] = (), temperature: float | None = None):
+    if temperature is not None and temperature != self.temperature:
+      raise ValueError(f'this DFlash generator samples at temperature {self.temperature}; create one for {temperature}')
     if not isinstance(tokens, list) or not tokens: raise ValueError('prompt must be a nonempty token list')
     if any(type(t) is not int or not 0 <= t < self.model.config.vocab_size for t in tokens): raise ValueError('invalid prompt token')
     if type(max_new_tokens) is not int or max_new_tokens < 0: raise ValueError('invalid output budget')
@@ -270,5 +277,5 @@ class DFlashGenerator:
 
   def _parallel_verifier(self, block):
     from infurnace.dflash.parallel import ParallelVerifier
-    if block not in self._parallel: self._parallel[block] = ParallelVerifier(self.observer, block)
+    if block not in self._parallel: self._parallel[block] = ParallelVerifier(self.observer, block, sampled=self.temperature > 0)
     return self._parallel[block]
