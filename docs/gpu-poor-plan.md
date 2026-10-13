@@ -102,7 +102,7 @@ run on the same full prompt.
 ## 4. Small default context, and DFlash cost grows with it
 
 - [x] Attend over the active length in the DFlash verifier and draft
-- [ ] Then raise the default `--max-context` to 8–16k
+- [x] Then raise the default `--max-context`: now 8,192 (about 5.3 GB with DFlash on the 5060)
 
 **Problem.** The default is 2,048 tokens. A thinking model can use most of that on one answer,
 and then chat starts dropping turns. Qwen3.5's attention cache is cheap: 8 attention layers ×
@@ -133,8 +133,15 @@ Memory at 16k with DFlash: 5.1 GB allocated by tinygrad, 6.9 GB peak for the who
 desktop running. Tests: `tests/kernels/test_nv_attention.py` (against plain softmax, across segment
 boundaries, causal/non-causal/sliding, one graph at every length).
 
-**Next.** Raise the default context, and check plain decoding: upstream's one-row attention also
-slows with length (105 → ~76 tok/s at 2.5k tokens), and this kernel handles one row too.
+**Plain decoding too.** One-row decode attention now goes through the same kernel (`_fused_attention`
+in `models/qwen35.py`, after upstream's AMD branch), with 32-key segments and queries per warp sized
+to the call. Same output tokens; 100-token prompt 107.5 → 108.9 tok/s, 2,532-token prompt
+73.7 → 95.5 tok/s. Accumulating in FP32 instead of FP16 flips some measured near-ties (0.006–0.08
+logits) between paths; the real-model tests now compare prefixes before them.
+
+**Default context: 8,192.** At the default, infurnace used about 5.3 GB with DFlash (whole card
+7.46 GB with 2.1 GB of desktop apps). 16k adds roughly half a GB of cache: it fits an 8 GB card only
+if other apps leave room, so it is not the default.
 
 ## 5. Greedy decoding only
 

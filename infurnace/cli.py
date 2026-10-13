@@ -23,7 +23,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                   help=f"model name ({', '.join(loader.MODELS)}; downloaded on first use) or a path to a local GGUF file")
   ap.add_argument("--max-tokens", type=_positive, help="reply length cap, including thinking (default: chat uses the remaining "
                                                        f"context, --prompt {PROMPT_MAX_TOKENS})")
-  ap.add_argument("--max-context", type=_positive, default=2048, help="context window in tokens (default 2048)")
+  ap.add_argument("--max-context", type=_positive, default=8192, help="context window in tokens (default 8192)")
   ap.add_argument("--no-thinking", action="store_true", help="disable thinking in chat formatting")
   ap.add_argument("--no-warmup", action="store_true", help="skip the startup warmup (the first reply is then slower)")
   ap.add_argument("--device", help="override automatic device selection, e.g. NV or CPU")

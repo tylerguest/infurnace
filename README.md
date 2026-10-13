@@ -63,7 +63,9 @@ infurnace --device CPU
 - **Startup:** chat and serving warm up first; `--no-warmup` skips this.
   Single-shot generation skips automatic warmup.
 - **Thinking:** enabled in chat; `--no-thinking` disables it.
-- **Context:** defaults to 2048 tokens; `--max-context` changes the window.
+- **Context:** defaults to 8,192 tokens; `--max-context` changes the window. At the default, infurnace
+  uses about 5.3 GB of GPU memory with DFlash (RTX 5060). Each extra 8k tokens adds roughly half a GB
+  of cache, so 16,384 fits on an 8 GB card if other apps leave room.
   Chat drops oldest complete turns with a notice and rejects oversized messages.
 - **Replies:** run until EOS or context exhaustion unless capped with
   `--max-tokens` (includes thinking). Raw prompts default to 64 output tokens.
