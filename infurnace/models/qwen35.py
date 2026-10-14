@@ -248,6 +248,16 @@ def _lazy_upstream_weights(path):
   try: yield
   finally: upstream_model.gguf_parse, upstream_model.gguf_shard = parse, shard
 
+SNAPSHOTS = 8  # prompt snapshots kept, about 50 MB of host memory each for Qwen3.5-4B
+
+@dataclass
+class _Snapshot:
+  prefix: list[int]
+  owner: object                 # the DFlash draft whose state was saved too, or None
+  draft_state: object
+  states: list[Tensor]          # recurrent and conv states, on the CPU
+  user: bool                    # saved at the end of a user message
+
 class Qwen35Model:
   """Bounded single-request runner around tinygrad's Qwen3.5 transformer."""
   def __init__(self, transformer: Transformer, metadata: dict, device: str | None = None):
@@ -265,9 +275,12 @@ class Qwen35Model:
     self._tied_head = False  # the packed output head is the token embedding table
     self._multirow_prefill = False  # prompts go through the fused 16-row GDN kernel (see _prefill)
     self._warming = False
-    # One saved prompt state for the next turn (see save_snapshot); turn_token marks where turns start.
+    # Saved prompt states for later turns (see save_snapshot). turn_token marks where turns start;
+    # user_turn (its header's tokens) and tool_marker tell a user message from a tool result.
     self.turn_token: int | None = None
-    self._snapshot, self._snapshot_buffers = None, None
+    self.user_turn: tuple[int, ...] = ()
+    self.tool_marker: int | None = None
+    self._snapshots: list[_Snapshot] = []
 
   def warmup(self) -> None:
     """Prime upstream prefill/decode JIT using the same chunk size as normal generation."""
@@ -305,14 +318,17 @@ class Qwen35Model:
     """Invalidate prefix reuse without reallocating tinygrad's cache or JIT."""
     if self._generating: raise RuntimeError("cannot reset during generation")
     self.transformer._cached_tokens = []
-    self._snapshot = None
+    self._snapshots = []
 
-  # Prompt snapshots, as llama.cpp's server and Ollama's MLX runner keep them. Recurrent state can't
-  # be rewound, so a new prompt that shares only part of the last one would be read from scratch.
-  # Instead the recurrent and conv states (and a DFlash draft's position) are saved at one point of
-  # each prompt, just before its final turn header: the next chat turn re-renders the previous reply
-  # without its thinking, so its prompt diverges right after that point. The attention KV caches need
-  # no copy: they are indexed by position, and later tokens only overwrite what follows the point.
+  # Prompt snapshots, as llama.cpp's server keeps its context checkpoints. Recurrent state can't be
+  # rewound, so a new prompt that shares only part of the last one would be read from scratch.
+  # Instead the recurrent and conv states (and a DFlash draft's position) are copied to host memory
+  # at one point of each prompt, just before its final turn header, and a later prompt resumes from
+  # the newest one it still matches. Qwen's template re-renders earlier replies without their thinking
+  # once a new user message arrives, so that message's prompt matches only up to the end of the
+  # previous user message: the snapshot saved there is kept however long the tool loop after it ran.
+  # The attention KV caches need no copy: they are indexed by position, and every snapshot is a prefix
+  # of what the cache holds; one a new prompt diverges from is dropped when its positions are rewritten.
 
   def _recurrent_states(self) -> list[Tensor]:
     return [Tensor(getattr(block, name).uop.buf_uop).reshape(getattr(block, name).shape)
@@ -325,28 +341,42 @@ class Qwen35Model:
     point = marks[-1] if marks else len(tokens) - 4
     return point if 0 < point < len(tokens) and point >= start else None
 
+  def _ends_user_message(self, prefix: list[int]) -> bool:
+    """Whether the last message in `prefix` is a user message (not a tool result)."""
+    if self.turn_token is None or not self.user_turn or self.turn_token not in prefix: return False
+    last = len(prefix) - 1 - prefix[::-1].index(self.turn_token)
+    header = tuple(prefix[last:last + len(self.user_turn)])
+    return header == self.user_turn and prefix[last + len(header):last + len(header) + 1] != [self.tool_marker]
+
   def save_snapshot(self, prefix: list[int], draft=None) -> None:
     """Save the current state as the state after `prefix` (and the draft's, if it read the same rows)."""
-    if self._snapshot is not None and self._snapshot[0] == prefix and self._snapshot[1] is draft: return
-    with Context(DEV=self.device):
-      live = self._recurrent_states()
-      if self._snapshot_buffers is None: self._snapshot_buffers = [state.clone().realize() for state in live]
-      else: Tensor.realize(*(Tensor(copy.uop.after(copy.uop.store(state.uop))) for copy, state in zip(self._snapshot_buffers, live)))
-    self._snapshot = (list(prefix), draft, None if draft is None else draft.save_state())
+    if any(snap.prefix == prefix and snap.owner is draft for snap in self._snapshots): return
+    with Context(DEV=self.device): states = [state.clone(device='CPU').realize() for state in self._recurrent_states()]
+    snap = _Snapshot(list(prefix), draft, None if draft is None else draft.save_state(), states, self._ends_user_message(prefix))
+    self._snapshots = sorted([s for s in self._snapshots if s.prefix != prefix] + [snap], key=lambda s: len(s.prefix))
+    while len(self._snapshots) > SNAPSHOTS:  # the oldest goes, except the last user message's
+      users = [s for s in self._snapshots if s.user]
+      self._snapshots.remove(next(s for s in self._snapshots if not users or s is not users[-1]))
+
+  def snapshot_length(self, tokens: list[int], draft=None) -> int:
+    """How much of `tokens` the newest usable snapshot covers (0 without one)."""
+    usable = [s for s in self._snapshots if len(tokens) > len(s.prefix) and tokens[:len(s.prefix)] == s.prefix
+              and (draft is None or s.owner is draft)]
+    return len(usable[-1].prefix) if usable else 0
 
   def restore_snapshot(self, tokens: list[int], start: int, draft=None) -> int:
-    """The position to resume `tokens` from: the snapshot's, after restoring it, when the prompt still
-    matches it and that beats `start`. A request that will overwrite positions the snapshot relies on
-    (starting before it without restoring) drops it."""
-    if self._snapshot is None: return start
-    prefix, owner, draft_state = self._snapshot
-    if (len(prefix) > start and len(tokens) > len(prefix) and tokens[:len(prefix)] == prefix
-        and (draft is None or owner is draft)):
+    """The position to resume `tokens` from: the newest matching snapshot's, after restoring it, when
+    that beats `start`. Snapshots this prompt diverges from past the resume point are dropped: their
+    cache rows are about to be overwritten."""
+    length = self.snapshot_length(tokens, draft)
+    if length > start:
+      snap = next(s for s in reversed(self._snapshots) if len(s.prefix) == length and (draft is None or s.owner is draft))
       with Context(DEV=self.device):
-        Tensor.realize(*(Tensor(state.uop.after(state.uop.store(copy.uop))) for state, copy in zip(self._recurrent_states(), self._snapshot_buffers)))
-      if draft is not None: draft.load_state(draft_state)
-      return len(prefix)
-    if start < len(prefix): self._snapshot = None
+        Tensor.realize(*(Tensor(state.uop.after(state.uop.store(copy.to(self.device).uop)))
+                         for state, copy in zip(self._recurrent_states(), snap.states)))
+      if draft is not None: draft.load_state(snap.draft_state)
+      start = length
+    self._snapshots = [s for s in self._snapshots if len(s.prefix) <= start or tokens[:len(s.prefix)] == s.prefix]
     return start
 
   def generate(self, tokens: list[int], max_new_tokens: int, temperature: float = 0.0, *,

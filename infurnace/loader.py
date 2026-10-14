@@ -64,7 +64,9 @@ def load_model(path: str | Path, max_context: int, device: str | None = None, nv
   tokenizer = Qwen35Tokenizer.from_gguf(metadata)
   model = Qwen35Model.from_gguf(path, max_context=max_context, device=device, nv_quant=packed, nv_prefill=prefill)
   # Prompt snapshots go just before the last turn header (see Qwen35Model.save_snapshot).
-  if (backend := getattr(tokenizer, "_backend", None)) is not None: model.turn_token = backend._special_tokens.get("<|im_start|>")
+  if (backend := getattr(tokenizer, "_backend", None)) is not None:
+    model.turn_token, model.tool_marker = backend._special_tokens.get("<|im_start|>"), backend._special_tokens.get("<tool_response>")
+    if model.turn_token is not None: model.user_turn = (model.turn_token, *tokenizer.encode("user\n"))
   return model, tokenizer
 
 def load_dflash(model, draft_path: str | Path):

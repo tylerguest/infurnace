@@ -8,7 +8,7 @@ not the server.
 
 ```sh
 pip install -e '.[qwen35,server]'
-infurnace --serve 8000 --max-context 16384
+infurnace --serve 8000 --max-context 32768
 ```
 
 Startup warms up before listening unless `--no-warmup` is supplied.
@@ -17,8 +17,10 @@ Startup warms up before listening unless `--no-warmup` is supplied.
   on NV, or `--dflash PATH`. `--no-dflash` serves plain decoding. One DFlash
   generator serves every request temperature, and greedy requests stay exactly
   greedy.
-- **Prefix reuse:** both paths resume from the previous request's prompt
-  snapshot, so an agent's growing conversation only prefills the new turn.
+- **Prefix reuse:** both paths resume from the newest prompt snapshot the
+  request still matches (up to 8, about 50 MB of system RAM each). A tool loop
+  reads only each new tool result, and the next user message only the turns
+  Qwen's template re-renders without their thinking.
 - **Thinking:** `--no-thinking` sets the default for the template's
   `enable_thinking`. A request can override it for itself with
   `chat_template_kwargs: {"enable_thinking": false}` (the vLLM/sglang convention)
@@ -49,8 +51,8 @@ Merge into `~/.pi/agent/models.json`:
         "reasoning": true,
         "compat": {"thinkingFormat": "qwen-chat-template", "supportsDeveloperRole": false,
                    "supportsReasoningEffort": false},
-        "contextWindow": 16384,
-        "maxTokens": 4096,
+        "contextWindow": 32768,
+        "maxTokens": 8192,
         "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}
       }]
     }
@@ -58,7 +60,9 @@ Merge into `~/.pi/agent/models.json`:
 }
 ```
 
-Match `contextWindow` to the server's `--max-context`. The server accepts any
+Match `contextWindow` to the server's `--max-context`. On an 8 GB RTX 5060,
+`--max-context 32768` with DFlash peaks at about 7.7 of 8.1 GB with a desktop
+running; `maxTokens: 8192` leaves room for large file writes. The server accepts any
 model ID as a label. With `reasoning: true` and the `qwen-chat-template`
 format, Pi's thinking toggle sends `chat_template_kwargs.enable_thinking`, which
 the server honors per request. With `reasoning: false`, Pi sends nothing and the

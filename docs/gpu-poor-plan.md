@@ -114,6 +114,16 @@ Measured on the RTX 5060, three-turn chat, thinking on, ~3.1k-token first messag
 Replies identical either way. Tests: `tests/dflash/test_prompt_snapshot.py` (CPU: resume point, output
 equal to reading from scratch, divergence drops the snapshot, DFlash with its draft).
 
+**Then: several snapshots, in host memory.** One snapshot failed agents: during a tool loop it moves
+with every call, so the next user message (whose prompt only matches up to the previous user message,
+since Qwen's template strips the loop's thinking) read the whole conversation again. pi showed it as
+`in: 0 + 1816` and `in: 0 + 3911`. Like llama.cpp (up to 32 checkpoints, always one at the last user
+message), Ollama (a trie of snapshots, 8 GiB, LRU), ExLlamaV3 (4 GiB host LRU) and SGLang (radix nodes,
+int8 option): now up to 8 snapshots (`SNAPSHOTS`), copied to host memory (~50 MB each, no VRAM), the
+newest match restored, the ones a prompt diverges from dropped, and the oldest evicted except the
+last user message's. RTX 5060, 32k context, a 10-step tool loop then a new user message: resumed at
+1,043 instead of 0 (reading only the 1,485 re-rendered tokens); the next message read 62 tokens.
+
 ## 4. Small default context, and DFlash cost grows with it
 
 - [x] Attend over the active length in the DFlash verifier and draft

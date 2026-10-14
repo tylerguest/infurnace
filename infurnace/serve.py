@@ -14,9 +14,8 @@ class ServerModel:
     self.max_context = model.config.context_length
 
   def get_start_pos(self, ids):  # only for the server's log line: the reused prefix, counting the prompt snapshot
-    start, snapshot = self.model.transformer.get_start_pos(ids), getattr(self.model, '_snapshot', None)
-    if snapshot is not None and list(ids[:len(snapshot[0])]) == snapshot[0]: start = max(start, len(snapshot[0]))
-    return start
+    snapshots = getattr(self.model, 'snapshot_length', None)
+    return max(self.model.transformer.get_start_pos(ids), snapshots(list(ids)) if snapshots else 0)
 
   def generate(self, ids, temperature=0.0):
     budget = self.max_context - len(ids)

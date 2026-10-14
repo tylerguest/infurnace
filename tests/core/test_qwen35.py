@@ -6,10 +6,10 @@ from tinygrad.llm.model import Transformer, TransformerConfig, SSMConfig, GatedD
 from tinygrad.nn.state import get_state_dict
 from infurnace.models.qwen35 import Qwen35Model
 
-def checkpoint(path, *, permuted_head=False):
+def checkpoint(path, *, permuted_head=False, context=16):
   """Small native GGUF fixture using upstream block/tensor names, no HF adapter."""
   c = TransformerConfig(num_blocks=2, dim=8, hidden_dim=12, n_heads=2, n_kv_heads=1, norm_eps=1e-6, vocab_size=16,
-    head_dim=4, v_head_dim=4, max_context=16, rope_dim=2, rope_theta=10000000, qk_norm=4, attn_output_gate=True,
+    head_dim=4, v_head_dim=4, max_context=context, rope_dim=2, rope_theta=10000000, qk_norm=4, attn_output_gate=True,
     ssm_layers=(True, False), ssm=SSMConfig(3, 2, 2, 4, 8))
   transformer = Transformer(c)
   state = {}
@@ -22,7 +22,7 @@ def checkpoint(path, *, permuted_head=False):
     state[name] = value
   if permuted_head:
     state['output.weight'] = state['token_embd.weight'][Tensor(list(range(1, 16)) + [0])]
-  metadata = {'general.architecture': 'qwen35', 'qwen35.block_count': 2, 'qwen35.context_length': 16,
+  metadata = {'general.architecture': 'qwen35', 'qwen35.block_count': 2, 'qwen35.context_length': context,
     'qwen35.embedding_length': 8, 'qwen35.feed_forward_length': 12, 'qwen35.attention.head_count': 2,
     'qwen35.attention.head_count_kv': 1, 'qwen35.attention.key_length': 4, 'qwen35.attention.value_length': 4,
     'qwen35.attention.layer_norm_rms_epsilon': 1e-6, 'qwen35.rope.dimension_count': 2, 'qwen35.rope.freq_base': 10000000.0,
