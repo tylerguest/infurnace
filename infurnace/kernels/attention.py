@@ -7,11 +7,14 @@ split into fixed segments processed in parallel and merged afterwards, as llama.
 flash_attn_combine_results does (ggml/src/ggml-cuda/fattn-common.cuh, MIT). Written in tinygrad UOps
 with FP32 FMA math over the FP16 cache.
 
-Only segments that hold active keys launch, so the cost follows `start + rows`, not the allocated
-cache, with one captured graph for every length. Row t (absolute position start+t) sees keys
-lo <= key < hi:
+Only segments that hold active keys launch (with a window, only those inside it), so the cost
+follows the visible length, not the allocated cache, with one captured graph for every length.
+Row t (absolute position start+t) sees keys lo <= key < hi:
   causal:      hi = start+t+1                  non-causal: hi = start+rows
   window > 0:  lo = start+t-window+1, and for non-causal also hi <= start+t+window
+  floor:       lo >= floor[0] (a one-element buffer, so captured graphs read its current value)
+A ring cache (`ring=True`, sliding windows only) holds position x at slot x % its length, which
+must be at least window + rows: it only keeps what a window can see. `store_rows` writes it.
 """
 from __future__ import annotations
 import functools
@@ -46,6 +49,12 @@ def _launch(outputs: tuple[Tensor, ...], inputs: tuple[Tensor, ...], start: int 
 def _live(start: int | UOp, rows: int, segment: int) -> int | UOp:
   return (start + rows + segment - 1) // segment
 
+def _first(start: int | UOp, window: int, segment: int) -> int | UOp:
+  """The first segment any row can see: the window's start for the first row."""
+  if not window: return 0
+  lo = start - window + 1
+  return (lo.maximum(0) if isinstance(lo, UOp) else max(lo, 0)) // segment
+
 def _visible(key: UOp, start: int | UOp, row: UOp, rows: int, causal: bool, window: int) -> UOp:
   position = start + row
   hi = position + 1 if causal else start + rows
@@ -55,16 +64,17 @@ def _visible(key: UOp, start: int | UOp, row: UOp, rows: int, causal: bool, wind
   return visible
 
 @functools.cache
-def _partial_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, *, start: int | UOp, kv_heads: int, groups: int, rows: int,
-                    dim: int, causal: bool, window: int, segment: int) -> UOp:
+def _partial_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, floor: UOp | None = None, *, start: int | UOp, kv_heads: int,
+                    groups: int, rows: int, dim: int, causal: bool, window: int, segment: int, ring: int) -> UOp:
   queries, lanes_dim = groups * rows, dim // 32
   per = min(QUERIES, queries)  # one-row decode packs only the grouped heads
   warps = -(-queries // per)
-  live = _live(start, rows, segment)
-  block = UOp.range(kv_heads * live, 0, axis_type=AxisType.GLOBAL)
+  first = _first(start, window, segment)
+  count = _live(start, rows, segment) - first
+  block = UOp.range(kv_heads * count, 0, axis_type=AxisType.GLOBAL)
   warp = UOp.range(warps, 1, axis_type=AxisType.LOCAL)
   lane = UOp.range(32, -1, axis_type=AxisType.WARP)
-  kv_head, part_index = block // live, block % live
+  kv_head, part_index = block // count, block % count
   active = start + rows
   ms = [warp * per + j for j in range(per)]                 # packed query vector: group * rows + row
   valid = [m < queries for m in ms]
@@ -81,7 +91,7 @@ def _partial_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, *, start: int | UOp,
   tiles = (active + TILE - 1) // TILE
   tiles = tiles.minimum(segment // TILE) if isinstance(tiles, UOp) else min(tiles, segment // TILE)
   tile = UOp.range(tiles, 2, axis_type=AxisType.LOOP)
-  base = part_index * segment + tile * TILE
+  base = (first + part_index) * segment + tile * TILE
   # Stage the tile's keys (transposed: lanes read consecutive keys) and values (lanes read consecutive dims).
   k_tile = UOp.placeholder((dim, TILE), dtypes.float16, slot=2, addrspace=AddrSpace.LOCAL)
   v_tile = UOp.placeholder((TILE, dim), dtypes.float16, slot=3, addrspace=AddrSpace.LOCAL)
@@ -91,7 +101,7 @@ def _partial_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, *, start: int | UOp,
   in_tile = element < elements
   key, column = element // dim, element % dim
   live_key = in_tile & (base + key < active)
-  kv_index = (base + key).valid(live_key)
+  kv_index = ((base + key) % ring if ring else base + key).valid(live_key)
   stage = UOp.group(k_tile[column.valid(in_tile), key].store(kv[0, 0, kv_head, kv_index, column].load()),
                     v_tile[key.valid(in_tile), column].store(kv[1, 0, kv_head, kv_index, column].load())).end(loader).barrier()
   k_tile, v_tile = k_tile.after(stage), v_tile.after(stage)
@@ -105,7 +115,8 @@ def _partial_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, *, start: int | UOp,
                                   for j in range(per))).end(d))
   scale = 1 / math.sqrt(dim)
   keys = base + lane
-  scores = [(valid[j] & (keys < active) & _visible(keys, start, row_of[j], rows, causal, window)).where(score[j].load() * scale, neg)
+  seen = (keys < active) & (keys >= floor[0].load().cast(keys.dtype)) if floor is not None else keys < active
+  scores = [(valid[j] & seen & _visible(keys, start, row_of[j], rows, causal, window)).where(score[j].load() * scale, neg)
             for j in range(per)]
 
   # Online softmax: freeze this tile's coefficients before overwriting the running state.
@@ -148,9 +159,9 @@ def _partial_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, *, start: int | UOp,
 
 @functools.cache
 def _merge_kernel(out: UOp, part: UOp, stats: UOp, *, start: int | UOp, kv_heads: int, groups: int, rows: int, dim: int,
-                  segment: int) -> UOp:
+                  window: int, segment: int) -> UOp:
   queries, lanes_dim = groups * rows, dim // 32
-  live = _live(start, rows, segment)
+  live = _live(start, rows, segment) - _first(start, window, segment)
   block = UOp.range(kv_heads * queries, 0, axis_type=AxisType.GLOBAL)
   lane = UOp.range(32, -1, axis_type=AxisType.WARP)
   kv_head, m = block // queries, block % queries
@@ -171,31 +182,60 @@ def _merge_kernel(out: UOp, part: UOp, stats: UOp, *, start: int | UOp, kv_heads
   stores = [out[0, head, row, lane + 32 * i].store(total[1 + i].load() / total[0].load()) for i in range(lanes_dim)]
   return UOp.group(*stores).end(block, lane).sink(arg=KernelInfo(name=f"attention_merge_d{dim}", opts_to_apply=()))
 
-def _masked(q: Tensor, kv: Tensor, start: int | UOp, causal: bool, window: int) -> Tensor:
+def _masked(q: Tensor, kv: Tensor, start: int | UOp, causal: bool, window: int, ring: bool, floor: Tensor | None) -> Tensor:
   """Tensor-op fallback for other devices: softmax over the whole cache with each row's key range."""
   rows, capacity = q.shape[2], kv.shape[3]
   keys, position = Tensor.arange(capacity).reshape(1, capacity), Tensor.arange(rows).reshape(rows, 1) + Tensor(start)
+  if ring:  # slot j holds the newest position at or below the last row's that is j modulo the length
+    top = Tensor(start) + (rows - 1)
+    keys = top - (top - keys + capacity) % capacity
   hi = position + 1 if causal else (position - Tensor.arange(rows).reshape(rows, 1)) + rows
   if window and not causal: hi = hi.minimum(position + window)
-  visible = keys < hi
+  visible = (keys < hi) & (keys >= 0)
   if window: visible = visible & (keys >= position - window + 1)
+  if floor is not None: visible = visible & (keys >= floor.reshape(1, 1))
   mask = visible.where(0.0, float('-inf')).reshape(1, 1, rows, capacity)
   return q.float().scaled_dot_product_attention(kv[0].float(), kv[1].float(), attn_mask=mask, enable_gqa=True)
 
-def attention(q: Tensor, kv: Tensor, start: int | UOp, *, causal: bool = True, window: int = 0, segment: int = SEGMENT) -> Tensor:
+def attention(q: Tensor, kv: Tensor, start: int | UOp, *, causal: bool = True, window: int = 0, segment: int = SEGMENT,
+              ring: bool = False, floor: Tensor | None = None) -> Tensor:
   """q: (1, heads, rows, dim) at positions start..start+rows-1; kv: (2, 1, kv_heads, capacity, dim) FP16
-  cache already holding those rows. Returns (1, heads, rows, dim) FP32. dim must be a multiple of 32.
+  cache already holding those rows (a ring of length capacity with `ring`). floor: optional (1,) int32
+  buffer, the lowest visible key. Returns (1, heads, rows, dim) FP32. dim must be a multiple of 32.
   The fused kernels need NV (CUDA warp shuffles); other devices use plain tensor ops over the whole cache."""
   _, heads, rows, dim = q.shape
   _, _, kv_heads, capacity, kv_dim = kv.shape
   if dim != kv_dim or heads % kv_heads: raise ValueError("attention needs matching head sizes and grouped heads")
-  if q.device.split(':')[0] != 'NV' or dim % 32 or kv.dtype != dtypes.float16: return _masked(q, kv, start, causal, window)
-  groups, segments = heads // kv_heads, -(-capacity // segment)
+  if ring and not 0 < window <= capacity - rows: raise ValueError("a ring cache needs a window and room for it plus the rows")
+  if q.device.split(':')[0] != 'NV' or dim % 32 or kv.dtype != dtypes.float16: return _masked(q, kv, start, causal, window, ring, floor)
+  # A ring's window can straddle one more segment boundary than its length spans.
+  groups, segments = heads // kv_heads, -(-capacity // segment) + int(ring)
   part = Tensor.empty(kv_heads, segments, groups * rows, dim, dtype=dtypes.float32, device=q.device)
   stats = Tensor.empty(kv_heads, segments, groups * rows, 2, dtype=dtypes.float32, device=q.device)
   scalar = _kernel_scalar(start)
-  part, stats = _launch((part, stats), (q.contiguous(), kv), start, functools.partial(
-    _partial_kernel, start=scalar, kv_heads=kv_heads, groups=groups, rows=rows, dim=dim, causal=causal, window=window, segment=segment))
+  part, stats = _launch((part, stats), (q.contiguous(), kv) + ((floor,) if floor is not None else ()), start, functools.partial(
+    _partial_kernel, start=scalar, kv_heads=kv_heads, groups=groups, rows=rows, dim=dim, causal=causal, window=window, segment=segment,
+    ring=capacity if ring else 0))
   out = Tensor.empty(1, heads, rows, dim, dtype=dtypes.float32, device=q.device)
   return _launch((out,), (part, stats), start, functools.partial(
-    _merge_kernel, start=scalar, kv_heads=kv_heads, groups=groups, rows=rows, dim=dim, segment=segment))[0]
+    _merge_kernel, start=scalar, kv_heads=kv_heads, groups=groups, rows=rows, dim=dim, window=window, segment=segment))[0]
+
+@functools.cache
+def _ring_store_kernel(cache: UOp, values: UOp, *, start: int | UOp, kv_heads: int, rows: int, dim: int, length: int) -> UOp:
+  i = UOp.range(2 * kv_heads * rows, 0, axis_type=AxisType.GLOBAL)
+  d = UOp.range(dim, 1, axis_type=AxisType.LOCAL)
+  c, h, r = i // (kv_heads * rows), (i // rows) % kv_heads, i % rows
+  return cache[c, 0, h, (start + r) % length, d].store(values[c, 0, h, r, d].load()).end(i, d).sink(
+    arg=KernelInfo(name=f"ring_store_d{dim}", opts_to_apply=()))
+
+def store_rows(cache: Tensor, values: Tensor, start: int | UOp, *, ring: bool = False) -> Tensor:
+  """Write values (2, 1, kv_heads, rows, dim) as positions start..start+rows-1 of cache, which then
+  holds them (a ring of its length with `ring`, so the rows may wrap around its end)."""
+  rows, length = values.shape[3], cache.shape[3]
+  if not ring: return Tensor(cache.uop.after(cache[:, :, :, start:start + rows].uop.store(values.uop)))
+  if cache.device.split(':')[0] == 'NV':
+    return _launch((cache,), (values.contiguous(),), start, functools.partial(
+      _ring_store_kernel, start=_kernel_scalar(start), kv_heads=cache.shape[2], rows=rows, dim=cache.shape[4], length=length))[0]
+  offset = (Tensor.arange(length) - Tensor(start) % length + length) % length    # each slot's row, if < rows
+  new = (offset < rows).reshape(1, 1, 1, length, 1).where(values[:, :, :, offset.clip(0, rows - 1)], cache).contiguous()
+  return Tensor(cache.uop.after(cache.uop.store(new.uop)))

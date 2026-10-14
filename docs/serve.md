@@ -61,7 +61,7 @@ Merge into `~/.pi/agent/models.json`:
 ```
 
 Match `contextWindow` to the server's `--max-context`. On an 8 GB RTX 5060,
-`--max-context 32768` with DFlash peaks at about 7.7 of 8.1 GB with a desktop
+`--max-context 32768` with DFlash peaks at about 7.35 of 8.1 GB with a desktop
 running; `maxTokens: 8192` leaves room for large file writes. The server accepts any
 model ID as a label. With `reasoning: true` and the `qwen-chat-template`
 format, Pi's thinking toggle sends `chat_template_kwargs.enable_thinking`, which

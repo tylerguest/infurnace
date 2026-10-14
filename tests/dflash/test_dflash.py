@@ -207,3 +207,46 @@ def test_gguf_metadata_not_stale_sidecar():
     invalid = dict(metadata)
     invalid[key] = value
     with pytest.raises(ValueError): DFlashConfig.from_gguf(invalid, model)
+
+def full_cache_draft(model, source):
+  """`source`'s weights with every layer on a full-length cache, the reference for its ring."""
+  draft = DFlashDraft(source.config, model, {k: v.float() for k, v in get_state_dict(source.weights).items()})
+  draft.ring = [False] * draft.config.layers
+  draft.cache = [Tensor.zeros(2, 1, draft.config.kv_heads, draft.cache_length, draft.config.head_dim, dtype=dtypes.float16)
+                 .contiguous().realize() for _ in draft.ring]
+  return draft
+
+def test_ring_cache_matches_a_full_cache(tmp_path):
+  # The sliding layer keeps window + 2 blocks = 16 slots; 60 positions wrap it several times.
+  with Context(DEV='CPU'):
+    model = Qwen35Model.from_gguf(checkpoint(tmp_path, context=64), device='CPU')
+    ring = tiny_draft(model)
+    full = full_cache_draft(model, ring)
+    assert ring.ring == [True, False] and ring.cache[0].shape[3] == ring.ring_length == 16
+    rows, noise = Tensor.randn(1, 60, 8).realize(), Tensor.randn(1, 4, 8).realize()
+    done = 0
+    for n in (3, 5, 1, 7, 4, 9, 2, 6, 8, 5, 3):
+      for draft in (ring, full):
+        draft.observe(rows[:, done:done + n].contiguous().realize())
+        draft.propose(1, done + n, 3)  # absorbs the staged rows and writes a noise block past them
+      done += n
+      hidden = [draft._denoise(noise, done).realize() for draft in (ring, full)]
+      assert (hidden[0] - hidden[1]).abs().max().item() < 1e-3, done
+
+def test_restoring_past_a_wrapped_ring_hides_overwritten_slots(tmp_path):
+  with Context(DEV='CPU'):
+    model = Qwen35Model.from_gguf(checkpoint(tmp_path, context=64), device='CPU')
+    draft = tiny_draft(model)
+    rows = Tensor.randn(1, 50, 8).realize()
+    draft.observe(rows[:, :10].contiguous().realize())
+    early = draft.save_state()
+    draft.observe(rows[:, 10:12].contiguous().realize())
+    draft.reset()
+    draft.load_state(early)            # nothing wrapped yet: every slot is still position k's
+    assert draft._floor.tolist() == [0]
+    draft.observe(rows[:, 10:50].contiguous().realize())
+    draft.reset()
+    draft.load_state(early)            # 40 more rows lapped the 16-slot ring
+    assert draft._floor.tolist() == [10] and draft.observed == 10
+    draft.reset()
+    assert draft._floor.tolist() == [0]  # reading from scratch rewrites every slot it reads

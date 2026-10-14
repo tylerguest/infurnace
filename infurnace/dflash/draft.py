@@ -14,7 +14,7 @@ from infurnace.kernels.quant_gemv import QUANT_SIZES
 from infurnace.kernels.quant_gemm import nv_prefill_supported
 from infurnace.models.qwen35 import Qwen35Model
 from infurnace.dflash.jit import captured
-from infurnace.kernels.attention import attention
+from infurnace.kernels.attention import attention, store_rows
 
 @dataclass(frozen=True)
 class DFlashConfig:
@@ -118,8 +118,15 @@ class DFlashDraft:
       load_state_dict(self.weights, state, verbose=False, realize=False)
       # One extra chunk of rows lets a padded context chunk end past capacity.
       self.cache_length = self.capacity + config.block_size
-      self.cache = [Tensor.zeros(2, 1, config.kv_heads, self.cache_length, config.head_dim, dtype=dtypes.float16,
-                                device=self.device).contiguous().realize() for _ in range(config.layers)]
+      # Sliding layers keep only what their window can see, in a ring: position x at slot x % ring_length.
+      # Two blocks of slack cover a padded context chunk plus the noise block written past the window.
+      self.ring_length = config.window + 2 * config.block_size
+      self.ring = [config.sliding[i] and config.window > 0 and self.ring_length < self.cache_length for i in range(config.layers)]
+      self.cache = [Tensor.zeros(2, 1, config.kv_heads, self.ring_length if ring else self.cache_length, config.head_dim,
+                                 dtype=dtypes.float16, device=self.device).contiguous().realize() for ring in self.ring]
+      # Ring slots below the floor hold positions from a later pass (see load_state); attention skips them.
+      self._floor = Tensor.zeros(1, dtype=dtypes.int32, device=self.device).contiguous().realize()
+      self._floor_value, self._high = 0, 0  # the floor, and an upper bound on every position written
       self.frequencies = precompute_freqs_cis(config.head_dim, self.cache_length, config.theta, device=self.device).realize()
       self._start = UOp.variable('dflash_context_start', 0, self.capacity - 1)
       self._absorb_jit = captured(self._absorb)
@@ -170,10 +177,21 @@ class DFlashDraft:
     # Old noise/cache rows are masked. Each reused prefix is overwritten by
     # actual target context before it is authorized again.
     self.length = self.observed = self._staged = 0
+    self._set_floor(0)
+
+  def _set_floor(self, value: int):
+    if value == self._floor_value: return
+    with Context(DEV=self.device):
+      Tensor(self._floor.uop.after(self._floor.uop.store(Tensor([value], dtype=dtypes.int32, device=self.device).uop))).realize()
+    self._floor_value = value
+
+  def _wrote(self, position: int):
+    self._high = max(self._high, position)
 
   def save_state(self):
     """What restores this draft to its current prompt position: the position and the staged target
-    rows not yet absorbed. Its K/V cache needs no copy: rows before the position stay valid in place."""
+    rows not yet absorbed. Its K/V cache needs no copy: rows before the position stay valid in place,
+    except ring slots a later pass wrote over (load_state hides those)."""
     with Context(DEV=self.device): context = self._context.clone().realize()
     return self.observed, self._staged, context
 
@@ -181,11 +199,15 @@ class DFlashDraft:
     observed, staged, context = state
     with Context(DEV=self.device): Tensor(self._context.uop.after(self._context.uop.store(context.uop))).realize()
     self.length, self.observed, self._staged = observed, observed, staged
+    # A ring slot for position k was overwritten if anything at k + ring_length or later was written:
+    # hide positions up to the highest write less a lap (never past the restored position itself).
+    if any(self.ring): self._set_floor(min(max(0, self._high - self.ring_length), observed))
 
   def synced(self, position: int):
     """Rows up to `position` were absorbed outside `observe` (fused rounds)."""
     self.length = self.observed = position
     self._staged = 0
+    self._wrote(position + 2 * self.config.block_size)  # that round's padded chunk and noise block
 
   def observe(self, features: Tensor):
     """Absorb target feature rows (1, rows, width) for the next positions.
@@ -209,6 +231,7 @@ class DFlashDraft:
         if self._staged == chunk:
           self._absorb_jit(self._context, self._start.bind(self.observed - chunk))
           self._staged = 0
+      self._wrote(self.observed + chunk)
 
   def _absorb(self, features: Tensor, start: UOp):
     # Fixed-width context chunk: write draft K/V for observed target rows.
@@ -221,8 +244,7 @@ class DFlashDraft:
       k = block.attn_k_norm(projection(block.attn_k, context).reshape(1, width, c.kv_heads, c.head_dim)).transpose(1, 2)
       v = projection(block.attn_v, context).reshape(1, width, c.kv_heads, c.head_dim).transpose(1, 2)
       k = apply_rope(k, self.frequencies[start:start + width])
-      store = self.cache[i][:, :, :, start:start + width].uop.store(Tensor.stack(k, v).half().uop)
-      stored.append(Tensor(self.cache[i].uop.after(store)))
+      stored.append(store_rows(self.cache[i], Tensor.stack(k, v).half(), start, ring=self.ring[i]))
     Tensor.realize(*stored)
 
   def _denoise(self, noise: Tensor, position: UOp):
@@ -234,11 +256,11 @@ class DFlashDraft:
       k = block.attn_k_norm(projection(block.attn_k, norm).reshape(1, rows, c.kv_heads, c.head_dim)).transpose(1, 2)
       v = projection(block.attn_v, norm).reshape(1, rows, c.kv_heads, c.head_dim).transpose(1, 2)
       q, k = apply_rope(q, self.frequencies[position:position + rows]), apply_rope(k, self.frequencies[position:position + rows])
-      store = self.cache[i][:, :, :, position:position + rows].uop.store(Tensor.stack(k, v).half().uop)
-      cache = Tensor(self.cache[i].uop.after(store))
+      cache = store_rows(self.cache[i], Tensor.stack(k, v).half(), position, ring=self.ring[i])
       # Over the active length only: rows see keys up to position+rows (causal: up to their own),
       # within the window on sliding layers.
-      attended = attention(q, cache, position, causal=c.layer_causal(i), window=c.window if c.sliding[i] else 0).cast(q.dtype)
+      attended = attention(q, cache, position, causal=c.layer_causal(i), window=c.window if c.sliding[i] else 0,
+                           ring=self.ring[i], floor=self._floor if self.ring[i] else None).cast(q.dtype)
       x = residual + projection(block.attn_output, attended.transpose(1, 2).reshape(1, rows, -1))
       norm = block.ffn_norm(x)
       x = x + projection(block.ffn_down, projection(block.ffn_gate, norm).silu() * projection(block.ffn_up, norm))
@@ -274,6 +296,7 @@ class DFlashDraft:
     if type(position) is not int or position != self.observed or position <= 0 or position + count + 1 > self.capacity:
       raise ValueError('DFlash proposal must follow the observed prefix and leave space for the noise block')
     if count == 0: return []
+    self._wrote(position + c.block_size + 1)
     with Context(DEV=self.device):
       # A partial chunk is absorbed padded; its padding rows land where later
       # context or this noise block overwrites them, or stay masked.

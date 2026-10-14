@@ -168,6 +168,19 @@ logits) between paths; the real-model tests now compare prefixes before them.
 7.46 GB with 2.1 GB of desktop apps). 16k adds roughly half a GB of cache: it fits an 8 GB card only
 if other apps leave room, so it is not the default.
 
+**Measured limit, then a smaller draft cache.** Filling the context to the end on the RTX 5060 with
+a desktop running (1.9–2.2 GB of other apps): 24k, 28k and 32k all fit with DFlash, 32k peaking at
+7,721 of 8,151 MiB. Per token, the target's cache costs 32 KiB and the draft's 24 KiB, but five of
+the draft's six layers only look back 4,096 tokens. Those now keep a ring of window + 2 blocks
+(4,128) slots, position x at slot x % 4,128 (`store_rows` writes it, `attention(ring=True)` reads
+it), and their attention skips segments before the window. Restoring an older prompt snapshot after
+the ring lapped it masks the overwritten slots with a floor buffer (keys below it are hidden) instead
+of copying the draft cache into every snapshot; output is exact either way, only proposals for the
+next ~4k tokens see less history. At 32k: about 520 MB less once ready, peak 7,721 → 7,346 MiB.
+Same output and speed on the pi tasks (4.3 s and 9.4 s). Tests: ring vs full cache in
+`tests/kernels/test_nv_attention.py` and `tests/dflash/test_dflash.py` (60 positions through a
+16-slot ring), the floor after a lapped restore.
+
 ## 5. Greedy decoding only
 
 - [x] Add `--temperature` for plain decoding
