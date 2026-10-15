@@ -76,7 +76,7 @@ class _DraftPolicy:
 
 class DFlashGenerator:
   def __init__(self, model, draft, *, verifier: str = 'sequential'):
-    if model.device.split(':')[0] not in ('CPU', 'NV'):
+    if model.device.split(':')[0] not in ('CPU', 'NV', 'CUDA'):
       raise ValueError('DFlash reference currently requires CPU/NV one-row upstream prefill')
     if draft.target is not model or draft.device != model.device: raise ValueError('DFlash draft belongs to a different target/device')
     if verifier not in ('sequential', 'parallel'): raise ValueError('invalid DFlash verifier')

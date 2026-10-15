@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Callable, Iterator
 from tinygrad.helpers import GlobalCounters, Timing, profile_marker
 from infurnace import loader
+from infurnace.device import nvidia
 
 PROMPT_MAX_TOKENS = 64
 
@@ -184,7 +185,7 @@ def run(args: argparse.Namespace) -> int:
   if args.benchmark is not None: return benchmark(model, tokenizer, *args.benchmark, warmup=not args.no_warmup)
 
   dflash = None
-  if draft is not None and not (automatic and model.device.split(':')[0] != 'NV'):  # the CPU reference is slower than plain
+  if draft is not None and not (automatic and not nvidia(model.device)):  # the CPU reference is slower than plain
     dflash = loader.load_dflash(model, loader.fetch_model(draft))
     print(f"DFlash speculative decoding{' on (--no-dflash turns it off)' if automatic else ''}.", file=sys.stderr, flush=True)
   generate, context = generator(model, tokenizer, dflash, args.temperature), model.config.context_length

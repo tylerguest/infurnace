@@ -36,7 +36,7 @@ are reused. Model weights are not shipped in the package.
 
 - Target: [Unsloth Qwen3.5-4B Q4_K_M](https://huggingface.co/unsloth/Qwen3.5-4B-GGUF), about 2.7 GB.
 - Draft: [Qwen3.5-4B DFlash Q4_K_M](https://huggingface.co/Anbeeld/Qwen3.5-4B-DFlash-GGUF), about 0.4 GB;
-  downloaded only when automatic DFlash is used on NV.
+  downloaded only when automatic DFlash is used on an NVIDIA GPU.
 
 ```sh
 infurnace                         # download if needed, warm up and chat
@@ -60,7 +60,9 @@ infurnace --device CPU
 ```
 
 - **Hardware:** probes usable GPUs, falling back to CPU; `--device` or `DEV`
-  overrides selection. NV/CUDA-C uses packed projections automatically.
+  overrides selection. On NVIDIA, both of tinygrad's backends get the fast kernels: `NV` (its own
+  driver interface, Linux; preferred) and `CUDA` (the CUDA driver API, which tinygrad also loads on
+  Windows; needs the CUDA toolkit's NVRTC). Same speed and output; `CUDA` takes ~20 s longer to warm up.
 - **Startup:** chat and serving warm up first; `--no-warmup` skips this.
   Single-shot generation skips automatic warmup.
 - **Thinking:** enabled in chat; `--no-thinking` disables it.

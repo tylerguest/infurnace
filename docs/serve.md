@@ -7,14 +7,14 @@ There is no fallback template in server mode. Tools are executed by the client,
 not the server.
 
 ```sh
-pip install -e '.[qwen35,server]'
+pip install -e '.[server]'
 infurnace --serve 8000 --max-context 32768
 ```
 
 Startup warms up before listening unless `--no-warmup` is supplied.
 
 - **DFlash:** generation uses DFlash whenever the chat would: the installed draft
-  on NV, or `--dflash PATH`. `--no-dflash` serves plain decoding. One DFlash
+  on an NVIDIA GPU (`NV` or `CUDA`), or `--dflash PATH`. `--no-dflash` serves plain decoding. One DFlash
   generator serves every request temperature, and greedy requests stay exactly
   greedy.
 - **Prefix reuse:** both paths resume from the newest prompt snapshot the

@@ -90,7 +90,7 @@ def test_prefill_forwarding_and_backend_gate(model_loader):
   assert calls == [('model', {'max_context': 64, 'device': 'NV', 'nv_quant': True, 'nv_prefill': True})]
   with pytest.raises(ValueError, match='requires NV quantized'):
     loader.load_model('model', 64, 'CPU', nv_quant=False, nv_prefill=True)
-  with pytest.raises(ValueError, match='requires NV with'):
+  with pytest.raises(ValueError, match='requires an NVIDIA device'):
     loader.load_model('model', 64, 'CPU', nv_quant=True)
   assert len(calls) == 1
 

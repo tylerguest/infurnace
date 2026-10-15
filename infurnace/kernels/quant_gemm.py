@@ -15,6 +15,7 @@ from tinygrad.renderer.cstyle import CUDARenderer
 from tinygrad.uop.ops import AxisType, KernelInfo
 
 from infurnace.kernels.quant_gemv import Q4_K, Q5_K, Q6_K, Q6_PREPARED_BYTES, QUANT_SIZES, _half, _q4_scales, _q6_swizzled_index, _q4_word
+from infurnace.device import nvidia
 
 class QuantGemmError(ValueError):
   """Inputs/backend do not satisfy the first prefill kernel contract."""
@@ -232,7 +233,7 @@ def _schedule(rows: int, width: int, tokens: int) -> tuple[int, int, int]:
 
 @functools.cache
 def nv_prefill_supported(device: str) -> bool:
-  if not isinstance(device, str) or device.split(":")[0] != "NV": return False
+  if not nvidia(device): return False
   with Context(ALLOW_DEVICE_USAGE=1): renderer = Device[device].renderer
   return isinstance(renderer, CUDARenderer) and any(
     tc.dims == (8, 16, 16) and tc.dtype_in == dtypes.float16 and tc.dtype_out == dtypes.float32 for tc in renderer.tensor_cores)
@@ -254,8 +255,8 @@ def quant_gemm(x: Tensor, packed: Tensor, *, out_features: int, in_features: int
   expected = out_features*in_features//256*(Q6_PREPARED_BYTES if q6_aligned else QUANT_SIZES[ggml_type])
   if packed.dtype != dtype or packed.numel()*dtype.itemsize != expected:
     raise QuantGemmError("packed dtype/size does not match prefill contract")
-  if x.device != packed.device or not isinstance(x.device, str) or x.device.split(":")[0] != "NV":
-    raise QuantGemmError("prefill requires activations/weights on the same NV device")
+  if x.device != packed.device or not nvidia(x.device):
+    raise QuantGemmError("prefill requires activations/weights on the same NVIDIA device")
   if not nv_prefill_supported(x.device):
     raise QuantGemmError("prefill requires CUDA-C FP16 m16n8k16 tensor cores")
   tokens = x.numel()//in_features

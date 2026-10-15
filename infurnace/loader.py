@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from tinygrad.helpers import fetch
-from infurnace.device import select_device, supports_nv_quant
+from infurnace.device import nvidia, select_device, supports_nv_quant
 from infurnace.gguf import read_gguf_metadata
 from infurnace.kernels.quant_gemm import nv_prefill_supported
 from infurnace.models.qwen35 import Qwen35Model
@@ -57,7 +57,7 @@ def load_model(path: str | Path, max_context: int, device: str | None = None, nv
   if metadata.get("general.architecture") != "qwen35": raise ValueError("only dense Qwen3.5 GGUF models are supported")
   device = select_device(device)
   packed = supports_nv_quant(device) if nv_quant is None else nv_quant
-  if packed and not supports_nv_quant(device): raise ValueError("NV quantized acceleration requires NV with the CUDA C renderer")
+  if packed and not supports_nv_quant(device): raise ValueError("packed acceleration requires an NVIDIA device (NV or CUDA) with the CUDA C renderer")
   if nv_prefill and not packed: raise ValueError("NV prefill requires NV quantized acceleration")
   prefill = packed and nv_prefill_supported(device) if nv_prefill is None else nv_prefill
   if prefill and not nv_prefill_supported(device): raise ValueError("NV prefill requires CUDA-C FP16 tensor cores")
@@ -72,5 +72,5 @@ def load_model(path: str | Path, max_context: int, device: str | None = None, nv
 def load_dflash(model, draft_path: str | Path):
   """Parallel multirow verification on NV, else the sequential CPU reference."""
   from infurnace.dflash import DFlashDraft, DFlashGenerator
-  verifier = 'parallel' if model.device.split(':')[0] == 'NV' else 'sequential'
+  verifier = 'parallel' if nvidia(model.device) else 'sequential'
   return DFlashGenerator(model, DFlashDraft.from_gguf(draft_path, model), verifier=verifier)

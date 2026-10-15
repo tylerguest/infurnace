@@ -28,6 +28,7 @@ from infurnace.kernels.attention import attention
 from infurnace.kernels.gdn import gdn_chunk
 from infurnace.kernels.sampling import Sampler
 from infurnace.kernels.embedding import packed_gather
+from infurnace.device import nvidia
 
 def _raw(tensor):
   return Tensor(tensor.uop.buf_uop).reshape(tensor.shape)
@@ -81,7 +82,7 @@ class ParallelVerifier:
     self._count = UOp.variable('dflash_commit_rows', 1, rows)
     self._forward_jit, self._commit_jit = captured(self._forward_store), captured(self._commit)
     self._round_jit = None
-    self._fused = rows == 16 and self.device.split(':')[0] == 'NV' and all(
+    self._fused = rows == 16 and nvidia(self.device) and all(
       b.head_k_dim == 128 and b.head_v_dim == 128 for b in model.transformer.blk if isinstance(b, GatedDeltaNetBlock))
 
   def fits(self, position: int) -> bool:
@@ -194,7 +195,7 @@ class ParallelVerifier:
 
   def fused_eligible(self, draft) -> bool:
     head = self.observer.model.transformer.output
-    return (self.device.split(':')[0] == 'NV' and getattr(head, 'packed', None) is not None and self.rows == draft.config.block_size)
+    return (nvidia(self.device) and getattr(head, 'packed', None) is not None and self.rows == draft.config.block_size)
 
   def fused_round(self, draft, count: int, anchor: int) -> tuple[list[int], list[int]]:
     """Commit `count` rows of the pending block (whose last decision is `anchor`),

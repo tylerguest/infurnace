@@ -17,6 +17,7 @@ from tinygrad import Tensor, UOp, dtypes
 from tinygrad.dtype import AddrSpace
 from tinygrad.uop.ops import AxisType, KernelInfo
 from infurnace.kernels.quant_gemv import warp_reduce
+from infurnace.device import nvidia
 
 THREADS, PER_THREAD = 256, 8
 CHUNK = THREADS * PER_THREAD  # logits per block
@@ -100,7 +101,7 @@ class Sampler:
   def __call__(self, logits: Tensor, temperature: Tensor) -> Tensor:
     """(rows, vocab) logits -> (rows,) int32 tokens: argmax at T = 0, else a sample from softmax(logits / T)."""
     rows, vocab = logits.shape
-    if self.device.split(':')[0] != 'NV':  # tensor ops elsewhere (CPU tests): same score, tinygrad's rand
+    if not nvidia(self.device):  # tensor ops elsewhere (CPU tests): same score, tinygrad's rand
       u = Tensor.rand(rows, vocab, device=logits.device).maximum(2.0 ** -24)
       return (logits.float() + temperature.float() * -(-u.log()).log()).argmax(-1).cast(dtypes.int32)
     best = Tensor.empty(rows, -(-vocab // CHUNK), 2, dtype=dtypes.float32, device=logits.device)

@@ -5,6 +5,7 @@ from typing import Callable
 from tinygrad import Tensor, UOp, dtypes
 from tinygrad.dtype import AddrSpace
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops
+from infurnace.device import nvidia
 
 Q4_K = 12
 Q5_K = 13
@@ -78,7 +79,7 @@ def prepare_q4(raw: Tensor, *, in_features: int, realize: bool = True) -> Tensor
       or raw.numel()%(in_features//256*144)):
     raise QuantGemvError("swizzled Q4 preparation requires complete uint8 rows with width multiple of 256")
   out = Tensor.empty(raw.numel()//4, dtype=dtypes.uint32, device=raw.device)
-  fxn = functools.partial(_prepare_q4_kernel, blocks_per_row=in_features//256, gpu=raw.device.split(':')[0] == 'NV')
+  fxn = functools.partial(_prepare_q4_kernel, blocks_per_row=in_features//256, gpu=nvidia(raw.device))
   result = Tensor(UOp.custom_kernel(out.uop, raw.uop.flatten(), fxn=fxn)[0])
   return result.realize() if realize else result
 
@@ -107,7 +108,7 @@ def prepare_q6(raw: Tensor, *, in_features: int | None = None, swizzled: bool = 
   if swizzled and (in_features is None or in_features <= 0 or in_features%256 or raw.numel()%(in_features//256*Q6_BYTES)):
     raise QuantGemvError("swizzled Q6 preparation requires complete rows with width multiple of 256")
   out = Tensor.empty(raw.numel()//Q6_BYTES*(Q6_PREPARED_BYTES//4), dtype=dtypes.uint32, device=raw.device)
-  fxn = functools.partial(_prepare_q6_kernel, gpu=raw.device.split(':')[0] == 'NV',
+  fxn = functools.partial(_prepare_q6_kernel, gpu=nvidia(raw.device),
                          blocks_per_row=in_features//256 if swizzled else 0)
   result = Tensor(UOp.custom_kernel(out.uop, raw.uop.flatten(), fxn=fxn)[0])
   return result.realize() if realize else result

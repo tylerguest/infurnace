@@ -14,6 +14,7 @@ ordered by impact. Each one says where the problem is in the code and how to che
 
 ## 1. Only one setup gets the fast path
 
+- [x] Run the kernels on tinygrad's `CUDA` backend too (the CUDA driver API; tinygrad loads it on Windows)
 - [ ] Benchmark plain decoding on an AMD RDNA3/4 card through upstream tinygrad
 - [ ] Try the packed kernels on AMD/Metal with the CUDA-renderer check relaxed
 - [ ] Publish a "what works on what" table in the README
@@ -34,6 +35,21 @@ Tensor-core GEMM also needs an `(8,16,16)` FP16 tensor core, so older cards that
   AMD/Metal with modest changes.
 
 **Check.** tok/s for `infurnace --benchmark` on each backend tried, recorded in the table.
+
+**Done: `CUDA`.** The kernels are CUDA C either way, so only device checks kept them to `NV`; they now
+use `device.nvidia()` (NV or CUDA) and the loader still requires the CUDA C renderer (tinygrad's PTX and
+NVCC renderers can't compile their intrinsics), so `CUDA` needs NVRTC from the CUDA toolkit. RTX 5060,
+same tokens on both backends:
+
+| | Generic path (before) | `CUDA` | `NV` |
+|---|---|---|---|
+| Plain decode, `--benchmark 128,64` | did not finish in 4 min 40 s | 112–114 tok/s | 112–114 tok/s |
+| DFlash code / prose (256 tokens) | — | 290 / 164 tok/s | 290 / 163 tok/s |
+| DFlash warmup | — | 92 s | 72 s |
+
+Kernel outputs are bit-identical across the two (`tests/kernels/test_nv_cuda_backend.py`); the fused
+DFlash rounds work on `CUDA` without the `NV` doorbell fix. `NV` stays first in device selection on
+Linux (faster graph capture); `CUDA` is what Windows NVIDIA users would get. Untested on Windows.
 
 ## 2. Plain decoding reads prompts one token at a time
 

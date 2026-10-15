@@ -21,5 +21,11 @@ def select_device(requested: str | None = None) -> str:
       failures.append(f"{backend}: {exc}")
   raise RuntimeError("no usable compute device: " + "; ".join(failures))
 
+def nvidia(device: str) -> bool:
+  """An NVIDIA backend: tinygrad's NV (its own driver interface, Linux) or CUDA (the CUDA driver API, also on
+  Windows). infurnace's kernels are CUDA C and run on either."""
+  return isinstance(device, str) and device.split(":")[0].upper() in ("NV", "CUDA")
+
 def supports_nv_quant(device: str) -> bool:
-  return device.split(":")[0].upper() == "NV" and isinstance(Device[device].renderer, CUDARenderer)
+  # The kernels are CUDA C: tinygrad's PTX or NVCC renderers can't compile their intrinsics.
+  return nvidia(device) and isinstance(Device[device].renderer, CUDARenderer)

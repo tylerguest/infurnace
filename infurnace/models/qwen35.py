@@ -27,6 +27,7 @@ from infurnace.kernels.gdn import gdn_decode, gdn_prefill
 from infurnace.kernels.quant_gemm import nv_prefill_supported
 from infurnace.kernels.quant_gemv import q8_quantize
 from infurnace.models.linear import _NVLinear
+from infurnace.device import nvidia
 
 @dataclass(frozen=True)
 class Qwen35Config:
@@ -500,7 +501,7 @@ class Qwen35Model:
       with Context(DEV=device):
         transformer, metadata = Transformer.from_gguf(Path(path), max_context=max_context, realize=False)
       return cls(transformer, metadata)
-    if device.split(':')[0] != 'NV': raise ValueError('Qwen3.5 packed projections require NV')
+    if not nvidia(device): raise ValueError('Qwen3.5 packed projections require an NVIDIA device')
     # Stage upstream's raw file in host memory; only packed projections and the
     # small remaining parameters are copied to the GPU. Upstream otherwise
     # re-unpacks every quantized weight inside each step's kernels.

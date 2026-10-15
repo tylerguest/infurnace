@@ -15,6 +15,7 @@ from infurnace.kernels.quant_gemm import nv_prefill_supported
 from infurnace.models.qwen35 import Qwen35Model
 from infurnace.dflash.jit import captured
 from infurnace.kernels.attention import attention, store_rows
+from infurnace.device import nvidia
 
 @dataclass(frozen=True)
 class DFlashConfig:
@@ -153,7 +154,7 @@ class DFlashDraft:
     result = cls(config, target, {name: entry.decode() for name, entry in resident.items()})
     result.metadata, result.path = metadata, Path(path)
     result.packed_linears = 0
-    if packed and target.device.split(':')[0] == 'NV':
+    if packed and nvidia(target.device):
       for name, entry in resident.items():
         if entry.ggml_type not in QUANT_SIZES or len(entry.shape) != 2 or entry.shape[0] % 16 or entry.shape[1] % 256: continue
         if name.startswith('blk.'):

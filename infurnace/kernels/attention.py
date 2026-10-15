@@ -25,6 +25,7 @@ from tinygrad import Tensor, UOp, dtypes
 from tinygrad.dtype import AddrSpace
 from tinygrad.uop.ops import AxisType, KernelInfo
 from infurnace.kernels.quant_gemv import warp_reduce
+from infurnace.device import nvidia
 
 TILE = 32      # keys staged per step: one per lane
 SEGMENT = 256  # keys per block; segments are merged afterwards
@@ -207,7 +208,7 @@ def attention(q: Tensor, kv: Tensor, start: int | UOp, *, causal: bool = True, w
   _, _, kv_heads, capacity, kv_dim = kv.shape
   if dim != kv_dim or heads % kv_heads: raise ValueError("attention needs matching head sizes and grouped heads")
   if ring and not 0 < window <= capacity - rows: raise ValueError("a ring cache needs a window and room for it plus the rows")
-  if q.device.split(':')[0] != 'NV' or dim % 32 or kv.dtype != dtypes.float16: return _masked(q, kv, start, causal, window, ring, floor)
+  if not nvidia(q.device) or dim % 32 or kv.dtype != dtypes.float16: return _masked(q, kv, start, causal, window, ring, floor)
   # A ring's window can straddle one more segment boundary than its length spans.
   groups, segments = heads // kv_heads, -(-capacity // segment) + int(ring)
   part = Tensor.empty(kv_heads, segments, groups * rows, dim, dtype=dtypes.float32, device=q.device)
@@ -233,7 +234,7 @@ def store_rows(cache: Tensor, values: Tensor, start: int | UOp, *, ring: bool = 
   holds them (a ring of its length with `ring`, so the rows may wrap around its end)."""
   rows, length = values.shape[3], cache.shape[3]
   if not ring: return Tensor(cache.uop.after(cache[:, :, :, start:start + rows].uop.store(values.uop)))
-  if cache.device.split(':')[0] == 'NV':
+  if nvidia(cache.device):
     return _launch((cache,), (values.contiguous(),), start, functools.partial(
       _ring_store_kernel, start=_kernel_scalar(start), kv_heads=cache.shape[2], rows=rows, dim=cache.shape[4], length=length))[0]
   offset = (Tensor.arange(length) - Tensor(start) % length + length) % length    # each slot's row, if < rows
