@@ -88,14 +88,14 @@ Each tool step reads its new tokens at only 250–380 tok/s against ~600 for lon
 
 ### 7. Raw speed
 
-A DFlash round is 23 ms: the 16-row target verify 15.8 ms (its matmuls 11 ms), the draft 4.1 ms,
-the rest ~1.6 ms. Plain decode is 10.3 ms per token (its matmuls 7.6 ms).
+A DFlash round was 23 ms: the 16-row target verify 15.8 ms (its matmuls 11 ms, now 8.6 ms), the draft
+4.1 ms, the rest ~1.6 ms. Plain decode is 10.3 ms per token (its matmuls 7.6 ms).
 
 - [x] **16-row Q4_K matmuls, Marlin-style** (done; see Done). All Q4_K projections 5.38 → 4.48 ms; with
   weights in L2 the kernel runs at 427 GB/s (95% of peak), so what remains is DRAM access.
 - [x] **The same design for Q6_K** (done; see Done): all Q6_K projections 3.29 → 2.35 ms.
-- [ ] **Q5_K** (attention and GDN projections, ~1.7 ms per round): its fifth bit sits in a separate
-  32-byte field, like Q6_K's high bits.
+- [x] **Q5_K** (done; see Done): all Q5_K projections 2.28 → 1.78 ms. All 16-row matmuls together:
+  10.95 → 8.61 ms per round.
 - [ ] **Draft vocabulary.** The draft scores all 248k tokens (1.9 ms of its 4.1 ms); scoring only the
   most frequent ~32k, as FR-Spec does, keeps output exact (the target still verifies). About +7%.
 - [ ] **Per-GPU tuning tables** (after ExLlamaV3's autotuner): replace hand-picked kernel constants
@@ -168,6 +168,9 @@ More in [benchmarks](../benchmarks/README.md). Rules that have caught mistakes b
 
 ## Done
 
+- 2026-10-15: Q5_K through the same 16-row kernel (fifth bits merged under the FP16 trick) and tiled like
+  Q4_K: all Q5_K projections 2.28 → 1.78 ms; DFlash +3%; plain decode unchanged. Over the day, Q4_K + Q5_K +
+  Q6_K: all 16-row matmuls 10.95 → 8.61 ms per round, DFlash code 290 → ~316–323 tok/s, prose 163 → ~184–186.
 - 2026-10-15: Marlin-style 16-row Q6_K kernel and a tiled Q6_K layout (replacing the swizzled one). All
   Q6_K projections at 16 rows 3.29 → 2.35 ms (vocabulary layer 1.83 → 1.33 ms, 403 GB/s); DFlash code
   303 → 323 tok/s, prose 172 → 184; plain decode unchanged within noise.

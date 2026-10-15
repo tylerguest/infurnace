@@ -2,7 +2,7 @@
 from tinygrad import Tensor, dtypes
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from infurnace.gguf import PackedTensor
-from infurnace.kernels.quant_gemv import (quant_gemv, prepare_q6, prepare_q4, dequant_prepared_q4, dequant_prepared_q6)
+from infurnace.kernels.quant_gemv import (quant_gemv, prepare_q6, prepare_q4, dequant_prepared_q4, dequant_prepared_q6, untile)
 from infurnace.kernels.quant_gemm import quant_gemm, nv_prefill_supported
 
 class _NVLinear:
@@ -19,18 +19,21 @@ class _NVLinear:
     dtype = dtypes.uint32 if entry.ggml_type in (12, 13) else dtypes.uint16
     # Typed preparation may allocate new storage on NV. Generic consumers and
     # tied embeddings must use this same storage.
-    # Q4_K and Q6_K go in 16-row tiles (prepare_q4, prepare_q6_tiled) when the rows allow it; every kernel reads them.
-    self.q4_tiled = q4_tiled and q6_aligned and entry.ggml_type == 12 and self.out_features % 16 == 0
+    # Q4_K, Q5_K and Q6_K go in 16-row tiles (prepare_q4, prepare_q6_tiled) when the rows allow it; every kernel
+    # reads them. q4_tiled covers Q4_K and Q5_K, which share their layout code.
+    self.q4_tiled = q4_tiled and q6_aligned and entry.ggml_type in (12, 13) and self.out_features % 16 == 0
     self.q6_aligned = q6_aligned and entry.ggml_type == 14
     self.q6_tiled = self.q6_aligned and q6_tiled and self.out_features % 16 == 0
     # realize=False leaves `packed` lazy so a caller can realize many adapters in one schedule.
-    self.packed = (prepare_q4(entry.data, in_features=self.in_features, realize=realize) if self.q4_tiled else
+    self.packed = (prepare_q4(entry.data, in_features=self.in_features, realize=realize, ggml_type=entry.ggml_type) if self.q4_tiled else
                    prepare_q6(entry.data, in_features=self.in_features, tiled=self.q6_tiled, realize=realize) if self.q6_aligned else
                    entry.data.contiguous().bitcast(dtype).flatten())
     if realize: self.packed.realize()
     # Generic consumers decode fields directly from the same padded allocation.
     # Neither the original GGUF bytes nor a second dense weight copy is retained.
-    decoded = (dequant_prepared_q4(self.packed, in_features=self.in_features) if self.q4_tiled else
+    decoded = (dequant_prepared_q4(self.packed, in_features=self.in_features) if self.q4_tiled and self.ggml_type == 12 else
+               ggml_data_to_tensor(untile(self.packed, in_features=self.in_features, block_bytes=176), self.in_features*self.out_features,
+                                   self.ggml_type) if self.q4_tiled else
                dequant_prepared_q6(self.packed, in_features=self.in_features, tiled=self.q6_tiled) if self.q6_aligned else
                ggml_data_to_tensor(self.packed.bitcast(dtypes.uint8), self.in_features * self.out_features, self.ggml_type))
     original.weight = decoded.reshape(entry.shape).cast(dtypes.float16)

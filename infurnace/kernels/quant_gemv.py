@@ -48,17 +48,22 @@ def _half(value:UOp) -> UOp:
 
 Q6_PREPARED_BYTES = 216
 
-def prepare_q4(raw: Tensor, *, in_features: int, realize: bool = True) -> Tensor:
-  """Q4_K rows in the tiled layout every Q4_K kernel reads: each 16-row tile of each 256-value block is one
-  contiguous 2,304-byte run, blocks in native word order. A 16-row tensor-core warp then reads one contiguous run
-  per block (after Marlin's weight layout), and a one-row warp reads its row's blocks 2,304 bytes apart."""
-  blocks = in_features//256
+def prepare_q4(raw: Tensor, *, in_features: int, realize: bool = True, ggml_type: int = Q4_K) -> Tensor:
+  """Q4_K (or Q5_K) rows in the tiled layout every kernel reads: each 16-row tile of each 256-value block is one
+  contiguous run (2,304 bytes for Q4_K, 2,816 for Q5_K), blocks in native word order. A 16-row tensor-core warp
+  then reads one contiguous run per block (after Marlin's weight layout); a one-row warp reads the same layout."""
+  blocks, size = in_features//256, QUANT_SIZES[ggml_type]
   if (raw.dtype != dtypes.uint8 or raw.numel() <= 0 or in_features <= 0 or in_features%256
-      or raw.numel()%(blocks*144) or (raw.numel()//(blocks*144))%16):
-    raise QuantGemvError("tiled Q4 preparation requires complete uint8 rows, width a multiple of 256 and rows of 16")
-  rows = raw.numel()//(blocks*144)
-  result = raw.flatten().reshape(rows//16, 16, blocks, 144).permute(0, 2, 1, 3).contiguous().flatten().bitcast(dtypes.uint32)
+      or raw.numel()%(blocks*size) or (raw.numel()//(blocks*size))%16):
+    raise QuantGemvError("tiled Q4/Q5 preparation requires complete uint8 rows, width a multiple of 256 and rows of 16")
+  rows = raw.numel()//(blocks*size)
+  result = raw.flatten().reshape(rows//16, 16, blocks, size).permute(0, 2, 1, 3).contiguous().flatten().bitcast(dtypes.uint32)
   return result.realize() if realize else result
+
+def untile(packed: Tensor, *, in_features: int, block_bytes: int) -> Tensor:
+  """Tiled words back to native GGUF block bytes in row order."""
+  words = packed.bitcast(dtypes.uint32).reshape(-1, in_features//256, 16, block_bytes//4)
+  return words.permute(0, 2, 1, 3).reshape(-1, block_bytes//4).bitcast(dtypes.uint8)
 
 def _prepare_q6_kernel(out: UOp, raw: UOp, *, gpu: bool = True) -> UOp:
   block = UOp.range((out.shape[0]+127)//128, 0, axis_type=AxisType.GLOBAL if gpu else AxisType.LOOP)
@@ -95,8 +100,7 @@ def prepare_q6_tiled(raw: Tensor, *, in_features: int, realize: bool = True) -> 
 
 def dequant_prepared_q4(packed: Tensor, *, in_features: int) -> Tensor:
   """FP32 weights straight from prepare_q4's tiled words (GGUF Q4_K field math)."""
-  words = packed.bitcast(dtypes.uint32).reshape(-1, in_features//256, 16, Q4_WORDS)
-  blocks = words.permute(0, 2, 1, 3).reshape(-1, Q4_WORDS).bitcast(dtypes.uint8)
+  blocks = untile(packed, in_features=in_features, block_bytes=Q4_WORDS*4)
   d, dmin = (blocks[:, i:i+2].bitcast(dtypes.float16).float().unsqueeze(-1) for i in (0, 2))
   s = blocks[:, 4:16]
   scales = s[:, 0:4].bitwise_and(63).cat(s[:, 8:12].bitwise_and(15).bitwise_or(s[:, 0:4].rshift(6).lshift(4)), dim=-1)
@@ -112,8 +116,7 @@ def _nibbles(data: Tensor, bits: int) -> Tensor:
 def dequant_prepared_q6(packed: Tensor, *, in_features: int = 0, tiled: bool = False) -> Tensor:
   """FP32 weights straight from prepare_q6's 216-byte blocks (GGUF Q6_K field math, read in place)."""
   if tiled:
-    words = packed.bitcast(dtypes.uint32).reshape(-1, in_features//256, 16, Q6_PREPARED_BYTES//4)
-    blocks = words.permute(0, 2, 1, 3).reshape(-1, Q6_PREPARED_BYTES//4).bitcast(dtypes.uint8)
+    blocks = untile(packed, in_features=in_features, block_bytes=Q6_PREPARED_BYTES)
   else: blocks = packed.bitcast(dtypes.uint8).reshape(-1, Q6_PREPARED_BYTES).contiguous()
   low = _nibbles(blocks[:, :128].reshape(-1, 2, 64), 4)
   high = _nibbles(blocks[:, 128:192].reshape(-1, 2, 32), 2).lshift(4)
@@ -235,7 +238,7 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, out_features:
     if ggml_type in (Q4_K, Q5_K):
       logical = output*in_features//GGML_BLOCK_SIZE+block
       block_words = Q4_WORDS if ggml_type == Q4_K else 44
-      # The tiled layout (prepare_q4): each 16-row tile of each block contiguous, native word order.
+      # The tiled layout (prepare_q4, for Q4_K and Q5_K): each 16-row tile of each block contiguous, native word order.
       base = ((output//16*(in_features//GGML_BLOCK_SIZE)+block)*16+output%16)*block_words if q4_tiled else logical*block_words
       payload_start = (4 if ggml_type == Q4_K else 12)+(subgroup//2)*8
       dot = UOp.const(0, dtypes.int32)
@@ -295,7 +298,7 @@ def quant_gemv(x:Tensor, packed:Tensor, *, out_features:int, in_features:int, gg
   if not x.shape or x.shape[-1] != in_features: raise QuantGemvError("activation shape does not match in_features")
   if x.device != packed.device: raise QuantGemvError("activations and packed weights must share a device")
 
-  if q4_tiled and (ggml_type != Q4_K or out_features%16): raise QuantGemvError("tiled Q4 requires Q4_K and 16-row tiles")
+  if q4_tiled and (ggml_type not in (Q4_K, Q5_K) or out_features%16): raise QuantGemvError("tiled Q4/Q5 requires Q4_K/Q5_K and 16-row tiles")
   if q6_tiled and (not q6_aligned or out_features%16): raise QuantGemvError("tiled Q6 requires prepared storage and 16-row tiles")
   if q6_aligned and ggml_type != Q6_K: raise QuantGemvError("aligned Q6 layout requires Q6_K")
   expected_dtype = dtypes.uint32 if ggml_type in (Q4_K, Q5_K) or q6_aligned else dtypes.uint16
