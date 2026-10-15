@@ -125,5 +125,7 @@ def test_prefill_adapter_symbolic_tails_and_storage(typ, size, prepared, width):
       assert result.shape[1] == rows
       actual = result[:count].tolist()
       assert len(actual) == count
+      # Tiled Q6_K rounds d*scale to FP16 before multiplying (as Marlin does): allow that relative to the largest output.
+      tolerance = max(2e-2, 2e-3*max(abs(v) for r in expected for v in r)) if typ == 14 and prepared else 2e-2
       for row, reference in zip(actual, expected[:count]):
-        assert row == pytest.approx(reference, rel=3e-3, abs=2e-2), (count, mode, actual.index(row))
+        assert row == pytest.approx(reference, rel=3e-3, abs=tolerance), (count, mode, actual.index(row))

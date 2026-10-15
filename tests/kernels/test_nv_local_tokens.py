@@ -13,9 +13,9 @@ pytestmark = pytest.mark.nv
 def test_cta_local_tokens_exact_prepared_projection_and_replay(typ, count, width):
   raw = packed(typ, 16, width, 'NV').bitcast(dtypes.uint8)
   weight = (prepare_q4(raw, in_features=width) if typ == 12 else
-            prepare_q6(raw, in_features=width, swizzled=True))
+            prepare_q6(raw, in_features=width, tiled=True))
   settings = dict(out_features=16, in_features=width, ggml_type=typ,
-                  q4_tiled=typ == 12, q6_aligned=typ == 14, q6_swizzled=typ == 14)
+                  q4_tiled=typ == 12, q6_aligned=typ == 14, q6_tiled=typ == 14)
   jit = TinyJit(lambda x: quant_gemv(x, weight, **settings, local_tokens=True, exact_rows=True))
   for _ in range(4):
     x = Tensor.randn(1, count, width, device='NV').realize()

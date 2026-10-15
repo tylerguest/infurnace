@@ -478,7 +478,7 @@ class Qwen35Model:
       with Context(DEV=self.device):
         ids = Tensor(tokens, dtype=dtypes.int32, device=self.device)
         rows = packed_gather(ids, head.packed, width=head.in_features, ggml_type=head.ggml_type, q6_aligned=head.q6_aligned,
-                             q6_swizzled=head.q6_swizzled, q4_tiled=head.q4_tiled)
+                             q6_tiled=head.q6_tiled, q4_tiled=head.q4_tiled)
         return rows.half().float().reshape(1, len(tokens), dim)
     if self._host_embedding is None:
       _, entries = parse_gguf(self._path)

@@ -93,9 +93,9 @@ the rest ~1.6 ms. Plain decode is 10.3 ms per token (its matmuls 7.6 ms).
 
 - [x] **16-row Q4_K matmuls, Marlin-style** (done; see Done). All Q4_K projections 5.38 → 4.48 ms; with
   weights in L2 the kernel runs at 427 GB/s (95% of peak), so what remains is DRAM access.
-- [ ] **The same design for Q6_K and Q5_K** (vocabulary layer and FFN-down; ~5.6 ms of the 11 ms of
-  16-row matmuls per round). Q6_K's 16-value scale groups and its separate high bits need their own
-  fragment math.
+- [x] **The same design for Q6_K** (done; see Done): all Q6_K projections 3.29 → 2.35 ms.
+- [ ] **Q5_K** (attention and GDN projections, ~1.7 ms per round): its fifth bit sits in a separate
+  32-byte field, like Q6_K's high bits.
 - [ ] **Draft vocabulary.** The draft scores all 248k tokens (1.9 ms of its 4.1 ms); scoring only the
   most frequent ~32k, as FR-Spec does, keeps output exact (the target still verifies). About +7%.
 - [ ] **Per-GPU tuning tables** (after ExLlamaV3's autotuner): replace hand-picked kernel constants
@@ -168,6 +168,9 @@ More in [benchmarks](../benchmarks/README.md). Rules that have caught mistakes b
 
 ## Done
 
+- 2026-10-15: Marlin-style 16-row Q6_K kernel and a tiled Q6_K layout (replacing the swizzled one). All
+  Q6_K projections at 16 rows 3.29 → 2.35 ms (vocabulary layer 1.83 → 1.33 ms, 403 GB/s); DFlash code
+  303 → 323 tok/s, prose 172 → 184; plain decode unchanged within noise.
 - 2026-10-15: Marlin-style 16-row Q4_K kernel and a tiled Q4_K layout shared with the one-row kernel.
   All Q4_K projections at 16 rows 5.38 → 4.48 ms; DFlash code 290 → 301–304 tok/s, prose 163 → 168–171;
   plain decode within noise (−1.5%, with 8 warps per block for one-row Q4_K). The kernel rounds d·scale to

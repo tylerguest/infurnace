@@ -173,7 +173,7 @@ class ParallelVerifier:
   def _gather(self, ids: Tensor) -> Tensor:
     head = self.observer.model.transformer.output
     return packed_gather(ids, head.packed, width=head.in_features, ggml_type=head.ggml_type, q6_aligned=head.q6_aligned,
-                         q6_swizzled=head.q6_swizzled, q4_tiled=head.q4_tiled)
+                         q6_tiled=head.q6_tiled, q4_tiled=head.q4_tiled)
 
   def _pick(self, count: UOp, *, mask: int):
     # Anchor = the held block's last accepted decision, then noise embeddings.

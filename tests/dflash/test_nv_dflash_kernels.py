@@ -45,8 +45,8 @@ def _q4_rows(rows, width):
   for offset in range(0, len(raw), 144): raw[offset:offset+4] = struct.pack('<ee', 0.002, 0.0004)
   return bytes(raw)
 
-@pytest.mark.parametrize('typ,swizzled', [(14, False), (14, True), (12, True), (12, False)])
-def test_packed_gather_decodes_only_requested_rows(typ, swizzled):
+@pytest.mark.parametrize('typ,tiled', [(14, False), (14, True), (12, True), (12, False)])
+def test_packed_gather_decodes_only_requested_rows(typ, tiled):
   rows, width = 48, 1280  # tiled Q4_K needs whole 16-row tiles
   raw_bytes = _q6_rows(rows, width) if typ == 14 else _q4_rows(rows, width)
   ids = [0, 39, 7, 7, 21, 1, 38, 12]
@@ -55,11 +55,11 @@ def test_packed_gather_decodes_only_requested_rows(typ, swizzled):
   with Context(DEV='NV'):
     raw = Tensor(raw_bytes, dtype=dtypes.uint8, device='NV').realize()
     if typ == 14:
-      packed = prepare_q6(raw, in_features=width, swizzled=swizzled)
-      options = dict(q6_aligned=True, q6_swizzled=swizzled)
+      packed = prepare_q6(raw, in_features=width, tiled=tiled)
+      options = dict(q6_aligned=True, q6_tiled=tiled)
     else:
-      packed = prepare_q4(raw, in_features=width) if swizzled else raw.bitcast(dtypes.uint32).flatten().realize()
-      options = dict(q4_tiled=swizzled)
+      packed = prepare_q4(raw, in_features=width) if tiled else raw.bitcast(dtypes.uint32).flatten().realize()
+      options = dict(q4_tiled=tiled)
     got = packed_gather(Tensor(ids, dtype=dtypes.int32), packed, width=width, ggml_type=typ, **options).tolist()
   for i, row in zip(ids, got): assert row == table[i]
 
