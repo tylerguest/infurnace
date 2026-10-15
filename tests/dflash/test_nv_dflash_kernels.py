@@ -47,7 +47,7 @@ def _q4_rows(rows, width):
 
 @pytest.mark.parametrize('typ,swizzled', [(14, False), (14, True), (12, True), (12, False)])
 def test_packed_gather_decodes_only_requested_rows(typ, swizzled):
-  rows, width = 40, 1280
+  rows, width = 48, 1280  # tiled Q4_K needs whole 16-row tiles
   raw_bytes = _q6_rows(rows, width) if typ == 14 else _q4_rows(rows, width)
   ids = [0, 39, 7, 7, 21, 1, 38, 12]
   with Context(DEV='CPU'):
@@ -59,7 +59,7 @@ def test_packed_gather_decodes_only_requested_rows(typ, swizzled):
       options = dict(q6_aligned=True, q6_swizzled=swizzled)
     else:
       packed = prepare_q4(raw, in_features=width) if swizzled else raw.bitcast(dtypes.uint32).flatten().realize()
-      options = dict(q4_swizzled=swizzled)
+      options = dict(q4_tiled=swizzled)
     got = packed_gather(Tensor(ids, dtype=dtypes.int32), packed, width=width, ggml_type=typ, **options).tolist()
   for i, row in zip(ids, got): assert row == table[i]
 

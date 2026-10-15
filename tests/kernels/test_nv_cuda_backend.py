@@ -18,8 +18,8 @@ def run(device, raw, x, q, kv, logits):
   with Context(DEV=device):
     packed = prepare_q4(Tensor(raw, dtype=dtypes.uint8), in_features=2560)
     xs = Tensor(x)
-    one = quant_gemv(xs[0], packed, out_features=256, in_features=2560, ggml_type=12, q4_swizzled=True)
-    rows = quant_gemm(xs.reshape(1, 16, 2560), packed, out_features=256, in_features=2560, ggml_type=12, q4_swizzled=True)
+    one = quant_gemv(xs[0], packed, out_features=256, in_features=2560, ggml_type=12, q4_tiled=True)
+    rows = quant_gemm(xs.reshape(1, 16, 2560), packed, out_features=256, in_features=2560, ggml_type=12, q4_tiled=True)
     attended = attention(Tensor(q), Tensor(kv, dtype=dtypes.float16), 300, window=128)
     sampled = Sampler(device, 5)(Tensor(logits), Tensor([0.0]))
     return [t.tolist() for t in (one, rows, attended, sampled)]

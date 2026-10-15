@@ -59,28 +59,16 @@ def _swizzled_index(linear_block: UOp, word: UOp | int, blocks_per_row: int, blo
 def _q6_swizzled_index(linear_block: UOp, word: UOp | int, blocks_per_row: int) -> UOp:
   return _swizzled_index(linear_block, word, blocks_per_row, Q6_PREPARED_BYTES//4)
 
-def _prepare_q4_kernel(out: UOp, raw: UOp, *, blocks_per_row: int, gpu: bool = True) -> UOp:
-  block = UOp.range((out.shape[0]+127)//128, 0, axis_type=AxisType.GLOBAL if gpu else AxisType.LOOP)
-  lane = UOp.range(128, 1, axis_type=AxisType.LOCAL if gpu else AxisType.LOOP)
-  index = block*128+lane
-  row, offset = index//(blocks_per_row*36), index%(blocks_per_row*36)
-  tile, tile_offset = offset//144, offset%144
-  live = (blocks_per_row-tile*4).minimum(4)
-  word = (tile_offset//(live*4))*4+tile_offset%4
-  logical = row*blocks_per_row+tile*4+(tile_offset%(live*4))//4
-  start = logical*144+word*4
-  value = sum((raw[(start+i).valid(index < out.shape[0])].load().cast(dtypes.uint32) << (i*8)
-               for i in range(4)), UOp.const(0, dtypes.uint32))
-  return out[index.valid(index < out.shape[0])].store(value).end(block, lane).sink(
-    arg=KernelInfo(name="prepare_q4_swizzled", opts_to_apply=()))
-
 def prepare_q4(raw: Tensor, *, in_features: int, realize: bool = True) -> Tensor:
+  """Q4_K rows in the tiled layout every Q4_K kernel reads: each 16-row tile of each 256-value block is one
+  contiguous 2,304-byte run, blocks in native word order. A 16-row tensor-core warp then reads one contiguous run
+  per block (after Marlin's weight layout), and a one-row warp reads its row's blocks 2,304 bytes apart."""
+  blocks = in_features//256
   if (raw.dtype != dtypes.uint8 or raw.numel() <= 0 or in_features <= 0 or in_features%256
-      or raw.numel()%(in_features//256*144)):
-    raise QuantGemvError("swizzled Q4 preparation requires complete uint8 rows with width multiple of 256")
-  out = Tensor.empty(raw.numel()//4, dtype=dtypes.uint32, device=raw.device)
-  fxn = functools.partial(_prepare_q4_kernel, blocks_per_row=in_features//256, gpu=nvidia(raw.device))
-  result = Tensor(UOp.custom_kernel(out.uop, raw.uop.flatten(), fxn=fxn)[0])
+      or raw.numel()%(blocks*144) or (raw.numel()//(blocks*144))%16):
+    raise QuantGemvError("tiled Q4 preparation requires complete uint8 rows, width a multiple of 256 and rows of 16")
+  rows = raw.numel()//(blocks*144)
+  result = raw.flatten().reshape(rows//16, 16, blocks, 144).permute(0, 2, 1, 3).contiguous().flatten().bitcast(dtypes.uint32)
   return result.realize() if realize else result
 
 def _prepare_q6_kernel(out: UOp, raw: UOp, *, gpu: bool = True, blocks_per_row: int = 0) -> UOp:
@@ -124,8 +112,9 @@ def _unswizzle(words: Tensor, in_features: int, block_words: int, word_group: in
   return (parts[0] if len(parts) == 1 else parts[0].cat(parts[1], dim=1)).reshape(-1, block_words).bitcast(dtypes.uint8)
 
 def dequant_prepared_q4(packed: Tensor, *, in_features: int) -> Tensor:
-  """FP32 weights straight from prepare_q4's swizzled words (GGUF Q4_K field math)."""
-  blocks = _unswizzle(packed.bitcast(dtypes.uint32), in_features, Q4_WORDS, 4)
+  """FP32 weights straight from prepare_q4's tiled words (GGUF Q4_K field math)."""
+  words = packed.bitcast(dtypes.uint32).reshape(-1, in_features//256, 16, Q4_WORDS)
+  blocks = words.permute(0, 2, 1, 3).reshape(-1, Q4_WORDS).bitcast(dtypes.uint8)
   d, dmin = (blocks[:, i:i+2].bitcast(dtypes.float16).float().unsqueeze(-1) for i in (0, 2))
   s = blocks[:, 4:16]
   scales = s[:, 0:4].bitwise_and(63).cat(s[:, 8:12].bitwise_and(15).bitwise_or(s[:, 0:4].rshift(6).lshift(4)), dim=-1)
@@ -196,7 +185,9 @@ def q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor, 
   return q, scale, xsum
 
 def _decode_warps(ggml_type: int, in_features: int, out_features: int) -> int:
-  if ggml_type == Q4_K: return 4
+  # RTX 5060, tiled Q4_K: 8 warps (eight adjacent rows, 1,152 contiguous bytes per block) 3.72 ms for all
+  # projections against 3.98-4.23 ms with 4.
+  if ggml_type == Q4_K: return 8
   # RTX 5060: the Qwen3.5-4B Q6 output head (tied to the embedding) takes 1.31 ms with 4 or 8 warps
   # against 1.45-1.48 ms with 1; FFN-down was screened earlier and stays at 1.
   if ggml_type == Q6_K and (out_features, in_features) == (248320, 2560): return 8
@@ -250,7 +241,7 @@ def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot:Callabl
          +('_sum' if fuse_chunks else ''), opts_to_apply=()))
 
 def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, out_features:int, in_features:int, ggml_type:int,
-                         q6_aligned: bool = False, q6_swizzled: bool = False, q4_swizzled: bool = False,
+                         q6_aligned: bool = False, q6_swizzled: bool = False, q4_tiled: bool = False,
                          interleave_tokens:bool=False, reuse_tokens:bool=False, local_tokens:bool=False,
                          loop_chunks:bool=False, fuse_chunks:bool=False, residual:UOp|None=None) -> UOp:
   group_count = in_features // Q8_GROUP_SIZE
@@ -260,8 +251,9 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, out_features:
     if ggml_type in (Q4_K, Q5_K):
       logical = output*in_features//GGML_BLOCK_SIZE+block
       block_words = Q4_WORDS if ggml_type == Q4_K else 44
-      base = logical if q4_swizzled else logical*block_words
-      swizzle_width = in_features//256 if q4_swizzled else 0
+      # The tiled layout (prepare_q4): each 16-row tile of each block contiguous, native word order.
+      base = ((output//16*(in_features//GGML_BLOCK_SIZE)+block)*16+output%16)*block_words if q4_tiled else logical*block_words
+      swizzle_width = 0
       payload_start = (4 if ggml_type == Q4_K else 12)+(subgroup//2)*8
       dot = UOp.const(0, dtypes.int32)
       for word_idx in range(8):
@@ -317,7 +309,7 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, out_features:
                         loop_chunks=loop_chunks, fuse_chunks=fuse_chunks, residual=residual)
 
 def quant_gemv(x:Tensor, packed:Tensor, *, out_features:int, in_features:int, ggml_type:int, q6_aligned: bool = False,
-               q6_swizzled: bool = False, q4_swizzled: bool = False,
+               q6_swizzled: bool = False, q4_tiled: bool = False,
                q8: tuple[Tensor, Tensor, Tensor] | None = None, interleave_tokens:bool=False,
                exact_rows:bool=False, return_parts:bool=False, reuse_tokens:bool=False, local_tokens:bool=False,
                loop_chunks:bool=False, fuse_chunks:bool=False, residual:Tensor|None=None) -> Tensor:
@@ -328,7 +320,7 @@ def quant_gemv(x:Tensor, packed:Tensor, *, out_features:int, in_features:int, gg
   if not x.shape or x.shape[-1] != in_features: raise QuantGemvError("activation shape does not match in_features")
   if x.device != packed.device: raise QuantGemvError("activations and packed weights must share a device")
 
-  if q4_swizzled and ggml_type != Q4_K: raise QuantGemvError("swizzled Q4 requires Q4_K")
+  if q4_tiled and (ggml_type != Q4_K or out_features%16): raise QuantGemvError("tiled Q4 requires Q4_K and 16-row tiles")
   if q6_swizzled and not q6_aligned: raise QuantGemvError("swizzled Q6 requires prepared storage")
   if q6_aligned and ggml_type != Q6_K: raise QuantGemvError("aligned Q6 layout requires Q6_K")
   expected_dtype = dtypes.uint32 if ggml_type in (Q4_K, Q5_K) or q6_aligned else dtypes.uint16
@@ -355,7 +347,7 @@ def quant_gemv(x:Tensor, packed:Tensor, *, out_features:int, in_features:int, gg
     if tensor.shape != shape or tensor.dtype != dtype or tensor.device != x.device:
       raise QuantGemvError("shared Q8 activation dtype/shape/device does not match the projection")
   decode = functools.partial(_quant_decode_kernel, ggml_type=ggml_type, q6_aligned=q6_aligned, q6_swizzled=q6_swizzled,
-                             q4_swizzled=q4_swizzled, interleave_tokens=interleave_tokens, reuse_tokens=reuse_tokens,
+                             q4_tiled=q4_tiled, interleave_tokens=interleave_tokens, reuse_tokens=reuse_tokens,
                              local_tokens=local_tokens, loop_chunks=loop_chunks or fuse_chunks, fuse_chunks=fuse_chunks)
   chunks = 1 if fuse_chunks else (in_features + 1023) // 1024
   out = Tensor.empty(tokens, out_features, chunks, dtype=dtypes.float32, device=x.device).uop

@@ -10,7 +10,7 @@ from tinygrad.llm.gguf import ggml_data_to_tensor as _dequant
 kernels = importlib.import_module("infurnace.kernels.quant_gemv")
 
 @pytest.mark.parametrize("typ,width,rows,expected", [
-  (12, 2560, 9728, 4), (14, 2560, 248320, 8), (14, 9728, 2560, 1),
+  (12, 2560, 9728, 8), (14, 2560, 248320, 8), (14, 9728, 2560, 1),
   (14, 2560, 1024, 1), (14, 2560, 65536, 1),
 ])
 def test_shape_specific_warp_selection(typ, width, rows, expected):

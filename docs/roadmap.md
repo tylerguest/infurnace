@@ -91,14 +91,11 @@ Each tool step reads its new tokens at only 250–380 tok/s against ~600 for lon
 A DFlash round is 23 ms: the 16-row target verify 15.8 ms (its matmuls 11 ms), the draft 4.1 ms,
 the rest ~1.6 ms. Plain decode is 10.3 ms per token (its matmuls 7.6 ms).
 
-- [ ] **16-row matmuls.** They reach ~250 GB/s against 350–400 for the one-row kernels, though a plain
-  streaming kernel reads at 430 GB/s at the same occupancy. The SASS shows instruction issue with poor
-  latency hiding, not memory, as the limit. An experiment is parked in `git stash` ("experimental 16-row
-  Q4_K kernel"): prefetching the next block during the current MMAs, 16-byte scale loads and an FP16
-  dequant without conversions take all Q4_K projections from 5.48 to 4.77 ms (−13%, same accuracy).
-  About a quarter of its instructions are register shuffles from building FP16 fragments out of
-  scalars; removing them needs `half2` operations tinygrad does not expose. Next: carry the parked work
-  to Q5_K/Q6_K and wire it in (about +5% DFlash).
+- [x] **16-row Q4_K matmuls, Marlin-style** (done; see Done). All Q4_K projections 5.38 → 4.48 ms; with
+  weights in L2 the kernel runs at 427 GB/s (95% of peak), so what remains is DRAM access.
+- [ ] **The same design for Q6_K and Q5_K** (vocabulary layer and FFN-down; ~5.6 ms of the 11 ms of
+  16-row matmuls per round). Q6_K's 16-value scale groups and its separate high bits need their own
+  fragment math.
 - [ ] **Draft vocabulary.** The draft scores all 248k tokens (1.9 ms of its 4.1 ms); scoring only the
   most frequent ~32k, as FR-Spec does, keeps output exact (the target still verifies). About +7%.
 - [ ] **Per-GPU tuning tables** (after ExLlamaV3's autotuner): replace hand-picked kernel constants
@@ -155,6 +152,9 @@ More in [benchmarks](../benchmarks/README.md). Rules that have caught mistakes b
 
 - **int8 tensor cores** (llama.cpp's MMQ approach): tinygrad's CUDA backend has FP16, BF16, TF32 and FP8
   shapes but no int8, and we don't change tinygrad.
+- **Building FP16 fragments from scalar halves** (the first 16-row rewrite): nvcc repacks them with
+  `MOV`/`PRMT`, a quarter of the loop. Packed `half2` math cut to halves only at the MMA avoids it; a
+  vector bitcast or a vector-shaped custom op instead sends tinygrad's devectorizer into an infinite loop.
 - **FP16 accumulation** in the 16-row matmuls (ExLlamaV3 uses it on consumer GPUs): slower on the 5060
   and 1,000× more error.
 - **More split-K, smaller tiles or blocks** for the 16-row matmuls: no gain once measured without L2 reuse.
@@ -168,6 +168,10 @@ More in [benchmarks](../benchmarks/README.md). Rules that have caught mistakes b
 
 ## Done
 
+- 2026-10-15: Marlin-style 16-row Q4_K kernel and a tiled Q4_K layout shared with the one-row kernel.
+  All Q4_K projections at 16 rows 5.38 → 4.48 ms; DFlash code 290 → 301–304 tok/s, prose 163 → 168–171;
+  plain decode within noise (−1.5%, with 8 warps per block for one-row Q4_K). The kernel rounds d·scale to
+  FP16 as Marlin does: output error 5.2e-5 mean against 3.7e-5 before, relative to the largest output.
 - 2026-10-15: fast kernels on tinygrad's `CUDA` backend too (identical output to `NV`).
 - 2026-10-13:
   - Ring caches for the draft's five sliding-window layers (~520 MB less at 32k); window attention

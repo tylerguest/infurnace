@@ -15,7 +15,7 @@ def test_loop_projection_preserves_every_partial_on_replay(typ, count, width):
   weight = (prepare_q4(raw, in_features=width) if typ == 12 else
             prepare_q6(raw, in_features=width, swizzled=True))
   settings = dict(out_features=16, in_features=width, ggml_type=typ, return_parts=True,
-                  q4_swizzled=typ == 12, q6_aligned=typ == 14, q6_swizzled=typ == 14)
+                  q4_tiled=typ == 12, q6_aligned=typ == 14, q6_swizzled=typ == 14)
   jits = [TinyJit(lambda x, local=local: quant_gemv(x, weight, **settings, loop_chunks=True, local_tokens=local))
           for local in (False, True)]
   for _ in range(4):

@@ -12,9 +12,10 @@ import os
 from tinygrad import Context, Device, Tensor, UOp, dtypes
 from tinygrad.dtype import AddrSpace
 from tinygrad.renderer.cstyle import CUDARenderer
-from tinygrad.uop.ops import AxisType, KernelInfo
+from tinygrad.uop.ops import AxisType, KernelInfo, Ops
 
-from infurnace.kernels.quant_gemv import Q4_K, Q5_K, Q6_K, Q6_PREPARED_BYTES, QUANT_SIZES, _half, _q4_scales, _q6_swizzled_index, _q4_word
+from infurnace.kernels.quant_gemv import (Q4_K, Q5_K, Q6_K, Q6_PREPARED_BYTES, QUANT_SIZES, _half, _load_lanes, _q4_scales,
+                                           _q6_swizzled_index, _q4_word)
 from infurnace.device import nvidia
 
 class QuantGemmError(ValueError):
@@ -26,16 +27,14 @@ def _q6_byte(raw: UOp, base: UOp, offset: UOp, blocks_per_row: int = 0) -> UOp:
   return (raw[index].load().cast(dtypes.uint32) >> ((offset%size)*8).cast(dtypes.uint32)) & 255
 
 def _weight(raw: UOp, row: UOp, col: UOp, width: int, typ: int, q6_aligned: bool = False,
-            q6_swizzled: bool = False, q4_swizzled: bool = False) -> UOp:
+            q6_swizzled: bool = False, q4_tiled: bool = False) -> UOp:
   block, within = col//256, col%256
   if typ == Q4_K:
-    logical = row*(width//256)+block
-    base = logical if q4_swizzled else logical*36
-    swizzle_width = width//256 if q4_swizzled else 0
+    base = q4_block_base(row, block, width) if q4_tiled else (row*(width//256)+block)*36
     subgroup = within//32
-    word = _q4_word(raw, base, 4+(subgroup//2)*8+(within%32)//4, swizzle_width)
+    word = _q4_word(raw, base, 4+(subgroup//2)*8+(within%32)//4)
     quant = (word >> ((subgroup%2)*4+(within%4)*8).cast(dtypes.uint32)) & 15
-    d, dmin, scale, minimum = _q4_scales(raw, base, subgroup, swizzle_width)
+    d, dmin, scale, minimum = _q4_scales(raw, base, subgroup)
     return (d*scale*quant.float()-dmin*minimum).cast(dtypes.float16)
   if typ == Q5_K:
     # 44 words: d/dmin, 12 scale bytes, 32 high-bit bytes (bit `subgroup` of
@@ -57,7 +56,7 @@ def _weight(raw: UOp, row: UOp, col: UOp, width: int, typ: int, q6_aligned: bool
   return (_half(raw[d_index].load())*quant.float()*scale).cast(dtypes.float16)
 
 @functools.cache
-def _prefill_q4_paired(out: UOp, raw: UOp, x: UOp, *, tokens: int, width: int, rows: int, q4_swizzled: bool = False,
+def _prefill_q4_paired(out: UOp, raw: UOp, x: UOp, *, tokens: int, width: int, rows: int,
                        tiles: int = 4, splits: int = 1, typ: int = Q4_K) -> UOp:
   """Q4_K/Q5_K MMA over a permuted k order that matches the packed nibble layout.
 
@@ -70,7 +69,6 @@ def _prefill_q4_paired(out: UOp, raw: UOp, x: UOp, *, tokens: int, width: int, r
   the same 8t..8t+7 for every pair, so they load once per block.
   """
   q5 = typ == Q5_K
-  if q5: q4_swizzled = False
   warps = math.gcd(rows//(8*tiles), 4)
   output_blocks = rows//(warps*8*tiles)
   blocks = width//256//splits
@@ -81,7 +79,6 @@ def _prefill_q4_paired(out: UOp, raw: UOp, x: UOp, *, tokens: int, width: int, r
   token_base = (rest//output_blocks)*16
   output_base = (rest%output_blocks)*warps*8*tiles+warp*8*tiles
   group, thread = lane//4, lane%4
-  swizzle_width = width//256 if q4_swizzled else 0
   accs = []
   for t in range(tiles):
     acc = UOp.placeholder((4,), dtypes.float32, slot=3+t, addrspace=AddrSpace.REG)
@@ -94,10 +91,10 @@ def _prefill_q4_paired(out: UOp, raw: UOp, x: UOp, *, tokens: int, width: int, r
     decoded = []
     for t in range(tiles):
       logical = (output_base+t*8+group)*(width//256)+column_block
-      base = logical if q4_swizzled else logical*(44 if q5 else 36)
-      low = _q4_scales(raw, base, UOp.const(2*pair), swizzle_width)
-      high = _q4_scales(raw, base, UOp.const(2*pair+1), swizzle_width)
-      words = [_q4_word(raw, base, (12 if q5 else 4)+8*pair+2*thread+w, swizzle_width) for w in (0, 1)]
+      base = logical*(44 if q5 else 36)
+      low = _q4_scales(raw, base, UOp.const(2*pair))
+      high = _q4_scales(raw, base, UOp.const(2*pair+1))
+      words = [_q4_word(raw, base, (12 if q5 else 4)+8*pair+2*thread+w) for w in (0, 1)]
       highs = [raw[base+4+2*thread+w].load() for w in (0, 1)] if q5 else None
       decoded.append((low, high, words, highs))
     for step in range(4):
@@ -117,6 +114,152 @@ def _prefill_q4_paired(out: UOp, raw: UOp, x: UOp, *, tokens: int, width: int, r
   stores = [out[split, token_base+group+row, output_base+t*8+thread*2+col].store(acc.after(done)[i].load())
             for t, acc in enumerate(accs) for i, (row, col) in enumerate(((0, 0), (0, 1), (8, 0), (8, 1)))]
   return UOp.group(*stores).end(block, warp, lane).sink(arg=KernelInfo(name=f"prefill_q{5 if q5 else 4}_k_paired", opts_to_apply=()))
+
+def q4_block_base(row: UOp, block: UOp, width: int) -> UOp:
+  """Word offset of (row, block) in the tiled Q4_K layout (prepare_q4): each 16-row tile of each 256-value
+  block is contiguous, blocks in native word order."""
+  return ((row//16*(width//256)+block)*16+row%16)*36
+
+# Packed FP16 pairs: two halves in one 32-bit register, operated on with half2 instructions through inline
+# CUDA (as Marlin does). Cutting a register into its two halves only where an MMA reads them lets the
+# compiler hand the register straight to the tensor core; scalar FP16 arithmetic would make it re-pack.
+_HALF2 = "tg_bitcast<half2>({})"
+_FP16_1024 = 0x64006400  # 1024.0 in both halves: OR-ing a nibble into the mantissa gives 1024 + q exactly
+
+def _h2(op: str, *args: UOp) -> UOp:
+  return UOp(Ops.CUSTOMI, src=args, arg=(f"tg_bitcast<unsigned int>({op}({', '.join([_HALF2] * len(args))}))", dtypes.uint32))
+
+def _halves(pair: UOp) -> list[UOp]:
+  return [(pair >> s).cast(dtypes.uint16).bitcast(dtypes.float16) for s in (0, 16)]
+
+def _q4_scale_pair(head: list[UOp], subgroup: int) -> tuple[UOp, UOp]:
+  """Packed (d*scale, d*scale) and (dmin*minimum, dmin*minimum) for a static Q4_K subgroup, from the block's
+  first four words. The header word is already the FP16 pair (d, dmin), and the two 6-bit values go through the
+  FP16 trick as a pair: one HMUL2, exactly as rounded as the FP32 product (an FP16 times a 6-bit integer is exact)."""
+  def byte(word: int, k: int) -> UOp: return (head[word] >> (8*k)) & 255
+  if subgroup < 4: scale, minimum = byte(1, subgroup) & 63, byte(2, subgroup) & 63
+  else:
+    k = subgroup-4
+    a, b, c = byte(2, k), byte(3, k), byte(1, k)
+    scale, minimum = (b & 15) | ((c >> 6) << 4), (b >> 4) | ((a >> 6) << 4)
+  integers = _h2("__hsub2", scale | (minimum << 16) | _FP16_1024, UOp.const(_FP16_1024, dtypes.uint32))
+  products = _h2("__hmul2", integers, head[0])  # (d*scale, dmin*minimum)
+  def broadcast(op: str) -> UOp:
+    return UOp(Ops.CUSTOMI, src=(products,), arg=(f"tg_bitcast<unsigned int>({op}({_HALF2}))", dtypes.uint32))
+  return broadcast("__low2half2"), broadcast("__high2half2")
+
+def _q4_fragment(word: UOp, nibble: int, scale: UOp, offset: UOp) -> UOp:
+  """The B fragment for nibble `nibble` of word's four bytes, as k slots (byte 0, byte 2, byte 1, byte 3):
+  the pairs the FP16 trick yields directly. A high nibble lands as 16q, so its scale comes pre-divided by 16.
+  `offset` is dmin*minimum, subtracted."""
+  mask = 0x000f000f << (4*nibble)
+  pairs = [((w & mask) | _FP16_1024) for w in (word, word >> 8)]
+  def dequant(p: UOp) -> UOp:  # (p - 1024) * scale - offset
+    q = _h2("__hsub2", p, UOp.const(_FP16_1024, dtypes.uint32))
+    return UOp(Ops.CUSTOMI, src=(q, scale, offset), arg=(f"tg_bitcast<unsigned int>(__hfma2({_HALF2}, {_HALF2}, __hneg2({_HALF2})))", dtypes.uint32))
+  pairs = [dequant(p) for p in pairs]
+  return UOp.stack(*_halves(pairs[0]), *_halves(pairs[1]))
+
+@functools.cache
+def _fragment_kernel(out: UOp, x: UOp, *, chunks: int, width: int) -> UOp:
+  steps = width//16
+  item = UOp.range(chunks*steps, 0, axis_type=AxisType.GLOBAL)
+  lane = UOp.range(32, 1, axis_type=AxisType.LOCAL)
+  chunk, step = item//steps, item%steps
+  group, thread = lane//4, lane%4
+  # step = block*16 + pair*4 + nibble*2 + word; column = block*256 + pair*64 + nibble*32 + t*8 + word*4 + i
+  column = (step//16)*256+((step//4)%4)*64+((step//2)%2)*32+thread*8+(step%2)*4
+  rows = [_load_lanes(x[chunk*16+group+8*r8, column], 4) for r8 in (0, 1)]
+  # slots: (r0 i0, r0 i2, r8 i0, r8 i2, r0 i1, r0 i3, r8 i1, r8 i3)
+  values = [rows[r8][i].cast(dtypes.float16) for i0 in (0, 1) for r8 in (0, 1) for i in (i0, i0+2)]
+  return UOp.group(*(out[chunk, step, lane, j].store(v) for j, v in enumerate(values))).end(item, lane).sink(
+    arg=KernelInfo(name="fragment_activations", opts_to_apply=()))
+
+def fragment_activations(x: Tensor, width: int) -> Tensor:
+  """16-row activation chunks (rows, width) as FP16 (rows/16, width/16, 32 lanes, 8 halves): each lane's A
+  fragment for one k step of _prefill_q4_mma, contiguous. Columns follow _prefill_q4_paired's permuted k order,
+  with the slots of every four taking columns (0, 2, 1, 3) to match _q4_fragment."""
+  chunks = x.shape[0]//16
+  out = Tensor.empty(chunks, width//16, 32, 8, dtype=dtypes.float16, device=x.device)
+  return Tensor.custom_kernel(out, x.float().contiguous(), fxn=functools.partial(_fragment_kernel, chunks=chunks, width=width))[0]
+
+@functools.cache
+def _prefill_q4_mma(out: UOp, raw: UOp, x: UOp, *, tokens: int, width: int, rows: int, tiles: int = 2, warps: int = 4,
+                    splits: int = 1) -> UOp:
+  """Tiled Q4_K (prepare_q4) x 16-row chunks on FP16 tensor cores, after Marlin:
+  - B fragments are dequantized straight into fragment registers: per 32-bit word, two bit operations and two
+    packed FP16 operations per register, with no repacking;
+  - each A fragment is one 16-byte load of pre-permuted activations (fragment_activations);
+  - a warp's 16 rows of one block are one contiguous 2,304-byte run of the tiled layout;
+  - the next block's weights and activations are loaded while the current block's MMAs run.
+  Split K writes partial sums to out[split]."""
+  output_blocks = rows//(warps*8*tiles)
+  blocks_per_row = width//256
+  blocks = blocks_per_row//splits
+  block = UOp.range((tokens//16)*output_blocks*splits, 0, axis_type=AxisType.GLOBAL)
+  lane = UOp.range(32, -1, axis_type=AxisType.WARP)
+  warp = UOp.range(warps, 1, axis_type=AxisType.LOCAL)
+  split, rest = block%splits, block//splits
+  chunk = rest//output_blocks
+  output_base = (rest%output_blocks)*warps*8*tiles+warp*8*tiles
+  group, thread = lane//4, lane%4
+  accs = []
+  for t in range(tiles):
+    acc = UOp.placeholder((4,), dtypes.float32, slot=3+t, addrspace=AddrSpace.REG)
+    accs.append(acc.after(acc.store(acc.const_like(0))))
+  per_tile = 12  # four header/scale words, then two words for each of four subgroup pairs
+
+  def fetch(column_block) -> list[UOp]:
+    loaded = []
+    for t in range(tiles):
+      start = q4_block_base(output_base+t*8+group, column_block, width)
+      head = _load_lanes(raw[start], 4)
+      loaded += [head[i] for i in range(4)]
+      for pair in range(4):
+        words = _load_lanes(raw[start+4+8*pair+2*thread], 2)
+        loaded += [words[0], words[1]]
+    return loaded
+
+  kb = UOp.range(blocks, 2, axis_type=getattr(AxisType, 'REDUCE', AxisType.LOOP))
+  staged = UOp.placeholder((tiles*per_tile,), dtypes.uint32, slot=3+tiles, addrspace=AddrSpace.REG)
+  staged = staged.after(UOp.group(*(staged[i].store(v) for i, v in enumerate(fetch(split*blocks)))))
+  current = [staged.after(kb)[i].load() for i in range(tiles*per_tile)]
+  upcoming = fetch(split*blocks+(kb+1).minimum(blocks-1))
+  def fragments(column_block) -> list[UOp]:
+    """The block's 16 A fragments (one per k step), 8 halves each, flattened."""
+    loaded = []
+    for step in range(16):
+      fragment = _load_lanes(x[chunk, column_block*16+step, lane, 0], 8)
+      loaded += [fragment[i] for i in range(8)]
+    return loaded
+
+  xstaged = UOp.placeholder((128,), dtypes.float16, slot=4+tiles, addrspace=AddrSpace.REG)
+  xstaged = xstaged.after(UOp.group(*(xstaged[i].store(v) for i, v in enumerate(fragments(split*blocks)))))
+  xcurrent = [xstaged.after(kb)[i].load() for i in range(128)]
+  xupcoming = fragments(split*blocks+(kb+1).minimum(blocks-1))
+  values = [acc.after(kb) for acc in accs]
+  for pair in range(4):
+    factors = []
+    for t in range(tiles):
+      head = current[t*per_tile:t*per_tile+4]
+      (scale0, min0), (scale1, min1) = _q4_scale_pair(head, 2*pair), _q4_scale_pair(head, 2*pair+1)
+      sixteenth = UOp.const(0x2c002c00, dtypes.uint32)  # a high nibble lands as 16q; dividing by 16 is exact
+      factors.append(((scale0, min0), (_h2("__hmul2", scale1, sixteenth), min1)))
+    for step in range(4):
+      a = UOp.stack(*xcurrent[(pair*4+step)*8:(pair*4+step+1)*8])
+      for t in range(tiles):
+        scale, offset = factors[t][step//2]
+        frag = _q4_fragment(current[t*per_tile+4+2*pair+step%2], step//2, scale, offset)
+        values[t] = UOp.wmma(a, frag, values[t], (8, 16, 16), 32)
+  updates = [acc.store(value) for acc, value in zip(accs, values)]
+  after = staged.after(*values)  # overwrite the staged words only after this iteration's MMAs have read them
+  updates += [after[i].store(v) for i, v in enumerate(upcoming)]
+  xafter = xstaged.after(*values)
+  updates += [xafter[i].store(v) for i, v in enumerate(xupcoming)]
+  done = UOp.group(*updates).end(kb)
+  stores = [out[split, chunk*16+group+row, output_base+t*8+thread*2+col].store(acc.after(done)[i].load())
+            for t, acc in enumerate(accs) for i, (row, col) in enumerate(((0, 0), (0, 1), (8, 0), (8, 1)))]
+  return UOp.group(*stores).end(block, warp, lane).sink(arg=KernelInfo(name="prefill_q4_k_mma", opts_to_apply=()))
 
 @functools.cache
 def _prefill_q6_paired(out: UOp, raw: UOp, x: UOp, *, tokens: int, width: int, rows: int, q6_swizzled: bool = False,
@@ -178,7 +321,7 @@ def _prefill_q6_paired(out: UOp, raw: UOp, x: UOp, *, tokens: int, width: int, r
 
 @functools.cache
 def _prefill_kernel(out: UOp, raw: UOp, x: UOp, *, tokens: int, width: int, rows: int, typ: int,
-                    q6_aligned: bool = False, q6_swizzled: bool = False, q4_swizzled: bool = False,
+                    q6_aligned: bool = False, q6_swizzled: bool = False, q4_tiled: bool = False,
                     tiles: int = 1, splits: int = 1, unroll: int = 1) -> UOp:
   # Each warp owns 16 tokens x (8*tiles) outputs: one A fragment load feeds
   # `tiles` independent MMAs. Split-K partitions the reduction across blocks;
@@ -206,7 +349,7 @@ def _prefill_kernel(out: UOp, raw: UOp, x: UOp, *, tokens: int, width: int, rows
     # NVIDIA mma.sync m16n8k16.row.col fragment order (not AMD WMMA order).
     a = UOp.stack(*(x[token_base+group+row, kk*16+thread*2+col].load()
                     for col_high in (0, 8) for row in (0, 8) for col in (col_high, col_high+1)))
-    bs = [UOp.stack(*(_weight(raw, output_base+t*8+group, kk*16+thread*2+col, width, typ, q6_aligned, q6_swizzled, q4_swizzled)
+    bs = [UOp.stack(*(_weight(raw, output_base+t*8+group, kk*16+thread*2+col, width, typ, q6_aligned, q6_swizzled, q4_tiled)
                       for col in (0, 1, 8, 9))) for t in range(tiles)]
     frags.append((a, bs))
   updates = []
@@ -239,7 +382,7 @@ def nv_prefill_supported(device: str) -> bool:
     tc.dims == (8, 16, 16) and tc.dtype_in == dtypes.float16 and tc.dtype_out == dtypes.float32 for tc in renderer.tensor_cores)
 
 def quant_gemm(x: Tensor, packed: Tensor, *, out_features: int, in_features: int, ggml_type: int,
-               q6_aligned: bool = False, q6_swizzled: bool = False, q4_swizzled: bool = False) -> Tensor:
+               q6_aligned: bool = False, q6_swizzled: bool = False, q4_tiled: bool = False) -> Tensor:
   """Concrete multi-token packed linear; symbolic padding belongs to the adapter."""
   if ggml_type not in (Q4_K, Q5_K, Q6_K): raise QuantGemmError("only Q4_K/Q5_K/Q6_K prefill is supported")
   if in_features <= 0 or in_features%256 or out_features <= 0 or out_features%8:
@@ -248,7 +391,7 @@ def quant_gemm(x: Tensor, packed: Tensor, *, out_features: int, in_features: int
     raise QuantGemmError("activation dtype/shape does not match prefill contract")
   if not isinstance(x.numel(), int) or x.numel()//in_features < 2:
     raise QuantGemmError("prefill requires a concrete multi-token shape")
-  if q4_swizzled and ggml_type != Q4_K: raise QuantGemmError("swizzled Q4 requires Q4_K")
+  if q4_tiled and (ggml_type != Q4_K or out_features%16): raise QuantGemmError("tiled Q4 requires Q4_K and 16-row tiles")
   if q6_swizzled and not q6_aligned: raise QuantGemmError("swizzled Q6 requires prepared storage")
   if q6_aligned and ggml_type != Q6_K: raise QuantGemmError("aligned Q6 layout requires Q6_K")
   dtype = dtypes.uint32 if ggml_type in (Q4_K, Q5_K) or q6_aligned else dtypes.uint16
@@ -274,17 +417,28 @@ def quant_gemm(x: Tensor, packed: Tensor, *, out_features: int, in_features: int
       splits=splits))[0]
     result = result[0] if splits == 1 else result.sum(0)
     return result[:tokens].reshape(*x.shape[:-1], out_features)
+  if ggml_type == Q4_K and q4_tiled:
+    tiles, warps = 2, math.gcd(out_features//16, 4)
+    blocks, output_blocks = in_features//256, out_features//(warps*8*tiles)
+    # Split K only for narrow outputs: about two blocks per SM on a 30-SM card
+    splits = next(s for s in range(1, blocks+1) if blocks % s == 0 and ((padded_tokens//16)*output_blocks*s >= 60 or s == blocks))
+    out = Tensor.empty(splits, padded_tokens, out_features, dtype=dtypes.float32, device=x.device)
+    fragments = fragment_activations(x.reshape(tokens, in_features).pad(((0, padded_tokens-tokens), (0, 0))), in_features)
+    result = Tensor.custom_kernel(out, packed.flatten().contiguous(), fragments, fxn=functools.partial(
+      _prefill_q4_mma, tokens=padded_tokens, width=in_features, rows=out_features, tiles=tiles, warps=warps, splits=splits))[0]
+    result = result[0] if splits == 1 else result.sum(0)
+    return result[:tokens].reshape(*x.shape[:-1], out_features)
   if paired and ggml_type in (Q4_K, Q5_K):
     blocks = in_features//256
     splits = next(s for s in range(1, blocks+1) if blocks % s == 0 and (splits <= s or s == blocks))
     out = Tensor.empty(splits, padded_tokens, out_features, dtype=dtypes.float32, device=x.device)
     result = Tensor.custom_kernel(out, packed.flatten().contiguous(), activation, fxn=functools.partial(
-      _prefill_q4_paired, tokens=padded_tokens, width=in_features, rows=out_features, q4_swizzled=q4_swizzled, tiles=tiles,
+      _prefill_q4_paired, tokens=padded_tokens, width=in_features, rows=out_features, tiles=tiles,
       splits=splits, typ=ggml_type))[0]
     result = result[0] if splits == 1 else result.sum(0)
     return result[:tokens].reshape(*x.shape[:-1], out_features)
   result = Tensor.custom_kernel(out, packed.flatten().contiguous(), activation,
     fxn=functools.partial(_prefill_kernel, tokens=padded_tokens, width=in_features, rows=out_features, typ=ggml_type,
-                         q6_aligned=q6_aligned, q6_swizzled=q6_swizzled, q4_swizzled=q4_swizzled, tiles=tiles, splits=splits, unroll=unroll))[0]
+                         q6_aligned=q6_aligned, q6_swizzled=q6_swizzled, q4_tiled=q4_tiled, tiles=tiles, splits=splits, unroll=unroll))[0]
   result = result[0] if splits == 1 else result.sum(0)
   return result[:tokens].reshape(*x.shape[:-1], out_features)
