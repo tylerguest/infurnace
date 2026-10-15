@@ -1,0 +1,7 @@
+{
+  "text": "benchmarks/quality/eval.txt",
+  "model": "qwen3.5:4b (Unsloth Qwen3.5-4B Q4_K_M, revision e87f176)",
+  "protocol": "llama.cpp perplexity: 512-token chunks, fresh state per chunk, tokens 257-511 of each scored",
+  "llama.cpp": {"version": "7e4c0a968 (2026-08-14), CUDA, -ngl 99 -b 512", "ppl": {"2": 16.3600, "8": 17.0323}},
+  "infurnace": {"commit": "e7eb8e5", "device": "RTX 5060", "one-row": {"8": 16.9965}, "16-row": {"8": 16.9852}}
+}

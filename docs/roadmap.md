@@ -39,14 +39,27 @@ Reproduced by hiding NVRTC with `CACHELEVEL=0`: device `NV`, `PTXRenderer`, fast
 - [ ] Fail loudly when an NVIDIA GPU can't use the fast path, saying how to fix it.
 - [ ] Test: NVRTC hidden, compile cache off, fast path still on.
 
-### 2. Output quality has never been measured
+### 2. Output quality: measured against llama.cpp
 
-Every kernel was checked for speed and by matching greedy tokens, never by perplexity or logit
-comparison against tinygrad's reference math. A subtle kernel bug would only show as a worse model.
+`benchmarks/quality.py` computes perplexity on a frozen text (`benchmarks/quality/eval.txt`, 10,436 tokens)
+with llama.cpp's protocol (512-token chunks, fresh state each, the second half scored), teacher-forcing
+infurnace's real kernels. The reference is llama.cpp's `llama-perplexity` on the same GGUF; both tokenizers
+produce identical tokens. 8 chunks, RTX 5060:
 
-- [ ] Teacher-forced comparison on fixed text: packed one-row and 16-row paths, DFlash verification
-  and the generic tinygrad path (`nv_quant=False`), as KL divergence or perplexity per path.
-- [ ] Run it on every kernel change; record the numbers here.
+| | Perplexity |
+|---|---|
+| llama.cpp (CUDA) | 17.032 |
+| infurnace one-row (decoding) | 16.997 (−0.2%) |
+| infurnace 16-row (prompt reading; same matmuls as DFlash verification) | 16.985 (−0.3%) |
+
+Before the Marlin-style kernels the same paths gave 16.9965 and 16.9845: no measurable change.
+`tests/core/test_nv_quality.py` (opt-in, ~1 minute) fails if either path drifts more than 1% from llama.cpp.
+(tinygrad's generic path can't be the reference: it dequantizes to FP16, about 8 GB.)
+
+- [x] Perplexity of the one-row and 16-row paths against llama.cpp, as a test.
+- [ ] The DFlash verifier's own path (`gdn_chunk`, the attention kernel at 16 rows): it returns decisions,
+  not logits, so it needs a logits hook.
+- [ ] A multilingual and a chat-formatted text, and longer contexts.
 
 ### 3. Fit any card without flags
 
@@ -135,6 +148,7 @@ A DFlash round was 23 ms: the 16-row target verify 15.8 ms (its matmuls 11 ms, n
 INFURNACE_TEST_NV=1 .venv/bin/pytest -q tests/kernels/test_nv_attention.py   # GPU tests, one file at a time
 INFURNACE_TEST_MODEL=/path/to/Qwen3.5-4B-Q4_K_M.gguf INFURNACE_TEST_GENERATION=1 \
   .venv/bin/pytest -q tests/core/test_runner.py::test_local_generation
+python benchmarks/quality.py --llama-perplexity ~/repos/llama.cpp/build/bin/llama-perplexity   # quality vs llama.cpp
 infurnace --benchmark 512,32                     # per-step plain decode timing
 ```
 

@@ -81,6 +81,16 @@ Performance depends on draft acceptance and workload. See [DFlash design and
 measurements](../docs/dflash.md) and the explicitly historical
 [experiment reports](experiments/dflash/README.md).
 
+## Output quality
+
+```sh
+python benchmarks/quality.py --llama-perplexity /path/to/llama.cpp/build/bin/llama-perplexity
+```
+
+Perplexity of the one-row and 16-row paths on `quality/eval.txt` with llama.cpp's protocol, and llama.cpp's
+own number on the same GGUF and tokens. Reference values: `quality/reference.json`; the opt-in
+`tests/core/test_nv_quality.py` checks both paths stay within 1% of llama.cpp.
+
 ## Interpretation limits
 
 - TTFT includes prefill and first-token work; cold runs also include JIT/compilation.
