@@ -31,6 +31,8 @@ Startup warms up before listening unless `--no-warmup` is supplied.
 The default bind address is `127.0.0.1`. This upstream server has no authentication;
 do not expose it to untrusted networks. Requests are processed serially.
 Temperature is honored; other sampling and tool-choice request controls are not.
+A request without a temperature (pi sends none) is decoded greedily, which Qwen
+warns can repeat in thinking mode.
 Tool-call deltas are emitted after generation.
 
 ## Pi
@@ -70,8 +72,9 @@ server's default applies. `supportsDeveloperRole: false` keeps Pi from sending i
 as a `developer` message to a reasoning model (the server maps `developer` to `system` anyway).
 
 Measured on an RTX 5060 8 GB (`--max-context 16384`, Pi print mode, read/edit
-tools, thinking on). Agent turns after the first reuse the prompt snapshot and
-prefill at about 2–3.7k tok/s.
+tools, thinking on). Agent turns after the first resume from a prompt snapshot and
+read only their new tokens, at 250–380 tok/s (about 0.3–0.4 s of fixed cost per
+request; see the [roadmap](roadmap.md)).
 
 | Pi task | Plain | DFlash |
 |---|---|---|

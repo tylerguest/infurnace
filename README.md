@@ -1,125 +1,79 @@
 # infurnace
 
-A small, single-user **Qwen3.5-4B runner on tinygrad**, with its optional
-[DFlash draft](docs/dflash.md). Chat locally or serve an OpenAI-compatible API;
-no batching, scheduler, multi-GPU or other model-family support.
+Fast local inference for modest GPUs: **Qwen3.5-4B** on [tinygrad](https://github.com/tinygrad/tinygrad),
+with [DFlash](docs/dflash.md) speculative decoding. Chat in the terminal or serve an OpenAI-compatible
+API for coding agents. One user and one model; no batching, scheduler or multi-GPU.
 
-The tested setup is **Qwen3.5-4B Q4_K_M + DFlash on an 8 GB RTX 5060**.
-Tinygrad owns the transformer, caches, sampling and JIT. Infurnace adds GGUF
-validation, a local chat CLI, packed NVIDIA projections and speculative decoding.
-Other GPUs and Qwen3.5 variants are not validated.
+On an 8 GB RTX 5060:
 
-Local measurements put plain decoding around 110 tok/s. DFlash can improve code
-answers by 1.4–2.2×, but falls back when drafting loses. These are workload-dependent
-measurements, not quality parity or a comparison against another inference engine.
+| | |
+|---|---|
+| Plain decoding | ~110 tok/s |
+| DFlash | ~340 tok/s on code, ~160 tok/s on prose with thinking |
+| Context | 8,192 tokens by default; 32,768 fits in 8 GB |
+| Later turns | resume from a saved prompt state: ~0.6 s to first token in a 3k-token chat |
+
+Only this card is validated. The fast path needs an NVIDIA GPU (RTX 30-series or newer for DFlash);
+everything else runs tinygrad's generic code, which is far too slow to use. See the [roadmap](docs/roadmap.md).
 
 ## Install
 
-Requires Python 3.11+ and Git:
+Requires Python 3.11+, Git, an NVIDIA driver and the **CUDA toolkit** (its NVRTC compiles the kernels;
+without it infurnace silently falls back to the slow generic path).
 
 ```sh
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e .
+pip install -e .              # '.[server]' for the HTTP server, '.[dev]' for tests
 ```
 
-For development/tests, use `pip install -e '.[dev]'`. The tinygrad dependency
-is pinned. After pulling changes, reinstall; if the pin changes, force reinstall
-that dependency because pip can retain an older same-version wheel.
-
-## Models
-
-`--model` / `-m` accepts `qwen3.5:4b` (the default) or a local Qwen3.5 GGUF path.
-Named files are downloaded on first use into `~/.local/share/infurnace/models/`
-(`XDG_DATA_HOME` respected). Existing copies there or under checkout `models/`
-are reused. Model weights are not shipped in the package.
-
-- Target: [Unsloth Qwen3.5-4B Q4_K_M](https://huggingface.co/unsloth/Qwen3.5-4B-GGUF), about 2.7 GB.
-- Draft: [Qwen3.5-4B DFlash Q4_K_M](https://huggingface.co/Anbeeld/Qwen3.5-4B-DFlash-GGUF), about 0.4 GB;
-  downloaded only when automatic DFlash is used on an NVIDIA GPU.
-
-```sh
-infurnace                         # download if needed, warm up and chat
-infurnace -m /path/to/Qwen3.5-4B-Q4_K_M.gguf
-infurnace --no-dflash              # plain decoding
-```
-
-Local targets use an installed draft only. `--dflash PATH` or
-`INFURNACE_DFLASH_DRAFT` overrides the draft. Uninstalling retains downloaded files.
-Details and the selected model revision: [Qwen3.5 setup](docs/qwen35.md).
+The tinygrad dependency is pinned to a fork with one fix for back-to-back GPU submissions. After
+pulling changes, reinstall; if the pin changed, force-reinstall tinygrad.
 
 ## Run
 
 ```sh
+infurnace                                    # chat; downloads ~3.1 GB on first use, warms up while you type
 infurnace --no-thinking
-infurnace --temperature 0.6                  # sample instead of greedy decoding (works with DFlash)
-infurnace --prompt "Hello" --max-tokens 64   # raw text, no chat template
-infurnace --serve                          # 127.0.0.1:8000, DFlash when the draft is installed
-infurnace --benchmark 512,32                # per-step timing
-infurnace --device CPU
+infurnace --temperature 0.6                  # sample instead of greedy (works with DFlash)
+infurnace --prompt "Hello" --max-tokens 64   # one raw prompt, no chat template
+infurnace --serve 8000 --max-context 32768   # OpenAI-compatible API, e.g. for pi
+infurnace --benchmark 512,32                 # per-step plain decode timing
+infurnace --no-dflash                        # plain decoding
 ```
 
-- **Hardware:** probes usable GPUs, falling back to CPU; `--device` or `DEV`
-  overrides selection. On NVIDIA, both of tinygrad's backends get the fast kernels: `NV` (its own
-  driver interface, Linux; preferred) and `CUDA` (the CUDA driver API, which tinygrad also loads on
-  Windows; needs the CUDA toolkit's NVRTC). Same speed and output; `CUDA` takes ~20 s longer to warm up.
-- **Startup:** chat and serving warm up first; `--no-warmup` skips this.
-  Single-shot generation skips automatic warmup.
-- **Thinking:** enabled in chat; `--no-thinking` disables it.
-- **Sampling:** greedy by default; `--temperature T` samples, with DFlash too: the draft proposes
-  greedily and a proposal is accepted when the target's own sample matches it, which keeps the
-  target's sampling distribution. Qwen suggests about 0.6 with thinking, where greedy can repeat.
-- **Context:** defaults to 8,192 tokens; `--max-context` changes the window. At the default, infurnace
-  uses about 5.3 GB of GPU memory with DFlash (RTX 5060). Each extra 8k tokens adds roughly half a GB
-  of cache, so 16,384 fits on an 8 GB card if other apps leave room.
-  Chat drops oldest complete turns with a notice and rejects oversized messages.
-- **Replies:** run until EOS or context exhaustion unless capped with
-  `--max-tokens` (includes thinking). Raw prompts default to 64 output tokens.
-- **Serving:** install `.[server]`; tool formatting/parsing reuses the GGUF
-  template and tinygrad server. Real-model tool-use reliability is unvalidated.
-  See [server setup](docs/serve.md).
+- **Models:** `--model qwen3.5:4b` (default) downloads the target (2.7 GB) and draft (0.4 GB) into
+  `~/.local/share/infurnace/models/`. `--model PATH` runs a local Qwen3.5 GGUF. See [Qwen3.5](docs/qwen35.md).
+- **Device:** NVIDIA through tinygrad's `NV` backend (Linux, probed first) or `CUDA`; `--device` or
+  `DEV` overrides. Startup takes about a minute (loading plus capturing GPU graphs).
+- **Context:** `--max-context` (default 8,192). Memory with DFlash is about 5.2 GB at 8k and
+  5.5 GB at 32k, plus whatever your desktop uses.
+- **Thinking:** on by default in chat and serving; `--no-thinking` turns it off. Replies run until
+  the model stops or the context fills, unless capped with `--max-tokens` (which counts thinking).
+- **Sampling:** greedy by default; `--temperature T` samples. Qwen suggests about 0.6 with thinking,
+  where greedy can repeat.
+- **Chat history:** when a new message doesn't fit, the oldest turns are dropped with a notice.
+- **Serving:** [server setup and pi configuration](docs/serve.md).
 
-`infurnace --help` lists all flags. Benchmark scripts can disable packed execution
-with `--no-nv-quant`; programmatic loading accepts `nv_quant=False`.
+## Docs
 
-## Acceleration and limits
-
-Q4_K/Q5_K/Q6_K projections stay packed. Single-row GEMV uses Q8-rounded
-activations; eligible multirow work uses FP16 tensor-core GEMM with FP32
-accumulation. The one-row GDN path also has an NV fused kernel. Norms, RoPE,
-attention, sampling and ordinary generation remain upstream.
-
-Plain NV generation currently prefills one row at a time because of upstream's
-recurrent-model generation path. DFlash uses fixed-width multirow verification
-and prefill, plus an adaptive fallback to one-row decoding.
-
-Acceleration is experimental. Full-model quality comparisons, long-session
-reliability and GPU peak-memory measurements remain open.
-
-- [Architecture](docs/architecture.md)
-- [Roadmap](docs/roadmap.md)
-- [Measurement limits](docs/baseline.md)
+- [Architecture](docs/architecture.md): modules, kernels, execution paths, snapshots
+- [DFlash](docs/dflash.md): how speculative decoding works here, and measurements
+- [Serving](docs/serve.md): the HTTP server and agent setup
+- [Roadmap](docs/roadmap.md): status, priorities, validation, what was tried
 - [Benchmarks](benchmarks/README.md)
-
-```sh
-python benchmarks/decode.py --tokens 32
-python benchmarks/compare.py --model qwen3.5:4b --tokens 32 --runs 1 \
-  --output /tmp/infurnace-vs-tinygrad.json
-```
 
 ## Layout
 
 ```text
 infurnace/
-├── cli.py              # chat, streaming and per-step benchmarks
-├── loader.py           # Qwen3.5 preset, downloads and device dispatch
-├── device.py           # backend probing and NV eligibility
-├── gguf.py             # validated packed storage and lazy decoding
-├── tokenizer.py        # Qwen3.5 BPE, streaming decode and text chat
-├── serve.py            # tinygrad HTTP server adapter
-├── models/
-│   ├── qwen35.py       # bounded upstream runner, packed loading and GDN dispatch
-│   └── linear.py       # packed NV adapter shared with DFlash
-├── dflash/             # draft, target observation and multirow verification
-└── kernels/            # packed GEMV/GEMM, embedding lookup and GDN kernels
+├── cli.py          # chat, raw prompt, server, benchmark
+├── serve.py        # tinygrad's HTTP server with DFlash and per-request thinking
+├── loader.py       # named models, downloads, device dispatch
+├── device.py       # device probing, NVIDIA fast-path check
+├── gguf.py         # GGUF parsing and metadata
+├── tokenizer.py    # Qwen3.5 tokenizer and chat formatting
+├── models/         # Qwen3.5 adapter (packed weights, fused layers, snapshots), packed projections
+├── dflash/         # draft, verification, adaptive drafting
+└── kernels/        # projections, recurrent layers, attention, sampling, embedding
 ```

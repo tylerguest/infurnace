@@ -16,9 +16,8 @@ prompts are exact-length repeated prose (default 512 tokens); `--prompt-file PAT
 uses untruncated raw UTF-8 text. The CLI per-step benchmark instead uses a numbers
 prompt and prints tinygrad traffic estimates.
 
-Plain NV generation currently prefills one row at a time because upstream forces
-that path for recurrent models. Packed multirow GEMM availability does not mean
-ordinary generation has multirow prefill.
+Plain decoding reads prompts 16 rows at a time on NVIDIA GPUs
+(`INFURNACE_MULTIROW_PREFILL=0` restores one row at a time).
 
 ## Independent upstream comparison
 
@@ -34,7 +33,7 @@ independently. They share the Qwen3.5 codec because the upstream SimpleTokenizer
 encoder does not implement this model's pretokenization. Prompt IDs and context
 capacity must match before a report is accepted. Neither worker uses DFlash.
 
-Infurnace automatically selects packed NV projections where supported.
+Infurnace automatically selects packed projections on NVIDIA GPUs (`NV` or `CUDA`).
 `--no-nv-quant` forces generic execution; `--no-nv-prefill` disables packed
 multirow GEMM while retaining packed decode. On CPU:
 
@@ -91,5 +90,5 @@ measurements](../docs/dflash.md) and the explicitly historical
 - Packed Q8/FP16 arithmetic differs from generic math; throughput does not establish quality parity.
 - Allocated capacity and active cache length are separate variables.
 
-Isolated NV tests require `INFURNACE_TEST_NV=1`. Real-model tests need additional
-model paths or flags; see [validation commands](../docs/baseline.md).
+GPU tests require `INFURNACE_TEST_NV=1`. Real-model tests need model paths and
+flags; see [measuring and validating](../docs/roadmap.md#measuring-and-validating).
