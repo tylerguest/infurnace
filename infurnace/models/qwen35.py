@@ -22,7 +22,7 @@ from tinygrad.llm.gguf import ggml_data_to_tensor
 from tinygrad.llm.model import GatedDeltaNetBlock, Transformer, TransformerBlock, apply_rope
 from tinygrad.nn.state import get_state_dict
 from infurnace.gguf import parse_gguf, read_gguf_metadata
-from infurnace.kernels.attention import attention
+from infurnace.kernels.attention import SEGMENT, attention
 from infurnace.kernels.gdn import gdn_decode, gdn_prefill
 from infurnace.kernels.quant_gemm import nv_prefill_supported
 from infurnace.kernels.quant_gemv import q8_quantize
@@ -204,14 +204,23 @@ def _fused_gdn(block: GatedDeltaNetBlock):
   return attention
 
 def _fused_attention(block: TransformerBlock):
-  """Upstream TransformerBlock._attention for one-row decoding, with the attention itself in
-  kernels/attention.py: upstream's attention over a runtime length slows as the conversation grows
-  (it swaps in its own kernel only on AMD, at this same spot). Other shapes use upstream's path."""
+  """Upstream TransformerBlock._attention for one-row decoding and 16-row prompt chunks, with the
+  attention itself in kernels/attention.py: upstream's attention over a runtime length slows as the
+  conversation grows (it swaps in its own kernel only on AMD, at this same spot). Other shapes use
+  upstream's path."""
   upstream_attention, c = block._attention, block.config
   def attention_step(x: Tensor, start_pos):
     B, T, _ = x.shape
+    if B == 1 and (isinstance(T, UOp) or T > 1) and x.max_shape[1] == PREFILL_ROWS:
+      # A prompt chunk of 1..16 rows, padded to 16 like the GDN prefill. The padding rows come from zero
+      # inputs, so their cached keys and values are finite (the kernel reads every key below start+16),
+      # and the prompt's next rows overwrite them. The prompt reader keeps start+16 within the cache.
+      x = x.pad_to((B, PREFILL_ROWS, x.shape[2]))
+      return rows_attention(x, start_pos, block.attn_q(x), block.attn_k(x), block.attn_v(x), segment=SEGMENT)[:, :T]
     if B != 1 or isinstance(T, UOp) or T != 1: return upstream_attention(x, start_pos)
-    q, k, v = _one_row(x, block.attn_q, block.attn_k, block.attn_v)
+    return rows_attention(x, start_pos, *_one_row(x, block.attn_q, block.attn_k, block.attn_v), segment=32)  # one row: smaller segments, more blocks
+  def rows_attention(x: Tensor, start_pos, q: Tensor, k: Tensor, v: Tensor, *, segment: int) -> Tensor:
+    B, T, _ = x.shape
     if c.qk_norm and c.qk_norm != c.head_dim: q, k = block.attn_q_norm(q), block.attn_k_norm(k)
     if c.attn_output_gate:
       qg = q.reshape(B, T, c.n_heads, 2, c.head_dim)
@@ -223,7 +232,7 @@ def _fused_attention(block: TransformerBlock):
     q = apply_rope(q[..., :c.rope_dim], block.freqs_cis[start_pos:start_pos + T]).cat(q[..., c.rope_dim:], dim=-1)
     k = apply_rope(k[..., :c.rope_dim], block.freqs_cis[start_pos:start_pos + T]).cat(k[..., c.rope_dim:], dim=-1)
     store = block.cache_kv[:, :, :, start_pos:start_pos + T, :].uop.store(Tensor.stack(k, v).cast(block.cache_kv.dtype).uop)
-    attn = attention(q, Tensor(block.cache_kv.uop.after(store)), start_pos, segment=32)  # one row: smaller segments, more blocks
+    attn = attention(q, Tensor(block.cache_kv.uop.after(store)), start_pos, segment=segment)
     attn = attn.cast(q.dtype).transpose(1, 2).reshape(B, T, -1)
     return block.attn_output(attn * gate.sigmoid() if c.attn_output_gate else attn)
   return attention_step
@@ -443,11 +452,14 @@ class Qwen35Model:
     def read(first: int, last: int):
       # Same graphs as upstream: 16-row chunks through prefill_jit, or one-row steps through
       # rollout_jit with upstream's own one-row `toks` variable.
-      size = PREFILL_ROWS if multirow else 1
-      v_rows = UOp.variable('toks', 1, size)
-      for position in range(first, last, size):
+      position = first
+      while position < last:
+        # A 16-row chunk writes 16 cache rows (see _fused_attention): the last rows of a full context go one at a time.
+        size = PREFILL_ROWS if multirow and position + PREFILL_ROWS <= t.max_context else 1
+        v_rows = UOp.variable('toks', 1, size)
         sp, rows = v_start.bind(position), v_rows.bind(min(size, last - position))
         t(ids[:, sp:sp + rows], sp, temp).realize()
+        position += size
     if point is not None:
       read(start, point)
       self.save_snapshot(tokens[:point])

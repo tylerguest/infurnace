@@ -250,3 +250,14 @@ def test_restoring_past_a_wrapped_ring_hides_overwritten_slots(tmp_path):
     assert draft._floor.tolist() == [10] and draft.observed == 10
     draft.reset()
     assert draft._floor.tolist() == [0]  # reading from scratch rewrites every slot it reads
+
+def test_shorter_proposals_reuse_the_full_block_graph(tmp_path):
+  with Context(DEV='CPU'):
+    model = Qwen35Model.from_gguf(checkpoint(tmp_path, context=64), device='CPU')
+    draft, rows = tiny_draft(model), Tensor.randn(1, 40, 8).realize()
+    full, done = draft.config.block_size - 1, 0
+    for count in (full, 1, 2, full):
+      draft.observe(rows[:, done:done + 5].contiguous().realize())
+      done += 5
+      assert len(draft.propose(1, done, count)) == count
+    assert list(draft._jits) == [full]  # each new row count would capture its own graph (seconds on a GPU)

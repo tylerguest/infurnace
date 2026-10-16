@@ -19,6 +19,18 @@ prompt and prints tinygrad traffic estimates.
 Plain decoding reads prompts 16 rows at a time on NVIDIA GPUs
 (`INFURNACE_MULTIROW_PREFILL=0` restores one row at a time).
 
+## Prompt-length sweep
+
+```sh
+python -m benchmarks.sweep --lengths 25,124,524,1024,2024,4024 [--dflash]
+python -m benchmarks.sweep --lengths 8024,16024 [--dflash]
+```
+
+Time to first token, prompt reading and decode rate after the usual warmup, one model load. The prompt is
+a chat message holding `quality/eval.txt` cut to each length, then a request to summarize it, so DFlash
+decodes ordinary prose and code. Each length runs once to capture, then once measured (`--once` skips the
+first; DFlash may then pay graph captures in the measurement).
+
 ## Independent upstream comparison
 
 ```sh

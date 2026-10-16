@@ -127,6 +127,9 @@ class DFlashGenerator:
           yield anchor
           if anchor in eos_token_ids or emitted == limit: return
           count = policy.start(min(block - 1, limit - emitted, self.model.config.context_length - observer.position - 1))
+          # The last positions of the context leave no room for a full block: step plainly there rather than
+          # capture a draft graph for each smaller block (seconds each).
+          if observer.position + (self._held or 0) + block > self.model.config.context_length: count = 0
           # A round yields its accepted tokens and returns the next anchor. Stopping here leaves it
           # suspended, so a sequential round never steps the target past an EOS or the limit.
           drafted = self._round(block, anchor, count, policy)

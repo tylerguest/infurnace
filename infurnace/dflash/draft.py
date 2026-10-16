@@ -302,12 +302,16 @@ class DFlashDraft:
       # A partial chunk is absorbed padded; its padding rows land where later
       # context or this noise block overwrites them, or stay masked.
       if self._staged: self._absorb_jit(self._context, self._start.bind(self.observed - self._staged))
-      graph = self._denoise_graph(count)
-      noise = self._noise_inputs[count]
-      embedded = self.target.embed([anchor] + [c.mask_token] * count)
+      # Always the full block, as fused rounds draft, and keep the first `count`: drafting fewer rows costs
+      # about the same, and each new row count would capture its own graph (seconds) on first use.
+      # Only the last positions of the context need a smaller block.
+      rows = c.block_size - 1 if position + c.block_size <= self.capacity else count
+      graph = self._denoise_graph(rows)
+      noise = self._noise_inputs[rows]
+      embedded = self.target.embed([anchor] + [c.mask_token] * rows)
       Tensor(noise.uop.after(noise.uop.store(embedded.uop))).realize()
-      pos = UOp.variable('dflash_position', 1, self.capacity - count - 1).bind(position)
+      pos = UOp.variable('dflash_position', 1, self.capacity - rows - 1).bind(position)
       decisions = graph(noise, pos).realize()
-      output = [int(v) for v in Tensor(decisions.uop.buf_uop).reshape(count).tolist()]
+      output = [int(v) for v in Tensor(decisions.uop.buf_uop).reshape(rows).tolist()][:count]
     self.length = position  # Transient noise K/V never authorizes future prefix reuse.
     return output

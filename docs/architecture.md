@@ -50,8 +50,9 @@ Small parameters (norms, gates) are cached under `~/.cache/infurnace/params/`.
 
 ## Plain decoding
 
-- **Prompt:** read 16 rows at a time with `quant_gemm` projections and `gdn_prefill`. Attention layers
-  use tinygrad's own code for these rows. The 16-row graph is captured at warmup or for long prompts.
+- **Prompt:** read 16 rows at a time with `quant_gemm` projections, `gdn_prefill` and the `attention`
+  kernel (chunks padded to 16 rows, like the verifier's). The 16-row graph is captured at warmup or for
+  long prompts.
 - **Each token:** `quant_gemv` projections, `gdn_decode` and the `attention` kernel (32-key segments).
 - Upstream tinygrad still drives generation, its KV cache and its JIT.
 
