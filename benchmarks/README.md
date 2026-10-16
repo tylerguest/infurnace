@@ -87,9 +87,10 @@ measurements](../docs/dflash.md) and the explicitly historical
 python benchmarks/quality.py --llama-perplexity /path/to/llama.cpp/build/bin/llama-perplexity
 ```
 
-Perplexity of the one-row and 16-row paths on `quality/eval.txt` with llama.cpp's protocol, and llama.cpp's
-own number on the same GGUF and tokens. Reference values: `quality/reference.json`; the opt-in
-`tests/core/test_nv_quality.py` checks both paths stay within 1% of llama.cpp.
+Perplexity of the one-row, 16-row and DFlash verifier paths with llama.cpp's protocol, and llama.cpp's own
+number on the same GGUF and tokens. `--text quality/multilingual.txt` scores the multilingual text, `--ctx`
+sets the chunk length. Reference values: `quality/reference.json`; the opt-in
+`tests/core/test_nv_quality.py` checks all three paths on both texts stay within 1% of llama.cpp.
 
 ## Interpretation limits
 

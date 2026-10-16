@@ -28,25 +28,30 @@ In order. Each item says what is wrong, the evidence, and how to check the fix.
 
 ### 1. Output quality: measured against llama.cpp
 
-`benchmarks/quality.py` computes perplexity on a frozen text (`benchmarks/quality/eval.txt`, 10,436 tokens)
-with llama.cpp's protocol (512-token chunks, fresh state each, the second half scored), teacher-forcing
-infurnace's real kernels. The reference is llama.cpp's `llama-perplexity` on the same GGUF; both tokenizers
-produce identical tokens. 8 chunks, RTX 5060:
+`benchmarks/quality.py` computes perplexity with llama.cpp's protocol (chunks of `--ctx` tokens, fresh state
+each, the second half scored), teacher-forcing infurnace's real kernels on three paths: one-row (decoding),
+16-row (prompt reading) and DFlash's verifier (`ParallelVerifier.logits`: `gdn_chunk`, the attention kernel at
+16 rows, and the closed-form commit that advances the recurrent state between blocks). The reference is
+llama.cpp's `llama-perplexity` on the same GGUF; both tokenizers produce identical tokens. RTX 5060:
 
-| | Perplexity |
-|---|---|
-| llama.cpp (CUDA) | 17.032 |
-| infurnace one-row (decoding) | 16.997 (−0.2%) |
-| infurnace 16-row (prompt reading; same matmuls as DFlash verification) | 16.985 (−0.3%) |
+| Text, context | llama.cpp | one-row | 16-row | verifier |
+|---|---|---|---|---|
+| `eval.txt` (docs and code, 10,436 tokens), 512 × 8 | 17.032 | 16.997 (−0.2%) | 16.985 (−0.3%) | 16.986 (−0.3%) |
+| `eval.txt`, 4,096 × 2 | 6.518 | 6.515 (−0.0%) | 6.511 (−0.1%) | 6.511 (−0.1%) |
+| `multilingual.txt` (9 languages, 3,057 tokens, 43% above id 100k), 512 × 5 | 6.930 | 6.906 (−0.4%) | 6.893 (−0.5%) | 6.893 (−0.5%) |
 
-Before the Marlin-style kernels the same paths gave 16.9965 and 16.9845: no measurable change.
-`tests/core/test_nv_quality.py` (opt-in, ~1 minute) fails if either path drifts more than 1% from llama.cpp.
-(tinygrad's generic path can't be the reference: it dequantizes to FP16, about 8 GB.)
+Before the Marlin-style kernels the one-row and 16-row paths gave 16.9965 and 16.9845 on the first row: no
+measurable change. `tests/core/test_nv_quality.py` (opt-in, ~2.5 minutes) fails if any path on either text
+drifts more than 1% from llama.cpp. (tinygrad's generic path can't be the reference: it dequantizes to FP16,
+about 8 GB.) `multilingual.txt` was written for this harness, not sampled from natural text: it is for
+comparing engines on the same tokens, not for absolute perplexity.
 
 - [x] Perplexity of the one-row and 16-row paths against llama.cpp, as a test.
-- [ ] The DFlash verifier's own path (`gdn_chunk`, the attention kernel at 16 rows): it returns decisions,
-  not logits, so it needs a logits hook.
-- [ ] A multilingual and a chat-formatted text, and longer contexts.
+- [x] The DFlash verifier's own path, through a logits method on the verifier.
+- [x] A multilingual text (exercises the embedding and output rows CJK, Cyrillic, Arabic and Hindi use) and
+  a 4,096-token context.
+- [ ] A chat-formatted text with special tokens: `llama-perplexity` always tokenizes them as plain text,
+  so llama.cpp can't score it as-is.
 
 ### 2. Fit any card without flags
 
@@ -169,6 +174,8 @@ More in [benchmarks](../benchmarks/README.md). Rules that have caught mistakes b
 
 ## Done
 
+- 2026-10-15: quality harness covers the DFlash verifier (`ParallelVerifier.logits`), a multilingual text and
+  4,096-token chunks; all paths within 0.6% of llama.cpp.
 - 2026-10-15: NVIDIA GPUs without NVRTC or the CUDA headers no longer run the generic path silently: loading
   compiles one FP16 kernel and stops with what is missing and how to provide it (the CUDA toolkit, or
   `NVRTC_PATH`/`CUDA_PATH` pointing at a copy such as NVIDIA's pip wheels). No new dependency: the user

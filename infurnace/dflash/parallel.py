@@ -151,7 +151,10 @@ class ParallelVerifier:
     attn = attention(q, cache, start_pos).cast(q.dtype).transpose(1, 2).reshape(B, T, -1)
     return block.attn_output(attn * gate.sigmoid() if c.attn_output_gate else attn)
 
-  def _forward(self, x: Tensor, start_pos: UOp):
+  def logits(self, x: Tensor, start_pos: UOp) -> tuple[Tensor, list[Tensor]]:
+    """The verification forward: (rows, vocabulary) logits and the feature taps. Writes the attention
+    caches and the GDN operands that `commit` folds into the recurrent state (benchmarks/quality.py
+    scores these logits)."""
     target, layers = self.observer.model.transformer, self.observer.layers
     features = []
     for index, block in enumerate(target.blk):
@@ -160,7 +163,10 @@ class ParallelVerifier:
       norm = block.attn_norm(x)
       h = x + (self._gdn(index, block, norm, start_pos) if isinstance(block, GatedDeltaNetBlock) else self._attention(block, norm, start_pos))
       x = (h + block._feed_forward(block.ffn_norm(h))).contiguous()
-    logits = target.output(target.output_norm(x)).reshape(x.shape[1], -1)
+    return target.output(target.output_norm(x)).reshape(x.shape[1], -1), features
+
+  def _forward(self, x: Tensor, start_pos: UOp):
+    logits, features = self.logits(x, start_pos)
     decisions = self._sampler(logits, _raw(self.observer._temperature)).reshape(1, -1)
     return decisions.contiguous(), features[0].cat(*features[1:], dim=-1).contiguous()
 

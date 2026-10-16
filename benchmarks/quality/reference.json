@@ -1,7 +1,16 @@
 {
-  "text": "benchmarks/quality/eval.txt",
   "model": "qwen3.5:4b (Unsloth Qwen3.5-4B Q4_K_M, revision e87f176)",
-  "protocol": "llama.cpp perplexity: 512-token chunks, fresh state per chunk, tokens 257-511 of each scored",
-  "llama.cpp": {"version": "7e4c0a968 (2026-08-14), CUDA, -ngl 99 -b 512", "ppl": {"2": 16.3600, "8": 17.0323}},
-  "infurnace": {"commit": "e7eb8e5", "device": "RTX 5060", "one-row": {"8": 16.9965}, "16-row": {"8": 16.9852}}
+  "protocol": "llama.cpp perplexity: --ctx-token chunks, fresh state per chunk, the second half of each scored",
+  "llama.cpp": "7e4c0a968 (2026-08-14), CUDA, -ngl 99 -b <ctx>",
+  "infurnace": "b4d746e + verifier path, RTX 5060",
+  "ppl": {
+    "eval.txt": {
+      "ctx 512, 2 chunks": {"llama.cpp": 16.3600, "verifier": 16.2807, "16-row": 16.2779},
+      "ctx 512, 8 chunks": {"llama.cpp": 17.0323, "one-row": 16.9965, "16-row": 16.9852, "verifier": 16.9864},
+      "ctx 4096, 2 chunks": {"llama.cpp": 6.5183, "one-row": 6.5153, "16-row": 6.5114, "verifier": 6.5110}
+    },
+    "multilingual.txt": {
+      "ctx 512, 5 chunks": {"llama.cpp": 6.9301, "one-row": 6.9057, "16-row": 6.8933, "verifier": 6.8934}
+    }
+  }
 }
