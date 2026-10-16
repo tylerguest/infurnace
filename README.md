@@ -18,8 +18,17 @@ everything else runs tinygrad's generic code, which is far too slow to use. See 
 
 ## Install
 
-Requires Python 3.11+, Git, an NVIDIA driver and the **CUDA toolkit** (its NVRTC compiles the kernels;
-without it infurnace silently falls back to the slow generic path).
+Requires Python 3.11+, Git, an NVIDIA driver, and NVIDIA's NVRTC compiler with the CUDA headers, which
+compile the kernels. The **CUDA toolkit** provides both. If you'd rather not install it, point tinygrad at any
+other copy, for example NVIDIA's pip packages:
+
+```sh
+pip install nvidia-cuda-nvrtc-cu12 nvidia-cuda-runtime-cu12
+export NVRTC_PATH=$(python -c "import nvidia.cuda_nvrtc, glob; print(glob.glob(nvidia.cuda_nvrtc.__path__[0] + '/lib/libnvrtc.so.*')[0])")
+export CUDA_PATH=$(python -c "import nvidia.cuda_runtime; print(nvidia.cuda_runtime.__path__[0])")
+```
+
+When either is missing, infurnace stops and says which.
 
 ```sh
 python3 -m venv .venv

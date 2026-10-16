@@ -23,8 +23,10 @@ a general inference engine.
 
 The fast path runs on NVIDIA GPUs through either of tinygrad's NVIDIA backends: `NV` (tinygrad's
 own driver interface, Linux; probed first) or `CUDA` (the CUDA driver API). Both need tinygrad's
-CUDA C renderer, which compiles with NVRTC from the CUDA toolkit. Without it tinygrad falls back to its
-PTX renderer and infurnace runs tinygrad's generic Qwen3.5 code, which is far too slow to use.
+CUDA C renderer, which compiles with NVRTC and includes `cuda_fp16.h`, both from the CUDA toolkit. Without
+them tinygrad falls back to its PTX renderer (or the compile fails), and tinygrad's generic Qwen3.5 code is far
+too slow to use, so `load_model` compiles one FP16 kernel first and stops with what is missing and how to
+provide it (`device.fast_path_problem`).
 Other devices (AMD, Metal, CPU) also run the generic code.
 
 ## Kernels
@@ -74,7 +76,7 @@ in [DFlash](dflash.md).
 - One-row projections round activations to Q8; 16-row projections round them to FP16 and accumulate
   in FP32. Neither equals tinygrad's generic math, and the two sum in different orders, so near-ties
   can flip a greedy token between paths.
-- Output quality against the reference has not been measured yet ([roadmap](roadmap.md), priority 2).
+- Output quality: perplexity within 0.3% of llama.cpp on the same GGUF for both paths (`benchmarks/quality.py`, [roadmap](roadmap.md)).
 - `loader.load_model(..., nv_quant=False)` (or `--no-nv-quant` in the benchmarks) runs the generic path.
 
 ## Switches

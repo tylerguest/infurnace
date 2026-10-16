@@ -4,6 +4,13 @@ import os
 from tinygrad import Device, Tensor
 from tinygrad.renderer.cstyle import CUDARenderer
 
+# infurnace's kernels are CUDA C, compiled by NVRTC (tinygrad's CUDA C renderer). NVRTC and the cuda_fp16.h
+# header ship with the CUDA toolkit, not the driver; without them tinygrad picks its PTX renderer and infurnace
+# would run the generic path, far too slow to use. How to provide them is the user's choice.
+NVRTC_HELP = ("infurnace's fast kernels need NVIDIA's NVRTC compiler and CUDA headers. Install the CUDA toolkit, "
+              "or point tinygrad at an existing copy: NVRTC_PATH=/path/to/libnvrtc.so CUDA_PATH=/dir/containing/include "
+              "(for example from the nvidia-cuda-nvrtc-cu12 and nvidia-cuda-runtime-cu12 pip packages)")
+
 def _probe(device: str) -> None:
   # Check actual execution, not just that a driver module can be imported.
   (Tensor([1.0], device=device) + 1).tolist()
@@ -29,3 +36,15 @@ def nvidia(device: str) -> bool:
 def supports_nv_quant(device: str) -> bool:
   # The kernels are CUDA C: tinygrad's PTX or NVCC renderers can't compile their intrinsics.
   return nvidia(device) and isinstance(Device[device].renderer, CUDARenderer)
+
+def fast_path_problem(device: str) -> str | None:
+  """Why infurnace's kernels can't run on this NVIDIA device, or None. Compiles one FP16 kernel, which needs
+  both NVRTC and cuda_fp16.h."""
+  if not nvidia(device): return None
+  if not supports_nv_quant(device): return f"{device} has no CUDA C compiler (NVRTC not found). {NVRTC_HELP}."
+  try: (Tensor([1.0], device=device).half() * 2).float().tolist()
+  except Exception as exc:  # NVRTC reports a missing header as a compile error
+    lines = [line.strip() for line in str(exc).splitlines() if line.strip()]
+    detail = next((line for line in lines if "error" in line.lower() and ":" in line), lines[0] if lines else type(exc).__name__)
+    return f"compiling a kernel on {device} failed ({detail[:200]}). {NVRTC_HELP}."
+  return None

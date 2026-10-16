@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from tinygrad.helpers import fetch
-from infurnace.device import nvidia, select_device, supports_nv_quant
+from infurnace.device import fast_path_problem, nvidia, select_device, supports_nv_quant
 from infurnace.gguf import read_gguf_metadata
 from infurnace.kernels.quant_gemm import nv_prefill_supported
 from infurnace.models.qwen35 import Qwen35Model
@@ -56,6 +56,8 @@ def load_model(path: str | Path, max_context: int, device: str | None = None, nv
   metadata = read_gguf_metadata(path)
   if metadata.get("general.architecture") != "qwen35": raise ValueError("only dense Qwen3.5 GGUF models are supported")
   device = select_device(device)
+  # On NVIDIA, the generic path is far too slow to use: say what is missing instead of falling back to it.
+  if nv_quant is None and (problem := fast_path_problem(device)): raise ValueError(problem)
   packed = supports_nv_quant(device) if nv_quant is None else nv_quant
   if packed and not supports_nv_quant(device): raise ValueError("packed acceleration requires an NVIDIA device (NV or CUDA) with the CUDA C renderer")
   if nv_prefill and not packed: raise ValueError("NV prefill requires NV quantized acceleration")

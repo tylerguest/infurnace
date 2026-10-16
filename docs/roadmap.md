@@ -18,7 +18,7 @@ Measured on an RTX 5060 8 GB (30 SMs, 448 GB/s), Qwen3.5-4B Q4_K_M, October 2026
 | Later chat or agent turns | resume from a saved prompt state: ~0.6 s to first token instead of ~6 s for a 3k-token chat |
 | Context | 8,192 by default; 32,768 fits on the 8 GB card (peak 7.35 GB with ~2 GB of desktop apps) |
 | Agent use (pi) | read-and-answer 4.1–4.4 s, read-and-fix 8.9–9.7 s |
-| Fast path | NVIDIA GPUs through tinygrad's `NV` (Linux) or `CUDA` backend, when NVRTC is installed |
+| Fast path | NVIDIA GPUs through tinygrad's `NV` (Linux) or `CUDA` backend, with NVRTC and the CUDA headers (stops with instructions when they are missing) |
 
 How it works: [architecture](architecture.md), [DFlash](dflash.md), [serving](serve.md).
 
@@ -26,20 +26,7 @@ How it works: [architecture](architecture.md), [DFlash](dflash.md), [serving](se
 
 In order. Each item says what is wrong, the evidence, and how to check the fix.
 
-### 1. The fast path needs the CUDA toolkit, and says nothing when it is missing
-
-Both NVIDIA backends compile infurnace's kernels as CUDA C through NVRTC, which ships with the CUDA
-toolkit, not the driver. Without it, tinygrad picks its PTX renderer, the loader sees a renderer the
-kernels can't use, and everything runs on the generic path. That path did not finish a 128-token
-benchmark in 4.5 minutes. No warning is printed and the README did not mention the toolkit.
-Reproduced by hiding NVRTC with `CACHELEVEL=0`: device `NV`, `PTXRenderer`, fast kernels off.
-
-- [ ] Depend on NVIDIA's NVRTC wheel and point tinygrad at it (`NVRTC_PATH`). `nvidia-cuda-nvrtc-cu12`
-  (12.9) reaches more cards than the CUDA 13 build: drivers from 525, and GTX 10-series.
-- [ ] Fail loudly when an NVIDIA GPU can't use the fast path, saying how to fix it.
-- [ ] Test: NVRTC hidden, compile cache off, fast path still on.
-
-### 2. Output quality: measured against llama.cpp
+### 1. Output quality: measured against llama.cpp
 
 `benchmarks/quality.py` computes perplexity on a frozen text (`benchmarks/quality/eval.txt`, 10,436 tokens)
 with llama.cpp's protocol (512-token chunks, fresh state each, the second half scored), teacher-forcing
@@ -61,7 +48,7 @@ Before the Marlin-style kernels the same paths gave 16.9965 and 16.9845: no meas
   not logits, so it needs a logits hook.
 - [ ] A multilingual and a chat-formatted text, and longer contexts.
 
-### 3. Fit any card without flags
+### 2. Fit any card without flags
 
 The default context is a fixed 8,192 tokens (about 5.2 GB with DFlash). A 6 GB card with a desktop
 running runs out of memory, and a 12 GB card wastes room.
@@ -74,7 +61,7 @@ Memory at 32k context, for reference: weights 2.64 GB, attention cache 1.0 GB (3
 draft weights 0.36 GB, draft caches 0.21 GB, recurrent state 0.05 GB, captured-graph scratch ~0.35 GB,
 tinygrad's runtime ~0.39 GB, and ~0.47 GB of CUDA context outside tinygrad.
 
-### 4. Startup takes about a minute
+### 3. Startup takes about a minute
 
 Every launch spends ~20 s loading and 40–70 s warming up (`NV`; `CUDA` takes ~20 s more). Chat hides
 part of it by warming up while the user types; the server does not. Most of the warmup is capturing a
@@ -82,7 +69,7 @@ separate draft graph for each proposal count from 1 to 15 (`_denoise_graph` in `
 
 - [ ] One denoise graph padded to the full block; time warmup before and after; outputs unchanged.
 
-### 5. Sensible sampling defaults
+### 4. Sensible sampling defaults
 
 Decoding is greedy unless asked otherwise, and pi sends no temperature, so agents get greedy decoding,
 which Qwen warns repeats in thinking mode. The fused sampler has no top-k or top-p, which Qwen's
@@ -91,7 +78,7 @@ recommended settings (0.6, top-p 0.95, top-k 20) need.
 - [ ] Top-k/top-p in `kernels/sampling.py`; Qwen's settings as the default with thinking.
 - [ ] A real tool-use reliability check with pi.
 
-### 6. Agent latency: fixed cost per request
+### 5. Agent latency: fixed cost per request
 
 Each tool step reads its new tokens at only 250–380 tok/s against ~600 for long prompts: about
 0.3–0.4 s of fixed cost per request. Saving and restoring prompt snapshots accounts for ~0.1 s
@@ -99,7 +86,7 @@ Each tool step reads its new tokens at only 250–380 tok/s against ~600 for lon
 
 - [ ] Profile one short follow-up request; cut the fixed cost.
 
-### 7. Raw speed
+### 6. Raw speed
 
 A DFlash round was 23 ms: the 16-row target verify 15.8 ms (its matmuls 11 ms, now 8.6 ms), the draft
 4.1 ms, the rest ~1.6 ms. Plain decode is 10.3 ms per token (its matmuls 7.6 ms).
@@ -121,7 +108,7 @@ A DFlash round was 23 ms: the 16-row target verify 15.8 ms (its matmuls 11 ms, n
 - [ ] **Recurrent-layer chunk on tensor cores** (`gdn_chunk`): part of the ~4.8 ms of non-matmul work
   in each verify.
 
-### 8. Hardware beyond current NVIDIA cards
+### 7. Hardware beyond current NVIDIA cards
 
 - RTX 20 and GTX 16 (sm_75): tinygrad offers only the m16n8k8 tensor-core shape there, so no 16-row
   path and no parallel DFlash. Plain decode should work; unmeasured.
@@ -132,7 +119,7 @@ A DFlash round was 23 ms: the 16-row target verify 15.8 ms (its matmuls 11 ms, n
 
 ## Reliability gates
 
-- [ ] Output quality per path (priority 2).
+- [ ] Output quality per path (priority 1).
 - [ ] DFlash output parity across prompt types, EOS positions, tail blocks, repeated requests and
   context exhaustion.
 - [ ] Long sessions: resets, snapshot restores after the draft's ring cache wrapped, interrupts,
@@ -174,7 +161,7 @@ More in [benchmarks](../benchmarks/README.md). Rules that have caught mistakes b
 - **More split-K, smaller tiles or blocks** for the 16-row matmuls: no gain once measured without L2 reuse.
 - **Confidence-calibrated draft windows** (ExLlamaV3): pointless while verification always runs a
   full 16-row block.
-- **Quantized attention cache** (FP8): ~575 MB saved at 32k context; revisit if priority 3 needs it.
+- **Quantized attention cache** (FP8): ~575 MB saved at 32k context; revisit if priority 2 needs it.
 - **`CUDA` as the default backend:** same speed and output as `NV`, slower warmup; `NV` stays first on
   Linux until `CUDA` has peak-memory and long-session data.
 - **EAGLE-3 and Qwen3 support:** removed to keep one model and one draft.
@@ -182,6 +169,10 @@ More in [benchmarks](../benchmarks/README.md). Rules that have caught mistakes b
 
 ## Done
 
+- 2026-10-15: NVIDIA GPUs without NVRTC or the CUDA headers no longer run the generic path silently: loading
+  compiles one FP16 kernel and stops with what is missing and how to provide it (the CUDA toolkit, or
+  `NVRTC_PATH`/`CUDA_PATH` pointing at a copy such as NVIDIA's pip wheels). No new dependency: the user
+  chooses. `nv_quant=False` still runs the generic path on request.
 - 2026-10-15: Q5_K through the same 16-row kernel (fifth bits merged under the FP16 trick) and tiled like
   Q4_K: all Q5_K projections 2.28 → 1.78 ms; DFlash +3%; plain decode unchanged. Over the day, Q4_K + Q5_K +
   Q6_K: all 16-row matmuls 10.95 → 8.61 ms per round, DFlash code 290 → ~316–323 tok/s, prose 163 → ~184–186.

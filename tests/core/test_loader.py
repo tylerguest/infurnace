@@ -46,6 +46,7 @@ def model_loader(monkeypatch):
   monkeypatch.setattr(loader, 'select_device', lambda device: device)
   monkeypatch.setattr(loader, 'supports_nv_quant', lambda device: device == 'NV')
   monkeypatch.setattr(loader, 'nv_prefill_supported', lambda device: device == 'NV')
+  monkeypatch.setattr(loader, 'fast_path_problem', lambda device: None)
   calls = []
   model = SimpleNamespace(metadata=metadata)
   def load(path, **kwargs):
@@ -100,3 +101,11 @@ def test_explicit_prefill_rejects_unsupported_tensor_cores(model_loader, monkeyp
   with pytest.raises(ValueError, match='requires CUDA-C FP16 tensor cores'):
     loader.load_model('model', 64, 'NV', nv_prefill=True)
   assert not calls
+
+def test_missing_compiler_stops_instead_of_running_the_slow_path(model_loader, monkeypatch):
+  _, model, calls = model_loader
+  monkeypatch.setattr(loader, 'fast_path_problem', lambda device: 'NV has no CUDA C compiler')
+  with pytest.raises(ValueError, match='no CUDA C compiler'):
+    loader.load_model('model', 64, 'NV')
+  assert not calls
+  assert loader.load_model('model', 64, 'NV', nv_quant=False)[0] is model  # an explicit request still runs it

@@ -28,6 +28,7 @@ def test_explicit_override(monkeypatch):
 def test_auto_acceleration(monkeypatch):
   monkeypatch.setattr(loader, "select_device", lambda requested: "NV")
   monkeypatch.setattr(loader, "supports_nv_quant", lambda device: True)
+  monkeypatch.setattr(loader, "fast_path_problem", lambda device: None)
   monkeypatch.setattr(loader, "nv_prefill_supported", lambda device: True)
   calls = []
   class Model:
@@ -42,3 +43,15 @@ def test_auto_acceleration(monkeypatch):
   assert calls[-1] == {"max_context": 16, "device": "NV", "nv_quant": True, "nv_prefill": True}
   loader.load_model("model", 16, None, False)
   assert calls[-1] == {"max_context": 16, "device": "NV", "nv_quant": False, "nv_prefill": False}
+
+def test_fast_path_problem_names_what_is_missing(monkeypatch):
+  assert device.fast_path_problem("CPU") is None
+  monkeypatch.setattr(device, "supports_nv_quant", lambda name: False)
+  problem = device.fast_path_problem("NV")
+  assert "NVRTC not found" in problem and "NVRTC_PATH" in problem and "CUDA toolkit" in problem
+  def failing_compile(*args, **kwargs):
+    raise RuntimeError('Nvrtc Error 6, NVRTC_ERROR_COMPILATION\n<null>(5): catastrophic error: cannot open source file "cuda_fp16.h"\n')
+  monkeypatch.setattr(device, "supports_nv_quant", lambda name: True)
+  monkeypatch.setattr(device, "Tensor", failing_compile)
+  problem = device.fast_path_problem("NV")
+  assert 'cannot open source file "cuda_fp16.h"' in problem and "CUDA_PATH" in problem
