@@ -22,7 +22,7 @@ from tinygrad.llm.gguf import ggml_data_to_tensor
 from tinygrad.llm.model import GatedDeltaNetBlock, Transformer, TransformerBlock, apply_rope
 from tinygrad.nn.state import get_state_dict
 from infurnace.gguf import parse_gguf, read_gguf_metadata
-from infurnace.kernels.attention import SEGMENT, attention
+from infurnace.kernels.attention import attention
 from infurnace.kernels.gdn import gdn_decode, gdn_prefill
 from infurnace.kernels.quant_gemm import nv_prefill_supported
 from infurnace.kernels.quant_gemv import q8_quantize
@@ -216,10 +216,10 @@ def _fused_attention(block: TransformerBlock):
       # inputs, so their cached keys and values are finite (the kernel reads every key below start+16),
       # and the prompt's next rows overwrite them. The prompt reader keeps start+16 within the cache.
       x = x.pad_to((B, PREFILL_ROWS, x.shape[2]))
-      return rows_attention(x, start_pos, block.attn_q(x), block.attn_k(x), block.attn_v(x), segment=SEGMENT)[:, :T]
+      return rows_attention(x, start_pos, block.attn_q(x), block.attn_k(x), block.attn_v(x))[:, :T]
     if B != 1 or isinstance(T, UOp) or T != 1: return upstream_attention(x, start_pos)
-    return rows_attention(x, start_pos, *_one_row(x, block.attn_q, block.attn_k, block.attn_v), segment=32)  # one row: smaller segments, more blocks
-  def rows_attention(x: Tensor, start_pos, q: Tensor, k: Tensor, v: Tensor, *, segment: int) -> Tensor:
+    return rows_attention(x, start_pos, *_one_row(x, block.attn_q, block.attn_k, block.attn_v))
+  def rows_attention(x: Tensor, start_pos, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
     B, T, _ = x.shape
     if c.qk_norm and c.qk_norm != c.head_dim: q, k = block.attn_q_norm(q), block.attn_k_norm(k)
     if c.attn_output_gate:
@@ -232,7 +232,7 @@ def _fused_attention(block: TransformerBlock):
     q = apply_rope(q[..., :c.rope_dim], block.freqs_cis[start_pos:start_pos + T]).cat(q[..., c.rope_dim:], dim=-1)
     k = apply_rope(k[..., :c.rope_dim], block.freqs_cis[start_pos:start_pos + T]).cat(k[..., c.rope_dim:], dim=-1)
     store = block.cache_kv[:, :, :, start_pos:start_pos + T, :].uop.store(Tensor.stack(k, v).cast(block.cache_kv.dtype).uop)
-    attn = attention(q, Tensor(block.cache_kv.uop.after(store)), start_pos, segment=segment)
+    attn = attention(q, Tensor(block.cache_kv.uop.after(store)), start_pos)
     attn = attn.cast(q.dtype).transpose(1, 2).reshape(B, T, -1)
     return block.attn_output(attn * gate.sigmoid() if c.attn_output_gate else attn)
   return attention_step

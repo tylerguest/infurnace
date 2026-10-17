@@ -12,8 +12,8 @@ Measured on an RTX 5060 8 GB (30 SMs, 448 GB/s), Qwen3.5-4B Q4_K_M, October 2026
 
 | | |
 |---|---|
-| Plain decode | 112–114 tok/s after a short prompt; 84 tok/s at 4k, 73 at 8k, 53 at 16k |
-| DFlash decode | ~340 tok/s on code (7.7 tokens per 23 ms round); 135–230 tok/s summarizing docs; ~100 tok/s at 16k; 1.6–2.0× plain at temperature 0.6 |
+| Plain decode | 107–112 tok/s up to 8k tokens of context; 89 tok/s at 16k |
+| DFlash decode | ~340 tok/s on code (7.7 tokens per 23 ms round); 135–230 tok/s summarizing docs; ~102 tok/s at 16k; 1.6–2.0× plain at temperature 0.6 |
 | Prompt reading | 16 rows at a time, ~600 tok/s from 1k to 16k tokens, plain or DFlash (1.7 s to first token at 1k, 30 s at 16k) |
 
 Prompt-length sweep (`benchmarks/sweep.py`: a chat message holding `eval.txt` cut to length, then "Summarize
@@ -21,14 +21,16 @@ the text above", 128 tokens out, after warmup):
 
 | Prompt tokens | TTFT | Prompt tok/s | Plain decode tok/s | DFlash decode tok/s |
 |---|---|---|---|---|
-| 25 | 0.20 s | – | 104.8 | 147.6 |
-| 124 | 0.36 s | 347 | 107.4 | 229.4 |
-| 524 | 0.96 s | 545 | 105.4 | 135.4 |
-| 1,024 | 1.7 s | 600 | 103.5 | 156.3 |
-| 2,024 | 3.3 s | 620 | 94.1 | 141.4 |
-| 4,024 | 6.5 s | 618 | 84.4 | 137.4 |
-| 8,024 | 13.5 s | 596 | 73.0 | 116.9 |
-| 16,024 | 29.7 s | 539 | 53.2 | 99.5 |
+| 25 | 0.20 s | – | 106.9 | 147.6 |
+| 124 | 0.33 s | 378 | 111.6 | 229.4 |
+| 524 | 0.92 s | 568 | 111.4 | 135.4 |
+| 1,024 | 1.8 s | 584 | 102.9 | 156.3 |
+| 2,024 | 3.2 s | 637 | 110.9 | 141.4 |
+| 4,024 | 6.4 s | 628 | 107.6 | 137.4 |
+| 8,024 | 13.3 s | 605 | 102.2 | 118.6 |
+| 16,024 | 30.0 s | 534 | 89.4 | 102.3 |
+
+Run-to-run noise is a few tok/s; DFlash depends on what it generates.
 | Later chat or agent turns | resume from a saved prompt state: ~0.6 s to first token instead of ~6 s for a 3k-token chat |
 | Context | 8,192 by default; 32,768 fits on the 8 GB card (peak 7.35 GB with ~2 GB of desktop apps) |
 | Agent use (pi) | read-and-answer 4.1–4.4 s, read-and-fix 8.9–9.7 s |
@@ -110,9 +112,11 @@ Each tool step reads its new tokens at only 250–380 tok/s against ~600 for lon
 A DFlash round was 23 ms: the 16-row target verify 15.8 ms (its matmuls 11 ms, now 8.6 ms), the draft
 4.1 ms, the rest ~1.6 ms. Plain decode is 10.3 ms per token (its matmuls 7.6 ms).
 
-- [ ] **Decode at long context.** Plain decode falls from 113 to 53 tok/s by 16k tokens: ~9.5 ms more per
-  token, where reading the 8 attention layers' 16k-token cache (~525 MB) takes ~1.2 ms at 430 GB/s. The
-  one-row attention kernel is far from bandwidth at long context; profile it (PROFILE=1) first.
+- [x] **Decode at long context** (done; see Done): plain decode at 16k 53 → 89 tok/s.
+- [ ] **DFlash at long context.** At 16k DFlash is only ~15% ahead of plain decode (102 vs 89 tok/s): the
+  16-row verify and the draft still use the tiled attention kernel (shared-memory staging, 2-byte loads),
+  which ran at ~49 GB/s for one row at 16k. Give 16 rows the decode kernel's layout (vector loads, softmax
+  in registers; 16 queries per KV head instead of 4).
 - [x] **16-row Q4_K matmuls, Marlin-style** (done; see Done). All Q4_K projections 5.38 → 4.48 ms; with
   weights in L2 the kernel runs at 427 GB/s (95% of peak), so what remains is DRAM access.
 - [x] **The same design for Q6_K** (done; see Done): all Q6_K projections 3.29 → 2.35 ms.
@@ -191,6 +195,11 @@ More in [benchmarks](../benchmarks/README.md). Rules that have caught mistakes b
 
 ## Done
 
+- 2026-10-16: one-row decode attention after flash-decoding (`_decode_kernel`): each warp walks 128 keys of a
+  KV head with one 16-byte load per lane per key, scores reduced by shuffles, softmax in registers. At 16k keys
+  1.2 ms → 0.21 ms per layer (decode part 411 GB/s); plain decode 84 → 108 tok/s at 4k, 73 → 102 at 8k,
+  53 → 89 at 16k. Perplexity within the one-row path's noise (17.006 vs 16.997; reordering the old kernel's
+  sums alone gives 16.980).
 - 2026-10-16: prompt reading through the attention kernel (16-row chunks padded like the verifier's): 16k-token
   prompt 255 → 30 s to first token, 8k 48 → 13 s; ~600 tok/s from 1k to 16k instead of 535 falling to 63.
   Perplexity unchanged (16.986, 6.511 at 4k). DFlash: drafting fewer than 15 tokens reuses the full-block graph,

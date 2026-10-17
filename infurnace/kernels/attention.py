@@ -24,12 +24,15 @@ import math
 from tinygrad import Tensor, UOp, dtypes
 from tinygrad.dtype import AddrSpace
 from tinygrad.uop.ops import AxisType, KernelInfo
-from infurnace.kernels.quant_gemv import warp_reduce
+from infurnace.kernels.quant_gemv import _load_lanes, warp_reduce
 from infurnace.device import nvidia
 
 TILE = 32      # keys staged per step: one per lane
 SEGMENT = 256  # keys per block; segments are merged afterwards
 QUERIES = 8    # packed query vectors per warp, at most
+# One-row decode (no window, ring or floor): each warp walks DECODE_SEGMENT keys of one KV head, DECODE_TILE
+# keys per softmax update, DECODE_WARPS warps per block.
+DECODE_SEGMENT, DECODE_TILE, DECODE_WARPS = 128, 8, 4
 _NEG = float('-inf')
 _VARIABLE_PARAM = {'param': True} if 'param' in inspect.signature(UOp.variable).parameters else {}
 
@@ -159,6 +162,66 @@ def _partial_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, floor: UOp | None = 
   return UOp.group(*stores).end(block, warp, lane).sink(arg=KernelInfo(name=f"attention_partial_d{dim}", opts_to_apply=()))
 
 @functools.cache
+def _decode_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, *, start: int | UOp, kv_heads: int, groups: int, dim: int,
+                   capacity: int, segment: int, tile: int, warps: int) -> UOp:
+  """One query row (every grouped head of a KV head) after flash-decoding: lane owns dim/32 consecutive
+  dimensions and reads them with one vector load per key, scores are summed across the warp by shuffles, and
+  the online softmax lives in registers (no shared memory or barriers). Each warp writes one partial."""
+  lanes_dim, F32 = dim // 32, dtypes.float32
+  zero, neg = UOp.const(0.0, F32), UOp.const(_NEG, F32)
+  active = start + 1
+  blocks = (active + segment * warps - 1) // (segment * warps)
+  block = UOp.range(kv_heads * blocks, 0, axis_type=AxisType.GLOBAL)
+  warp = UOp.range(warps, 1, axis_type=AxisType.LOCAL)
+  lane = UOp.range(32, -1, axis_type=AxisType.WARP)
+  kv_head, entry = block // blocks, (block % blocks) * warps + warp
+  scale = 1 / math.sqrt(dim)
+  qs = UOp.placeholder((groups * lanes_dim,), F32, slot=0, addrspace=AddrSpace.REG)
+  qs = qs.after(UOp.group(*(qs[j * lanes_dim + i].store(q[0, kv_head * groups + j, 0, lane * lanes_dim + i].load().float() * scale)
+                            for j in range(groups) for i in range(lanes_dim))))
+  # max[j], sum[j], then this lane's output columns per query
+  state = UOp.placeholder((2 * groups + groups * lanes_dim,), F32, slot=1, addrspace=AddrSpace.REG)
+  state = state.after(UOp.group(*(state[j].store(neg) for j in range(groups)),
+                                *(state[groups + j].store(zero) for j in range(groups + groups * lanes_dim))))
+  t = UOp.range(segment // tile, 2, axis_type=AxisType.LOOP)
+  cur, qv = state.after(t), [qs[i].load() for i in range(groups * lanes_dim)]
+  scores, values = [[] for _ in range(groups)], []
+  for u in range(tile):
+    key = entry * segment + t * tile + u
+    live = key < active
+    row = key.minimum(capacity - 1)  # past the active length: in bounds, masked below
+    k = _load_lanes(kv[0, 0, kv_head, row, lane * lanes_dim], lanes_dim)
+    v = _load_lanes(kv[1, 0, kv_head, row, lane * lanes_dim], lanes_dim)
+    # Unwritten cache rows may hold any bits: zero their values so a 0 weight can't meet a NaN.
+    values.append([live.where(v[i].float(), zero) for i in range(lanes_dim)])
+    for j in range(groups):
+      dot = qv[j * lanes_dim] * k[0].float()
+      for i in range(1, lanes_dim): dot = dot + qv[j * lanes_dim + i] * k[i].float()
+      scores[j].append(live.where(warp_reduce(dot, full_wave=True), neg))
+  updates = []
+  for j in range(groups):
+    top = scores[j][0]
+    for sc in scores[j][1:]: top = top.maximum(sc)
+    old = cur[j].load()
+    new_max = old.maximum(top)
+    safe = new_max.ne(neg).where(new_max, zero)        # all masked so far: keep exp() finite
+    alpha, ps = (old - safe).exp(), [(sc - safe).exp() for sc in scores[j]]
+    total = cur[groups + j].load() * alpha
+    for p in ps: total = total + p
+    updates += [cur[j].store(new_max), cur[groups + j].store(total)]
+    for i in range(lanes_dim):
+      slot = 2 * groups + j * lanes_dim + i
+      acc = cur[slot].load() * alpha
+      for p, v in zip(ps, values): acc = acc + p * v[i]
+      updates.append(cur[slot].store(acc))
+  state = state.after(UOp.group(*updates).end(t))
+  stores = [part[kv_head, entry, j, lane * lanes_dim + i].store(state[2 * groups + j * lanes_dim + i].load())
+            for j in range(groups) for i in range(lanes_dim)]
+  stores += [stats[kv_head, entry, UOp.const(j, lane.dtype).valid(lane.eq(0)), s].store(state[s * groups + j].load())
+             for j in range(groups) for s in range(2)]  # lane 0 only
+  return UOp.group(*stores).end(block, warp, lane).sink(arg=KernelInfo(name=f"attention_decode_d{dim}", opts_to_apply=()))
+
+@functools.cache
 def _merge_kernel(out: UOp, part: UOp, stats: UOp, *, start: int | UOp, kv_heads: int, groups: int, rows: int, dim: int,
                   window: int, segment: int) -> UOp:
   queries, lanes_dim = groups * rows, dim // 32
@@ -203,17 +266,30 @@ def attention(q: Tensor, kv: Tensor, start: int | UOp, *, causal: bool = True, w
   """q: (1, heads, rows, dim) at positions start..start+rows-1; kv: (2, 1, kv_heads, capacity, dim) FP16
   cache already holding those rows (a ring of length capacity with `ring`). floor: optional (1,) int32
   buffer, the lowest visible key. Returns (1, heads, rows, dim) FP32. dim must be a multiple of 32.
-  The fused kernels need NV (CUDA warp shuffles); other devices use plain tensor ops over the whole cache."""
+  The fused kernels need NV (CUDA warp shuffles); other devices use plain tensor ops over the whole cache.
+  One row without a window, ring or floor (decoding) uses the flash-decoding kernel, which splits the keys
+  itself (DECODE_SEGMENT per warp); `segment` applies to the other shapes."""
   _, heads, rows, dim = q.shape
   _, _, kv_heads, capacity, kv_dim = kv.shape
   if dim != kv_dim or heads % kv_heads: raise ValueError("attention needs matching head sizes and grouped heads")
   if ring and not 0 < window <= capacity - rows: raise ValueError("a ring cache needs a window and room for it plus the rows")
   if not nvidia(q.device) or dim % 32 or kv.dtype != dtypes.float16: return _masked(q, kv, start, causal, window, ring, floor)
+  groups, scalar = heads // kv_heads, _kernel_scalar(start)
+  if rows == 1 and not window and not ring and floor is None and dim // 32 in (2, 4, 8):
+    seg = DECODE_SEGMENT
+    entries = -(-capacity // (seg * DECODE_WARPS)) * DECODE_WARPS
+    part = Tensor.empty(kv_heads, entries, groups, dim, dtype=dtypes.float32, device=q.device)
+    stats = Tensor.empty(kv_heads, entries, groups, 2, dtype=dtypes.float32, device=q.device)
+    part, stats = _launch((part, stats), (q.contiguous(), kv), start, functools.partial(
+      _decode_kernel, start=scalar, kv_heads=kv_heads, groups=groups, dim=dim, capacity=capacity, segment=seg,
+      tile=DECODE_TILE, warps=DECODE_WARPS))
+    out = Tensor.empty(1, heads, 1, dim, dtype=dtypes.float32, device=q.device)
+    return _launch((out,), (part, stats), start, functools.partial(
+      _merge_kernel, start=scalar, kv_heads=kv_heads, groups=groups, rows=1, dim=dim, window=0, segment=seg))[0]
   # A ring's window can straddle one more segment boundary than its length spans.
-  groups, segments = heads // kv_heads, -(-capacity // segment) + int(ring)
+  segments = -(-capacity // segment) + int(ring)
   part = Tensor.empty(kv_heads, segments, groups * rows, dim, dtype=dtypes.float32, device=q.device)
   stats = Tensor.empty(kv_heads, segments, groups * rows, 2, dtype=dtypes.float32, device=q.device)
-  scalar = _kernel_scalar(start)
   part, stats = _launch((part, stats), (q.contiguous(), kv) + ((floor,) if floor is not None else ()), start, functools.partial(
     _partial_kernel, start=scalar, kv_heads=kv_heads, groups=groups, rows=rows, dim=dim, causal=causal, window=window, segment=segment,
     ring=capacity if ring else 0))

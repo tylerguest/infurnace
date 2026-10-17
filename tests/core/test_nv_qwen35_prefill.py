@@ -48,11 +48,17 @@ def test_multirow_logits_match_one_row(loaded):
 
 def test_multirow_prompt_matches_one_row_prompt(loaded):
   model, tokenizer = loaded
-  # Several full 16-row chunks plus a partial one, through generate, on a prompt without a near-tie
-  # in these tokens (the palindrome prompt's first token is a 0.006-logit tie, "Here" vs "```").
+  # Several full 16-row chunks plus a partial one, through generate.
   tokens = ids(tokenizer, 'Explain how a refrigerator keeps food cold, in simple terms suitable for a ten year old child, using an analogy.')
   assert len(tokens) > 2 * 16 and (len(tokens) - 1) % 16
-  assert run(model, tokens) == run(model, tokens, multirow=False)
+  multi, one = run(model, tokens), run(model, tokens, multirow=False)
+  if multi != one:
+    # The two paths' logits differ by ~1% (see above), so they may flip a near-tie, but only that: the two
+    # choices must be the top two candidates, closer than that difference (here " heat" vs " vacuum").
+    i = next(k for k in range(len(multi)) if multi[k] != one[k])
+    n = len(tokens) + i
+    values, top = (x.tolist() for x in last_logits(model, tokens + multi[:i], [16] * (n // 16) + [1] * (n % 16)).topk(2))
+    assert {multi[i], one[i]} == set(top) and values[0] - values[1] < 0.01 * abs(values[0]), (i, top, values)
 
 def test_extending_the_cached_prefix_prefills_only_new_tokens(loaded):
   model, tokenizer = loaded
