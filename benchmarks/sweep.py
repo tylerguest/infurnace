@@ -49,7 +49,7 @@ def main():
   path = loader.fetch_model(args.model)
   model, tokenizer = loader.load_model(path, max(lengths) + args.tokens + 256)  # headroom, as a real context has
   dflash = loader.load_dflash(model, loader.fetch_model(loader.dflash_draft(args.model))) if args.dflash else None
-  # As chat and the server do before their first reply: captures the 16-row prompt graph (and DFlash's rounds).
+  # As chat and the server do before their first reply: captures the prompt graph (and DFlash's rounds).
   if dflash is not None: dflash.warmup()
   else: model.warmup()
   print(f"loaded and warmed up in {time.perf_counter() - began:.0f}s on {model.device}, context {model.config.context_length}"

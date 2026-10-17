@@ -181,7 +181,6 @@ def test_cold_short_prompt_does_not_capture():
   # spending ~19 s capturing the 16-row graph.
   from infurnace.models import qwen35
   model = qwen35.Qwen35Model.__new__(qwen35.Qwen35Model)
-  transformer = type('T', (), {})()
-  transformer.prefill_jit = type('J', (), {'captured': None, 'cnt': 0})()
-  model.transformer, model._multirow_prefill, model._warming = transformer, True, False
-  assert not model._multirow_ready(39) and transformer.prefill_jit.cnt == 0
+  model._prompt_jit = type('J', (), {'captured': None, 'cnt': 0})()
+  model._multirow_prefill, model._warming = True, False
+  assert not model._multirow_ready(39) and model._prompt_jit.cnt == 0

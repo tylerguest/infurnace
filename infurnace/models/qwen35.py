@@ -15,7 +15,7 @@ import os
 import struct
 from pathlib import Path
 from typing import Iterator
-from tinygrad import Context, Tensor, UOp, dtypes
+from tinygrad import Context, Tensor, TinyJit, UOp, dtypes
 from tinygrad.device import Buffer
 import tinygrad.llm.model as upstream_model
 from tinygrad.llm.gguf import ggml_data_to_tensor
@@ -118,9 +118,12 @@ class _PackedLinear(_NVLinear):
     if self.prefill: return super().__call__(x)
     return self.decode(x)
 
-PREFILL_ROWS = 16  # prompt chunk for the fused multirow GDN kernel (it is specialized to 16 rows)
-# Capturing the 16-row prompt graph costs ~19 s and a one-row step ~9 ms (RTX 5060), so outside warmup
-# it is captured only for a prompt long enough to pay for it.
+PREFILL_ROWS = 16  # rows of the fused multirow GDN kernel (it is specialized to 16 rows)
+# Prompt chunk: a fixed-size graph (see Qwen35Model._prompt_chunk) reading 64 rows at once reads prompts ~2.5x
+# faster than 16 (RTX 5060: ~1,600 vs ~650 tok/s). GDN layers scan it 16 rows at a time.
+PROMPT_ROWS = 64
+# Capturing the prompt graph costs ~20-30 s and a one-row step ~9 ms (RTX 5060), so outside warmup it is
+# captured only for a prompt long enough to pay for it.
 PREFILL_CAPTURE_TOKENS = 2048
 
 _SHARED_Q8 = os.environ.get('INFURNACE_SHARED_Q8', '1') != '0'
@@ -148,8 +151,8 @@ def _fused_gdn(block: GatedDeltaNetBlock):
   """Upstream GatedDeltaNetBlock._attention with NV kernels where upstream has them only on AMD.
 
   One-row decoding: the conv, q/k norms, recurrence, RMSNorm and gate in one kernel (elsewhere the
-  step is dozens of small kernels). 16-row prompt chunks: upstream's input processing, then one
-  closed-form kernel for the scan instead of its row-by-row loop. Other shapes use upstream's path."""
+  step is dozens of small kernels). Prompt chunks (multiples of 16 rows): upstream's input processing, then
+  closed-form kernels for the scan, 16 rows each, instead of its row-by-row loop. Other shapes use upstream's path."""
   upstream_attention = block._attention
   H, K, V = block.num_v_heads, block.head_k_dim, block.head_v_dim
   def prefill(x: Tensor, start_pos: UOp) -> Tensor:
@@ -164,12 +167,18 @@ def _fused_gdn(block: GatedDeltaNetBlock):
     conv_state = initial.where(0, block.conv_state)
     conv_window = conv_state.cat(block.attn_qkv(x).cast(conv_state.dtype), dim=1)
     conv_window = conv_window.pad_to((B, block.ssm_conv_kernel - 1 + T_pad, block.conv_channels)).contiguous()
-    conv_state_store = block.conv_state.uop.store(conv_window[:, T:T + block.ssm_conv_kernel - 1].cast(block.conv_state.dtype).uop)
+    # A prompt chunk always runs PROMPT_ROWS rows; only the first `live` are prompt (see Qwen35Model._prompt_chunk).
+    live = getattr(block, '_prompt_rows', None)
+    end = T if live is None else live
+    conv_state_store = block.conv_state.uop.store(conv_window[:, end:end + block.ssm_conv_kernel - 1].cast(block.conv_state.dtype).uop)
     conv_out = functools.reduce(lambda a, b: a + b,
       (conv_window[:, i:i + T_pad] * block.ssm_conv1d['weight'][:, i] for i in range(block.ssm_conv_kernel))).silu()
     # Padding rows are no-ops: beta 0 (no update) and log-decay 0 (no decay).
     out_gate, beta = out_gate.pad_to((B, T_pad, H, V)), beta.pad_to((B, T_pad, H))
     log_alpha = log_alpha.pad_to((B, T_pad, *log_alpha.shape[2:]))
+    if live is not None:
+      prompt = Tensor.arange(T_pad).reshape(1, T_pad, 1) < Tensor(live)
+      beta, log_alpha = prompt.where(beta, 0), prompt.unsqueeze(-1).where(log_alpha, 0)
     q, k, v = conv_out.split([block.q_dim, block.q_dim, block.conv_channels - 2 * block.q_dim], dim=-1)
     q, k = (z.reshape(B, T_pad, block.num_k_heads, K).normalize(dim=-1, eps=1e-6).repeat(1, 1, H // block.num_k_heads, 1)
             for z in (q, k))
@@ -178,16 +187,24 @@ def _fused_gdn(block: GatedDeltaNetBlock):
     q = q * K**-0.5
     # The scan, RMSNorm and gate in one kernel that also advances the recurrent state in place,
     # ordered after the conv state write like upstream's AMD kernel.
-    g = log_alpha.transpose(1, 2)[..., 0].cumsum(-1)
+    # A longer chunk is scanned 16 rows at a time, each scan continuing the state the previous one left.
+    log_decay = log_alpha.transpose(1, 2)[0, ..., 0]                                   # (H, T_pad)
     state = Tensor(block.recurrent_state.uop.after(conv_state_store)).reshape(H, V, K)
-    z = gdn_prefill(q[0], k[0], v[0], beta[0], g[0], state, out_gate[0], block.ssm_norm.weight,
-                    (1 - initial.float()).reshape(1), block.ssm_norm.eps)
+    zs = []
+    for first in range(0, T_pad, PREFILL_ROWS):
+      rows = slice(first, first + PREFILL_ROWS)
+      keep = (1 - initial.float()).reshape(1) if first == 0 else Tensor.ones(1)
+      z = gdn_prefill(q[0, :, rows], k[0, :, rows], v[0, :, rows], beta[0, :, rows], log_decay[:, rows].cumsum(-1), state,
+                      out_gate[0, rows], block.ssm_norm.weight, keep, block.ssm_norm.eps)
+      zs.append(z)
+      state = Tensor(state.uop.after(z.uop))
+    z = zs[0].cat(*zs[1:]) if len(zs) > 1 else zs[0]
     return block.ssm_out(z.reshape(1, T_pad, H * V)[:, :T])
   def attention(x: Tensor, start_pos):
     B, T, _ = x.shape
     if not isinstance(start_pos, UOp): start_pos = UOp.variable('start_pos', 0, block.config.max_context - 1).bind(start_pos)
     multirow = isinstance(T, UOp) or T > 1  # prompt chunks have a symbolic row count
-    if B == 1 and multirow and x.max_shape[1] == PREFILL_ROWS: return prefill(x, start_pos)
+    if B == 1 and multirow and x.max_shape[1] % PREFILL_ROWS == 0: return prefill(x, start_pos)
     if B != 1 or multirow: return upstream_attention(x, start_pos)
     initial = Tensor(start_pos).eq(0)
     x = x.half()
@@ -204,18 +221,18 @@ def _fused_gdn(block: GatedDeltaNetBlock):
   return attention
 
 def _fused_attention(block: TransformerBlock):
-  """Upstream TransformerBlock._attention for one-row decoding and 16-row prompt chunks, with the
+  """Upstream TransformerBlock._attention for one-row decoding and multirow prompt chunks, with the
   attention itself in kernels/attention.py: upstream's attention over a runtime length slows as the
   conversation grows (it swaps in its own kernel only on AMD, at this same spot). Other shapes use
   upstream's path."""
   upstream_attention, c = block._attention, block.config
   def attention_step(x: Tensor, start_pos):
     B, T, _ = x.shape
-    if B == 1 and (isinstance(T, UOp) or T > 1) and x.max_shape[1] == PREFILL_ROWS:
-      # A prompt chunk of 1..16 rows, padded to 16 like the GDN prefill. The padding rows come from zero
-      # inputs, so their cached keys and values are finite (the kernel reads every key below start+16),
-      # and the prompt's next rows overwrite them. The prompt reader keeps start+16 within the cache.
-      x = x.pad_to((B, PREFILL_ROWS, x.shape[2]))
+    if B == 1 and (isinstance(T, UOp) or T > 1) and x.max_shape[1] % PREFILL_ROWS == 0:
+      # A prompt chunk (1..16 or 1..64 rows), padded to its maximum like the GDN prefill. The padding rows come
+      # from zero inputs, so their cached keys and values are finite (the kernel reads every key below the
+      # padded end), and the prompt's next rows overwrite them. The prompt reader keeps the padded end in the cache.
+      x = x.pad_to((B, x.max_shape[1], x.shape[2]))
       return rows_attention(x, start_pos, block.attn_q(x), block.attn_k(x), block.attn_v(x))[:, :T]
     if B != 1 or isinstance(T, UOp) or T != 1: return upstream_attention(x, start_pos)
     return rows_attention(x, start_pos, *_one_row(x, block.attn_q, block.attn_k, block.attn_v))
@@ -285,6 +302,11 @@ class Qwen35Model:
     self._tied_head = False  # the packed output head is the token embedding table
     self._multirow_prefill = False  # prompts go through the fused 16-row GDN kernel (see _prefill)
     self._warming = False
+    # Prompt chunks: a captured step that slices the prompt from a persistent device buffer (see _prompt_chunk)
+    self._prompt_jit = TinyJit(self._prompt_chunk)
+    self._prompt_ids: Tensor | None = None
+    # Target layers whose inputs a prompt chunk also returns (DFlash's feature taps; set by its generator)
+    self.feature_layers: tuple[int, ...] = ()
     # Saved prompt states for later turns (see save_snapshot). turn_token marks where turns start;
     # user_turn (its header's tokens) and tool_marker tell a user message from a tool result.
     self.turn_token: int | None = None
@@ -296,7 +318,7 @@ class Qwen35Model:
     """Prime upstream prefill/decode JIT using the same chunk size as normal generation."""
     if self.config.context_length < 2: return
     # Long enough to capture the multirow prompt graph too (one full chunk and a partial one).
-    prompt = [0] * min(PREFILL_ROWS + 2, self.config.context_length - 1)
+    prompt = [0] * min(PROMPT_ROWS + 2, self.config.context_length - 1)
     count = min(4, self.config.context_length - len(prompt))
     self._warming = True
     try:
@@ -323,6 +345,59 @@ class Qwen35Model:
       if self.device not in Tensor._device_seeds: Tensor._next_counter(self.device, 0)
       states += [Tensor._device_seeds[self.device], Tensor._device_rng_counters[self.device]]
       if pending := [t for t in states if not t.uop.is_realized]: Tensor.realize(*pending)
+
+  def _prompt_chunk(self, ids: Tensor, start_pos: UOp, rows: UOp) -> Tensor:
+    """Read prompt rows start_pos..start_pos+rows-1 (1..PROMPT_ROWS) into the caches and states.
+
+    The graph always runs PROMPT_ROWS rows sliced from the whole prompt, already on the device; `rows` is only a
+    value: GDN layers treat later rows as no-ops (β 0, no decay) and keep their conv window at `rows`, and the
+    keys and values attention writes for them lie past the prompt, overwritten before anything reads them. A
+    symbolic row count would give hundreds of kernels runtime launch sizes, which the GPU patches on every
+    replay: 65 ms per chunk instead of 33 (RTX 5060). Unlike upstream's forward, there is no output head or
+    sample, and no host-side slice to schedule and upload."""
+    t, features = self.transformer, []
+    for block in t.blk:
+      if isinstance(block, GatedDeltaNetBlock): block._prompt_rows = rows
+    try:
+      x = t.token_embd(ids[:, start_pos:start_pos + PROMPT_ROWS]).float()
+      for index, block in enumerate(t.blk):
+        if index in self.feature_layers: features.append(x)  # tap N is the input of block N
+        x = block(x, start_pos)
+    finally:
+      for block in t.blk: block._prompt_rows = None
+    # The last row's output depends on every layer's cache and state writes; the taps alone would leave out the
+    # layers after the last tap, so they are returned beside it, never instead of it.
+    last = x[:, -1:].contiguous()
+    return (features[0].cat(*features[1:], dim=-1).contiguous(), last) if features else last
+
+  def set_feature_layers(self, layers: tuple[int, ...]):
+    """Have prompt chunks return the inputs of these target layers (DFlash's feature taps)."""
+    if tuple(layers) != self.feature_layers:
+      self.feature_layers = tuple(layers)
+      self._prompt_jit.reset()  # a graph captured for other taps
+
+  def upload_prompt(self, tokens: list[int]):
+    """Put the whole prompt on the device once; each chunk's graph slices its rows from it."""
+    t = self.transformer
+    with Context(DEV=self.device):
+      if self._prompt_ids is None: self._prompt_ids = Tensor.empty(1, t.max_context, dtype=dtypes.int32, device=self.device).realize()
+      padded = Tensor(tokens + [0] * (t.max_context - len(tokens)), dtype=dtypes.int32).reshape(1, t.max_context)
+      Tensor(self._prompt_ids.uop.after(self._prompt_ids.uop.store(padded.to(self.device).uop))).realize()
+
+  def read_prompt(self, first: int, last: int, consume=None) -> int:
+    """Read uploaded prompt rows from `first` toward `last` in PROMPT_ROWS chunks; returns where it stopped
+    (short of `last` only near the end of the context: a chunk writes all its padded cache rows). With
+    feature layers set, `consume(features, rows)` gets each chunk's taps (1, PROMPT_ROWS, width) and its row
+    count before the next chunk overwrites them."""
+    t, position = self.transformer, first
+    v_start, v_rows = UOp.variable('start_pos', 0, t.max_context - 1), UOp.variable('prompt_rows', 1, PROMPT_ROWS)
+    with Context(DEV=self.device):
+      while position < last and position + PROMPT_ROWS <= t.max_context:
+        rows = min(PROMPT_ROWS, last - position)
+        out = self._prompt_jit(self._prompt_ids, v_start.bind(position), v_rows.bind(rows))
+        if consume is not None: consume(out[0], rows)
+        position += rows
+    return position
 
   def reset(self) -> None:
     """Invalidate prefix reuse without reallocating tinygrad's cache or JIT."""
@@ -421,17 +496,16 @@ class Qwen35Model:
       self._generating = False
 
   def _multirow_ready(self, rows: int) -> bool:
-    """Whether to read `rows` prompt tokens 16 at a time (capturing that graph if needed)."""
-    t = self.transformer
+    """Whether to read `rows` prompt tokens in PROMPT_ROWS chunks (capturing that graph if needed)."""
     if not self._multirow_prefill or rows <= 0: return False
-    if t.prefill_jit.captured is None:
+    if self._prompt_jit.captured is None:
       # Not captured yet: worth it during warmup or for a long prompt, otherwise upstream reads
       # this prompt one row at a time (a short cold `--prompt` would wait ~19 s to save ~0.2 s).
       if not (self._warming or rows >= PREFILL_CAPTURE_TOKENS): return False
       # Skip TinyJit's eager first call and capture right away: with every state buffer already
       # real, the eager call has nothing left to set up.
       self.realize_state()
-      t.prefill_jit.cnt = 1
+      self._prompt_jit.cnt = 1
     return True
 
   def _prefill(self, tokens: list[int], temperature: float):
@@ -440,7 +514,7 @@ class Qwen35Model:
 
     Resumes from the prompt snapshot when the prompt still matches it, and saves a new one on the way.
     Upstream prefills hybrid models one row per step except on AMD (its scan is a row-by-row loop
-    elsewhere); with the fused GDN kernels, rows go 16 at a time through upstream's own forward."""
+    elsewhere); with the fused GDN kernels, rows go PROMPT_ROWS at a time through _prompt_chunk."""
     t = self.transformer
     end = len(tokens) - 1
     start = self.restore_snapshot(tokens, t.get_start_pos(tokens))
@@ -449,17 +523,14 @@ class Qwen35Model:
     v_start = UOp.variable('start_pos', 0, t.max_context - 1)
     ids = Tensor(tokens + [0] * (t.max_context - len(tokens)), dtype='int32').reshape(1, t.max_context)
     temp = Tensor([temperature])
+    if multirow: self.upload_prompt(tokens)
     def read(first: int, last: int):
-      # Same graphs as upstream: 16-row chunks through prefill_jit, or one-row steps through
-      # rollout_jit with upstream's own one-row `toks` variable.
-      position = first
-      while position < last:
-        # A 16-row chunk writes 16 cache rows (see _fused_attention): the last rows of a full context go one at a time.
-        size = PREFILL_ROWS if multirow and position + PREFILL_ROWS <= t.max_context else 1
-        v_rows = UOp.variable('toks', 1, size)
-        sp, rows = v_start.bind(position), v_rows.bind(min(size, last - position))
+      # Prompt chunks through the captured prompt step, then any rest (near the end of the context, or every
+      # row without chunks) as one-row steps through upstream's rollout_jit with its own one-row `toks` variable.
+      position = self.read_prompt(first, last) if multirow else first
+      for position in range(position, last):
+        sp, rows = v_start.bind(position), UOp.variable('toks', 1, 1).bind(1)
         t(ids[:, sp:sp + rows], sp, temp).realize()
-        position += size
     if point is not None:
       read(start, point)
       self.save_snapshot(tokens[:point])

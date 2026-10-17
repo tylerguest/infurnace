@@ -186,18 +186,22 @@ def _mma_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, floor: UOp | None = None
   in four neighbouring lanes), then P·V with P taken straight from the score fragments, which are already
   in the A-operand layout. Same partial/stats outputs as _partial_kernel."""
   queries, steps, tiles_n = groups * rows, dim // 16, dim // 8
-  warps = -(-queries // 16)
+  # Up to 4 warps (64 queries) a block: at dim 256 a lane takes ~254 registers, so a block can't be larger.
+  # More queries (a 64-row prompt chunk) go to more blocks, each reading the same keys.
+  warps = min(-(-queries // 16), 4)
+  qblocks = -(-queries // (16 * warps))
   first = _first(start, window, segment)
   count = _live(start, rows, segment) - first
-  block = UOp.range(kv_heads * count, 0, axis_type=AxisType.GLOBAL)
+  block = UOp.range(kv_heads * count * qblocks, 0, axis_type=AxisType.GLOBAL)
   warp = UOp.range(warps, 1, axis_type=AxisType.LOCAL)
   lane = UOp.range(32, -1, axis_type=AxisType.WARP)
-  kv_head, part_index = block // count, block % count
+  kv_head, rest = block // (count * qblocks), block % (count * qblocks)
+  part_index, qblock = rest // qblocks, rest % qblocks
   group, thread = lane // 4, lane % 4
   active = start + rows
   F32, F16, zero, neg = dtypes.float32, dtypes.float16, UOp.const(0.0, dtypes.float32), UOp.const(_NEG, dtypes.float32)
   # This lane's two query rows: packed query m = group*rows + row, as in _partial_kernel.
-  ms = [warp * 16 + group + 8 * r for r in (0, 1)]
+  ms = [(qblock * warps + warp) * 16 + group + 8 * r for r in (0, 1)]
   valid_m = [m < queries for m in ms]
   heads, row_of = [kv_head * groups + m // rows for m in ms], [m % rows for m in ms]
   # Q as A fragments, loaded once: slot order (r0,c0) (r0,c1) (r8,c0) (r8,c1) (r0,c8) (r0,c9) (r8,c8) (r8,c9).
@@ -418,6 +422,11 @@ def attention(q: Tensor, kv: Tensor, start: int | UOp, *, causal: bool = True, w
     return _launch((out,), (part, stats), start, functools.partial(
       _merge_kernel, start=scalar, kv_heads=kv_heads, groups=groups, rows=1, dim=dim, window=0, segment=seg))[0]
   # A ring's window can straddle one more segment boundary than its length spans.
+  if rows > 16 and not (dim % 16 == 0 and segment % 32 == 0 and _MMA and _tensor_cores(q.device)):
+    # The FP32 kernel stages a probability row per query: past 16 rows its shared memory runs out. Slices of
+    # up to 16 rows are the same attention at later starting positions.
+    return Tensor.cat(*(attention(q[:, :, i:i + 16], kv, start + i, causal=causal, window=window, segment=segment, ring=ring,
+                                  floor=floor) for i in range(0, rows, 16)), dim=2)
   segments = -(-capacity // segment) + int(ring)
   part = Tensor.empty(kv_heads, segments, groups * rows, dim, dtype=dtypes.float32, device=q.device)
   stats = Tensor.empty(kv_heads, segments, groups * rows, 2, dtype=dtypes.float32, device=q.device)

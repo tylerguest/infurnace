@@ -4,6 +4,7 @@ Marked nv (INFURNACE_TEST_NV=1); needs the model file below; loads ~3 GB once.
 """
 from pathlib import Path
 import pytest
+from infurnace.models.qwen35 import PROMPT_ROWS
 
 TARGET = Path('models/qwen35-validation/Qwen3.5-4B-Q4_K_M.gguf')
 pytestmark = [pytest.mark.nv, pytest.mark.skipif(not TARGET.is_file(), reason='needs the Qwen3.5-4B target under models/')]
@@ -15,7 +16,7 @@ def loaded():
   assert model._multirow_prefill
   # Outside warmup, short prompts never capture the 16-row graph; warm up so these tests exercise it.
   model.warmup()
-  assert model.transformer.prefill_jit.captured is not None
+  assert model._prompt_jit.captured is not None
   return model, tokenizer
 
 def ids(tokenizer, text):
@@ -36,6 +37,22 @@ def last_logits(model, tokens, chunks):
       x, position = x.realize(), position + rows
     return t.output(t.output_norm(x[:, -1:]))[0, -1].float().realize()
 
+def one_row_logits(model, tokens):
+  """Logits after `tokens`, read one row at a time through a captured step (eager steps take seconds each)."""
+  from tinygrad import Context, Tensor, TinyJit, UOp, dtypes
+  t = model.transformer
+  if not hasattr(model, '_test_step'):
+    def step(token, position):
+      x = t.token_embd(token).float()
+      for block in t.blk: x = block(x, position)
+      return t.output(t.output_norm(x)).reshape(-1).float().contiguous()
+    model._test_step = TinyJit(step)
+  position = UOp.variable('start_pos', 0, t.max_context - 1)
+  with Context(DEV='NV'):
+    model.reset()
+    for i, token in enumerate(tokens): logits = model._test_step(Tensor([[token]], dtype=dtypes.int32), position.bind(i))
+    return Tensor(logits.tolist())
+
 def test_multirow_logits_match_one_row(loaded):
   model, tokenizer = loaded
   tokens = ids(tokenizer, 'List five facts about the planet Mars, one per line, each with a short explanation of why it matters.')
@@ -48,17 +65,18 @@ def test_multirow_logits_match_one_row(loaded):
 
 def test_multirow_prompt_matches_one_row_prompt(loaded):
   model, tokenizer = loaded
-  # Several full 16-row chunks plus a partial one, through generate.
-  tokens = ids(tokenizer, 'Explain how a refrigerator keeps food cold, in simple terms suitable for a ten year old child, using an analogy.')
-  assert len(tokens) > 2 * 16 and (len(tokens) - 1) % 16
+  # Several full prompt chunks plus a partial one, through generate.
+  question = 'Explain how a refrigerator keeps food cold, in simple terms suitable for a ten year old child, using an analogy.'
+  notes = ' '.join(f'Note {i}: the compressor, the coils and the refrigerant each play a part.' for i in range(9))
+  tokens = ids(tokenizer, notes + '\n\n' + question)
+  assert len(tokens) > 2 * PROMPT_ROWS and (len(tokens) - 1) % PROMPT_ROWS  # full prompt chunks and a partial one
   multi, one = run(model, tokens), run(model, tokens, multirow=False)
   if multi != one:
-    # The two paths' logits differ by ~1% (see above), so they may flip a near-tie, but only that: the two
-    # choices must be the top two candidates, closer than that difference (here " heat" vs " vacuum").
+    # The two paths' logits differ by up to 3% (see above), so they may flip a near-tie, but only that: the two
+    # choices must be the top two candidates, closer than that difference (here 0.19 on 13.9).
     i = next(k for k in range(len(multi)) if multi[k] != one[k])
-    n = len(tokens) + i
-    values, top = (x.tolist() for x in last_logits(model, tokens + multi[:i], [16] * (n // 16) + [1] * (n % 16)).topk(2))
-    assert {multi[i], one[i]} == set(top) and values[0] - values[1] < 0.01 * abs(values[0]), (i, top, values)
+    values, top = (x.tolist() for x in one_row_logits(model, tokens + multi[:i]).topk(2))
+    assert {multi[i], one[i]} == set(top) and values[0] - values[1] < 0.03 * abs(values[0]), (i, top, values)
 
 def test_extending_the_cached_prefix_prefills_only_new_tokens(loaded):
   model, tokenizer = loaded

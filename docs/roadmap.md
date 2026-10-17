@@ -14,21 +14,24 @@ Measured on an RTX 5060 8 GB (30 SMs, 448 GB/s), Qwen3.5-4B Q4_K_M, October 2026
 |---|---|
 | Plain decode | 103–110 tok/s up to 8k tokens of context; 95 tok/s at 16k |
 | DFlash decode | ~340 tok/s on code (7.7 tokens per 23 ms round); 140–230 tok/s summarizing docs; ~158 tok/s at 16k; 1.6–2.0× plain at temperature 0.6 |
-| Prompt reading | 16 rows at a time, 600–650 tok/s from 1k to 16k tokens, plain or DFlash (1.7 s to first token at 1k, 25 s at 16k) |
+| Prompt reading | 64 rows at a time: 1,400–1,700 tok/s plain, 1,100–1,350 with DFlash, from 1k to 16k tokens (0.7 s to first token at 1k, 10 s at 16k) |
 
 Prompt-length sweep (`benchmarks/sweep.py`: a chat message holding `eval.txt` cut to length, then "Summarize
 the text above", 128 tokens out, after warmup):
 
 | Prompt tokens | TTFT | Prompt tok/s | Plain decode tok/s | DFlash decode tok/s |
 |---|---|---|---|---|
-| 25 | 0.20 s | – | 110.1 | 146.4 |
-| 124 | 0.35 s | 354 | 103.7 | 229.5 |
-| 524 | 0.95 s | 550 | 103.5 | 140.6 |
-| 1,024 | 1.6 s | 631 | 108.8 | 162.6 |
-| 2,024 | 3.2 s | 639 | 103.6 | 166.3 |
-| 4,024 | 6.2 s | 649 | 104.3 | 178.7 |
-| 8,024 | 12.2 s | 658 | 97.2 | 163.2 |
-| 16,024 | 24.6 s | 652 | 95.1 | 158.4 |
+| 25 | 0.21 s | – | 105.6 | 144.3 |
+| 124 | 0.24 s | 512 | 105.9 | 232.5 |
+| 524 | 0.49 s | 1,079 | 105.1 | 146.2 |
+| 1,024 | 0.74 s | 1,390 | 105.2 | 165.8 |
+| 2,024 | 1.3 s | 1,566 | 104.5 | 169.2 |
+| 4,024 | 2.4 s | 1,683 | 103.8 | 181.8 |
+| 8,024 | 4.8 s | 1,678 | 98.0 | 157.8 |
+| 16,024 | 10.0 s | 1,603 | 90.4 | 161.0 |
+
+TTFT and prompt rate are plain decoding's; with DFlash the prompt reads at 1,126 (1k), 1,336 (4k) and 1,294
+(16k) tok/s, 12.4 s to first token at 16k.
 
 Run-to-run noise is about ±5 tok/s (other apps drawing on the GPU cost up to 10%); DFlash depends on what it
 generates.
@@ -85,11 +88,13 @@ tinygrad's runtime ~0.39 GB, and ~0.47 GB of CUDA context outside tinygrad.
 
 ### 3. Startup takes about a minute
 
-Every launch spends ~20 s loading and 40–70 s warming up (`NV`; `CUDA` takes ~20 s more). Chat hides
-part of it by warming up while the user types; the server does not. Most of the warmup is capturing a
-separate draft graph for each proposal count from 1 to 15 (`_denoise_graph` in `dflash/draft.py`).
+Load plus warmup takes ~47 s plain and ~77 s with DFlash (`NV`; `CUDA` takes ~20 s more). Chat hides part
+of it by warming up while the user types; the server does not. Most of the warmup is capturing graphs: the
+64-row prompt graph alone adds ~11 s plain and ~29 s with DFlash (whose prompt reading used to reuse its
+verify graph).
 
-- [ ] One denoise graph padded to the full block; time warmup before and after; outputs unchanged.
+- [x] One denoise graph padded to the full block (drafting reuses it for any proposal count).
+- [ ] Save captured graphs between runs, or capture the prompt graph in the background after the first reply.
 
 ### 4. Sensible sampling defaults
 
@@ -102,9 +107,10 @@ recommended settings (0.6, top-p 0.95, top-k 20) need.
 
 ### 5. Agent latency: fixed cost per request
 
-Each tool step reads its new tokens at only 250–380 tok/s against ~600 for long prompts: about
-0.3–0.4 s of fixed cost per request. Saving and restoring prompt snapshots accounts for ~0.1 s
-(50 MB each way to host memory).
+Measured before 64-row prompt chunks: each tool step read its new tokens at only 250–380 tok/s against ~600
+for long prompts, about 0.3–0.4 s of fixed cost per request. Saving and restoring prompt snapshots accounts
+for ~0.1 s (50 MB each way to host memory). Short prompts now read at ~400–500 tok/s against ~1,600; re-measure
+with pi before profiling.
 
 - [ ] Profile one short follow-up request; cut the fixed cost.
 
@@ -117,8 +123,10 @@ A DFlash round was 23 ms: the 16-row target verify 15.8 ms (its matmuls 11 ms, n
 - [x] **DFlash at long context** (done; see Done): 102 → 158 tok/s at 16k.
 - [ ] **16-row attention at head dim 256** (the target verify and prompt reading): 393 µs a layer at 16k keys,
   ~2.5× the time to read its cache. The output fragments take 128 registers a lane (254 in all: 8 warps an
-  SM), so loads aren't overlapped; splitting the head dimension across warps or pipelining the K loads
-  (cp.async) are the candidates.
+  SM), so loads aren't overlapped. Tried: 64–512-key segments (256 is best); values staged in shared memory
+  (461 µs: barriers at this occupancy); Q fragments in shared memory (537 µs: the compiler spends the freed
+  registers on more prefetch and spills). Left: splitting the head dimension's output across warps, or
+  pipelining loads with cp.async. Worth ~2 ms a DFlash round at 16k, little at short contexts.
 - [x] **16-row Q4_K matmuls, Marlin-style** (done; see Done). All Q4_K projections 5.38 → 4.48 ms; with
   weights in L2 the kernel runs at 427 GB/s (95% of peak), so what remains is DRAM access.
 - [x] **The same design for Q6_K** (done; see Done): all Q6_K projections 3.29 → 2.35 ms.
@@ -197,6 +205,13 @@ More in [benchmarks](../benchmarks/README.md). Rules that have caught mistakes b
 
 ## Done
 
+- 2026-10-16: prompt reading in 64-row chunks through one fixed-size captured graph that slices the prompt
+  from the device (`Qwen35Model._prompt_chunk`); the row count is a value, not a shape (a symbolic count gave
+  hundreds of kernels runtime launch sizes, patched on every replay: 65 vs 33 ms a chunk). DFlash reads its
+  prompt through the same chunks, which also return the draft's feature taps. Plain prompt reading
+  ~650 → ~1,600 tok/s, DFlash ~600 → ~1,300; 16k prompt 25 → 10 s to first token (12.4 s with DFlash).
+  Warmup +11 s plain, +29 s with DFlash. Attention runs in 16-row slices on the FP32 kernel (its shared
+  memory ran out at 64 rows).
 - 2026-10-16: 16-row attention on FP16 tensor cores (`_mma_kernel`, FlashAttention-2's layout on mma.sync
   m16n8k16): the target verify and prompt reading, and the draft's sliding and full layers. At 16k keys: target
   1.51 → 0.39 ms a layer, draft full layer 1.60 → 0.33 ms, sliding layer 0.76 → 0.11 ms (values staged

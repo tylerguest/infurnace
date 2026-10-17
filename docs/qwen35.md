@@ -31,7 +31,7 @@ generation. On an NVIDIA GPU infurnace then:
 
 - keeps Q4_K/Q5_K/Q6_K projection weights packed and swaps in its projection kernels;
 - replaces the one-row recurrent and attention layers with fused kernels;
-- reads prompts 16 rows at a time;
+- reads prompts 64 rows at a time;
 - saves prompt snapshots so later turns resume where the conversation diverged.
 
 Details: [architecture](architecture.md).

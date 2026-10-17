@@ -82,7 +82,9 @@ class DFlashGenerator:
     if verifier not in ('sequential', 'parallel'): raise ValueError('invalid DFlash verifier')
     self.model, self.draft, self.verifier = model, draft, verifier
     self.observer = TargetObserver(model, draft.config.feature_layers)
+    model.set_feature_layers(draft.config.feature_layers)  # prompt chunks return the draft's taps
     self._parallel = {}
+    self._chunks = False  # this prompt reads through the model's prompt chunks (see _prefill)
     # Break-even tokens/round for parallel verification vs one-row decode on
     # the 5060 (one round ~= 3.2 ordinary steps), and the fallback length.
     self.min_tau, self.cooldown_steps, self.max_backoff = 3.5, 8, 16
@@ -158,6 +160,8 @@ class DFlashGenerator:
     done = self.model.restore_snapshot(tokens, 0, draft=self.draft)
     self.observer.position = done
     point = self.model.snapshot_point(tokens, done)
+    self._chunks = self.verifier == 'parallel' and self.model._multirow_ready(len(tokens) - 1 - done)
+    if self._chunks: self.model.upload_prompt(tokens)
     for stop in ([point] if point is not None else []) + [len(tokens)]:
       anchor = self._read(tokens, done, stop, block)
       if stop == point: self.model.save_snapshot(tokens[:point], draft=self.draft)
@@ -167,7 +171,13 @@ class DFlashGenerator:
   def _read(self, tokens: list[int], first: int, last: int, block: int) -> int | None:
     """Prompt rows first..last-1; returns the decision after the last one."""
     anchor, done = None, first
-    if self.verifier == 'parallel' and block > 1:
+    if self._chunks:
+      # The model's prompt chunks (64 rows, one captured graph) for all rows but the last, each chunk's feature
+      # taps going to the draft; the last row is an ordinary target step, which decides the next token.
+      def observe(features, rows): self.draft.observe(features[:, :rows])
+      done = self.model.read_prompt(first, last - 1, observe)
+      self.observer.position = done
+    elif self.verifier == 'parallel' and block > 1:
       # Multirow prompt prefill in fixed-width chunks; the tail falls back
       # to one-row steps only when a chunk would overrun the context.
       verifier = self._parallel_verifier(block)
@@ -270,8 +280,10 @@ class DFlashGenerator:
       # rule decides while no plain step is timed) so plain steps are captured too.
       for min_tau, plain_cost in ((0.0, float('inf')), (float('inf'), None)):
         self.min_tau, self.plain_cost = min_tau, plain_cost
+        self.model._warming = True  # the prompt reads through (and captures) the model's prompt chunks
         for _ in range(2): list(self.stream(list(prompt), max_new_tokens=48, block_size=block_size))
     finally:
+      self.model._warming = False
       self.min_tau, self.plain_cost = saved
       self.stats = DFlashStats()
       self.model.reset()  # no warmup prompt becomes a reusable prefix or snapshot

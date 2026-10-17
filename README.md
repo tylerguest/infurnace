@@ -10,7 +10,7 @@ On an 8 GB RTX 5060:
 |---|---|
 | Plain decoding | ~105 tok/s up to 8k tokens of context, ~95 tok/s at 16k |
 | DFlash | ~340 tok/s on code, ~140–230 tok/s on prose; ~160 tok/s at 16k |
-| Reading a prompt | 600–650 tok/s from 1k to 16k tokens: 1.6 s to first token at 1k, 25 s at 16k |
+| Reading a prompt | ~1,400–1,700 tok/s from 1k to 16k tokens (~1,100–1,350 with DFlash): 0.7 s to first token at 1k, 10 s at 16k |
 | Context | 8,192 tokens by default; 32,768 fits in 8 GB |
 | Later turns | resume from a saved prompt state: ~0.6 s to first token in a 3k-token chat |
 
@@ -55,7 +55,7 @@ infurnace --no-dflash                        # plain decoding
 - **Models:** `--model qwen3.5:4b` (default) downloads the target (2.7 GB) and draft (0.4 GB) into
   `~/.local/share/infurnace/models/`. `--model PATH` runs a local Qwen3.5 GGUF. See [Qwen3.5](docs/qwen35.md).
 - **Device:** NVIDIA through tinygrad's `NV` backend (Linux, probed first) or `CUDA`; `--device` or
-  `DEV` overrides. Startup takes about a minute (loading plus capturing GPU graphs).
+  `DEV` overrides. Startup takes about a minute (loading plus capturing GPU graphs: ~45 s plain, ~75 s with DFlash).
 - **Context:** `--max-context` (default 8,192). Memory with DFlash is about 5.2 GB at 8k and
   5.5 GB at 32k, plus whatever your desktop uses.
 - **Thinking:** on by default in chat and serving; `--no-thinking` turns it off. Replies run until

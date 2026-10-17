@@ -37,7 +37,7 @@ All are tinygrad UOp kernels that render as CUDA C.
 |---|---|
 | `quant_gemv` | One-row projections: Q4_K/Q5_K/Q6_K weights against Q8 activations (`dp4a`). Projections that share an input share one quantization. |
 | `quant_gemm` | 16-row projections on FP16 tensor cores (`mma.sync m16n8k16`, FP32 accumulation). Following Marlin: weights dequantize straight into fragment registers (packed `half2` math through inline CUDA, no repacking), activations are pre-permuted so each A fragment is one 16-byte load, and the next block is prefetched during the current MMAs. One kernel serves Q4_K and Q5_K (whose fifth bits join under the same FP16 trick), another Q6_K. |
-| `gdn` | Recurrent (gated delta net) layers: `gdn_decode` for one row, `gdn_prefill` for 16-row prompt chunks, `gdn_chunk` for DFlash verification |
+| `gdn` | Recurrent (gated delta net) layers: `gdn_decode` for one row, `gdn_prefill` for prompt chunks (16 rows per call), `gdn_chunk` for DFlash verification |
 | `attention` | Attention over the active length only: split-KV partials and a merge (after vLLM's unified attention and llama.cpp's combine step). Grouped query heads, causal/non-causal, sliding windows, ring caches. One-row decode has its own flash-decoding partial kernel (vector loads per lane, softmax in registers); multirow attention runs on FP16 tensor cores (FlashAttention-2 layout on `mma.sync`). |
 | `sampling` | Fused Gumbel-max sampling over all rows (greedy at temperature 0) |
 | `embedding` | Token embedding gathered straight from packed weights |
@@ -50,8 +50,11 @@ Small parameters (norms, gates) are cached under `~/.cache/infurnace/params/`.
 
 ## Plain decoding
 
-- **Prompt:** read 16 rows at a time with `quant_gemm` projections, `gdn_prefill` and the `attention`
-  kernel (chunks padded to 16 rows, like the verifier's). The 16-row graph is captured at warmup or for
+- **Prompt:** read 64 rows at a time (`Qwen35Model._prompt_chunk`) with `quant_gemm` projections, `gdn_prefill`
+  (four 16-row scans) and the `attention` kernel. The graph always runs 64 rows and takes the real row count
+  as a value: with a symbolic count, hundreds of kernels get runtime launch sizes, which the GPU patches on
+  every replay (65 instead of 33 ms a chunk). The prompt is uploaded once and sliced inside the graph. With
+  DFlash, the same chunks also return the draft's feature taps. The prompt graph is captured at warmup or for
   long prompts.
 - **Each token:** `quant_gemv` projections, `gdn_decode` and the `attention` decode kernel (128 keys per warp).
 - Upstream tinygrad still drives generation, its KV cache and its JIT.
