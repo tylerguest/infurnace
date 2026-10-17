@@ -88,7 +88,7 @@ def test_context_error_keeps_history(monkeypatch, capsys):
 def test_warmup_status(capsys):
   model = Model()
   calls = []
-  model.warmup = lambda: calls.append(True)
+  model.warmup = lambda prompt_graph=True: calls.append(prompt_graph)
   cli.warmup(model)
   assert calls == [True]
   output = capsys.readouterr()
@@ -114,7 +114,7 @@ def test_background_warmup_runs_off_the_main_thread_and_reraises(capsys):
   import threading
   started, release = threading.Event(), threading.Event()
   model = Model()
-  def slow_failure():
+  def slow_failure(prompt_graph=True):
     started.set()
     assert threading.current_thread() is not threading.main_thread()
     release.wait(5)

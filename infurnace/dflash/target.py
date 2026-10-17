@@ -1,6 +1,7 @@
 """One-row tinygrad target observation and exclusive request ownership."""
-from tinygrad import Context, Tensor, TinyJit, UOp, dtypes
+from tinygrad import Context, Tensor, UOp, dtypes
 from tinygrad.uop.ops import Ops
+from infurnace.dflash.jit import captured
 from infurnace.models.qwen35 import Qwen35Model
 
 def detach_rng(device: str):
@@ -24,7 +25,9 @@ class TargetObserver:
     # The input token is a bound variable patched into the captured graph's
     # kernel arguments: no host-to-device upload or store kernel per step.
     self._token = UOp.variable('dflash_token', 0, model.config.vocab_size - 1)
-    self._jit = TinyJit(self._forward)  # eager first: its RNG advance must match upstream sampling
+    # Captured on its first call: realize_state makes the RNG counter and every state buffer real before it,
+    # so an eager pass has nothing left to set up (it cost ~5 s of warmup).
+    self._jit = captured(self._forward)
     self._temperature = None
 
   def _realize_state(self):

@@ -299,6 +299,13 @@ class ParallelVerifier:
       self._fused_absorb, self._fused_draft = captured(draft._absorb), captured(draft._forward)
     return self._round_jit
 
+  def draft_graph(self, draft):
+    """The fused round's draft graph and the noise buffer it reads, for the draft's unfused full-block
+    proposals too: one capture instead of two, still always on the same input buffer."""
+    with Context(DEV=self.device): self._allocate()
+    self._round_graphs(draft)
+    return self._fused_draft, _raw(self._noise)
+
   def run(self, inputs: list[int]) -> tuple[list[int], Tensor]:
     observer = self.observer
     if not observer.active: raise RuntimeError('use verifier inside the target observer')

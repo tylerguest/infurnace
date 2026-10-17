@@ -88,13 +88,15 @@ tinygrad's runtime ~0.39 GB, and ~0.47 GB of CUDA context outside tinygrad.
 
 ### 3. Startup takes about a minute
 
-Load plus warmup takes ~47 s plain and ~77 s with DFlash (`NV`; `CUDA` takes ~20 s more). Chat hides part
-of it by warming up while the user types; the server does not. Most of the warmup is capturing graphs: the
-64-row prompt graph alone adds ~11 s plain and ~29 s with DFlash (whose prompt reading used to reuse its
-verify graph).
+Load (~11 s) plus warmup: ~47 s plain, ~75 s with DFlash (`NV`; `CUDA` takes ~20 s more). Nearly all of the
+warmup is capturing graphs (DFlash: prompt chunk 25 s, verify 19 s, one-row target 7 s, draft 6 s, the rest
+~4 s), and most of a capture is tinygrad's scheduler, redone on every start. Chat warms up while the user
+types; the server listens after ~50 s and captures the prompt graph in its first idle moment.
 
 - [x] One denoise graph padded to the full block (drafting reuses it for any proposal count).
-- [ ] Save captured graphs between runs, or capture the prompt graph in the background after the first reply.
+- [x] No eager pass before the one-row target capture; unfused proposals share the fused round's draft graph.
+- [x] The server captures the prompt graph after it starts listening (`capture_prompt_graph`).
+- [ ] Save captured graphs between runs (without the weights they reference), so a start skips capturing.
 
 ### 4. Sensible sampling defaults
 
@@ -205,6 +207,10 @@ More in [benchmarks](../benchmarks/README.md). Rules that have caught mistakes b
 
 ## Done
 
+- 2026-10-17: startup. The one-row target graph is captured without an eager pass and unfused proposals share
+  the fused round's draft graph (DFlash warmup 73 → 64 s); the server listens before capturing its prompt
+  graph, then captures it in its first idle moment without disturbing a conversation (listening after ~50 s
+  instead of ~84 s).
 - 2026-10-16: prompt reading in 64-row chunks through one fixed-size captured graph that slices the prompt
   from the device (`Qwen35Model._prompt_chunk`); the row count is a value, not a shape (a symbolic count gave
   hundreds of kernels runtime launch sizes, patched on every replay: 65 vs 33 ms a chunk). DFlash reads its

@@ -63,7 +63,7 @@ def test_installed_draft_is_used_automatically(monkeypatch, tmp_path, device, fl
   monkeypatch.setattr(loader, 'load_model', lambda *a, **kw: (model, Tokenizer()))
   loaded, engine = [], Engine()
   monkeypatch.setattr(loader, 'load_dflash', lambda target_model, path, **kw: loaded.append(path) or engine)
-  monkeypatch.setattr(cli, 'warmup', lambda *a: None)
+  monkeypatch.setattr(cli, 'warmup', lambda *a, **kw: None)
   served = []
   monkeypatch.setattr('infurnace.serve.serve', lambda model, *a, **kw: served.append(kw['dflash']))
   run = ['--prompt', 'hello'] if '--serve' not in flags else []

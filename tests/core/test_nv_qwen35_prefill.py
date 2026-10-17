@@ -88,3 +88,20 @@ def test_extending_the_cached_prefix_prefills_only_new_tokens(loaded):
   assert run(model, first, 8) == reply  # leaves prompt + reply as the cached prefix
   assert model.transformer.get_start_pos(extended) > 0
   assert run(model, extended, reuse_cache=True) == run(model, extended, multirow=False)
+
+def test_capturing_the_prompt_graph_later_keeps_the_conversation(loaded):
+  # A server captures the prompt graph in its first idle moment, maybe after a request: the cached prefix,
+  # the conversation's cache rows and the recurrent states must come through unchanged.
+  model, tokenizer = loaded
+  model._prompt_jit.reset()
+  tokens = ids(tokenizer, 'Name three rivers in Europe.')
+  run(model, tokens, 4, reuse_cache=True)
+  cached = list(model.transformer._cached_tokens)
+  def state():
+    rows = len(cached)
+    return [block.cache_kv[:, :, :, :rows].tolist() if hasattr(block, 'cache_kv') else block.recurrent_state.tolist()
+            for block in model.transformer.blk] + [s.tolist() for s in model._recurrent_states()]
+  before = state()
+  assert model.capture_prompt_graph() and model._prompt_jit.captured is not None
+  assert model.transformer._cached_tokens == cached and state() == before
+  assert not model.capture_prompt_graph()  # already captured

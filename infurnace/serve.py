@@ -73,14 +73,21 @@ class RequestHandler(Handler):
     finally: template.request_thinking = None
 
 class Server(LLMServer):
-  def __init__(self, server_address: tuple, model, model_name: str, tok, template):
-    self.model, self.model_name, self.tok, self.template = model, model_name, tok, template
+  def __init__(self, server_address: tuple, model, model_name: str, tok, template, idle=None):
+    self.model, self.model_name, self.tok, self.template, self.idle = model, model_name, tok, template, idle
     TCPServerWithReuse.__init__(self, server_address, RequestHandler)
 
-def serve(model, tokenizer, port=8000, host='127.0.0.1', *, enable_thinking=True, dflash=None, block_size=16):
+  def service_actions(self):
+    # Requests run one at a time on this thread; one-off work given as `idle` runs in its first free moment.
+    if self.idle is not None:
+      work, self.idle = self.idle, None
+      work()
+
+def serve(model, tokenizer, port=8000, host='127.0.0.1', *, enable_thinking=True, dflash=None, block_size=16, idle=None):
   template = ChatTemplate(model.metadata, tokenizer, enable_thinking)
   name = model.metadata.get('general.name') or 'infurnace'
   eos = tuple(i for i in (tokenizer.eos_id, tokenizer.eot_id) if i is not None)
-  with Server((host, port), ServerModel(model, dflash, eos_token_ids=eos, block_size=block_size), name, tokenizer, template) as server:
+  with Server((host, port), ServerModel(model, dflash, eos_token_ids=eos, block_size=block_size), name, tokenizer, template,
+              idle) as server:
     print(f"Serving {name} at http://{host}:{server.server_address[1]}/v1{' with DFlash' if dflash is not None else ''}", flush=True)
     server.serve_forever()

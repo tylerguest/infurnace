@@ -11,7 +11,10 @@ pip install -e '.[server]'
 infurnace --serve 8000 --max-context 32768
 ```
 
-Startup warms up before listening unless `--no-warmup` is supplied.
+Startup warms up before listening unless `--no-warmup` is supplied (~50 s with DFlash on an RTX 5060, loading
+included). The prompt-reading graph is captured in the server's first idle moment after that (~26 s): a
+request arriving meanwhile waits for it, and until then prompts read through DFlash's verifier (~600 tok/s
+instead of ~1,300).
 
 - **DFlash:** generation uses DFlash whenever the chat would: the installed draft
   on an NVIDIA GPU (`NV` or `CUDA`), or `--dflash PATH`. `--no-dflash` serves plain decoding. One DFlash

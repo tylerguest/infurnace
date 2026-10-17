@@ -201,6 +201,7 @@ class DFlashGenerator:
   def _round(self, block: int, anchor: int, count: int, policy: _DraftPolicy):
     """One round after `anchor`: fused, parallel or sequential drafting, or a plain step when `count` is 0."""
     parallel = self.verifier == 'parallel'
+    if parallel: self._parallel_verifier(block)  # before any proposal: it lends the draft its full-block graph
     if parallel and count and self._held is not None:
       verifier = self._parallel_verifier(block)
       if self.fused and verifier.fused_eligible(self.draft) and verifier.fits(self.observer.position + self._held):
@@ -267,12 +268,14 @@ class DFlashGenerator:
     # when nothing was proposed). Never reached past an EOS or the limit.
     return self._step(current)
 
-  def warmup(self, block_size: int | None = None) -> None:
+  def warmup(self, block_size: int | None = None, prompt_graph: bool = True) -> None:
     """Capture the graphs a request uses before the first one: drafting rounds
-    (fused when enabled) and the plain-step fallback. Leaves no request state."""
-    self._capture(block_size)
+    (fused when enabled), the plain-step fallback and, with `prompt_graph`, the model's prompt chunks
+    (~25 s; else model.capture_prompt_graph later, and prompts read through the verifier meanwhile).
+    Leaves no request state."""
+    self._capture(block_size, prompt_graph)
 
-  def _capture(self, block_size: int | None):
+  def _capture(self, block_size: int | None, prompt_graph: bool = True):
     saved = self.min_tau, self.plain_cost
     prompt = [0] * min(16, self.model.config.context_length // 4)
     try:
@@ -280,7 +283,7 @@ class DFlashGenerator:
       # rule decides while no plain step is timed) so plain steps are captured too.
       for min_tau, plain_cost in ((0.0, float('inf')), (float('inf'), None)):
         self.min_tau, self.plain_cost = min_tau, plain_cost
-        self.model._warming = True  # the prompt reads through (and captures) the model's prompt chunks
+        self.model._warming = prompt_graph  # the prompt reads through (and captures) the model's prompt chunks
         for _ in range(2): list(self.stream(list(prompt), max_new_tokens=48, block_size=block_size))
     finally:
       self.model._warming = False
@@ -290,5 +293,7 @@ class DFlashGenerator:
 
   def _parallel_verifier(self, block):
     from infurnace.dflash.parallel import ParallelVerifier
-    if block not in self._parallel: self._parallel[block] = ParallelVerifier(self.observer, block)
+    if block not in self._parallel:
+      verifier = self._parallel[block] = ParallelVerifier(self.observer, block)
+      if self.fused and verifier.fused_eligible(self.draft): self.draft.full_block_graph = lambda: verifier.draft_graph(self.draft)
     return self._parallel[block]

@@ -314,13 +314,15 @@ class Qwen35Model:
     self.tool_marker: int | None = None
     self._snapshots: list[_Snapshot] = []
 
-  def warmup(self) -> None:
-    """Prime upstream prefill/decode JIT using the same chunk size as normal generation."""
+  def warmup(self, prompt_graph: bool = True) -> None:
+    """Prime upstream prefill/decode JIT using the same chunk size as normal generation. Without
+    `prompt_graph`, the prompt-chunk graph is left for capture_prompt_graph (~11 s of the warmup)."""
     if self.config.context_length < 2: return
     # Long enough to capture the multirow prompt graph too (one full chunk and a partial one).
-    prompt = [0] * min(PROMPT_ROWS + 2, self.config.context_length - 1)
+    prompt = [0] * min(PROMPT_ROWS + 2 if prompt_graph else 8, self.config.context_length - 1)
     count = min(4, self.config.context_length - len(prompt))
-    self._warming = True
+    self._warming, multirow = True, self._multirow_prefill
+    if not prompt_graph: self._multirow_prefill = False
     try:
       # First calls execute, second calls capture, third calls verify replay.
       for _ in range(3):
@@ -329,8 +331,27 @@ class Qwen35Model:
           for _ in stream: pass
         finally: stream.close()
     finally:
-      self._warming = False
+      self._warming, self._multirow_prefill = False, multirow
       self.reset()  # No dummy tokens become conversation history or reusable prefix.
+
+  def capture_prompt_graph(self) -> bool:
+    """Capture the prompt-chunk graph outside a request (a server's idle time), leaving the conversation as
+    it was: the chunk is read at the end of the cache, past any prompt, and the recurrent states it advances
+    are put back. True when it captured the graph."""
+    t = self.transformer
+    position = t.max_context - PROMPT_ROWS
+    if not self._multirow_prefill or self._prompt_jit.captured is not None or self._generating or position < 0: return False
+    self.realize_state()
+    with Context(DEV=self.device):
+      states = self._recurrent_states()
+      saved = [state.clone().realize() for state in states]
+      self.upload_prompt([0])
+      self._prompt_jit.cnt = 1  # capture right away (see _multirow_ready)
+      self.read_prompt(position, position + 1)
+      Tensor.realize(*(Tensor(state.uop.after(state.uop.store(copy.uop))) for state, copy in zip(states, saved)))
+    # Cache rows from `position` on now hold the capture's: forget a prefix or snapshot that reaches them.
+    if len(t._cached_tokens) > position or any(len(s.prefix) > position for s in self._snapshots): self.reset()
+    return True
 
   def realize_state(self) -> None:
     """Create upstream's lazily initialized state as real buffers: KV caches, RoPE tables, conv and

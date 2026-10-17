@@ -108,6 +108,9 @@ class DFlashDraft:
     # the draft K/V cache.
     self.observed = self._staged = 0
     self._jits = {}
+    # Full-block proposals can run on the fused round's draft graph instead of capturing their own (~4 s of
+    # warmup): a callable returning (graph, its noise buffer), set by the parallel verifier.
+    self.full_block_graph = None
     with Context(DEV=self.device):
       self.weights = DraftWeights(config)
       expected = get_state_dict(self.weights)
@@ -282,11 +285,12 @@ class DFlashDraft:
   def _denoise_graph(self, count: int):
     """The captured denoise graph for `count` proposals and its persistent noise
     input (one buffer per shape: captured graphs always see the same address)."""
+    if count == self.config.block_size - 1 and self.full_block_graph is not None: return self.full_block_graph()
     if count not in self._jits:
       with Context(DEV=self.device):
         self._noise_inputs[count] = Tensor.empty(1, count + 1, self.config.dim, device=self.device).realize()
       self._jits[count] = captured(self._forward)
-    return self._jits[count]
+    return self._jits[count], self._noise_inputs[count]
 
   def propose(self, anchor: int, position: int, count: int) -> list[int]:
     """Draft `count` tokens after `anchor` at `position`; every target row
@@ -306,8 +310,7 @@ class DFlashDraft:
       # about the same, and each new row count would capture its own graph (seconds) on first use.
       # Only the last positions of the context need a smaller block.
       rows = c.block_size - 1 if position + c.block_size <= self.capacity else count
-      graph = self._denoise_graph(rows)
-      noise = self._noise_inputs[rows]
+      graph, noise = self._denoise_graph(rows)
       embedded = self.target.embed([anchor] + [c.mask_token] * rows)
       Tensor(noise.uop.after(noise.uop.store(embedded.uop))).realize()
       pos = UOp.variable('dflash_position', 1, self.capacity - rows - 1).bind(position)

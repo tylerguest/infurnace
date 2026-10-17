@@ -121,3 +121,12 @@ def test_http_tool_round_trip():
     finally:
       server.shutdown()
       thread.join()
+
+def test_idle_work_runs_once():
+  # The server's first free moment runs the work its warmup left out (the prompt graph), and only once.
+  calls = []
+  server = Server.__new__(Server)
+  server.idle = lambda: calls.append(1)
+  server.service_actions()
+  server.service_actions()
+  assert calls == [1]

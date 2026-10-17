@@ -101,16 +101,21 @@ def generator(model, tokenizer, dflash=None, temperature: float = 0.0) -> Callab
   eos, block = tuple(i for i in (tokenizer.eos_id, tokenizer.eot_id) if i is not None), _dflash_block(dflash)
   return lambda ids, budget: dflash.stream(ids, max_new_tokens=budget, block_size=block, eos_token_ids=eos, temperature=temperature)
 
-def _warm(model, dflash=None) -> None:
+def _warm(model, dflash=None, prompt_graph: bool = True) -> None:
   # DFlash requests never use plain generation's graphs, so it captures its own.
-  if dflash is not None: dflash.warmup(_dflash_block(dflash))
-  else: model.warmup()
+  if dflash is not None: dflash.warmup(_dflash_block(dflash), prompt_graph=prompt_graph)
+  else: model.warmup(prompt_graph=prompt_graph)
 
-def warmup(model, dflash=None) -> None:
+def warmup(model, dflash=None, prompt_graph: bool = True) -> None:
   print(f"Warming up {model.device} (first startup may take a while)...", file=sys.stderr, flush=True)
   start = time.perf_counter()
-  _warm(model, dflash)
+  _warm(model, dflash, prompt_graph)
   print(f"Ready in {time.perf_counter() - start:.1f}s.", file=sys.stderr, flush=True)
+
+def capture_prompt_graph(model) -> None:
+  """The server's first idle moment: the prompt-chunk graph its warmup left out (a request waits for it)."""
+  start = time.perf_counter()
+  if model.capture_prompt_graph(): print(f"Prompt reading graph ready in {time.perf_counter() - start:.1f}s.", file=sys.stderr, flush=True)
 
 class BackgroundWarmup:
   """Warm up on a thread while the user types the first message. tinygrad is not thread-safe, but
@@ -195,9 +200,11 @@ def run(args: argparse.Namespace) -> int:
     return 0
   if args.serve is not None:
     from infurnace.serve import serve
-    if not args.no_warmup: warmup(model, dflash)  # once per server start, before it listens
+    # Once per server start, before it listens; the prompt graph follows in its first idle moment.
+    if not args.no_warmup: warmup(model, dflash, prompt_graph=False)
     block = _dflash_block(dflash) if dflash is not None else 16
-    serve(model, tokenizer, args.serve, args.host, enable_thinking=not args.no_thinking, dflash=dflash, block_size=block)
+    serve(model, tokenizer, args.serve, args.host, enable_thinking=not args.no_thinking, dflash=dflash, block_size=block,
+          idle=None if args.no_warmup else lambda: capture_prompt_graph(model))
     return 0
   window, thinking = min(args.max_context, context), not args.no_thinking
   if args.no_warmup: return chat(generate, tokenizer, window, args.max_tokens, thinking)

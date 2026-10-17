@@ -55,7 +55,8 @@ infurnace --no-dflash                        # plain decoding
 - **Models:** `--model qwen3.5:4b` (default) downloads the target (2.7 GB) and draft (0.4 GB) into
   `~/.local/share/infurnace/models/`. `--model PATH` runs a local Qwen3.5 GGUF. See [Qwen3.5](docs/qwen35.md).
 - **Device:** NVIDIA through tinygrad's `NV` backend (Linux, probed first) or `CUDA`; `--device` or
-  `DEV` overrides. Startup takes about a minute (loading plus capturing GPU graphs: ~45 s plain, ~75 s with DFlash).
+  `DEV` overrides. Startup takes under a minute (loading plus capturing GPU graphs: ~45 s plain, ~65 s with DFlash; the server
+listens after ~50 s and captures its prompt graph in its first idle moment).
 - **Context:** `--max-context` (default 8,192). Memory with DFlash is about 5.2 GB at 8k and
   5.5 GB at 32k, plus whatever your desktop uses.
 - **Thinking:** on by default in chat and serving; `--no-thinking` turns it off. Replies run until
