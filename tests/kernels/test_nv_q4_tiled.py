@@ -84,3 +84,27 @@ def test_q5_tiled_decode_and_prefill(width):
   actual = quant_gemm(x, packed, out_features=rows, in_features=width, ggml_type=13, q4_tiled=True)
   # The tiled kernel rounds d*scale to FP16 before multiplying (as Marlin does).
   assert (actual-expected).abs().max().item() < 1e-3 * expected.abs().max().item()
+
+def q6_data(rows, width):
+  rng = random.Random(83)
+  raw = bytearray(rng.getrandbits(8) for _ in range(rows*width//256*210))
+  for offset in range(0, len(raw), 210): raw[offset+208:offset+210] = struct.pack('<e', 0.001)
+  return bytes(raw)
+
+@pytest.mark.parametrize('typ', [12, 13, 14])
+@pytest.mark.parametrize('tokens', [3, 32, 50, 64])
+def test_tiled_prefill_with_several_chunks_per_warp(typ, tokens):
+  # A warp multiplies up to four 16-row chunks with each dequantized weight block (64-row prompt chunks):
+  # 32 tokens is two chunks, 64 four; 3 and 50 pad to one and four (50 + padding: 64).
+  from infurnace.kernels.quant_gemv import prepare_q6
+  rows, width = 64, 2560
+  raw = Tensor({12: data, 13: q5_data, 14: q6_data}[typ](rows, width), dtype=dtypes.uint8, device='NV').realize()
+  native = raw.bitcast(dtypes.uint16 if typ == 14 else dtypes.uint32).flatten().realize()
+  if typ == 14: packed, options = prepare_q6(raw, in_features=width, tiled=True), dict(q6_aligned=True, q6_tiled=True)
+  else: packed, options = prepare_q4(raw, in_features=width, ggml_type=typ), dict(q4_tiled=True)
+  x = Tensor.randn(tokens, width, device='NV').realize()
+  expected = quant_gemm(x, native, out_features=rows, in_features=width, ggml_type=typ)
+  actual = quant_gemm(x, packed, out_features=rows, in_features=width, ggml_type=typ, **options)
+  assert actual.shape == (tokens, rows)
+  # The tiled kernels round d*scale to FP16 before multiplying (as Marlin does).
+  assert (actual-expected).abs().max().item() < 1e-3 * expected.abs().max().item()

@@ -189,9 +189,39 @@ def fragment_activations(x: Tensor, width: int, typ: int = Q4_K) -> Tensor:
   out = Tensor.empty(chunks, width//16, 32, 8, dtype=dtypes.float16, device=x.device)
   return Tensor.custom_kernel(out, x.float().contiguous(), fxn=functools.partial(_fragment_kernel, chunks=chunks, width=width, typ=typ))[0]
 
+def _activation_fragments(x: UOp, chunk: UOp, lane: UOp, first_block: UOp, kb: UOp, blocks: int, mtiles: int, fragments,
+                          slot: int, values: list[UOp]):
+  """A fragments for the k steps of block kb: (fragment(m, step), updates(values)). One chunk: the block's 16
+  fragments are loaded a block ahead into registers. More chunks would need too many registers for that, so
+  each fragment is one 16-byte load at its step (the block's warps read the same ones, from L1)."""
+  if mtiles == 1:
+    xstaged = UOp.placeholder((128,), dtypes.float16, slot=slot, addrspace=AddrSpace.REG)
+    xstaged = xstaged.after(UOp.group(*(xstaged[i].store(v) for i, v in enumerate(fragments(first_block)))))
+    xcurrent = [xstaged.after(kb)[i].load() for i in range(128)]
+    xupcoming = fragments(first_block+(kb+1).minimum(blocks-1))
+    def updates(done: list[UOp]) -> list[UOp]:
+      xafter = xstaged.after(*done)
+      return [xafter[i].store(v) for i, v in enumerate(xupcoming)]
+    return (lambda m, step: UOp.stack(*xcurrent[step*8:(step+1)*8])), updates
+  def fragment(m: int, step: int) -> UOp:
+    loaded = _load_lanes(x[chunk+m, (first_block+kb)*16+step, lane, 0], 8)
+    return UOp.stack(*(loaded[i] for i in range(8)))
+  return fragment, lambda done: []
+
+def _finish_block(accs, values, staged, upcoming, xupdates, kb) -> UOp:
+  updates = [acc.store(value) for acc, value in zip(accs, values)]
+  after = staged.after(*values)  # overwrite the staged words only after this iteration's MMAs have read them
+  updates += [after[i].store(v) for i, v in enumerate(upcoming)]
+  return UOp.group(*updates, *xupdates).end(kb)
+
+def _store_tiles(out, accs, done, split, chunk, group, thread, output_base, tiles, mtiles, block, warp, lane, name) -> UOp:
+  stores = [out[split, (chunk+m)*16+group+row, output_base+t*8+thread*2+col].store(accs[t*mtiles+m].after(done)[i].load())
+            for t in range(tiles) for m in range(mtiles) for i, (row, col) in enumerate(((0, 0), (0, 1), (8, 0), (8, 1)))]
+  return UOp.group(*stores).end(block, warp, lane).sink(arg=KernelInfo(name=name, opts_to_apply=()))
+
 @functools.cache
 def _prefill_q4_mma(out: UOp, raw: UOp, x: UOp, *, tokens: int, width: int, rows: int, tiles: int = 2, warps: int = 4,
-                    splits: int = 1, typ: int = Q4_K) -> UOp:
+                    splits: int = 1, typ: int = Q4_K, mtiles: int = 1) -> UOp:
   """Tiled Q4_K (prepare_q4) x 16-row chunks on FP16 tensor cores, after Marlin:
   - B fragments are dequantized straight into fragment registers: per 32-bit word, two bit operations and two
     packed FP16 operations per register, with no repacking;
@@ -199,22 +229,25 @@ def _prefill_q4_mma(out: UOp, raw: UOp, x: UOp, *, tokens: int, width: int, rows
   - a warp's 16 rows of one block are one contiguous 2,304-byte run of the tiled layout;
   - the next block's weights and activations are loaded while the current block's MMAs run.
   Q5_K works the same way, with the lane's two qh words (the same for every subgroup pair) adding fifth bits.
+  A warp covers `mtiles` 16-row chunks: each dequantized B fragment feeds that many MMAs, so the weights are read
+  once per 16*mtiles rows (with more than one chunk, A fragments load at their k step instead of a block ahead).
   Split K writes partial sums to out[split]."""
   q5 = typ == Q5_K
   output_blocks = rows//(warps*8*tiles)
   blocks_per_row = width//256
   blocks = blocks_per_row//splits
-  block = UOp.range((tokens//16)*output_blocks*splits, 0, axis_type=AxisType.GLOBAL)
+  block = UOp.range((tokens//(16*mtiles))*output_blocks*splits, 0, axis_type=AxisType.GLOBAL)
   lane = UOp.range(32, -1, axis_type=AxisType.WARP)
   warp = UOp.range(warps, 1, axis_type=AxisType.LOCAL)
   split, rest = block%splits, block//splits
-  chunk = rest//output_blocks
+  chunk = (rest//output_blocks)*mtiles
   output_base = (rest%output_blocks)*warps*8*tiles+warp*8*tiles
   group, thread = lane//4, lane%4
-  accs = []
-  for t in range(tiles):
-    acc = UOp.placeholder((4,), dtypes.float32, slot=3+t, addrspace=AddrSpace.REG)
+  accs = []  # tile t, chunk m at t*mtiles + m
+  for i in range(tiles*mtiles):
+    acc = UOp.placeholder((4,), dtypes.float32, slot=3+i, addrspace=AddrSpace.REG)
     accs.append(acc.after(acc.store(acc.const_like(0))))
+  first = 3+tiles*mtiles  # the next free register slot
   # Per row: four header/scale words, Q5_K's two qh words, then two words for each of four subgroup pairs.
   extra = 2 if q5 else 0
   per_tile = 12+extra
@@ -234,7 +267,7 @@ def _prefill_q4_mma(out: UOp, raw: UOp, x: UOp, *, tokens: int, width: int, rows
     return loaded
 
   kb = UOp.range(blocks, 2, axis_type=getattr(AxisType, 'REDUCE', AxisType.LOOP))
-  staged = UOp.placeholder((tiles*per_tile,), dtypes.uint32, slot=3+tiles, addrspace=AddrSpace.REG)
+  staged = UOp.placeholder((tiles*per_tile,), dtypes.uint32, slot=first, addrspace=AddrSpace.REG)
   staged = staged.after(UOp.group(*(staged[i].store(v) for i, v in enumerate(fetch(split*blocks)))))
   current = [staged.after(kb)[i].load() for i in range(tiles*per_tile)]
   upcoming = fetch(split*blocks+(kb+1).minimum(blocks-1))
@@ -246,11 +279,8 @@ def _prefill_q4_mma(out: UOp, raw: UOp, x: UOp, *, tokens: int, width: int, rows
       loaded += [fragment[i] for i in range(8)]
     return loaded
 
-  xstaged = UOp.placeholder((128,), dtypes.float16, slot=4+tiles, addrspace=AddrSpace.REG)
-  xstaged = xstaged.after(UOp.group(*(xstaged[i].store(v) for i, v in enumerate(fragments(split*blocks)))))
-  xcurrent = [xstaged.after(kb)[i].load() for i in range(128)]
-  xupcoming = fragments(split*blocks+(kb+1).minimum(blocks-1))
   values = [acc.after(kb) for acc in accs]
+  a_fragment, xupdates = _activation_fragments(x, chunk, lane, split*blocks, kb, blocks, mtiles, fragments, first+1, values)
   for pair in range(4):
     factors = []
     for t in range(tiles):
@@ -259,22 +289,16 @@ def _prefill_q4_mma(out: UOp, raw: UOp, x: UOp, *, tokens: int, width: int, rows
       sixteenth = UOp.const(0x2c002c00, dtypes.uint32)  # a Q4_K high nibble lands as 16q; dividing by 16 is exact
       factors.append(((scale0, min0), (scale1 if q5 else _h2("__hmul2", scale1, sixteenth), min1)))
     for step in range(4):
-      a = UOp.stack(*xcurrent[(pair*4+step)*8:(pair*4+step+1)*8])
+      a = [a_fragment(m, pair*4+step) for m in range(mtiles)]
       for t in range(tiles):
         scale, offset = factors[t][step//2]
         word = current[t*per_tile+4+extra+2*pair+step%2]
         high = current[t*per_tile+4+step%2] if q5 else None
         frag = _q4_fragment(word, step//2, scale, offset, high, 2*pair+step//2)
-        values[t] = UOp.wmma(a, frag, values[t], (8, 16, 16), 32)
-  updates = [acc.store(value) for acc, value in zip(accs, values)]
-  after = staged.after(*values)  # overwrite the staged words only after this iteration's MMAs have read them
-  updates += [after[i].store(v) for i, v in enumerate(upcoming)]
-  xafter = xstaged.after(*values)
-  updates += [xafter[i].store(v) for i, v in enumerate(xupcoming)]
-  done = UOp.group(*updates).end(kb)
-  stores = [out[split, chunk*16+group+row, output_base+t*8+thread*2+col].store(acc.after(done)[i].load())
-            for t, acc in enumerate(accs) for i, (row, col) in enumerate(((0, 0), (0, 1), (8, 0), (8, 1)))]
-  return UOp.group(*stores).end(block, warp, lane).sink(arg=KernelInfo(name=f"prefill_q{5 if q5 else 4}_k_mma", opts_to_apply=()))
+        for m in range(mtiles): values[t*mtiles+m] = UOp.wmma(a[m], frag, values[t*mtiles+m], (8, 16, 16), 32)
+  done = _finish_block(accs, values, staged, upcoming, xupdates(values), kb)
+  return _store_tiles(out, accs, done, split, chunk, group, thread, output_base, tiles, mtiles, block, warp, lane,
+                      f"prefill_q{5 if q5 else 4}_k_mma")
 
 def q6_block_base(row: UOp, block: UOp, width: int) -> UOp:
   """Word offset of (row, block) in the tiled Q6_K layout (prepare_q6_tiled): 54-word blocks, each 16-row tile
@@ -299,27 +323,29 @@ def _q6_fragment(ql: UOp, qh: UOp, nibble: int, qh_shift: UOp, scale: UOp) -> UO
 
 @functools.cache
 def _prefill_q6_mma(out: UOp, raw: UOp, x: UOp, *, tokens: int, width: int, rows: int, tiles: int = 2, warps: int = 4,
-                    splits: int = 1) -> UOp:
+                    splits: int = 1, mtiles: int = 1) -> UOp:
   """Tiled Q6_K (prepare_q6_tiled) x 16-row chunks on FP16 tensor cores, the Q6_K counterpart of _prefill_q4_mma.
 
   In half h of a block, lane t owns ql bytes 16t..16t+15 (low nibbles: values 128h + 16t + j, scale group 8h + t;
   high nibbles: values 128h + 64 + 16t + j, group 8h + 4 + t) and qh bytes 16t..16t+15 mod 32 of the half's 32,
   whose 2-bit fields sit at shift 2*(t//2), plus 4 for the high-nibble values. Step (h, nibble, word) feeds the
-  lane's word `word` of that run; each lane applies its own group's scale before the MMA."""
+  lane's word `word` of that run; each lane applies its own group's scale before the MMA. `mtiles` as in
+  _prefill_q4_mma."""
   output_blocks = rows//(warps*8*tiles)
   blocks_per_row = width//256
   blocks = blocks_per_row//splits
-  block = UOp.range((tokens//16)*output_blocks*splits, 0, axis_type=AxisType.GLOBAL)
+  block = UOp.range((tokens//(16*mtiles))*output_blocks*splits, 0, axis_type=AxisType.GLOBAL)
   lane = UOp.range(32, -1, axis_type=AxisType.WARP)
   warp = UOp.range(warps, 1, axis_type=AxisType.LOCAL)
   split, rest = block%splits, block//splits
-  chunk = rest//output_blocks
+  chunk = (rest//output_blocks)*mtiles
   output_base = (rest%output_blocks)*warps*8*tiles+warp*8*tiles
   group, thread = lane//4, lane%4
-  accs = []
-  for t in range(tiles):
-    acc = UOp.placeholder((4,), dtypes.float32, slot=3+t, addrspace=AddrSpace.REG)
+  accs = []  # tile t, chunk m at t*mtiles + m
+  for i in range(tiles*mtiles):
+    acc = UOp.placeholder((4,), dtypes.float32, slot=3+i, addrspace=AddrSpace.REG)
     accs.append(acc.after(acc.store(acc.const_like(0))))
+  first = 3+tiles*mtiles  # the next free register slot
   per_tile = 21  # ql: 4 words per half; qh: 4 words per half; the 4 scale words; d
 
   def fetch(column_block) -> list[UOp]:
@@ -345,15 +371,12 @@ def _prefill_q6_mma(out: UOp, raw: UOp, x: UOp, *, tokens: int, width: int, rows
     return loaded
 
   kb = UOp.range(blocks, 2, axis_type=getattr(AxisType, 'REDUCE', AxisType.LOOP))
-  staged = UOp.placeholder((tiles*per_tile,), dtypes.uint32, slot=3+tiles, addrspace=AddrSpace.REG)
+  staged = UOp.placeholder((tiles*per_tile,), dtypes.uint32, slot=first, addrspace=AddrSpace.REG)
   staged = staged.after(UOp.group(*(staged[i].store(v) for i, v in enumerate(fetch(split*blocks)))))
   current = [staged.after(kb)[i].load() for i in range(tiles*per_tile)]
   upcoming = fetch(split*blocks+(kb+1).minimum(blocks-1))
-  xstaged = UOp.placeholder((128,), dtypes.float16, slot=4+tiles, addrspace=AddrSpace.REG)
-  xstaged = xstaged.after(UOp.group(*(xstaged[i].store(v) for i, v in enumerate(fragments(split*blocks)))))
-  xcurrent = [xstaged.after(kb)[i].load() for i in range(128)]
-  xupcoming = fragments(split*blocks+(kb+1).minimum(blocks-1))
   values = [acc.after(kb) for acc in accs]
+  a_fragment, xupdates = _activation_fragments(x, chunk, lane, split*blocks, kb, blocks, mtiles, fragments, first+1, values)
   shift = (thread//2)*2
   for h in range(2):
     factors = []
@@ -368,20 +391,13 @@ def _prefill_q6_mma(out: UOp, raw: UOp, x: UOp, *, tokens: int, width: int, rows
       factors.append((low, high))
     for nibble in range(2):
       for word in range(4):
-        a = UOp.stack(*xcurrent[(h*8+nibble*4+word)*8:(h*8+nibble*4+word+1)*8])
+        a = [a_fragment(m, h*8+nibble*4+word) for m in range(mtiles)]
         for t in range(tiles):
           words = current[t*per_tile:(t+1)*per_tile]
           frag = _q6_fragment(words[4*h+word], words[8+4*h+word], nibble, shift+4*nibble, factors[t][nibble])
-          values[t] = UOp.wmma(a, frag, values[t], (8, 16, 16), 32)
-  updates = [acc.store(value) for acc, value in zip(accs, values)]
-  after = staged.after(*values)  # overwrite the staged words only after this iteration's MMAs have read them
-  updates += [after[i].store(v) for i, v in enumerate(upcoming)]
-  xafter = xstaged.after(*values)
-  updates += [xafter[i].store(v) for i, v in enumerate(xupcoming)]
-  done = UOp.group(*updates).end(kb)
-  stores = [out[split, chunk*16+group+row, output_base+t*8+thread*2+col].store(acc.after(done)[i].load())
-            for t, acc in enumerate(accs) for i, (row, col) in enumerate(((0, 0), (0, 1), (8, 0), (8, 1)))]
-  return UOp.group(*stores).end(block, warp, lane).sink(arg=KernelInfo(name="prefill_q6_k_mma", opts_to_apply=()))
+          for m in range(mtiles): values[t*mtiles+m] = UOp.wmma(a[m], frag, values[t*mtiles+m], (8, 16, 16), 32)
+  done = _finish_block(accs, values, staged, upcoming, xupdates(values), kb)
+  return _store_tiles(out, accs, done, split, chunk, group, thread, output_base, tiles, mtiles, block, warp, lane, "prefill_q6_k_mma")
 
 @functools.cache
 def _prefill_q6_paired(out: UOp, raw: UOp, x: UOp, *, tokens: int, width: int, rows: int,
@@ -533,15 +549,19 @@ def quant_gemm(x: Tensor, packed: Tensor, *, out_features: int, in_features: int
   if q4_tiled or q6_tiled:
     tiles, warps = 2, math.gcd(out_features//16, 4)
     blocks, output_blocks = in_features//256, out_features//(warps*8*tiles)
+    # Two 16-row chunks a warp where they divide: at 64 rows the MMAs (FP32 accumulation) bound the kernel rather
+    # than weight reads, and two beat one and four by ~5-25% (RTX 5060, 2,560-9,728-wide projections).
+    mtiles = next(m for m in (2, 1) if (padded_tokens//16) % m == 0)
     # Split K only for narrow outputs: about two blocks per SM on a 30-SM card
-    splits = next(s for s in range(1, blocks+1) if blocks % s == 0 and ((padded_tokens//16)*output_blocks*s >= 60 or s == blocks))
+    splits = next(s for s in range(1, blocks+1)
+                  if blocks % s == 0 and ((padded_tokens//(16*mtiles))*output_blocks*s >= 60 or s == blocks))
     out = Tensor.empty(splits, padded_tokens, out_features, dtype=dtypes.float32, device=x.device)
     # Q5_K reads its k order like Q4_K
     fragments = fragment_activations(x.reshape(tokens, in_features).pad(((0, padded_tokens-tokens), (0, 0))), in_features,
                                      Q6_K if ggml_type == Q6_K else Q4_K)
     kernel = _prefill_q6_mma if ggml_type == Q6_K else functools.partial(_prefill_q4_mma, typ=ggml_type)
     result = Tensor.custom_kernel(out, packed.flatten().contiguous(), fragments, fxn=functools.partial(
-      kernel, tokens=padded_tokens, width=in_features, rows=out_features, tiles=tiles, warps=warps, splits=splits))[0]
+      kernel, tokens=padded_tokens, width=in_features, rows=out_features, tiles=tiles, warps=warps, splits=splits, mtiles=mtiles))[0]
     result = result[0] if splits == 1 else result.sum(0)
     return result[:tokens].reshape(*x.shape[:-1], out_features)
   if paired and ggml_type == Q6_K and q6_aligned:
