@@ -124,3 +124,15 @@ def test_gdn_prefill_matches_sequential_scan_and_advances_state(rows):
       z = gdn_prefill(q, k, v, beta, log_alpha.cumsum(-1), S0, gate, weight, Tensor([keep]), eps).realize()
       assert ((z[:rows].float() - z_ref).abs().max() / z_ref.abs().max()).item() < 2e-3
       assert ((S0 - S_ref).abs().max() / S_ref.abs().max()).item() < 1e-4   # advanced in place, padding ignored
+
+@pytest.mark.parametrize('rows', [16, 64])
+def test_gdn_gates_match_fp32_projection(rows):
+  from infurnace.kernels.gdn import gdn_gates
+  with Context(DEV='NV'):
+    Tensor.manual_seed(11)
+    x = (Tensor.randn(rows, 2560) * 0.5).half().realize()
+    weight = (Tensor.randn(64, 2560) * 0.02).half().realize()   # β and α stacked: 2 x 32 heads
+    got = gdn_gates(x, weight).float()
+    reference = (x.float() @ weight.float().T).half().float()   # FP16 out, like upstream's FP16 Linear
+    assert got.shape == (rows, 64)
+    assert ((got - reference).abs().max() / reference.abs().max()).item() < 2e-3

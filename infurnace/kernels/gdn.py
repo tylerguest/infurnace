@@ -19,7 +19,7 @@ from tinygrad import Tensor, UOp, dtypes
 from tinygrad.dtype import AddrSpace
 from tinygrad.uop.ops import AxisType, KernelInfo
 
-from infurnace.kernels.quant_gemv import warp_reduce
+from infurnace.kernels.quant_gemv import _load_lanes, warp_reduce
 
 def _silu(x: UOp) -> UOp:
   return x / (UOp.const(1.0, dtypes.float32) + (-x).exp())
@@ -111,6 +111,36 @@ def gdn_chunk(q: Tensor, k: Tensor, v: Tensor, beta: Tensor, g: Tensor, state: T
                                                                          keep.float().contiguous()]
   z, u = Tensor.custom_kernel(z, u, *inputs, fxn=functools.partial(_gdn_chunk_kernel, heads=heads, rows=rows, eps=eps))[:2]
   return z, u
+
+@functools.cache
+def _gates_kernel(out: UOp, x: UOp, w: UOp, *, rows: int, outs: int, width: int) -> UOp:
+  # One warp per (row, output): lanes take 8 consecutive inputs a step (16-byte loads), FP32 sums, one shuffle reduction.
+  warps = 4
+  item = UOp.range(rows*outs//warps, 0, axis_type=AxisType.GLOBAL)
+  warp = UOp.range(warps, 1, axis_type=AxisType.LOCAL)
+  lane = UOp.range(32, -1, axis_type=AxisType.WARP)
+  index = item*warps + warp
+  row, o = index // outs, index % outs
+  total = None
+  for step in range(width // 256):
+    xs, ws = _load_lanes(x[row, step*256 + lane*8], 8), _load_lanes(w[o, step*256 + lane*8], 8)
+    for i in range(8):
+      term = xs[i].float() * ws[i].float()
+      total = term if total is None else total + term
+  total = warp_reduce(total, full_wave=True)
+  return out[row, o.valid(lane.eq(0))].store(total.cast(dtypes.float16)).end(item, warp, lane).sink(
+    arg=KernelInfo(name=f"gdn_gates_{outs}", opts_to_apply=()))
+
+def gdn_gates(x: Tensor, weight: Tensor) -> Tensor:
+  """x (rows, width) @ weight (outs, width)ᵀ for the GDN β and α projections (width → 2 × heads, both weights
+  stacked), FP16 out like upstream's FP16 Linear. tinygrad's generic matmul spends ~90 us a call on these
+  (2,560 → 32, 64 rows; RTX 5060); one warp per output takes a few."""
+  rows, width = x.shape
+  outs = weight.shape[0]
+  if width % 256 or outs % 4: raise ValueError("gdn_gates needs a width multiple of 256 and outputs a multiple of 4")
+  out = Tensor.empty(rows, outs, dtype=dtypes.float16, device=x.device)
+  return Tensor.custom_kernel(out, x.half().contiguous(), weight.half().contiguous(),
+                              fxn=functools.partial(_gates_kernel, rows=rows, outs=outs, width=width))[0]
 
 def gdn_prefill(q: Tensor, k: Tensor, v: Tensor, beta: Tensor, g: Tensor, state: Tensor, gate: Tensor,
                 weight: Tensor, keep: Tensor, eps: float) -> Tensor:

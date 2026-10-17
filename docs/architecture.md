@@ -37,7 +37,7 @@ All are tinygrad UOp kernels that render as CUDA C.
 |---|---|
 | `quant_gemv` | One-row projections: Q4_K/Q5_K/Q6_K weights against Q8 activations (`dp4a`). Projections that share an input share one quantization. |
 | `quant_gemm` | 16-row projections on FP16 tensor cores (`mma.sync m16n8k16`, FP32 accumulation). Following Marlin: weights dequantize straight into fragment registers (packed `half2` math through inline CUDA, no repacking), activations are pre-permuted so each A fragment is one 16-byte load, and the next block is prefetched during the current MMAs. One kernel serves Q4_K and Q5_K (whose fifth bits join under the same FP16 trick), another Q6_K. For prompt chunks a warp multiplies two 16-row chunks with each dequantized weight block. |
-| `gdn` | Recurrent (gated delta net) layers: `gdn_decode` for one row, `gdn_prefill` for prompt chunks (16 rows per call), `gdn_chunk` for DFlash verification |
+| `gdn` | Recurrent (gated delta net) layers: `gdn_decode` for one row, `gdn_prefill` for prompt chunks (16 rows per call), `gdn_chunk` for DFlash verification, `gdn_gates` for the β and α projections of multirow chunks |
 | `attention` | Attention over the active length only: split-KV partials and a merge (after vLLM's unified attention and llama.cpp's combine step). Grouped query heads, causal/non-causal, sliding windows, ring caches. One-row decode has its own flash-decoding partial kernel (vector loads per lane, softmax in registers); multirow attention runs on FP16 tensor cores (FlashAttention-2 layout on `mma.sync`). |
 | `sampling` | Fused Gumbel-max sampling over all rows (greedy at temperature 0) |
 | `embedding` | Token embedding gathered straight from packed weights |

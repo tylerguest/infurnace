@@ -23,7 +23,7 @@ from tinygrad.llm.model import GatedDeltaNetBlock, Transformer, TransformerBlock
 from tinygrad.nn.state import get_state_dict
 from infurnace.gguf import parse_gguf, read_gguf_metadata
 from infurnace.kernels.attention import attention
-from infurnace.kernels.gdn import gdn_decode, gdn_prefill
+from infurnace.kernels.gdn import gdn_gates, gdn_decode, gdn_prefill
 from infurnace.kernels.quant_gemm import nv_prefill_supported
 from infurnace.kernels.quant_gemv import q8_quantize
 from infurnace.models.linear import _NVLinear
@@ -155,6 +155,8 @@ def _fused_gdn(block: GatedDeltaNetBlock):
   closed-form kernels for the scan, 16 rows each, instead of its row-by-row loop. Other shapes use upstream's path."""
   upstream_attention = block._attention
   H, K, V = block.num_v_heads, block.head_k_dim, block.head_v_dim
+  # β and α projections stacked for one gdn_gates launch (prompt chunks, and DFlash's verifier reads it from the block)
+  gates = block.gdn_gates = block.ssm_beta.weight.cat(block.ssm_alpha.weight).contiguous().realize()
   def prefill(x: Tensor, start_pos: UOp) -> Tensor:
     # Upstream's input processing, verbatim for the non-KDA case; only the scan below differs.
     B, T, _ = x.shape
@@ -162,8 +164,12 @@ def _fused_gdn(block: GatedDeltaNetBlock):
     initial = Tensor(start_pos).eq(0)
     x = x.half()
     out_gate = block.attn_gate(x).reshape(B, T, H, V)
-    beta = block.ssm_beta(x).sigmoid().reshape(B, T, H)
-    log_alpha = (block.ssm_alpha(x).float() + block.ssm_dt['bias']).softplus().reshape(B, T, H, -1) * block.ssm_a.reshape(H, -1)
+    if isinstance(T, int):
+      projected = gdn_gates(x.reshape(B * T, -1), gates).reshape(B, T, 2 * H)
+      beta_in, alpha_in = projected[..., :H], projected[..., H:]
+    else: beta_in, alpha_in = block.ssm_beta(x), block.ssm_alpha(x)
+    beta = beta_in.sigmoid().reshape(B, T, H)
+    log_alpha = (alpha_in.float() + block.ssm_dt['bias']).softplus().reshape(B, T, H, -1) * block.ssm_a.reshape(H, -1)
     conv_state = initial.where(0, block.conv_state)
     conv_window = conv_state.cat(block.attn_qkv(x).cast(conv_state.dtype), dim=1)
     conv_window = conv_window.pad_to((B, block.ssm_conv_kernel - 1 + T_pad, block.conv_channels)).contiguous()

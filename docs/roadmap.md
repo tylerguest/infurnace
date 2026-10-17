@@ -13,25 +13,25 @@ Measured on an RTX 5060 8 GB (30 SMs, 448 GB/s), Qwen3.5-4B Q4_K_M, October 2026
 | | |
 |---|---|
 | Plain decode | 103–110 tok/s up to 8k tokens of context; 95 tok/s at 16k |
-| DFlash decode | ~340 tok/s on code (7.7 tokens per 23 ms round); 140–230 tok/s summarizing docs; ~158 tok/s at 16k; 1.6–2.0× plain at temperature 0.6 |
-| Prompt reading | 64 rows at a time: 1,500–1,850 tok/s plain, 1,100–1,350 with DFlash, from 1k to 16k tokens (0.7 s to first token at 1k, ~9 s at 16k) |
+| DFlash decode | ~340 tok/s on code; 160–270 tok/s summarizing docs; ~184 tok/s at 16k; 1.6–2.0× plain at temperature 0.6 |
+| Prompt reading | 64 rows at a time: 1,600–2,050 tok/s plain, 1,330–1,580 with DFlash, from 1k to 16k tokens (0.6 s to first token at 1k, 8.3 s at 16k) |
 
 Prompt-length sweep (`benchmarks/sweep.py`: a chat message holding `eval.txt` cut to length, then "Summarize
 the text above", 128 tokens out, after warmup):
 
 | Prompt tokens | TTFT | Prompt tok/s | Plain decode tok/s | DFlash decode tok/s |
 |---|---|---|---|---|
-| 25 | 0.21 s | – | 105.6 | 144.3 |
-| 124 | 0.24 s | 512 | 105.9 | 232.5 |
-| 524 | 0.49 s | 1,079 | 105.1 | 146.2 |
-| 1,024 | 0.74 s | 1,390 | 105.2 | 165.8 |
-| 2,024 | 1.3 s | 1,566 | 104.5 | 169.2 |
-| 4,024 | 2.4 s | 1,683 | 103.8 | 181.8 |
-| 8,024 | 4.8 s | 1,678 | 98.0 | 157.8 |
-| 16,024 | 10.0 s | 1,603 | 90.4 | 161.0 |
+| 25 | 0.20 s | – | 111.6 | 160.7 |
+| 124 | 0.22 s | 561 | 111.8 | 267.0 |
+| 524 | 0.42 s | 1,263 | 109.2 | 164.2 |
+| 1,024 | 0.63 s | 1,631 | 101.0 | 182.6 |
+| 2,024 | 1.1 s | 1,876 | 105.6 | 190.8 |
+| 4,024 | 2.0 s | 2,041 | 108.1 | 197.7 |
+| 8,024 | 3.9 s | 2,051 | 103.0 | 189.6 |
+| 16,024 | 8.3 s | 1,934 | 92.9 | 183.8 |
 
-TTFT and prompt rate are plain decoding's; with DFlash the prompt reads at 1,126 (1k), 1,336 (4k) and 1,294
-(16k) tok/s, 12.4 s to first token at 16k.
+TTFT and prompt rate are plain decoding's; with DFlash the prompt reads at 1,330 (1k), 1,574 (4k) and 1,561
+(16k) tok/s, 10.3 s to first token at 16k.
 
 Run-to-run noise is about ±5 tok/s (other apps drawing on the GPU cost up to 10%); DFlash depends on what it
 generates.
@@ -125,8 +125,8 @@ A DFlash round was 23 ms: the 16-row target verify 15.8 ms (its matmuls 11 ms, n
 - [x] **DFlash at long context** (done; see Done): 102 → 158 tok/s at 16k.
 - [ ] **Prompt chunk, after multi-chunk matmuls** (64 rows, ~32 ms of GPU work, RTX 5060): matmuls 14.7 ms, now
   bound by FP16 MMAs with FP32 accumulation (~32 TFLOPS) rather than weight reads; four 16-row GDN scans a layer
-  8.0 ms; the GDN β and α projections (2,560 → 32 each) 4.4 ms on tinygrad's generic matmul (~91 µs a call: a
-  dedicated kernel for both should take a few µs); attention 1.0 ms; the rest ~4 ms, plus ~5 ms of replay.
+  8.0 ms; attention 1.0 ms; the GDN β and α projections 0.3 ms (`gdn_gates`, was 4.4 ms); the rest ~4 ms, plus
+  ~5 ms of replay. Next: one 64-row GDN scan instead of four 16-row ones.
 - [ ] **16-row attention at head dim 256** (the target verify and prompt reading): 393 µs a layer at 16k keys,
   ~2.5× the time to read its cache. The output fragments take 128 registers a lane (254 in all: 8 warps an
   SM), so loads aren't overlapped. Tried: 64–512-key segments (256 is best); values staged in shared memory
@@ -211,6 +211,10 @@ More in [benchmarks](../benchmarks/README.md). Rules that have caught mistakes b
 
 ## Done
 
+- 2026-10-17: `gdn_gates`: the GDN β and α projections (2,560 → 32 each) in one launch, one warp per output, for
+  prompt chunks and DFlash's verifier, instead of tinygrad's generic matmul (~91 µs a call). Plain prompt reading
+  1,734 → 1,958 tok/s (2k prompt); DFlash decode +9-15% (1k: 166 → 183 tok/s; 16k: 161 → 184), its prompt reading
+  +16-18%. Perplexity unchanged (16-row 16.9860, verifier 16.9856).
 - 2026-10-17: prompt-chunk matmuls take two 16-row chunks a warp (`mtiles`): each dequantized weight block feeds
   two MMAs. Prompt reading +8-10% (1k: 1,390 → 1,521 tok/s; 4k: 1,683 → 1,829). At 64 rows the kernels turned out
   bound by the MMAs, not weight reads: one, two and four chunks a warp are within ~5-25% of each other.

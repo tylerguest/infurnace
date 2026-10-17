@@ -25,7 +25,7 @@ from tinygrad.llm.model import GatedDeltaNetBlock, apply_rope
 from infurnace.dflash.jit import captured
 from infurnace.dflash.target import TargetObserver, detach_rng
 from infurnace.kernels.attention import attention
-from infurnace.kernels.gdn import gdn_chunk
+from infurnace.kernels.gdn import gdn_chunk, gdn_gates
 from infurnace.kernels.sampling import Sampler
 from infurnace.kernels.embedding import packed_gather
 from infurnace.device import nvidia
@@ -97,8 +97,12 @@ class ParallelVerifier:
     initial = Tensor(start_pos).eq(0)
     x = x.half()
     out_gate = block.attn_gate(x).reshape(B, T, H, V)
-    beta = block.ssm_beta(x).sigmoid().reshape(B, T, H)
-    log_alpha = (block.ssm_alpha(x).float() + block.ssm_dt['bias']).softplus().reshape(B, T, H, -1) * block.ssm_a.reshape(H, -1)
+    if (gates := getattr(block, 'gdn_gates', None)) is not None:  # both projections in one launch (models/qwen35.py)
+      projected = gdn_gates(x.reshape(B * T, -1), gates).reshape(B, T, 2 * H)
+      beta_in, alpha_in = projected[..., :H], projected[..., H:]
+    else: beta_in, alpha_in = block.ssm_beta(x), block.ssm_alpha(x)
+    beta = beta_in.sigmoid().reshape(B, T, H)
+    log_alpha = (alpha_in.float() + block.ssm_dt['bias']).softplus().reshape(B, T, H, -1) * block.ssm_a.reshape(H, -1)
     conv_state = initial.where(0, _raw(block.conv_state))
     window = conv_state.float().cat(block.attn_qkv(x).float(), dim=1)
     window = _stored(ops.window, window)
