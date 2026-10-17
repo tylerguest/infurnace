@@ -13,8 +13,8 @@ Measured on an RTX 5060 8 GB (30 SMs, 448 GB/s), Qwen3.5-4B Q4_K_M, October 2026
 | | |
 |---|---|
 | Plain decode | 103–110 tok/s up to 8k tokens of context; 95 tok/s at 16k |
-| DFlash decode | ~340 tok/s on code; 160–270 tok/s summarizing docs; ~184 tok/s at 16k; 1.6–2.0× plain at temperature 0.6 |
-| Prompt reading | 64 rows at a time: 1,600–2,050 tok/s plain, 1,330–1,580 with DFlash, from 1k to 16k tokens (0.6 s to first token at 1k, 8.3 s at 16k) |
+| DFlash decode | ~340 tok/s on code; 200–255 tok/s summarizing docs; ~180 tok/s at 16k; 1.6–2.0× plain at temperature 0.6 |
+| Prompt reading | 64 rows at a time: 1,850–2,300 tok/s plain, 1,400–1,750 with DFlash, from 1k to 16k tokens (0.55 s to first token at 1k, 7.4 s at 16k) |
 
 Prompt-length sweep (`benchmarks/sweep.py`: a chat message holding `eval.txt` cut to length, then "Summarize
 the text above", 128 tokens out, after warmup):
@@ -125,8 +125,9 @@ A DFlash round was 23 ms: the 16-row target verify 15.8 ms (its matmuls 11 ms, n
 - [x] **DFlash at long context** (done; see Done): 102 → 158 tok/s at 16k.
 - [ ] **Prompt chunk, after multi-chunk matmuls** (64 rows, ~32 ms of GPU work, RTX 5060): matmuls 14.7 ms, now
   bound by FP16 MMAs with FP32 accumulation (~32 TFLOPS) rather than weight reads; four 16-row GDN scans a layer
-  8.0 ms; attention 1.0 ms; the GDN β and α projections 0.3 ms (`gdn_gates`, was 4.4 ms); the rest ~4 ms, plus
-  ~5 ms of replay. Next: one 64-row GDN scan instead of four 16-row ones.
+  ~4.6 ms (48 µs a call, was 83); attention 1.0 ms; the GDN β and α projections 0.3 ms (`gdn_gates`, was 4.4 ms);
+  the rest ~4 ms, plus ~5 ms of replay. A single 64-row scan would not save much: the state projection and update
+  (the bulk of a scan) happen once per 16 rows either way.
 - [ ] **16-row attention at head dim 256** (the target verify and prompt reading): 393 µs a layer at 16k keys,
   ~2.5× the time to read its cache. The output fragments take 128 registers a lane (254 in all: 8 warps an
   SM), so loads aren't overlapped. Tried: 64–512-key segments (256 is best); values staged in shared memory
@@ -211,6 +212,12 @@ More in [benchmarks](../benchmarks/README.md). Rules that have caught mistakes b
 
 ## Done
 
+- 2026-10-17: the GDN chunk kernel (`gdn_chunk`, `gdn_prefill`) splits a head over 4 blocks of 32 state rows and,
+  inside, 4 warps of 32 key columns (one 128-thread block a head left one warp per scheduler and thousands of
+  dependent steps a thread); S0 staged coalesced, K/Q rows padded against bank conflicts, the state update as a
+  loop of eight rows (unrolled it spilled). 87 → 48 µs a call. RMSNorm and the gate now follow the kernel as
+  tensor ops (a head's values span four blocks). Prompt reading +11-14% (4k: 2,041 → 2,297 tok/s; 16k prompt
+  7.4 s to first token), DFlash decode 1k 183 → 224 tok/s. Perplexity unchanged (16-row 16.9860, verifier 16.9861).
 - 2026-10-17: `gdn_gates`: the GDN β and α projections (2,560 → 32 each) in one launch, one warp per output, for
   prompt chunks and DFlash's verifier, instead of tinygrad's generic matmul (~91 µs a call). Plain prompt reading
   1,734 → 1,958 tok/s (2k prompt); DFlash decode +9-15% (1k: 166 → 183 tok/s; 16k: 161 → 184), its prompt reading

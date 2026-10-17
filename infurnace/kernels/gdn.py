@@ -25,78 +25,95 @@ def _silu(x: UOp) -> UOp:
   return x / (UOp.const(1.0, dtypes.float32) + (-x).exp())
 
 @functools.cache
-def _gdn_chunk_kernel(z: UOp, u: UOp, q: UOp, k: UOp, v: UOp, beta: UOp, g: UOp, state: UOp, gate: UOp,
-                      weight: UOp, keep: UOp, *, heads: int, rows: int, eps: float, advance: bool = False) -> UOp:
-  T, D = rows, 128
-  head = UOp.range(heads, 0, axis_type=AxisType.GLOBAL)
-  warp = UOp.range(4, 1, axis_type=AxisType.LOCAL)
+def _gdn_chunk_kernel(o: UOp, u: UOp, q: UOp, k: UOp, v: UOp, beta: UOp, g: UOp, state: UOp, keep: UOp, *,
+                      heads: int, rows: int, advance: bool = False) -> UOp:
+  """The closed-form chunk for one 16-row block. A head is split over 4 blocks of 32 value rows (S0's rows) and,
+  inside a block, over 4 warps of 32 key columns: with one 128-thread block a head, each thread ran thousands of
+  dependent steps with one warp per scheduler to hide them (~68 us a call; RTX 5060)."""
+  T, D, R, W = rows, 128, 32, 4  # rows, head dim, value rows a block, warps (key-column quarters)
+  assert T == 16, "fused GDN chunk is specialized to 16 rows"
+  F32, zero = dtypes.float32, UOp.const(0.0, dtypes.float32)
+  item = UOp.range(heads*(D//R), 0, axis_type=AxisType.GLOBAL)
+  warp = UOp.range(W, 1, axis_type=AxisType.LOCAL)
   lane = UOp.range(32, -1, axis_type=AxisType.WARP)
+  head, row0 = item // (D//R), (item % (D//R))*R
   col = warp*32+lane
+  row, column0 = row0+lane, warp*32  # this lane's value row (row phases), this warp's key columns
 
-  # Stage this head's K and Q rows (coalesced over the 128 columns).
-  ksh = UOp.placeholder((T, D), dtypes.float32, slot=0, addrspace=AddrSpace.LOCAL)
-  qsh = UOp.placeholder((T, D), dtypes.float32, slot=1, addrspace=AddrSpace.LOCAL)
+  # Stage this head's K and Q rows (coalesced over the 128 columns). Rows padded by one: the Gram loop below reads
+  # 16 rows at one column, which unpadded all fall in one bank (a 16-way conflict, ~16 of 48 us).
+  ksh = UOp.placeholder((T, D+1), F32, slot=0, addrspace=AddrSpace.LOCAL)
+  qsh = UOp.placeholder((T, D+1), F32, slot=1, addrspace=AddrSpace.LOCAL)
   staged = UOp.group(*(ksh[t, col].store(k[head, t, col].load()) for t in range(T)),
                      *(qsh[t, col].store(q[head, t, col].load()) for t in range(T))).barrier()
   ksh, qsh = ksh.after(staged), qsh.after(staged)
 
   # Gram matrices K Kᵀ and Q Kᵀ (T x T): each thread computes two entries of each.
-  pairs = [(col//T, col%T), ((col+128)//T, (col+128)%T)] if T == 16 else None
-  assert pairs is not None, "fused GDN chunk is specialized to 16 rows"
-  gram = UOp.placeholder((4,), dtypes.float32, slot=2, addrspace=AddrSpace.REG)
-  gram = gram.after(UOp.group(*(gram[i].store(UOp.const(0.0, dtypes.float32)) for i in range(4))))
+  pairs = [(col//T, col%T), ((col+128)//T, (col+128)%T)]
+  gram = UOp.placeholder((4,), F32, slot=2, addrspace=AddrSpace.REG)
+  gram = gram.after(UOp.group(*(gram[i].store(zero) for i in range(4))))
   d = UOp.range(D, 2, axis_type=AxisType.LOOP)
   acc = gram.after(d)
   terms = [ksh[pairs[0][0], d].load()*ksh[pairs[0][1], d].load(), ksh[pairs[1][0], d].load()*ksh[pairs[1][1], d].load(),
            qsh[pairs[0][0], d].load()*ksh[pairs[0][1], d].load(), qsh[pairs[1][0], d].load()*ksh[pairs[1][1], d].load()]
   gram = gram.after(UOp.group(*(acc[i].store(acc[i].load()+term) for i, term in enumerate(terms))).end(d))
-  kk = UOp.placeholder((T, T), dtypes.float32, slot=3, addrspace=AddrSpace.LOCAL)
-  qk = UOp.placeholder((T, T), dtypes.float32, slot=4, addrspace=AddrSpace.LOCAL)
+  kk = UOp.placeholder((T, T), F32, slot=3, addrspace=AddrSpace.LOCAL)
+  qk = UOp.placeholder((T, T), F32, slot=4, addrspace=AddrSpace.LOCAL)
   grams = UOp.group(kk[pairs[0]].store(gram[0].load()), kk[pairs[1]].store(gram[1].load()),
                     qk[pairs[0]].store(gram[2].load()), qk[pairs[1]].store(gram[3].load())).barrier()
   kk, qk = kk.after(grams), qk.after(grams)
 
-  # This thread's value row of S0 against every K and Q row.
-  proj = UOp.placeholder((2*T,), dtypes.float32, slot=5, addrspace=AddrSpace.REG)
-  proj = proj.after(UOp.group(*(proj[i].store(UOp.const(0.0, dtypes.float32)) for i in range(2*T))))
-  j = UOp.range(D, 3, axis_type=AxisType.LOOP)
-  s0 = state[head, col, j].load()*keep[0].load()
-  acc = proj.after(j)
-  proj = proj.after(UOp.group(*(acc[t].store(acc[t].load()+ksh[t, j].load()*s0) for t in range(T)),
-                              *(acc[T+t].store(acc[T+t].load()+qsh[t, j].load()*s0) for t in range(T))).end(j))
-  ks, qs = [proj[t].load() for t in range(T)], [proj[T+t].load() for t in range(T)]
+  # S0 rows against every K and Q row, each warp over its 32 key columns. The warp stages its 32 x 32 piece of S0
+  # coalesced (lanes along the columns), then lane r reads row r of it (+1 padding: no bank conflicts).
+  tile = UOp.placeholder((W, 2*T, R+1), F32, slot=5, addrspace=AddrSpace.LOCAL)  # S0 piece, then partial sums
+  piece = tile.after(UOp.group(*(tile[warp, r, lane].store(state[head, row0+r, column0+lane].load()*keep[0].load())
+                                 for r in range(R))).barrier())
+  proj = UOp.placeholder((2*T,), F32, slot=6, addrspace=AddrSpace.REG)
+  proj = proj.after(UOp.group(*(proj[i].store(zero) for i in range(2*T))))
+  j = UOp.range(R, 3, axis_type=AxisType.LOOP)
+  s0, acc = piece[warp, lane, j].load(), proj.after(j)
+  proj = proj.after(UOp.group(*(acc[t].store(acc[t].load()+ksh[t, column0+j].load()*s0) for t in range(T)),
+                              *(acc[T+t].store(acc[T+t].load()+qsh[t, column0+j].load()*s0) for t in range(T))).end(j).barrier())
+  # Sum the four warps' partial sums: the tile now holds them, partial[warp, t, row].
+  partial = tile.after(UOp.group(*(tile.after(proj)[warp, t, lane].store(proj[t].load()) for t in range(2*T))).barrier())
+  sums = [sum((partial[w, t, lane].load() for w in range(1, W)), partial[0, t, lane].load()) for t in range(2*T)]
+  ks, qs = sums[:T], sums[T:]
 
-  # Forward substitution and outputs, entirely in this thread's registers.
+  # Forward substitution and outputs for value row `row`, in registers (every warp computes them; warp 0 stores).
   gs = [g[head, t].load() for t in range(T)]
   bs = [beta[head, t].load() for t in range(T)]
   us, outs = [], []
   for t in range(T):
-    value = bs[t]*(v[head, t, col].load()-gs[t].exp()*ks[t])
+    value = bs[t]*(v[head, t, row].load()-gs[t].exp()*ks[t])
     for s in range(t): value = value-bs[t]*(gs[t]-gs[s]).exp()*kk[t, s].load()*us[s]
     us.append(value)
   for t in range(T):
     value = gs[t].exp()*qs[t]
     for s in range(t+1): value = value+(gs[t]-gs[s]).exp()*qk[t, s].load()*us[s]
     outs.append(value)
-
-  # RMSNorm over the 128 value columns: warp shuffle, then combine four warps.
-  partial = UOp.placeholder((4, T), dtypes.float32, slot=6, addrspace=AddrSpace.LOCAL)
-  reduced = UOp.group(*(partial[warp, t].store(warp_reduce(outs[t]*outs[t], full_wave=True)) for t in range(T))).barrier()
-  partial = partial.after(reduced)
-  stores = []
-  for t in range(T):
-    mean = sum((partial[w, t].load() for w in range(1, 4)), partial[0, t].load())/D
-    scale = (mean+eps).sqrt().reciprocal()*weight[col].load()
-    stores.append(z[t, head, col].store((outs[t]*scale*_silu(gate[t, head, col].load().float())).cast(dtypes.float16)))
-    stores.append(u[head, t, col].store(us[t]))
+  first = warp.eq(0)
+  stores = [o[t, head, row.valid(first)].store(outs[t]) for t in range(T)]
+  stores += [u[head, t, row.valid(first)].store(us[t]) for t in range(T)]
   if advance:
-    # S_T[v, :] = γ_T S0[v, :] + Σ_t (γ_T/γ_t) u_t[v] k_t; this thread read only row v of S0 above.
-    weights = [(gs[T-1]-gs[t]).exp()*us[t] for t in range(T)]
-    i = UOp.range(D, 4, axis_type=AxisType.LOOP)
-    total = sum((weights[t]*ksh[t, i].load() for t in range(T)), gs[T-1].exp()*state[head, col, i].load()*keep[0].load())
-    stores.append(state[head, col, i].store(total).end(i))
+    # S_T[v, :] = γ_T S0[v, :] + Σ_t (γ_T/γ_t) u_t[v] k_t, with lanes along the key columns (coalesced): the block's
+    # rows' weights go through shared memory, each lane keeps its column of K in registers.
+    wsh = UOp.placeholder((T, R), F32, slot=7, addrspace=AddrSpace.LOCAL)
+    wsh = wsh.after(UOp.group(*(wsh[t, lane.valid(first)].store((gs[T-1]-gs[t]).exp()*us[t]) for t in range(T))).barrier())
+    kcol = [ksh[t, col].load() for t in range(T)]
+    decay = gs[T-1].exp()*keep[0].load()
+    # Eight rows an iteration: their loads are in flight together; all 32 unrolled would spill registers.
+    r8 = UOp.range(R//8, 4, axis_type=AxisType.LOOP)
+    rows8 = [r8*8+i for i in range(8)]
+    totals = [sum((wsh[t, r].load()*kcol[t] for t in range(T)), decay*state[head, row0+r, col].load()) for r in rows8]
+    stores.append(UOp.group(*(state[head, row0+r, col].store(total) for r, total in zip(rows8, totals))).end(r8))
   name = "gdn_prefill" if advance else "gdn_chunk"
-  return UOp.group(*stores).end(head, warp, lane).sink(arg=KernelInfo(name=name, opts_to_apply=()))
+  return UOp.group(*stores).end(item, warp, lane).sink(arg=KernelInfo(name=name, opts_to_apply=()))
+
+def _gated_norm(o: Tensor, gate: Tensor, weight: Tensor, eps: float) -> Tensor:
+  """RMSNorm over each head's 128 values, times the SiLU gate: z (T, H, 128) FP16. A separate step since a head's
+  values are spread over four blocks of the chunk kernel."""
+  # contiguous: fused across a prompt chunk's four scans and their concatenation, tinygrad builds an invalid kernel
+  return (o * (o.square().mean(-1, keepdim=True) + eps).rsqrt() * weight.float() * gate.float().silu()).cast(dtypes.float16).contiguous()
 
 def gdn_chunk(q: Tensor, k: Tensor, v: Tensor, beta: Tensor, g: Tensor, state: Tensor, gate: Tensor,
               weight: Tensor, keep: Tensor, eps: float) -> tuple[Tensor, Tensor]:
@@ -105,12 +122,11 @@ def gdn_chunk(q: Tensor, k: Tensor, v: Tensor, beta: Tensor, g: Tensor, state: T
   Returns z (T, H, 128) FP16 and u (H, T, 128) FP32."""
   heads, rows, dim = q.shape
   if dim != 128 or rows != 16: raise ValueError("fused GDN chunk requires 16 rows of 128-dimensional heads")
-  z = Tensor.empty(rows, heads, dim, dtype=dtypes.float16, device=q.device)
+  o = Tensor.empty(rows, heads, dim, dtype=dtypes.float32, device=q.device)
   u = Tensor.empty(heads, rows, dim, dtype=dtypes.float32, device=q.device)
-  inputs = [t.float().contiguous() for t in (q, k, v, beta, g, state)] + [gate.contiguous(), weight.float().contiguous(),
-                                                                         keep.float().contiguous()]
-  z, u = Tensor.custom_kernel(z, u, *inputs, fxn=functools.partial(_gdn_chunk_kernel, heads=heads, rows=rows, eps=eps))[:2]
-  return z, u
+  inputs = [t.float().contiguous() for t in (q, k, v, beta, g, state)] + [keep.float().contiguous()]
+  o, u = Tensor.custom_kernel(o, u, *inputs, fxn=functools.partial(_gdn_chunk_kernel, heads=heads, rows=rows))[:2]
+  return _gated_norm(o, gate, weight, eps), u
 
 @functools.cache
 def _gates_kernel(out: UOp, x: UOp, w: UOp, *, rows: int, outs: int, width: int) -> UOp:
@@ -148,11 +164,11 @@ def gdn_prefill(q: Tensor, k: Tensor, v: Tensor, beta: Tensor, g: Tensor, state:
   past all 16 rows in place. Padding rows (β = 0, log-decay 0) leave it unchanged. Returns z (T, H, 128) FP16."""
   heads, rows, dim = q.shape
   if dim != 128 or rows != 16: raise ValueError("fused GDN prefill requires 16 rows of 128-dimensional heads")
-  z = Tensor.empty(rows, heads, dim, dtype=dtypes.float16, device=q.device)
+  o = Tensor.empty(rows, heads, dim, dtype=dtypes.float32, device=q.device)
   u = Tensor.empty(heads, rows, dim, dtype=dtypes.float32, device=q.device)
-  inputs = [t.float().contiguous() for t in (q, k, v, beta, g)] + [state, gate.contiguous(), weight.float().contiguous(),
-                                                                  keep.float().contiguous()]
-  return Tensor.custom_kernel(z, u, *inputs, fxn=functools.partial(_gdn_chunk_kernel, heads=heads, rows=rows, eps=eps, advance=True))[0]
+  inputs = [t.float().contiguous() for t in (q, k, v, beta, g)] + [state, keep.float().contiguous()]
+  o = Tensor.custom_kernel(o, u, *inputs, fxn=functools.partial(_gdn_chunk_kernel, heads=heads, rows=rows, advance=True))[0]
+  return _gated_norm(o, gate, weight, eps)
 
 @functools.cache
 def _gdn_decode_kernel(z: UOp, state: UOp, qkv: UOp, conv: UOp, conv_w: UOp, x: UOp, w_beta: UOp, w_alpha: UOp, dt_bias: UOp,
