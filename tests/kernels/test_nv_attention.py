@@ -48,20 +48,27 @@ def test_one_captured_graph_serves_every_length():
       out = step(q, variable.bind(start))
       assert (out - reference(q, kv, start)).abs().max().item() < 2e-3, start
 
-def test_one_row_decode_graph_ignores_unwritten_rows():
-  # Decode's flash-decoding kernel reads whole key tiles: rows past the active length may hold any bits.
+@pytest.mark.parametrize('heads,kv_heads,rows,dim,causal', [
+  (16, 4, 1, 256, True),     # one-row decode (flash-decoding kernel)
+  (16, 4, 16, 256, True),    # target verify (tensor-core kernel, values read from global)
+  (32, 8, 16, 128, False),   # DFlash draft's full layer (values staged in shared memory)
+  (32, 8, 5, 128, False),    # partial block: padded query rows
+])
+def test_one_graph_ignores_unwritten_rows(heads, kv_heads, rows, dim, causal):
+  # The kernels read whole key tiles: rows past the active length may hold any bits.
   with Context(DEV='NV'):
     Tensor.manual_seed(6)
     capacity = 1300  # not a multiple of a block's keys
-    kv = (Tensor.randn(2, 1, 4, capacity, 256) * 0.5).half().contiguous().realize()
-    q = Tensor.randn(1, 16, 1, 256).realize()
-    variable = UOp.variable('start_pos', 0, capacity - 1)
-    step = TinyJit(lambda q, kv, start: attention(q, kv, start).realize())
-    for start in (0, 127, 128, 700, 1299, 3):
-      poisoned = (Tensor.arange(capacity).reshape(1, 1, 1, capacity, 1) > start).where(float('nan'), kv.float()).half().contiguous().realize()
+    kv = (Tensor.randn(2, 1, kv_heads, capacity, dim) * 0.5).half().contiguous().realize()
+    q = Tensor.randn(1, heads, rows, dim).realize()
+    variable = UOp.variable('start_pos', 0, capacity - rows)
+    step = TinyJit(lambda q, kv, start: attention(q, kv, start, causal=causal).realize())
+    for start in (0, 127, 128, 700, capacity - rows, 3):
+      active = start + rows
+      poisoned = (Tensor.arange(capacity).reshape(1, 1, 1, capacity, 1) >= active).where(float('nan'), kv.float()).half().contiguous().realize()
       out = step(q, poisoned, variable.bind(start))
       assert not out.isnan().any().item(), start  # max() below would skip NaNs
-      assert (out - reference(q, kv, start)).abs().max().item() < 2e-3, start
+      assert (out - reference(q, kv, start, causal)).abs().max().item() < 2e-3, start
 
 def ring_of(kv, top, length):
   """The ring cache of `length` slots holding positions top-length+1..top of a full cache."""

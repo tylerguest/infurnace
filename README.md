@@ -8,9 +8,9 @@ On an 8 GB RTX 5060:
 
 | | |
 |---|---|
-| Plain decoding | ~110 tok/s up to 8k tokens of context, ~89 tok/s at 16k |
-| DFlash | ~340 tok/s on code, ~140–230 tok/s on prose; ~100 tok/s at 16k |
-| Reading a prompt | ~600 tok/s from 1k to 16k tokens: 1.7 s to first token at 1k, 30 s at 16k |
+| Plain decoding | ~105 tok/s up to 8k tokens of context, ~95 tok/s at 16k |
+| DFlash | ~340 tok/s on code, ~140–230 tok/s on prose; ~160 tok/s at 16k |
+| Reading a prompt | 600–650 tok/s from 1k to 16k tokens: 1.6 s to first token at 1k, 25 s at 16k |
 | Context | 8,192 tokens by default; 32,768 fits in 8 GB |
 | Later turns | resume from a saved prompt state: ~0.6 s to first token in a 3k-token chat |
 

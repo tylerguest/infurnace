@@ -12,25 +12,26 @@ Measured on an RTX 5060 8 GB (30 SMs, 448 GB/s), Qwen3.5-4B Q4_K_M, October 2026
 
 | | |
 |---|---|
-| Plain decode | 107–112 tok/s up to 8k tokens of context; 89 tok/s at 16k |
-| DFlash decode | ~340 tok/s on code (7.7 tokens per 23 ms round); 135–230 tok/s summarizing docs; ~102 tok/s at 16k; 1.6–2.0× plain at temperature 0.6 |
-| Prompt reading | 16 rows at a time, ~600 tok/s from 1k to 16k tokens, plain or DFlash (1.7 s to first token at 1k, 30 s at 16k) |
+| Plain decode | 103–110 tok/s up to 8k tokens of context; 95 tok/s at 16k |
+| DFlash decode | ~340 tok/s on code (7.7 tokens per 23 ms round); 140–230 tok/s summarizing docs; ~158 tok/s at 16k; 1.6–2.0× plain at temperature 0.6 |
+| Prompt reading | 16 rows at a time, 600–650 tok/s from 1k to 16k tokens, plain or DFlash (1.7 s to first token at 1k, 25 s at 16k) |
 
 Prompt-length sweep (`benchmarks/sweep.py`: a chat message holding `eval.txt` cut to length, then "Summarize
 the text above", 128 tokens out, after warmup):
 
 | Prompt tokens | TTFT | Prompt tok/s | Plain decode tok/s | DFlash decode tok/s |
 |---|---|---|---|---|
-| 25 | 0.20 s | – | 106.9 | 147.6 |
-| 124 | 0.33 s | 378 | 111.6 | 229.4 |
-| 524 | 0.92 s | 568 | 111.4 | 135.4 |
-| 1,024 | 1.8 s | 584 | 102.9 | 156.3 |
-| 2,024 | 3.2 s | 637 | 110.9 | 141.4 |
-| 4,024 | 6.4 s | 628 | 107.6 | 137.4 |
-| 8,024 | 13.3 s | 605 | 102.2 | 118.6 |
-| 16,024 | 30.0 s | 534 | 89.4 | 102.3 |
+| 25 | 0.20 s | – | 110.1 | 146.4 |
+| 124 | 0.35 s | 354 | 103.7 | 229.5 |
+| 524 | 0.95 s | 550 | 103.5 | 140.6 |
+| 1,024 | 1.6 s | 631 | 108.8 | 162.6 |
+| 2,024 | 3.2 s | 639 | 103.6 | 166.3 |
+| 4,024 | 6.2 s | 649 | 104.3 | 178.7 |
+| 8,024 | 12.2 s | 658 | 97.2 | 163.2 |
+| 16,024 | 24.6 s | 652 | 95.1 | 158.4 |
 
-Run-to-run noise is a few tok/s; DFlash depends on what it generates.
+Run-to-run noise is about ±5 tok/s (other apps drawing on the GPU cost up to 10%); DFlash depends on what it
+generates.
 | Later chat or agent turns | resume from a saved prompt state: ~0.6 s to first token instead of ~6 s for a 3k-token chat |
 | Context | 8,192 by default; 32,768 fits on the 8 GB card (peak 7.35 GB with ~2 GB of desktop apps) |
 | Agent use (pi) | read-and-answer 4.1–4.4 s, read-and-fix 8.9–9.7 s |
@@ -113,10 +114,11 @@ A DFlash round was 23 ms: the 16-row target verify 15.8 ms (its matmuls 11 ms, n
 4.1 ms, the rest ~1.6 ms. Plain decode is 10.3 ms per token (its matmuls 7.6 ms).
 
 - [x] **Decode at long context** (done; see Done): plain decode at 16k 53 → 89 tok/s.
-- [ ] **DFlash at long context.** At 16k DFlash is only ~15% ahead of plain decode (102 vs 89 tok/s): the
-  16-row verify and the draft still use the tiled attention kernel (shared-memory staging, 2-byte loads),
-  which ran at ~49 GB/s for one row at 16k. Give 16 rows the decode kernel's layout (vector loads, softmax
-  in registers; 16 queries per KV head instead of 4).
+- [x] **DFlash at long context** (done; see Done): 102 → 158 tok/s at 16k.
+- [ ] **16-row attention at head dim 256** (the target verify and prompt reading): 393 µs a layer at 16k keys,
+  ~2.5× the time to read its cache. The output fragments take 128 registers a lane (254 in all: 8 warps an
+  SM), so loads aren't overlapped; splitting the head dimension across warps or pipelining the K loads
+  (cp.async) are the candidates.
 - [x] **16-row Q4_K matmuls, Marlin-style** (done; see Done). All Q4_K projections 5.38 → 4.48 ms; with
   weights in L2 the kernel runs at 427 GB/s (95% of peak), so what remains is DRAM access.
 - [x] **The same design for Q6_K** (done; see Done): all Q6_K projections 3.29 → 2.35 ms.
@@ -195,6 +197,11 @@ More in [benchmarks](../benchmarks/README.md). Rules that have caught mistakes b
 
 ## Done
 
+- 2026-10-16: 16-row attention on FP16 tensor cores (`_mma_kernel`, FlashAttention-2's layout on mma.sync
+  m16n8k16): the target verify and prompt reading, and the draft's sliding and full layers. At 16k keys: target
+  1.51 → 0.39 ms a layer, draft full layer 1.60 → 0.33 ms, sliding layer 0.76 → 0.11 ms (values staged
+  transposed in shared memory at head dim 128). DFlash 102 → 158 tok/s at 16k, 119 → 163 at 8k; 16k prompt
+  30 → 25 s to first token. Perplexity unchanged.
 - 2026-10-16: one-row decode attention after flash-decoding (`_decode_kernel`): each warp walks 128 keys of a
   KV head with one 16-byte load per lane per key, scores reduced by shuffles, softmax in registers. At 16k keys
   1.2 ms → 0.21 ms per layer (decode part 411 GB/s); plain decode 84 → 108 tok/s at 4k, 73 → 102 at 8k,

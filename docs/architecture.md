@@ -38,7 +38,7 @@ All are tinygrad UOp kernels that render as CUDA C.
 | `quant_gemv` | One-row projections: Q4_K/Q5_K/Q6_K weights against Q8 activations (`dp4a`). Projections that share an input share one quantization. |
 | `quant_gemm` | 16-row projections on FP16 tensor cores (`mma.sync m16n8k16`, FP32 accumulation). Following Marlin: weights dequantize straight into fragment registers (packed `half2` math through inline CUDA, no repacking), activations are pre-permuted so each A fragment is one 16-byte load, and the next block is prefetched during the current MMAs. One kernel serves Q4_K and Q5_K (whose fifth bits join under the same FP16 trick), another Q6_K. |
 | `gdn` | Recurrent (gated delta net) layers: `gdn_decode` for one row, `gdn_prefill` for 16-row prompt chunks, `gdn_chunk` for DFlash verification |
-| `attention` | Attention over the active length only: split-KV partials and a merge (after vLLM's unified attention and llama.cpp's combine step). Grouped query heads, causal/non-causal, sliding windows, ring caches. One-row decode has its own flash-decoding partial kernel: vector loads per lane, softmax in registers, no shared memory. |
+| `attention` | Attention over the active length only: split-KV partials and a merge (after vLLM's unified attention and llama.cpp's combine step). Grouped query heads, causal/non-causal, sliding windows, ring caches. One-row decode has its own flash-decoding partial kernel (vector loads per lane, softmax in registers); multirow attention runs on FP16 tensor cores (FlashAttention-2 layout on `mma.sync`). |
 | `sampling` | Fused Gumbel-max sampling over all rows (greedy at temperature 0) |
 | `embedding` | Token embedding gathered straight from packed weights |
 
@@ -88,6 +88,7 @@ in [DFlash](dflash.md).
 | `INFURNACE_DFLASH_FUSED=0` | Unfused DFlash rounds |
 | `INFURNACE_MULTIROW_PREFILL=0` | One-row prompt reading for plain decoding |
 | `INFURNACE_FUSED_GDN=0`, `INFURNACE_FUSED_ATTENTION=0` | tinygrad's own recurrent and attention layers |
+| `INFURNACE_MMA_ATTENTION=0` | Multirow attention on the FP32 FMA kernel instead of tensor cores |
 | `INFURNACE_SHARED_Q8=0` | Quantize activations per projection |
 | `INFURNACE_PARAM_CACHE=0` | Don't cache small parameters on disk |
 | `INFURNACE_TEST_NV=1` | Run GPU tests |
