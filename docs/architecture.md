@@ -8,10 +8,11 @@ a general inference engine.
 
 | Module | Responsibility |
 |---|---|
-| `cli.py` | Chat (warms up while you type), one raw prompt, the HTTP server, per-step benchmark |
-| `serve.py` | tinygrad's OpenAI-compatible server with DFlash, per-request thinking and temperature |
-| `loader.py` | Named models and first-use downloads, architecture checks, device dispatch, DFlash loading |
-| `device.py` | Device probing; `nvidia()` (NV or CUDA) and the fast-path check |
+| `cli.py` | Commands (`serve`, `run`, `ps`, `stop`, `pull`, `list`, `rm`, `launch`) and the original in-process flags |
+| `client.py` | Talking to the server: finding or starting it, chat and one-shot replies, `ps`/`stop`, `launch pi` |
+| `serve.py` | tinygrad's OpenAI-compatible server (`/v1`) plus infurnace's `/api`; DFlash, per-request thinking, warmup on a thread |
+| `loader.py` | Named models, downloads (`pull`, `list`, `rm`), architecture checks, device dispatch, DFlash loading, context from free VRAM |
+| `device.py` | Device probing, the fast-path check, NVIDIA's pip-installed compiler, free VRAM |
 | `gguf.py` | GGUF parsing (tinygrad's parser) and metadata |
 | `tokenizer.py` | Qwen3.5 BPE, streaming decode, text-only chat formatting |
 | `models/qwen35.py` | Upstream model loading, packed weights, fused layers, multirow prefill, prompt snapshots |

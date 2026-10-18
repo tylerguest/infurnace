@@ -1,16 +1,43 @@
-# Single-user serving and Pi
+# Commands and serving
+
+## Commands
+
+| Command | |
+|---|---|
+| `infurnace` | chat with the default model (same as `infurnace run`) |
+| `infurnace run [MODEL] [PROMPT]` | chat, or answer one prompt and exit; piped input works too (`cat notes.txt \| infurnace run "Summarize this"`) |
+| `infurnace serve` | start the server yourself; `run`, `ps`, `stop` and `launch` talk to it, and `run` starts one in the background when none answers (log: `~/.local/state/infurnace/serve.log`) |
+| `infurnace ps` | the running server: model, context, readiness, DFlash |
+| `infurnace stop` | stop the server and free the GPU |
+| `infurnace pull MODEL`, `list`, `rm MODEL` | download a model (and its DFlash draft), list downloads, delete them |
+| `infurnace launch pi` | point the pi coding agent at the server and start it |
+
+In a chat: `/set think`, `/set nothink`, `/set temperature T`, `/clear`, `/bye`, and `"""` for multi-line messages.
+When a conversation no longer fits, the oldest turns are dropped with a notice.
+
+## Options
+
+| Option | |
+|---|---|
+| `--think`, `--nothink` (`run`); `--no-thinking` (`serve`) | thinking is on by default |
+| `--temperature T` (`run`) | greedy by default; Qwen suggests about 0.6 with thinking, where greedy can repeat |
+| `--max-tokens N` (`run`) | cap a reply (thinking counts); otherwise it runs until the model stops or the context fills |
+| `--max-context N` | the context window; by default the most that fits in free GPU memory, in steps of 8,192 (24-32k on an 8 GB card next to a desktop) |
+| `--model MODEL` (`serve`) | a model name or a local GGUF file (`serve --model ~/models/Qwen3.5-4B-Q4_K_M.gguf`) |
+| `--no-dflash` | plain decoding, without the draft model |
+| `--device`, `DEV` | the tinygrad device (`NV` on Linux, probed first, or `CUDA`) |
+| `INFURNACE_HOST` | the server's address (default `127.0.0.1:8000`) |
+
+Models download into `~/.local/share/infurnace/models/`: `qwen3.5:4b` is the target (2.7 GB) and its DFlash
+draft (0.4 GB).
+
+## The server
 
 Infurnace reuses `tinygrad.llm.serve.LLMServer`: Chat Completions, SSE,
 reasoning separation, tool-call parsing and usage reporting. Infurnace supplies
 its bounded model adapter, tokenizer and the GGUF's embedded Jinja chat template.
 There is no fallback template in server mode. Tools are executed by the client,
 not the server.
-
-```sh
-python3 -m pip install -e .
-infurnace serve                  # or let `infurnace run` / `infurnace launch pi` start it
-infurnace launch pi              # writes pi's models.json and settings.json, then starts pi
-```
 
 The server listens at once (`INFURNACE_HOST`, default `127.0.0.1:8000`) and warms up on a thread: loading takes
 ~11 s, the warmup ~42 s, then the prompt-reading graph ~27 s more (RTX 5060, DFlash). Until warmup ends,
@@ -59,7 +86,7 @@ Tool-call deltas are emitted after generation.
 
 ## Pi
 
-Merge into `~/.pi/agent/models.json`:
+`infurnace launch pi` does this for you. By hand, merge into `~/.pi/agent/models.json`:
 
 ```json
 {
@@ -108,3 +135,24 @@ for plain decoding.
 
 Start with a harmless read-only request and check the whole tool call and result
 cycle before allowing edits or shell commands.
+
+## Updating
+
+```sh
+git pull
+python3 -m pip install -e .
+```
+
+The tinygrad dependency is pinned to a fork with one fix for back-to-back GPU submissions. If the pin in
+`pyproject.toml` changed, also run
+`python3 -m pip install --force-reinstall --no-deps "tinygrad @ git+https://github.com/tylerguest/tinygrad@<commit>"`.
+
+## Without the server
+
+The original flags run everything in one process: `infurnace --chat`, `infurnace --prompt "..."` (a raw prompt,
+no chat template), `infurnace --serve PORT`, `infurnace --benchmark 512,32` (per-step decode timing).
+
+## Development
+
+`python3 -m pip install -e '.[dev]'` adds ruff and pytest. `pytest` runs the CPU tests;
+`INFURNACE_TEST_NV=1 pytest tests/...` runs the GPU ones (see the [roadmap](roadmap.md) for the quality gate).
