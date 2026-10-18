@@ -28,25 +28,25 @@ def host() -> str:
 
 def base_url() -> str: return f"http://{host()}"
 
+def _error(exc: urllib.error.HTTPError) -> ServerError:
+  """The server's {"error": ...} message as a ServerError."""
+  try: message = json.loads(exc.read()).get("error", str(exc))
+  except (ValueError, AttributeError): message = str(exc)
+  return ServerError(message if isinstance(message, str) else json.dumps(message))
+
 def request(method: str, path: str, body: dict | None = None, timeout: float | None = 10) -> dict:
   data = json.dumps(body).encode() if body is not None else None
   req = urllib.request.Request(base_url() + path, data=data, method=method, headers={"Content-Type": "application/json"})
   try:
     with urllib.request.urlopen(req, timeout=timeout) as response: return json.loads(response.read() or b"{}")
-  except urllib.error.HTTPError as exc:
-    try: message = json.loads(exc.read()).get("error", str(exc))
-    except ValueError: message = str(exc)
-    raise ServerError(message if isinstance(message, str) else json.dumps(message)) from exc
+  except urllib.error.HTTPError as exc: raise _error(exc) from exc
 
 def stream(path: str, body: dict) -> Iterator[dict]:
   """POST and yield each record of a newline-delimited JSON reply. Closing the iterator closes the connection,
   which stops generation on the server."""
   req = urllib.request.Request(base_url() + path, data=json.dumps(body).encode(), method="POST", headers={"Content-Type": "application/json"})
   try: response = urllib.request.urlopen(req, timeout=None)
-  except urllib.error.HTTPError as exc:
-    try: message = json.loads(exc.read()).get("error", str(exc))
-    except ValueError: message = str(exc)
-    raise ServerError(message) from exc
+  except urllib.error.HTTPError as exc: raise _error(exc) from exc
   with response:
     for line in response:
       if line.strip(): yield json.loads(line)
@@ -191,9 +191,13 @@ def chat(model: str, think: bool | None, options: dict) -> int:
         answer = _reply(history + [message], model, think, options, show_thinking=True)
         break
       except ServerError as exc:
-        if "context" not in str(exc) or not history: raise
-        history = history[2:]
-        print("[Context window: discarded the oldest turn; earlier details are no longer remembered.]", file=sys.stderr)
+        if "context" in str(exc) and history:
+          history = history[2:]
+          print("[Context window: discarded the oldest turn; earlier details are no longer remembered.]", file=sys.stderr)
+          continue
+        print(f"[Error: {exc}]", file=sys.stderr)  # the conversation goes on without this message
+        answer = None
+        break
       except KeyboardInterrupt:
         print("\n[Interrupted.]", file=sys.stderr)
         answer = None
@@ -206,11 +210,10 @@ def run(model: str | None, prompt: str | None, think: bool | None, options: dict
   if piped:
     stdin = sys.stdin.read()
     prompt = "\n".join(p for p in (stdin, prompt) if p) or prompt
+    if prompt is None: return 0  # nothing to answer: don't start a server for it
   current = connect(model, serve_args)
   model = model or current.get("model") or ""
-  if prompt is None:
-    if piped: return 0
-    return chat(model, think, options)
+  if prompt is None: return chat(model, think, options)
   wait_ready()
   _reply([{"role": "user", "content": prompt}], model, think, options, show_thinking=sys.stdout.isatty())
   return 0
@@ -259,7 +262,9 @@ def configure_pi(model: str, context: int, home: Path | None = None) -> Path:
   config = json.loads(models_path.read_text()) if models_path.is_file() else {}
   providers = config.setdefault("providers", {})
   provider = providers.setdefault("infurnace", {})
-  provider.setdefault("baseUrl", base_url() + "/v1")
+  if provider.get("baseUrl") not in (None, base_url() + "/v1"):
+    print(f"Pointing pi's infurnace provider at {base_url()}/v1 (was {provider['baseUrl']}).", file=sys.stderr)
+  provider["baseUrl"] = base_url() + "/v1"  # the server just configured, wherever an earlier one was
   provider.setdefault("api", "openai-completions")
   provider.setdefault("apiKey", "infurnace")
   entry = {"id": model, "_launch": True, "input": ["text"], "reasoning": True, "contextWindow": context,

@@ -48,7 +48,7 @@ class ChatTemplate:
     try:
       import jinja2
     except ImportError as exc:
-      raise ValueError("HTTP serving requires Jinja2: install infurnace[server]") from exc
+      raise ValueError("HTTP serving requires Jinja2: python3 -m pip install jinja2 (or reinstall infurnace)") from exc
     source = metadata.get('tokenizer.chat_template')
     if not isinstance(source, str) or not source:
       raise ValueError("HTTP serving requires a GGUF chat template (no tool-unsafe fallback)")
@@ -111,17 +111,24 @@ class RequestHandler(Handler):
         threading.Thread(target=close, daemon=True).start()
       elif route == '/api/show': self.send_json(self.server.show())
       elif route in ('/api/chat', '/api/generate'):
-        self.server.ready.wait()
+        if not self.wait_usable(): return
         with self.server.gpu: self.api_generate(body, chat=route == '/api/chat')
       else: self.send_json({'error': f'unknown endpoint {route}'}, 404)
       return
-    self.server.ready.wait()
+    if not self.wait_usable(): return
     self.rfile = io.BytesIO(raw)  # tinygrad's handler reads the body again
     template = self.server.template
     template.request_thinking = request_thinking(body)
     try:
       with self.server.gpu: super().do_POST()
     finally: template.request_thinking = None
+
+  def wait_usable(self) -> bool:
+    """Wait for warmup; after a failed one, answer 503 with its error instead of running a half-set-up model."""
+    self.server.ready.wait()
+    if self.server.failure is None: return True
+    self.send_json({'error': f'the server failed to warm up: {self.server.failure}'}, 503)
+    return False
 
   def api_generate(self, body: dict, chat: bool):
     """/api/chat or /api/generate: tinygrad's streamed chunks as newline-delimited JSON records."""
@@ -137,7 +144,7 @@ class RequestHandler(Handler):
     template = server.template
     template.request_thinking = _think(body)
     try:
-      rendered = body.get('prompt') or '' if generate and body.get('raw') else \
+      rendered = (body.get('prompt') or '') if generate and body.get('raw') else \
                  template.render(messages=messages, tools=body.get('tools'), add_generation_prompt=True, preserve_thinking=True)
     finally: template.request_thinking = None
     ids = server.tok.encode(rendered)
@@ -146,7 +153,10 @@ class RequestHandler(Handler):
     options = body.get('options') if isinstance(body.get('options'), dict) else {}
     limit = options.get('num_predict')
     max_tokens = limit if isinstance(limit, int) and limit > 0 else None
-    temperature = float(options.get('temperature', 0.0))
+    temperature = options.get('temperature')
+    try: temperature = 0.0 if temperature is None else float(temperature)
+    except (TypeError, ValueError): temperature = -1.0
+    if not 0 <= temperature < float('inf'): return self.send_json({'error': 'options.temperature must be a number >= 0'}, 400)
     chunks = self.run_model(ids, name, True, max_tokens=max_tokens, temperature=temperature, reasoning=rendered.rstrip().endswith('<think>'))
     text_key = 'response' if generate else 'content'
     def records():

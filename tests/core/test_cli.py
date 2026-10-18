@@ -29,3 +29,8 @@ def test_cli_device_timeout_diagnostic_does_not_swallow_other_errors(monkeypatch
   else:
     assert cli.main(['--prompt', 'hello', '--no-dflash']) == 1
     assert 'the GPU stopped responding' in capsys.readouterr().err
+
+@pytest.mark.parametrize('value,model', [('qwen3.5:4b', True), ('~/m/x.gguf', True), ('other:7b', True), ('Explain RAII', False),
+                                         ('https://example.com/notes.txt', False), ('note:', False)])
+def test_run_tells_models_from_prompts(value, model):
+  assert cli._looks_like_model(value) is model

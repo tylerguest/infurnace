@@ -29,7 +29,7 @@ def test_configure_pi_keeps_user_entries(tmp_path, monkeypatch):
   models = config['providers']['infurnace']['models']
   assert models[0] == mine and len(models) == 2
   assert models[1]['id'] == 'qwen3.5:4b' and models[1]['_launch'] and models[1]['contextWindow'] == 32768
-  assert config['providers']['infurnace']['baseUrl'] == 'http://127.0.0.1:8000/v1'  # the user's own URL stays
+  assert config['providers']['infurnace']['baseUrl'] == 'http://127.0.0.1:8123/v1'  # pointed at the server just configured
   assert 'other' in config['providers']
   settings = json.loads((agent / 'settings.json').read_text())
   assert settings == {'theme': 'dark', 'defaultModel': 'qwen3.5:4b', 'defaultProvider': 'infurnace'}
@@ -91,3 +91,23 @@ def test_interactive_chat_commands(monkeypatch, capsys):
     server.shutdown()
     thread.join(5)
     server.server_close()
+
+def test_chat_survives_server_errors(monkeypatch, capsys):
+  # A message the server rejects (here: too long even without history) is reported; the chat goes on.
+  replies = iter([client.ServerError('prompt has 9000 tokens, but the model context is 8192'), 'fine'])
+  def reply(*args, **kwargs):
+    value = next(replies)
+    if isinstance(value, Exception): raise value
+    return value
+  monkeypatch.setattr(client, '_reply', reply)
+  monkeypatch.setattr(client, 'wait_ready', lambda: None)
+  lines = iter(['huge message', 'small message', '/bye'])
+  monkeypatch.setattr('builtins.input', lambda prompt='': next(lines))
+  assert client.chat('qwen3.5:4b', None, {}) == 0
+  assert 'prompt has 9000 tokens' in capsys.readouterr().err
+
+def test_empty_piped_input_starts_no_server(monkeypatch):
+  monkeypatch.setattr('sys.stdin', io.StringIO(''))
+  monkeypatch.setattr(client, 'connect', lambda *args: pytest.fail('must not connect or start a server'))
+  assert client.run(None, None, None, {}, []) == 0
+

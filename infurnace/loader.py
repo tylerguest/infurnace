@@ -75,9 +75,10 @@ def model_info(name: str, path: Path, dflash: bool) -> dict:
   url = MODELS[name][0] if name in MODELS else str(path)
   return {'size': Path(path).stat().st_size, 'dflash': dflash, 'details': _details(name, url)}
 
-# Measured on an RTX 5060 (Qwen3.5-4B + DFlash draft): beyond the weights and the caches, captured graphs, scratch and
-# working buffers take ~1.45 GB; the margin leaves room for what the desktop does meanwhile.
-OVERHEAD, MARGIN, CONTEXT_STEP = 1.45e9, 0.25e9, 8192
+# Beyond the weights and the caches: a fixed runtime (the CUDA context ~0.47 GB, tinygrad's ~0.39 GB) and graph
+# scratch and working buffers, which grow with the model; measured together as ~1.45 GB for Qwen3.5-4B with its
+# DFlash draft (3.1 GB of weights) on an RTX 5060. The margin leaves room for what the desktop does meanwhile.
+RUNTIME, SCRATCH_PER_WEIGHT_BYTE, MARGIN, CONTEXT_STEP = 0.86e9, 0.19, 0.25e9, 8192
 
 def cache_bytes_per_token(metadata: dict) -> int:
   """KV cache bytes per context token: full-attention layers of the model (Qwen3.5: every `full_attention_interval`
@@ -100,7 +101,8 @@ def fit_context(model_path: str | Path, draft_path: str | Path | None, free: int
   per_token = sum(cache_bytes_per_token(m) for m in metadata)
   arch = metadata[0].get("general.architecture", "")
   limit = metadata[0].get(f"{arch}.context_length", 32768)
-  room = free - MARGIN - OVERHEAD - sum(path.stat().st_size for path in paths)
+  weights = sum(path.stat().st_size for path in paths)
+  room = free - MARGIN - RUNTIME - weights * (1 + SCRATCH_PER_WEIGHT_BYTE)
   steps = int(room // (per_token * CONTEXT_STEP)) if per_token > 0 and room > 0 else 0
   if not steps and room < per_token * 4096:
     print(f"Warning: the model may not fit in {free / 1e9:.1f} GB of free GPU memory; free some (close other GPU programs) "

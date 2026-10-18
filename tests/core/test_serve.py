@@ -192,3 +192,33 @@ def test_requests_wait_for_warmup():
     assert status == 200 and json.loads(data)['message']['content'] == 'ok'
     assert json.loads(call('GET', '/api/status')[1])['status'] == 'ready'
   finally: stop()
+
+def test_generate_renders_the_chat_template():
+  # /api/generate wraps the prompt in the chat template unless `raw` is set.
+  model, tok = Model(), Tokenizer()
+  model.output = 'ok'
+  template = ChatTemplate({'tokenizer.chat_template': '{% for m in messages %}<{{ m.role }}>{{ m.content }}{% endfor %}'}, tok)
+  server, call, stop = serving(model, tok, template)
+  try:
+    assert call('POST', '/api/generate', {'model': 'test', 'prompt': 'hi', 'stream': False})[0] == 200
+    assert tok.rendered == '<user>hi'
+    assert call('POST', '/api/generate', {'model': 'test', 'prompt': 'hi', 'raw': True, 'stream': False})[0] == 200
+    assert tok.rendered == 'hi'
+    status, data = call('POST', '/api/chat', {'model': 'test', 'messages': [], 'options': {'temperature': 'hot'}})
+    assert status == 400 and 'temperature' in json.loads(data)['error']
+    assert call('POST', '/api/chat', {'model': 'test', 'messages': [], 'options': {'temperature': None}, 'stream': False})[0] == 200
+  finally: stop()
+
+def test_failed_warmup_answers_503():
+  model, tok = Model(), Tokenizer()
+  template = ChatTemplate({'tokenizer.chat_template': '{% for m in messages %}{{ m.content }}{% endfor %}'}, tok)
+  def fail(): raise MemoryError('Allocation of 256.00 MB failed on NV')
+  server, call, stop = serving(model, tok, template, warmup=fail)
+  try:
+    server.ready.wait(5)
+    status, data = call('POST', '/api/chat', {'model': 'test', 'messages': [{'role': 'user', 'content': 'x'}]})
+    assert status == 503 and 'Allocation of 256.00 MB' in json.loads(data)['error']
+    status, _ = call('POST', '/v1/chat/completions', {'model': 'test', 'messages': [{'role': 'user', 'content': 'x'}]})
+    assert status == 503
+  finally: stop()
+

@@ -295,6 +295,7 @@ def _forward(args: argparse.Namespace) -> list[str]:
 
 def _looks_like_model(value: str) -> bool:
   """`run`'s first argument names a model (a catalog name, name:tag or a GGUF file); anything else starts the prompt."""
+  if "://" in value: return False  # a URL is prompt text, never a model to download
   return value in loader.MODELS or value.endswith(".gguf") or (" " not in value and ":" in value and not value.endswith(":"))
 
 def _model_name(model: str) -> str:
