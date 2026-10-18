@@ -71,7 +71,7 @@ def test_run_one_prompt_through_a_server(monkeypatch, capsys):
     assert client.run(None, 'say hi', None, {}, []) == 0
     assert 'hello' in capsys.readouterr().out
     assert tok.rendered == 'say hi'
-    with pytest.raises(client.ServerError, match='serving qwen3.5:4b'): client.run('other:1b', 'x', None, {}, [])
+    with pytest.raises(client.ServerError, match='not available on this server'): client.run('other:1b', 'x', None, {}, [])
     assert client.connect('/models/qwen3.5:4b.gguf', [])['model'] == 'qwen3.5:4b'  # a path matches the stem it is served as
     assert client.ps() == 0 and 'qwen3.5:4b' in capsys.readouterr().out
     assert client.stop() == 0
@@ -134,3 +134,31 @@ def test_empty_piped_input_starts_no_server(monkeypatch):
   monkeypatch.setattr(client, 'connect', lambda *args: pytest.fail('must not connect or start a server'))
   assert client.run(None, None, None, {}, []) == 0
 
+
+def test_run_switches_the_server_to_another_model(monkeypatch, capsys):
+  from test_serve import Models, models_server
+  models = Models({'a:1b': 'from a', 'b:1b': 'from b'})
+  server, call, stop = models_server(models)
+  monkeypatch.setenv('INFURNACE_HOST', '%s:%d' % server.server_address)
+  monkeypatch.setattr('sys.stdin', io.StringIO(''))
+  try:
+    assert client.run('b:1b', 'hi', None, {}, []) == 0
+    out = capsys.readouterr()
+    assert 'from b' in out.out and 'Loading b:1b on the server' in out.err and models.loads == ['b:1b']
+    assert client.run('b:1b', 'hi', None, {}, []) == 0 and models.loads == ['b:1b']  # already loaded: no reload
+  finally: stop()
+
+def test_stop_waits_for_the_server_process(monkeypatch):
+  # Stopped means the process is gone too: a server started right after would otherwise find the GPU still taken.
+  states = iter([{'status': 'ready', 'pid': 4242}, None, None, None])
+  monkeypatch.setattr(client, 'status', lambda: next(states))
+  monkeypatch.setattr(client, 'request', lambda *args, **kwargs: {'status': 'stopping'})
+  monkeypatch.setattr(client.time, 'sleep', lambda seconds: None)
+  alive = iter([True, True, False])
+  def kill(pid, signal):
+    assert (pid, signal) == (4242, 0)
+    if not next(alive): raise ProcessLookupError
+  monkeypatch.setattr(client.os, 'kill', kill)
+  monkeypatch.setenv('INFURNACE_HOST', '127.0.0.1:8124')
+  assert client.stop() == 0
+  assert next(alive, 'done') == 'done'  # it waited through both checks that found the process alive

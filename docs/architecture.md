@@ -17,9 +17,9 @@ a general inference engine.
 | `device.py` | Device probing, the fast-path check, NVIDIA's pip-installed compiler, free VRAM |
 | `gguf.py` | GGUF parsing (tinygrad's parser) and metadata |
 | `chat.py` | Chat prompts from the GGUF's Jinja template (server and local chat) |
-| `tokenizer.py` | Qwen3.5 BPE and streaming decode |
+| `tokenizer.py` | Byte-level BPE (pretokenizer per GGUF preset: Qwen3.5, Qwen2/3, Llama 3) and streaming decode |
 | `engine.py` | `Model`: upstream model loading, packed weights, fused attention and feed-forward, prompt chunks, generation, prompt snapshots |
-| `models/` | Model families (`Family`: tokenizer, extra passes, snapshots); `models/qwen35.py` adds the fused GDN layers |
+| `models/` | Model families (`Family`: tokenizer, extra passes, snapshots): `qwen35.py` adds the fused GDN layers; `attention.py` covers attention-only models (Qwen3) |
 | `models/linear.py` | `_NVLinear`: packed projection used by both the target and the draft |
 | `dflash/` | Draft model, target observation, parallel verification, adaptive drafting |
 | `kernels/` | Custom tinygrad UOp kernels (below) |

@@ -16,10 +16,27 @@ def test_prefer_gpu(monkeypatch):
 
 def test_cpu_fallback(monkeypatch):
   monkeypatch.delenv("DEV", raising=False)
+  monkeypatch.setattr(device, "nvidia_gpu_present", lambda: False)
   def probe(name):
     if name != "CPU": raise OSError("no driver")
   monkeypatch.setattr(device, "_probe", probe)
   assert device.select_device() == "CPU"
+
+def test_an_nvidia_gpu_is_waited_for_never_replaced_by_the_cpu(monkeypatch):
+  monkeypatch.delenv("DEV", raising=False)
+  monkeypatch.setattr(device, "nvidia_gpu_present", lambda: True)
+  monkeypatch.setattr(device.time, "sleep", lambda seconds: None)
+  attempts = []
+  def probe(name):
+    attempts.append(name)
+    if name != "NV" or attempts.count("NV") < 3: raise RuntimeError("No interface for NV:0 is available")
+  monkeypatch.setattr(device, "_probe", probe)
+  assert device.select_device() == "NV" and "CPU" not in attempts  # opened on a retry
+  def never(name): raise RuntimeError("No interface for NV:0 is available")
+  monkeypatch.setattr(device, "_probe", never)
+  clock = iter(range(100))
+  monkeypatch.setattr(device.time, "monotonic", lambda: next(clock))
+  with pytest.raises(RuntimeError, match="NVIDIA GPU is present but tinygrad could not open it"): device.select_device()
 
 def test_explicit_override(monkeypatch):
   def probe(name): pytest.fail("explicit device must not trigger auto probing")

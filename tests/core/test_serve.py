@@ -1,16 +1,17 @@
 import http.client
 import json
+import os
 import socket
 import threading
 import time
 from types import SimpleNamespace
 
 from infurnace.chat import ChatTemplate
-from infurnace.serve import Server, ServerModel
+from infurnace.serve import loaded, Server, ServerModel
 
 class Tokenizer:
   bos_id = None
-  eos_id = 999
+  eos_id, eot_id = 999, None
 
   def encode(self, text):
     self.rendered = text
@@ -27,6 +28,7 @@ class Tokenizer:
 
 class Model:
   config = SimpleNamespace(context_length=1024)
+  device = 'CPU'
   transformer = SimpleNamespace(get_start_pos=lambda ids: 0)
 
   def __init__(self):
@@ -293,9 +295,10 @@ def test_generate_renders_the_chat_template():
     assert tok.rendered == '<user>hi'
     assert call('POST', '/api/generate', {'model': 'test', 'prompt': 'hi', 'raw': True, 'stream': False})[0] == 200
     assert tok.rendered == 'hi'
-    status, data = call('POST', '/api/chat', {'model': 'test', 'messages': [], 'options': {'temperature': 'hot'}})
+    message = [{'role': 'user', 'content': 'x'}]
+    status, data = call('POST', '/api/chat', {'model': 'test', 'messages': message, 'options': {'temperature': 'hot'}})
     assert status == 400 and 'temperature' in json.loads(data)['error']
-    assert call('POST', '/api/chat', {'model': 'test', 'messages': [], 'options': {'temperature': None}, 'stream': False})[0] == 200
+    assert call('POST', '/api/chat', {'model': 'test', 'messages': message, 'options': {'temperature': None}, 'stream': False})[0] == 200
   finally: stop()
 
 def test_failed_warmup_answers_503():
@@ -311,3 +314,123 @@ def test_failed_warmup_answers_503():
     assert status == 503
   finally: stop()
 
+
+class Models:
+  """A fake loader: models named in `outputs` (name -> reply text); loading `broken` fails."""
+  def __init__(self, outputs, broken=()):
+    self.outputs, self.broken, self.loads = outputs, broken, []
+
+  def names(self): return list(self.outputs)
+
+  def __call__(self, name):
+    self.loads.append(name)
+    if name in self.broken: raise MemoryError('out of GPU memory')
+    model = Model()
+    model.output, model.metadata = self.outputs[name], {'tokenizer.chat_template': '{% for m in messages %}{{ m.content }}{% endfor %}'}
+    model.device = 'CPU'
+    return loaded(model, Tokenizer(), name=name)
+
+def models_server(models, **kwargs):
+  first = models(models.names()[0])
+  models.loads.clear()
+  server = Server(('127.0.0.1', 0), first.model, first.name, first.tokenizer, first.template, loader=models, **kwargs)
+  thread = threading.Thread(target=server.serve_forever, daemon=True)
+  thread.start()
+  def call(method, path, body=None):
+    conn = http.client.HTTPConnection(*server.server_address)
+    conn.request(method, path, json.dumps(body) if body is not None else None, {'Content-Type': 'application/json'})
+    response = conn.getresponse()
+    data = response.read().decode()
+    conn.close()
+    return response.status, json.loads(data)
+  def stop():
+    server.shutdown()
+    thread.join()
+    server.server_close()
+  return server, call, stop
+
+def chat(call, model):
+  return call('POST', '/api/chat', {'model': model, 'messages': [{'role': 'user', 'content': 'x'}], 'stream': False})
+
+def test_requests_switch_between_models():
+  models = Models({'a:1b': 'from a', 'b:1b': 'from b'})
+  server, call, stop = models_server(models)
+  try:
+    assert chat(call, 'a:1b')[1]['message']['content'] == 'from a' and models.loads == []  # already loaded
+    status, reply = chat(call, 'b:1b')
+    assert status == 200 and reply['message']['content'] == 'from b' and reply['model'] == 'b:1b' and models.loads == ['b:1b']
+    assert call('GET', '/api/status')[1] == {'status': 'ready', 'model': 'b:1b', 'pid': os.getpid()}
+    assert call('GET', '/api/ps')[1]['models'][0]['name'] == 'b:1b'
+    assert chat(call, None)[1]['message']['content'] == 'from b'  # no model named: the loaded one
+    # An unknown model: 404 on the infurnace API, the loaded model on the OpenAI API (clients send fixed names)
+    status, reply = chat(call, 'nope:7b')
+    assert status == 404 and 'not available on this server' in reply['error'] and models.loads == ['b:1b']
+    status, reply = call('POST', '/v1/chat/completions', {'model': 'gpt-4', 'messages': [{'role': 'user', 'content': 'x'}]})
+    assert status == 200 and reply['choices'][0]['message']['content'] == 'from b'
+    # A load-only request (an empty prompt), as the client sends to switch before chatting
+    status, reply = call('POST', '/api/generate', {'model': 'a:1b'})
+    assert status == 200 and reply['done_reason'] == 'load' and models.loads == ['b:1b', 'a:1b'] and server.model_name == 'a:1b'
+  finally: stop()
+
+def test_a_failed_load_puts_the_previous_model_back():
+  models = Models({'a:1b': 'from a', 'b:1b': 'from b'}, broken=('b:1b',))
+  server, call, stop = models_server(models)
+  try:
+    status, reply = chat(call, 'b:1b')
+    assert status == 500 and 'could not load b:1b' in reply['error'] and 'out of GPU memory' in reply['error']
+    assert models.loads == ['b:1b', 'a:1b'] and chat(call, 'a:1b')[1]['message']['content'] == 'from a'
+  finally: stop()
+
+def test_keep_alive_unloads_and_the_next_request_reloads(monkeypatch):
+  models = Models({'a:1b': 'from a'})
+  server, call, stop = models_server(models, keep_alive=0.2)
+  try:
+    deadline = time.monotonic() + 10
+    while server.model is not None and time.monotonic() < deadline: time.sleep(0.05)
+    assert server.model is None and call('GET', '/api/status')[1]['status'] == 'unloaded'
+    assert call('GET', '/api/ps')[1]['models'] == []
+    assert chat(call, None)[1]['message']['content'] == 'from a' and models.loads == ['a:1b']
+    # keep_alive 0 with nothing to answer unloads at once (Ollama's `stop` request)
+    assert call('POST', '/api/generate', {'model': 'a:1b', 'keep_alive': 0})[1]['done_reason'] == 'unload' and server.model is None
+  finally: stop()
+
+def test_requests_go_before_background_work():
+  # A request that arrives during warmup is answered before the prompt graph (background work) is captured.
+  model, tok = Model(), Tokenizer()
+  model.output = 'ok'
+  template = ChatTemplate({'tokenizer.chat_template': '{% for m in messages %}{{ m.content }}{% endfor %}'}, tok)
+  release, order = threading.Event(), []
+  original = model.generate
+  def generate(*args, **kwargs):
+    order.append('reply')
+    yield from original(*args, **kwargs)
+  model.generate = generate
+  server, call, stop = serving(model, tok, template, warmup=lambda: release.wait(5), idle=lambda: order.append('graph'))
+  try:
+    threading.Timer(0.3, release.set).start()  # the request below is waiting when warmup ends
+    status, _ = call('POST', '/api/chat', {'model': 'test', 'messages': [{'role': 'user', 'content': 'x'}], 'stream': False})
+    deadline = time.monotonic() + 5
+    while 'graph' not in order and time.monotonic() < deadline: time.sleep(0.05)
+    assert status == 200 and order == ['reply', 'graph']
+  finally: stop()
+
+def test_unloading_frees_a_model_whose_background_work_is_still_waiting():
+  # The prompt graph waits for an idle moment; unloading meanwhile must leave nothing holding the model
+  # (a waiting thread that kept it alive made the next model's load run out of GPU memory).
+  import functools, gc, weakref
+  def build():
+    model, tok = Model(), Tokenizer()
+    template = ChatTemplate({'tokenizer.chat_template': '{% for m in messages %}{{ m.content }}{% endfor %}'}, tok)
+    ran = []
+    server = Server(('127.0.0.1', 0), ServerModel(model), 'test', tok, template, functools.partial(ran.append, model),
+                    warmup=functools.partial(lambda m: None, model))
+    return server, weakref.ref(model), ran
+  server, alive, ran = build()
+  try:
+    assert server.ready.wait(5)
+    with server.gpu: server.unload()  # within the background work's quiet second
+    gc.collect()
+    assert alive() is None
+    time.sleep(1.5)
+    assert ran == []  # the work went with its model
+  finally: server.server_close()

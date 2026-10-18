@@ -277,7 +277,7 @@ class Model:
       self.upload_prompt([0])
       self._prompt_jit.cnt = 1  # capture right away (see _multirow_ready)
       self.read_prompt(position, position + 1)
-      Tensor.realize(*(Tensor(state.uop.after(state.uop.store(copy.uop))) for state, copy in zip(states, saved)))
+      if states: Tensor.realize(*(Tensor(state.uop.after(state.uop.store(copy.uop))) for state, copy in zip(states, saved)))
     # Cache rows from `position` on now hold the capture's: forget a prefix or snapshot that reaches them.
     if len(t._cached_tokens) > position or any(len(s.prefix) > position for s in self._snapshots): self.reset()
     return True

@@ -3,19 +3,29 @@ infurnace's own API (/api: chat, generate, tags, ps, show, version, status, shut
 
 The server listens before its warmup ends: warmup (and then the prompt graph) runs on a thread. Each request has
 its own thread, so the endpoints that don't touch the GPU (status, ps, shutdown) answer at any time; generation
-takes the GPU lock (tinygrad is not thread-safe), so it waits for the warmup or another reply."""
+takes the GPU lock (tinygrad is not thread-safe), so it waits for the warmup or another reply.
+
+One model is on the GPU at a time. A request naming another model the server can load (a downloaded catalog
+model) switches to it: the current one is freed, the new one loaded and warmed up while the request waits. With
+a keep-alive, a model left idle that long is unloaded, and the next request loads it again."""
 from __future__ import annotations
+import contextlib
 import datetime
+import gc
 import io
 import json
+import os
 import select
 import socket
 import socketserver
 import sys
 import threading
 import time
+from dataclasses import dataclass, field
 from importlib import metadata as _metadata
+from typing import Any, Callable
 
+from tinygrad import Device
 from tinygrad.llm.serve import Handler, LLMServer, normalize_messages
 from tinygrad.viz.serve import TCPServerWithReuse
 from infurnace.chat import ChatTemplate
@@ -47,6 +57,25 @@ class ServerModel:
     finally:
       stream.close()
 
+@dataclass
+class Loaded:
+  """A model as the server serves it: what generates, its tokenizer and chat template, what /api/ps and /api/show
+  report, and its warmup and background work (e.g. the prompt graph)."""
+  name: str
+  model: ServerModel
+  tokenizer: Any
+  template: ChatTemplate
+  info: dict = field(default_factory=dict)
+  warmup: Callable[[], None] | None = None
+  idle: Callable[[], None] | None = None
+  dflash: bool = False
+
+def loaded(model, tokenizer, *, name=None, dflash=None, block_size=16, enable_thinking=True, info=None, warmup=None, idle=None) -> Loaded:
+  name = name or model.metadata.get('general.name') or 'infurnace'
+  eos = tuple(i for i in (tokenizer.eos_id, tokenizer.eot_id) if i is not None)
+  return Loaded(name, ServerModel(model, dflash, eos_token_ids=eos, block_size=block_size), tokenizer,
+                ChatTemplate(model.metadata, tokenizer, enable_thinking), info or {}, warmup, idle, dflash is not None)
+
 def request_thinking(body) -> bool | None:
   """A request's thinking switch: `chat_template_kwargs.enable_thinking` (vLLM and sglang's convention,
   pi's qwen-chat-template format) or a top-level `enable_thinking` (pi's qwen format)."""
@@ -72,7 +101,7 @@ class RequestHandler(Handler):
     if route == '/api/version': self.send_json({'version': VERSION})
     elif route == '/api/status': self.send_json(server.status())
     elif route == '/api/tags': self.send_json({'models': server.installed()})
-    elif route == '/api/ps': self.send_json({'models': [server.loaded()]})
+    elif route == '/api/ps': self.send_json({'models': [server.loaded()] if server.model is not None else []})
     else: super().do_GET()
 
   def do_POST(self):
@@ -94,24 +123,39 @@ class RequestHandler(Handler):
         threading.Thread(target=close, daemon=True).start()
       elif route == '/api/show': self.send_json(self.server.show())
       elif route in ('/api/chat', '/api/generate'):
-        if not self.wait_usable(): return
-        with self.server.gpu: self.api_generate(body, chat=route == '/api/chat')
+        with self.server.request_gpu():
+          if self.usable() and self.use_model(body.get('model'), strict=True): self.api_generate(body, chat=route == '/api/chat')
+          self.server.last_used = time.monotonic()
       else: self.send_json({'error': f'unknown endpoint {route}'}, 404)
       return
-    if not self.wait_usable(): return
     self.rfile = io.BytesIO(raw)  # tinygrad's handler reads the body again
-    template = self.server.template
-    with self.server.gpu:  # the template's switch is shared: set it only while this request holds the GPU
+    with self.server.request_gpu():  # the template's switch is shared: set it only while this request holds the GPU
+      # OpenAI clients often send a fixed model name: an unknown one is served by the current model
+      if not self.usable() or not self.use_model(body.get('model') if isinstance(body, dict) else None, strict=False): return
+      template = self.server.template
       template.request_thinking = request_thinking(body)
       try: super().do_POST()
-      finally: template.request_thinking = None
+      finally:
+        template.request_thinking = None
+        self.server.last_used = time.monotonic()
 
-  def wait_usable(self) -> bool:
-    """Wait for warmup; after a failed one, answer 503 with its error instead of running a half-set-up model."""
-    self.server.ready.wait()
+  def usable(self) -> bool:
+    """After a failed warmup, answer 503 with its error instead of running a half-set-up model."""
     if self.server.failure is None: return True
     self.send_json({'error': f'the server failed to warm up: {self.server.failure}'}, 503)
     return False
+
+  def use_model(self, requested, strict: bool) -> bool:
+    """With the GPU lock held: load the requested model if it isn't the loaded one (or none is). Answers the
+    request with an error and returns False when it can't: an unknown model (404, if `strict`) or a failed load."""
+    try: self.server.use(requested if isinstance(requested, str) and requested else None, strict)
+    except LookupError as exc:
+      self.send_json({'error': str(exc)}, 404)
+      return False
+    except Exception as exc:
+      self.send_json({'error': str(exc)}, 500)
+      return False
+    return True
 
   def client_gone(self) -> bool:
     """The client closed its connection (a readable socket with nothing to read)."""
@@ -123,6 +167,12 @@ class RequestHandler(Handler):
     generate = not chat
     server, started = self.server, time.perf_counter_ns()
     name = server.model_name
+    if (body.get('prompt') if generate else body.get('messages')) in (None, '', []):
+      # Nothing to answer: the request only loads the model, or unloads it with keep_alive 0
+      unload = body.get('keep_alive') in (0, '0', '0s')
+      if unload: server.unload()
+      return self.send_json({'model': name, 'created_at': _now(), **({'response': ''} if generate else
+                             {'message': {'role': 'assistant', 'content': ''}}), 'done': True, 'done_reason': 'unload' if unload else 'load'})
     if generate:
       messages = ([{'role': 'system', 'content': body['system']}] if body.get('system') else []) + \
                  [{'role': 'user', 'content': body.get('prompt') or ''}]
@@ -207,19 +257,114 @@ def _arguments(value):
 class Server(socketserver.ThreadingMixIn, LLMServer):
   """`warmup` runs on a thread from the start, then `idle` (work a request may wait for, e.g. the prompt graph);
   generating requests wait for `ready` and take the `gpu` lock. `info` describes the loaded model for /api/ps and
-  /api/show; `installed()` lists downloaded models for /api/tags."""
+  /api/show; `installed()` lists downloaded models for /api/tags.
+
+  `loader` (optional) makes other models servable: `loader.names()` lists them and `loader(name)` returns a Loaded.
+  `keep_alive` (seconds, optional) unloads a model left idle that long."""
   daemon_threads = True  # finish() waits for the GPU instead
   def __init__(self, server_address: tuple, model, model_name: str, tok, template, idle=None, *, warmup=None, info=None,
-               installed=None):
+               installed=None, loader=None, keep_alive: float | None = None, dflash: bool = False):
     self.model, self.model_name, self.tok, self.template, self.idle = model, model_name, tok, template, idle
-    self.info, self.installed = info or {}, installed or (lambda: [])
+    self.info, self.installed, self.dflash = info or {}, installed or (lambda: []), dflash
+    self.loader, self.keep_alive, self.switching, self.last_used = loader, keep_alive, None, time.monotonic()
+    self.waiting, self._waiting = 0, threading.Lock()  # requests waiting for the GPU (background work lets them go first)
     self.ready, self.failure, self.warmup_seconds, self.gpu = threading.Event(), None, None, threading.Lock()
     self.stopping, self.closed, self._finishing = False, threading.Event(), threading.Lock()
     TCPServerWithReuse.__init__(self, server_address, RequestHandler)
     if warmup is None and idle is None: self.ready.set()
-    else: threading.Thread(target=self._warm, args=(warmup, idle), name='infurnace-warmup', daemon=True).start()
+    else: threading.Thread(target=self._warm, args=(warmup,), name='infurnace-warmup', daemon=True).start()
+    if keep_alive: threading.Thread(target=self._unload_when_idle, name='infurnace-keep-alive', daemon=True).start()
 
-  def _warm(self, warmup, idle):
+  def _install(self, model: Loaded):
+    self.model, self.model_name, self.tok, self.template = model.model, model.name, model.tokenizer, model.template
+    self.info, self.dflash, self.idle = model.info, model.dflash, model.idle
+
+  def unload(self):
+    """With the GPU lock held: free the loaded model's GPU memory (its name stays, to load it again)."""
+    if self.model is None: return
+    device = self.model.model.device
+    self.model = self.tok = self.template = self.idle = None
+    self.info, self.dflash = {}, False
+    gc.collect()  # the model's buffers go once nothing refers to them
+    allocator = getattr(Device[device], 'allocator', None)
+    if hasattr(allocator, 'free_cache'): allocator.free_cache()  # tinygrad keeps freed buffers for reuse otherwise
+
+  def servable(self) -> list[str]:
+    return list(dict.fromkeys([self.model_name, *(self.loader.names() if self.loader is not None else [])]))
+
+  def use(self, requested: str | None, strict: bool):
+    """With the GPU lock held: make sure a model is loaded, the requested one when it is servable. An unknown name
+    raises LookupError when `strict`, else is served by the current model."""
+    if requested is not None and requested not in self.servable():
+      if strict: raise LookupError(f"model {requested!r} is not available on this server (available: {', '.join(self.servable())}; "
+                                   f"`infurnace pull {requested}` downloads a catalog model)")
+      requested = None
+    target = requested or self.model_name
+    if self.model is not None and target == self.model_name: return
+    if self.loader is None: raise RuntimeError(f'this server cannot load {target}')
+    self._switch(target)
+
+  def _switch(self, target: str):
+    previous = self.model_name if self.model is not None else None
+    start, self.switching = time.perf_counter(), target
+    print(f"Loading {target}" + (f" in place of {previous}" if previous else "") + "...", file=sys.stderr, flush=True)
+    try:
+      self.unload()
+      try:
+        model = self.loader(target)
+        if model.warmup is not None: model.warmup()
+      except BaseException as exc:
+        model, error = None, f'{type(exc).__name__}: {exc}'
+        print(f"Loading {target} failed: {error}", file=sys.stderr, flush=True)
+        if previous is not None: self._restore(previous)
+        raise RuntimeError(f'could not load {target}: {error}') from exc
+      self._install(model)
+      print(f"Switched to {target} in {time.perf_counter() - start:.1f}s.", file=sys.stderr, flush=True)
+    finally: self.switching = None
+    if self.idle is not None: self._start_background()
+
+  def _restore(self, name: str):
+    """After a failed load, put `name` back so the server stays usable (what the failure left is freed first)."""
+    gc.collect()
+    try:
+      back = self.loader(name)
+      if back.warmup is not None: back.warmup()
+      self._install(back)
+    except BaseException as exc:  # nothing is loaded now; the next request tries again
+      print(f"Loading {name} again failed too: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+
+  def _start_background(self):
+    threading.Thread(target=self._background, name='infurnace-idle', daemon=True).start()
+
+  def _background(self, quiet: float = 1.0):
+    """Run the loaded model's background work (`self.idle`: the prompt graph) in the first idle moment: no request
+    waiting and none for `quiet` seconds (a client that just loaded a model sends its reply's request right after).
+    A request that arrives while it runs waits for it. The thread holds no reference to the work while it waits,
+    so unloading the model (which drops `self.idle`) frees it; the work is then skipped."""
+    def idle() -> bool: return not self.waiting and time.monotonic() - self.last_used >= quiet
+    while True:
+      if idle():
+        with self.gpu:
+          if self.stopping or self.idle is None: return
+          if idle():  # again: a request may have held the lock meanwhile, and another be about to follow it
+            work, self.idle = self.idle, None
+            try: work()
+            except BaseException as exc: print(f"Background work failed: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+            return
+      time.sleep(0.05)
+
+  def _unload_when_idle(self):
+    while not self.stopping:
+      time.sleep(min(5.0, self.keep_alive))
+      if self.model is None or time.monotonic() - self.last_used < self.keep_alive or not self.gpu.acquire(blocking=False): continue
+      try:
+        if self.model is not None and not self.stopping and time.monotonic() - self.last_used >= self.keep_alive:
+          name = self.model_name
+          self.unload()
+          print(f"Unloaded {name} after {self.keep_alive:g}s idle; the next request loads it again.", file=sys.stderr, flush=True)
+      finally: self.gpu.release()
+
+  def _warm(self, warmup):
     start = time.perf_counter()
     with self.gpu:
       try:
@@ -228,12 +373,21 @@ class Server(socketserver.ThreadingMixIn, LLMServer):
         self.failure = f'{type(exc).__name__}: {exc}'
         print(f"Warmup failed: {self.failure}", file=sys.stderr, flush=True)
       self.warmup_seconds = time.perf_counter() - start
+      self.last_used = time.monotonic()  # clients polling the status send their request right after
       self.ready.set()
-    if idle is not None and not self.failure:
-      with self.gpu:  # a request that arrives meanwhile waits for it
-        if self.stopping: return
-        try: idle()
-        except BaseException as exc: print(f"Background work failed: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+    if self.idle is not None and not self.failure: self._start_background()
+
+  @contextlib.contextmanager
+  def request_gpu(self):
+    """The GPU lock for a request, after the warmup; while it waits, background work doesn't start."""
+    with self._waiting: self.waiting += 1
+    try:
+      self.ready.wait()
+      self.gpu.acquire()
+    finally:
+      with self._waiting: self.waiting -= 1
+    try: yield
+    finally: self.gpu.release()
 
   def finish(self):
     """Stop listening once the warmup thread is off the GPU (it skips the prompt graph if that has not started),
@@ -249,27 +403,33 @@ class Server(socketserver.ThreadingMixIn, LLMServer):
       self.closed.set()
 
   def status(self) -> dict:
-    state = 'failed' if self.failure else 'ready' if self.ready.is_set() else 'warming up'
-    return {'status': state, 'model': self.model_name, **({'error': self.failure} if self.failure else {}),
+    state = ('failed' if self.failure else 'warming up' if not self.ready.is_set() else 'loading' if self.switching
+             else 'unloaded' if self.model is None else 'ready')
+    return {'status': state, 'model': self.switching or self.model_name, 'pid': os.getpid(), **({'error': self.failure} if self.failure else {}),
             **({'warmup_seconds': round(self.warmup_seconds, 1)} if self.warmup_seconds is not None else {})}
 
   def loaded(self) -> dict:
     return {'name': self.model_name, 'model': self.model_name, 'size': self.info.get('size', 0), 'size_vram': self.info.get('size', 0),
             'context_length': self.model.max_context, 'expires_at': None, 'details': self.info.get('details', {}),
-            'infurnace': {'ready': self.ready.is_set() and not self.failure, 'dflash': self.info.get('dflash', False)}}
+            'expires_in': self.keep_alive, 'infurnace': {'ready': self.ready.is_set() and not self.failure, 'dflash': self.info.get('dflash', False)}}
 
   def show(self) -> dict:
     return {'details': self.info.get('details', {}), 'model_info': self.info.get('model_info', {}),
-            'capabilities': ['completion', 'tools', 'thinking'], 'context_length': self.model.max_context}
+            'capabilities': ['completion', 'tools', 'thinking'], 'context_length': self.model.max_context if self.model is not None else 0}
 
 def serve(model, tokenizer, port=8000, host='127.0.0.1', *, enable_thinking=True, dflash=None, block_size=16, idle=None,
           warmup=None, name=None, info=None, installed=None):
-  template = ChatTemplate(model.metadata, tokenizer, enable_thinking)
-  name = name or model.metadata.get('general.name') or 'infurnace'
-  eos = tuple(i for i in (tokenizer.eos_id, tokenizer.eot_id) if i is not None)
-  with Server((host, port), ServerModel(model, dflash, eos_token_ids=eos, block_size=block_size), name, tokenizer, template,
-              idle, warmup=warmup, info=info, installed=installed) as server:
+  """Serve one model as given (the in-process flags); `infurnace serve` uses serve_models."""
+  serve_models(loaded(model, tokenizer, name=name, dflash=dflash, block_size=block_size, enable_thinking=enable_thinking, info=info,
+                      warmup=warmup, idle=idle), port, host, installed=installed)
+
+def serve_models(first: Loaded, port=8000, host='127.0.0.1', *, installed=None, loader=None, keep_alive=None):
+  """Serve `first`, and with a `loader` the other models it can load (see Server)."""
+  with Server((host, port), first.model, first.name, first.tokenizer, first.template, first.idle, warmup=first.warmup,
+              info=first.info, installed=installed, loader=loader, keep_alive=keep_alive, dflash=first.dflash) as server:
+    name, has_draft, warming = first.name, first.dflash, first.warmup is not None
+    del first  # the Server holds the model now: unloading it must leave no other reference
     print(f"Serving {name} at http://{host}:{server.server_address[1]} (OpenAI-compatible API at /v1, infurnace API at /api)"
-          f"{' with DFlash' if dflash is not None else ''}{'; warming up' if warmup is not None else ''}", flush=True)
+          f"{' with DFlash' if has_draft else ''}{'; warming up' if warming else ''}", flush=True)
     try: server.serve_forever()
     finally: server.finish()  # after /api/shutdown or Ctrl-C

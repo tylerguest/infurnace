@@ -1,3 +1,4 @@
+import argparse
 from types import SimpleNamespace
 import pytest
 
@@ -37,7 +38,7 @@ def test_run_tells_models_from_prompts(value, model):
 
 def test_unknown_models_are_rejected_before_any_server(monkeypatch):
   monkeypatch.setattr('infurnace.client.run', lambda *args: pytest.fail('must not contact a server'))
-  with pytest.raises(ValueError, match="unknown model 'qwen3:4b'"): cli.command(['run', 'qwen3:4b', 'hi'])
+  with pytest.raises(ValueError, match="unknown model 'qwen9:4b'"): cli.command(['run', 'qwen9:4b', 'hi'])
   cli._check_model('qwen3.5:4b')
   cli._check_model('~/m/x.gguf')
 
@@ -51,3 +52,11 @@ def test_list_shows_downloaded_and_available_models(monkeypatch, capsys):
   assert header.split() == ['NAME', 'QUANT', 'SIZE', 'DFLASH', 'STATUS']
   assert downloaded.split() == ['qwen3.5:4b', 'Q4_K_M', '3.4', 'GB', 'yes', 'downloaded']
   assert available.split()[:4] == ['other:3b', 'Q4_K_M', '-', 'no'] and 'infurnace pull other:3b' in available
+
+@pytest.mark.parametrize('value,seconds', [('90', 90), ('90s', 90), ('30m', 1800), ('2h', 7200), ('1.5h', 5400)])
+def test_keep_alive_durations(value, seconds):
+  assert cli._duration(value) == seconds
+
+@pytest.mark.parametrize('value', ['', '0', '-5m', 'soon', '5d'])
+def test_invalid_keep_alive_durations(value):
+  with pytest.raises(argparse.ArgumentTypeError): cli._duration(value)

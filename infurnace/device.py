@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from tinygrad import Device, Tensor
@@ -54,6 +55,16 @@ def _probe(device: str) -> None:
   # Check actual execution, not just that a driver module can be imported.
   (Tensor([1.0], device=device) + 1).tolist()
 
+def nvidia_gpu_present() -> bool:
+  """An NVIDIA GPU the driver lists (nvidia-smi -L), whether or not tinygrad can open it."""
+  if (smi := shutil.which("nvidia-smi")) is None: return False
+  try: return subprocess.run([smi, "-L"], capture_output=True, text=True, timeout=10).stdout.lstrip().startswith("GPU ")
+  except (OSError, subprocess.SubprocessError): return False
+
+NVIDIA_RETRY_SECONDS = 10.0
+
+class DeviceError(RuntimeError): pass
+
 def select_device(requested: str | None = None) -> str:
   if requested is not None: return requested
   # Respect tinygrad's explicit environment configuration, including renderer selection.
@@ -65,6 +76,20 @@ def select_device(requested: str | None = None) -> str:
       return backend
     except Exception as exc:  # any failure (tinygrad raises ExceptionGroups for missing interfaces) means: try the next
       failures.append(f"{backend}: {exc}")
+    if backend == "CUDA" and nvidia_gpu_present():
+      # With an NVIDIA GPU, the CPU would be minutes per reply: wait for the GPU instead (a process that just
+      # exited may still be releasing it), then say what failed.
+      deadline = time.monotonic() + NVIDIA_RETRY_SECONDS
+      while time.monotonic() < deadline:
+        time.sleep(1.0)
+        for nvidia_backend in ("NV", "CUDA"):
+          try:
+            _probe(nvidia_backend)
+            return nvidia_backend
+          except Exception: pass
+      raise DeviceError("the NVIDIA GPU is present but tinygrad could not open it ("
+                         + "; ".join(f for f in failures if f.startswith(("NV", "CUDA"))) + "). If another program just released it, "
+                         "try again; pass --device CPU to run on the CPU anyway (very slow).")
   raise RuntimeError("no usable compute device: " + "; ".join(failures))
 
 def nvidia(device: str) -> bool:

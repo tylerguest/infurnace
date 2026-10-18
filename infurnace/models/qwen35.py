@@ -1,7 +1,7 @@
 """Qwen3.5: hybrid Gated DeltaNet (GDN) and attention layers.
 
 Its family adds the fused GDN pass on NV and prompt snapshots (GDN state can't be rewound); the tokenizer is
-Qwen35Tokenizer. Everything else is the shared engine."""
+BPETokenizer. Everything else is the shared engine."""
 import functools
 import os
 from tinygrad import Context, Tensor, UOp
@@ -9,7 +9,7 @@ from tinygrad.llm.model import GatedDeltaNetBlock
 from infurnace.engine import PREFILL_ROWS, _one_row
 from infurnace.kernels.gdn import gdn_gates, gdn_decode, gdn_prefill
 from infurnace.models import Family
-from infurnace.tokenizer import Qwen35Tokenizer
+from infurnace.tokenizer import BPETokenizer
 
 def _fused_gdn(block: GatedDeltaNetBlock):
   """Upstream GatedDeltaNetBlock._attention with NV kernels where upstream has them only on AMD.
@@ -111,4 +111,4 @@ def turn_markers(tokenizer) -> tuple[int | None, tuple[int, ...], int | None]:
   turn = special.get("<|im_start|>")
   return turn, (turn, *tokenizer.encode("user\n")) if turn is not None else (), special.get("<tool_response>")
 
-FAMILY = Family('qwen35', ('qwen35',), Qwen35Tokenizer.from_gguf, accelerate, recurrent=True, turn_markers=turn_markers)
+FAMILY = Family('qwen35', ('qwen35',), BPETokenizer.from_gguf, accelerate, recurrent=True, turn_markers=turn_markers)

@@ -148,7 +148,7 @@ def test_cli_packed_projection_flags_require_nv_before_loading(tmp_path, monkeyp
 def test_tokenizer_reference(tmp_path):
   tokenizers = pytest.importorskip('tokenizers')
   from tokenizers import Regex, models, trainers, pre_tokenizers, decoders, normalizers
-  from infurnace.tokenizer import Qwen35Tokenizer
+  from infurnace.tokenizer import BPETokenizer
   hf = tokenizers.Tokenizer(models.BPE())
   hf.normalizer = normalizers.NFC()
   pattern = (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}|"
@@ -163,7 +163,7 @@ def test_tokenizer_reference(tmp_path):
   data = json.loads((tmp_path / 'tokenizer.json').read_text())
   words = sorted(data['model']['vocab'], key=data['model']['vocab'].get)
   special = {entry['id'] for entry in data['added_tokens']}
-  tokenizer = Qwen35Tokenizer.from_gguf({'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': 'qwen35',
+  tokenizer = BPETokenizer.from_gguf({'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': 'qwen35',
     'tokenizer.ggml.tokens': words, 'tokenizer.ggml.token_type': [3 if i in special else 1 for i in range(len(words))],
     'tokenizer.ggml.merges': [' '.join(pair) for pair in data['model']['merges']],
     'tokenizer.ggml.eos_token_id': data['model']['vocab']['<|im_end|>']})

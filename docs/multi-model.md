@@ -76,26 +76,48 @@ path, goes away.
 Qwen3-4B adds the least new surface: head_dim 128, Q4_K/Q6_K weights, tied embeddings, ChatML, the `qwen2`
 tokenizer preset. A failure points at the split, not at the kernels.
 
-- [ ] Generic `BPETokenizer`; encodings match llama.cpp's on the quality texts
-- [ ] Multirow prompt reading without GDN: `_multirow_prefill` is only set inside the fused-GDN branch today,
-      so attention-only models need their own switch, plus a test that chunked and one-row prompts give the
-      same caches
-- [ ] Prefix reuse through the KV cache; no snapshots for non-recurrent families
-- [ ] Perplexity against llama.cpp (`benchmarks/quality.py`); speed sweep (decode, prompt reading, TTFT)
-- [ ] Catalog entry `qwen3:4b`; README Models line
+- [x] Generic `BPETokenizer`; encodings match llama.cpp's on the quality texts (eval.txt 10,098 tokens and
+      multilingual.txt 3,936 tokens identical; llama.cpp skips the NFC step Qwen's tokenizer.json specifies)
+- [x] Multirow prompt reading without GDN: the attention family turns prompt chunks on; `tests/core/test_nv_prompt.py`
+      checks chunked against one-row prompts, prefix reuse and a later graph capture on both models
+- [x] Prefix reuse through the KV cache; no snapshots for non-recurrent families
+- [x] Perplexity against llama.cpp and the speed sweep (below)
+- [x] Catalog entry `qwen3:4b` (Qwen's official GGUF); README models table
 
-### P3: DFlash for attention-only targets
+Measured 2026-10-18 (RTX 5060): perplexity on eval.txt (512 × 8) llama.cpp 27.8028, one-row 27.8171 (+0.05%),
+16-row 27.8032; multilingual.txt (512 × 5) llama.cpp 8.0761, one-row 8.0090, 16-row 8.0015 (−0.8 to −0.9%, as
+Qwen3.5's −0.4 to −0.5%). Plain decoding:
 
-- [ ] Verifier without GDN operands: rolling back is only moving the position
-- [ ] A GGUF draft: z-lab publishes Qwen3 DFlash drafts as safetensors; find or convert a GGUF
-- [ ] Acceptance and speed measured against plain decoding; the draft policy falls back when it loses
+| Prompt | TTFT | Prompt reading | Decode |
+|---|---|---|---|
+| 124 | 68 ms | 1,822 tok/s | 108.2 tok/s |
+| 1,024 | 360 ms | 2,846 tok/s | 106.7 tok/s |
+| 4,024 | 1.56 s | 2,577 tok/s | 97.1 tok/s |
+| 8,024 | 3.79 s | 2,116 tok/s | 81.6 tok/s |
+
+Decode falls faster with length than Qwen3.5's (its 36 layers are all attention, against 8 of 32): the decode
+attention kernel at head_dim 128 is the next thing to tune. Freeing a model inside a process works (GPU memory
+3.67 → 0.80 GB after dropping every reference and `gc.collect()`), which P4 builds on.
+
+### P3: DFlash for attention-only targets (not planned)
+
+Set aside on 2026-10-18: z-lab publishes its Qwen3 drafts as safetensors only, so it would start with a GGUF
+conversion, and the user chose to spend the effort elsewhere. Qwen3-4B runs plain decoding.
 
 ### P4: switching models in the server
 
-- [ ] A request for another model unloads the current one, loads the new one and warms it up (about a
-      minute); one model on the GPU at a time
-- [ ] The client stops asking to `infurnace stop` first
-- [ ] Unload after a configurable idle time
+- [x] A request for another model unloads the current one, loads the new one and warms it up; one model on the
+      GPU at a time; a failed load puts the previous one back
+- [x] The client stops asking to `infurnace stop` first: `run MODEL` downloads the model if needed and has the
+      server load it (an empty `/api/generate`, as in Ollama)
+- [x] Unload after a configurable idle time (`serve --keep-alive 30m`)
+
+Measured 2026-10-18 (RTX 5060): switching Qwen3.5 → Qwen3 51 s to the first reply (load 11 s, warmup 39 s);
+back to Qwen3.5 with DFlash 25 s (kernels already compiled); an unloaded server holds no GPU memory beyond the
+desktop's. Along the way: the prompt graph now waits for an idle moment instead of delaying the first reply
+(cold start to first reply 69 → 42 s), `stop` waits for the server process to exit, and with an NVIDIA GPU
+present a failed open is retried and reported instead of falling back to the CPU (a server restarted right after
+`stop` had silently run on the CPU).
 
 ### P5: more families
 
@@ -115,4 +137,4 @@ tokenizer preset. A failure points at the split, not at the kernels.
 ## Open decisions
 
 - Second model: Qwen3-4B (decided 2026-10-18)
-- P4 timing: swap models on request now, or keep "stop it first" until P2 lands
+- P4 timing: after P2, before P3 (decided 2026-10-18); P3 set aside

@@ -63,13 +63,13 @@ def test_prefill_selection_forwarded_to_children(monkeypatch, flags, expected):
 def test_comparison_worker_runs_qwen35_fixture(tmp_path, monkeypatch, worker):
   from types import SimpleNamespace
   from tinygrad import Context
-  from infurnace.tokenizer import Qwen35Tokenizer
+  from infurnace.tokenizer import BPETokenizer
   from test_qwen35 import checkpoint
   monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / 'benchmarks'))
   with Context(DEV='CPU'):
     path = checkpoint(tmp_path)
   tokenizer = SimpleNamespace(bos_id=None, encode=lambda text: [1, 2])
-  monkeypatch.setattr(Qwen35Tokenizer, 'from_gguf', lambda metadata: tokenizer)
+  monkeypatch.setattr(BPETokenizer, 'from_gguf', lambda metadata: tokenizer)
   args = benchmark.parser().parse_args(['--worker', worker, '--model', str(path), '--device', 'CPU', '--context', '16',
                                        '--tokens', '3', '--runs', '1', '--prompt-tokens', '2', '--no-nv-quant'])
   report = benchmark.worker(args)

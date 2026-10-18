@@ -63,7 +63,7 @@ def worker(args) -> dict:
   from tinygrad import Context, Device
   from tinygrad.helpers import GlobalCounters
   from infurnace.device import select_device
-  from infurnace.tokenizer import Qwen35Tokenizer
+  from infurnace.tokenizer import BPETokenizer
   from tinygrad.llm.model import Transformer
   from infurnace.loader import load_model
   from decode import benchmark_prompt_ids, validate_benchmark_context
@@ -84,7 +84,7 @@ def worker(args) -> dict:
       model, metadata = Transformer.from_gguf(Path(args.model), args.context, realize=False)
       if metadata.get('general.architecture') != 'qwen35': raise ValueError('expected dense Qwen3.5 GGUF')
       # Shared Qwen3.5 codec; transformer loading/execution stays independent.
-      tokenizer = Qwen35Tokenizer.from_gguf(metadata)
+      tokenizer = BPETokenizer.from_gguf(metadata)
       context = model.max_context
       def reset(): model._cached_tokens = []
       def generate(): return model.generate(list(ids), chunk_size=args.chunk_size, temperature=0.0)

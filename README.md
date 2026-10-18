@@ -34,7 +34,12 @@ Other apps can use it as an OpenAI-compatible API at `http://127.0.0.1:8000/v1`.
 
 ## Models
 
-Today: Qwen3.5-4B (`qwen3.5:4b`). More small models are coming.
+| Model | Name | Speed (RTX 5060) |
+|---|---|---|
+| Qwen3.5-4B | `qwen3.5:4b` (default) | ~110 tokens/s, 200–340 with DFlash |
+| Qwen3-4B | `qwen3:4b` | ~108 tokens/s |
+
+`infurnace run qwen3:4b` runs another one; `infurnace list` shows them all. More small models are coming.
 
 ## Learn more
 

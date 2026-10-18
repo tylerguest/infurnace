@@ -5,7 +5,7 @@
 | Command | |
 |---|---|
 | `infurnace` | chat with the default model (same as `infurnace run`) |
-| `infurnace run [MODEL] [PROMPT]` | chat, or answer one prompt and exit; piped input works too (`cat notes.txt \| infurnace run "Summarize this"`) |
+| `infurnace run [MODEL] [PROMPT]` | chat, or answer one prompt and exit; piped input works too (`cat notes.txt \| infurnace run "Summarize this"`). A running server switches to MODEL (downloaded first if needed) |
 | `infurnace serve` | start the server yourself; `run`, `ps`, `stop` and `launch` talk to it, and `run` starts one in the background when none answers (log: `~/.local/state/infurnace/serve.log`) |
 | `infurnace ps` | the running server: model, context, readiness, DFlash |
 | `infurnace stop` | stop the server and free the GPU |
@@ -23,13 +23,14 @@ When a conversation no longer fits, the oldest turns are dropped with a notice.
 | `--temperature T` (`run`) | greedy by default; Qwen suggests about 0.6 with thinking, where greedy can repeat |
 | `--max-tokens N` (`run`) | cap a reply (thinking counts); otherwise it runs until the model stops or the context fills |
 | `--max-context N` | the context window; by default the most that fits in free GPU memory, in steps of 8,192 (24-32k on an 8 GB card next to a desktop) |
-| `--model MODEL` (`serve`) | a model name or a local GGUF file (`serve --model ~/models/Qwen3.5-4B-Q4_K_M.gguf`) |
+| `--model MODEL` (`serve`) | the model to start with: a model name or a local GGUF file (`serve --model ~/models/Qwen3.5-4B-Q4_K_M.gguf`) |
+| `--keep-alive DURATION` (`serve`) | unload the model after this long idle (`30m`, `2h`), freeing the GPU; the next request loads it again. By default it stays loaded |
 | `--no-dflash` | plain decoding, without the draft model |
 | `--device`, `DEV` | the tinygrad device (`NV` on Linux, probed first, or `CUDA`) |
 | `INFURNACE_HOST` | the server's address (default `127.0.0.1:8000`) |
 
-Models download into `~/.local/share/infurnace/models/`: `qwen3.5:4b` is the target (2.7 GB) and its DFlash
-draft (0.4 GB).
+Models download into `~/.local/share/infurnace/models/`: `qwen3.5:4b` (2.7 GB, and its 0.4 GB DFlash draft) and
+`qwen3:4b` (2.5 GB).
 
 ## The server
 
@@ -41,9 +42,18 @@ not the server.
 
 The server listens at once (`INFURNACE_HOST`, default `127.0.0.1:8000`) and warms up on a thread: loading takes
 ~11 s, the warmup ~42 s, then the prompt-reading graph ~27 s more (RTX 5060, DFlash). Until warmup ends,
-`/api/status` says `warming up` and generating requests wait; a request arriving during the prompt-graph capture
-waits for it, and until then prompts read through DFlash's verifier. `--no-warmup` skips both.
-`infurnace stop` (or `POST /api/shutdown`) stops it.
+`/api/status` says `warming up` and generating requests wait. The prompt graph is captured in the first idle
+moment: a request that is waiting goes first, one arriving during the capture waits for it, and until it is
+captured prompts read through DFlash's verifier. `--no-warmup` skips both. `infurnace stop` (or
+`POST /api/shutdown`) stops it, and returns once the server process has exited and the GPU is free.
+
+**Switching models.** One model is on the GPU at a time. A request naming another downloaded model (`model` in
+`/api/chat`, `/api/generate` or `/v1`) frees the current one and loads and warms up the new one while it waits:
+~50 s the first time, ~25 s for a model loaded before (its kernels are compiled). Other requests wait meanwhile,
+and `/api/status` says `loading`. If the load fails, the previous model is loaded again. An unknown name is a 404
+on `/api`; `/v1` serves it with the loaded model, as OpenAI clients often send a fixed name. Each model gets the
+context that fits the GPU memory free when the server started. With `--keep-alive`, an idle model is unloaded
+(`/api/status` says `unloaded`, `/api/ps` lists nothing) and the next request loads it again.
 
 The context is the most that fits in free GPU memory (`loader.fit_context`: the weights, 36 KB per token of KV
 cache for Qwen3.5-4B with its draft, ~1.45 GB of graphs and buffers, a 0.25 GB margin); `--max-context` overrides.
@@ -53,9 +63,9 @@ cache for Qwen3.5-4B with its draft, ~1.45 GB of graphs and buffers, a 0.25 GB m
 | Endpoint | |
 |---|---|
 | `POST /api/chat` | `{model, messages, stream (default true), think, tools, options: {temperature, num_predict}}`; newline-delimited JSON records with `message.content`, `message.thinking`, `message.tool_calls`, then a final record with `done_reason` and token counts and durations |
-| `POST /api/generate` | the same with `prompt` (and `system`, `raw`), the text in `response` |
-| `GET /api/tags`, `/api/ps`, `POST /api/show` | downloaded models; the loaded one (context, DFlash, readiness); its details |
-| `GET /api/status`, `/api/version` | `warming up`, `ready` or `failed` (with the error); the version |
+| `POST /api/generate` | the same with `prompt` (and `system`, `raw`), the text in `response`. Without a prompt it only loads `model`; with `keep_alive: 0` it unloads it |
+| `GET /api/tags`, `/api/ps`, `POST /api/show` | downloaded models; the loaded one (context, DFlash, readiness), if any; its details |
+| `GET /api/status`, `/api/version` | `warming up`, `ready`, `loading` (switching models), `unloaded` or `failed` (with the error), and the server's pid; the version |
 | `POST /api/shutdown` | stop the server |
 
 **launch pi** adds an entry for the served model under the `infurnace` provider in `~/.pi/agent/models.json`

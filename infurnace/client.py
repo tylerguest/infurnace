@@ -85,21 +85,30 @@ def start_server(serve_args: list[str]) -> None:
     time.sleep(0.5)
   raise ServerError(f"the server did not start within 5 minutes; see {log}")
 
+def _served_name(model: str) -> str:
+  """The name a server gives a model: a catalog name as is, a GGUF path its file name's stem."""
+  return Path(model).stem if model.endswith(".gguf") else model
+
 def connect(model: str | None, serve_args: list[str]) -> dict:
-  """The running server's status, starting one when none answers. A different model than the one it serves is an error."""
+  """The running server's status, starting one when none answers. When it serves another model (or has unloaded
+  its own), it is asked to load `model` now (downloading a catalog model first), so the wait happens here."""
   current = status()
   if current is None:
     start_server((["--model", model] if model else []) + serve_args)
     current = status() or {}
-  # A GGUF path is served under its file name's stem
-  if model and current.get("model") not in (None, model, Path(model).stem if model.endswith(".gguf") else model):
-    raise ServerError(f"the server at {host()} is serving {current.get('model')}; stop it first (infurnace stop) to run {model}")
+  if model and (current.get("model") != _served_name(model) or current.get("status") == "unloaded"):
+    from infurnace import catalog
+    if model in catalog.CATALOG and not catalog.local(catalog.CATALOG[model].url): catalog.pull(model)
+    wait_ready()
+    print(f"Loading {model} on the server (about a minute)...", file=sys.stderr, flush=True)
+    request("POST", "/api/generate", {"model": _served_name(model)}, timeout=600)
+    current = status() or {}
   return current
 
 def wait_ready() -> None:
   """Block until the server has finished warming up, saying so once if it has not."""
   told = False
-  while (current := status()) is not None and current.get("status") == "warming up":
+  while (current := status()) is not None and current.get("status") in ("warming up", "loading"):
     if not told:
       print("Warming up the GPU (about a minute on a fresh start)...", file=sys.stderr, flush=True)
       told = True
@@ -232,15 +241,25 @@ def ps() -> int:
   if current.get("status") == "busy":
     print(f"The infurnace server at {host()} is busy and not answering.")
     return 0
-  for loaded in request("GET", "/api/ps").get("models", []):
+  models = request("GET", "/api/ps").get("models", [])
+  if not models: print(f"The infurnace server at {host()} has no model loaded (it unloaded {current.get('model')}; the next request loads it).")
+  for loaded in models:
     details = loaded.get("details", {})
     flags = ["DFlash"] if loaded.get("infurnace", {}).get("dflash") else []
     print(f"{loaded['name']:<16} {details.get('quantization_level', ''):<8} {loaded.get('size', 0) / 1e9:5.1f} GB  "
           f"context {loaded.get('context_length')}  {current.get('status')}  {' '.join(flags)}  {base_url()}")
   return 0
 
+def _exited(pid: int | None) -> bool:
+  """Whether a local server process is gone (True when it isn't local, its pid is unknown, or it is this process)."""
+  if not pid or pid == os.getpid() or host().rsplit(":", 1)[0] not in ("127.0.0.1", "localhost", "::1", "[::1]"): return True
+  try: os.kill(pid, 0)
+  except ProcessLookupError: return True
+  except PermissionError: return False
+  return False
+
 def stop() -> int:
-  if status() is None:
+  if (current := status()) is None:
     print(f"No infurnace server is running at {host()}.")
     return 0
   # Whatever is on the GPU (a reply in progress, or the warmup and the prompt graph after it: about a minute on a
@@ -249,7 +268,8 @@ def stop() -> int:
   request("POST", "/api/shutdown", {}, timeout=120)
   deadline = time.monotonic() + 300
   while time.monotonic() < deadline:
-    if status() is None:
+    # Stopped once it stops listening and its process is gone: until then the GPU may not be released yet
+    if status() is None and _exited(current.get("pid")):
       print("Stopped the infurnace server.")
       return 0
     time.sleep(0.25)

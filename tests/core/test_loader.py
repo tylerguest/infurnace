@@ -48,9 +48,12 @@ def test_dflash_draft_for_names_and_paths(tiny_models, monkeypatch, tmp_path):
   assert loader.dflash_draft("tiny:1b") == Path.home() / "draft.gguf"
 
 def test_catalog():
-  assert list(catalog.CATALOG) == ['qwen3.5:4b'] and catalog.DEFAULT == 'qwen3.5:4b'
+  assert list(catalog.CATALOG) == ['qwen3.5:4b', 'qwen3:4b'] and catalog.DEFAULT == 'qwen3.5:4b'
   entry = catalog.CATALOG['qwen3.5:4b']
   assert entry.architecture == 'qwen35' and entry.draft.endswith('qwen35-4b-dflash-Q4_K_M.gguf')
+  qwen3 = catalog.CATALOG['qwen3:4b']
+  assert qwen3.architecture == 'qwen3' and qwen3.draft is None  # no DFlash draft yet (P3)
+  for e in catalog.ENTRIES: family_for(e.architecture)  # every entry has a family that runs it
   with pytest.raises(ValueError, match='unknown model'): catalog.entry('nope')
 
 @pytest.fixture
@@ -78,7 +81,7 @@ def test_build_uses_validated_metadata(model_loader):
   assert result is model and tokenizer is metadata
   assert calls == [('model', {'max_context': 16, 'device': 'CPU', 'nv_quant': False, 'nv_prefill': False})]
 
-@pytest.mark.parametrize('architecture', ['qwen3', 'llama', 'qwen35moe', None])
+@pytest.mark.parametrize('architecture', ['llama', 'qwen35moe', None])
 def test_rejects_other_architectures_before_loading(model_loader, architecture):
   metadata, _, calls = model_loader
   metadata['general.architecture'] = architecture

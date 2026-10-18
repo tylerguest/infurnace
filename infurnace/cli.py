@@ -4,6 +4,7 @@ talk to it (starting it when needed); `pull`, `list` and `rm` manage downloads.
 The original flags still work: `--prompt`, `--serve [PORT]`, `--benchmark` and in-process chat (`--chat`)."""
 from __future__ import annotations
 import argparse
+import functools
 import sys
 import threading
 import time
@@ -11,7 +12,7 @@ from pathlib import Path
 from typing import Callable, Iterator
 from tinygrad.helpers import GlobalCounters, Timing, profile_marker
 from infurnace import catalog, loader
-from infurnace.device import free_vram, nvidia, select_device
+from infurnace.device import DeviceError, free_vram, nvidia, select_device
 
 PROMPT_MAX_TOKENS = 64
 
@@ -54,6 +55,14 @@ def _temperature(value: str) -> float:
   except ValueError: temperature = -1.0
   if not 0 <= temperature < float('inf'): raise argparse.ArgumentTypeError("must be a finite number >= 0")
   return temperature
+
+def _duration(value: str) -> float:
+  """Seconds from 90, 90s, 30m or 2h."""
+  scale = {"s": 1, "m": 60, "h": 3600}.get(value[-1:].lower(), None)
+  try: seconds = float(value[:-1] if scale else value) * (scale or 1)
+  except ValueError: seconds = -1.0
+  if not 0 < seconds < float("inf"): raise argparse.ArgumentTypeError("expected a duration such as 90s, 30m or 2h")
+  return seconds
 
 def _positive(value: str) -> int:
   if not value.isdigit() or int(value) <= 0: raise argparse.ArgumentTypeError("must be a positive integer")
@@ -234,6 +243,9 @@ def main(argv: list[str] | None = None) -> int:
   except KeyboardInterrupt:
     print("\nInterrupted.", file=sys.stderr)
     return 130
+  except DeviceError as exc:
+    print(f"infurnace: {exc}", file=sys.stderr)
+    return 1
   except RuntimeError as exc:
     if 'signal wait timed out' not in str(exc) and 'hang detected' not in str(exc): raise
     print(f"infurnace: the GPU stopped responding ({exc}). Restart infurnace; if it repeats, try --no-dflash.", file=sys.stderr)
@@ -269,6 +281,8 @@ def command_parser() -> argparse.ArgumentParser:
   serve.add_argument("--dflash", type=Path, metavar="GGUF", help="DFlash draft file (the named model's is used automatically)")
   serve.add_argument("--no-thinking", action="store_true", help="disable thinking unless a request asks for it")
   serve.add_argument("--no-warmup", action="store_true", help="skip the warmup (the first replies are then slower)")
+  serve.add_argument("--keep-alive", type=_duration, metavar="DURATION",
+                     help="unload the model after this long idle, e.g. 30m or 2h (default: keep it loaded); the next request loads it again")
   run_ = sub.add_parser("run", help="chat with a model, or answer one prompt (an argument or piped input)")
   run_.add_argument("model", nargs="?", help=f"model name (default: the server's, else {default})")
   run_.add_argument("prompt", nargs="*", help="answer this and exit")
@@ -309,35 +323,56 @@ def _check_model(model: str | None) -> None:
 def _model_name(model: str) -> str:
   return model if model in catalog.CATALOG else Path(model).stem
 
+def _serve_warmup(model, dflash) -> None:
+  start = time.perf_counter()
+  print(f"Warming up {model.device}...", file=sys.stderr, flush=True)
+  _warm(model, dflash, prompt_graph=False)
+  print(f"Ready in {time.perf_counter() - start:.1f}s; {GlobalCounters.mem_used / 1e9:.2f} GB on the GPU.", file=sys.stderr, flush=True)
+
+class ServerModels:
+  """The models `infurnace serve` can serve: downloaded catalog models, and the one it started with (a catalog name
+  or a local GGUF). Calling it with a name loads that model as a serve.Loaded. Without --max-context each model gets
+  the context that fits the GPU memory free at startup (measured once: later, infurnace's own runtime counts as
+  used). It holds no model itself, so a server's switch or unload can free one."""
+  def __init__(self, args: argparse.Namespace, device: str):
+    self.args, self.device, self.first = args, device, _model_name(args.model)
+    self.free = free_vram(device) if args.max_context is None else None
+
+  def names(self) -> list[str]:
+    return [self.first, *(m['name'] for m in catalog.installed() if m['name'] != self.first)]
+
+  def __call__(self, name: str):
+    from infurnace.serve import loaded
+    args, first = self.args, name == self.first
+    source = args.model if first else name
+    # --dflash names the first model's draft; --no-dflash applies to every model
+    draft, automatic = _dflash_draft(argparse.Namespace(**{**vars(args), 'model': source, 'dflash': args.dflash if first else None}))
+    path = catalog.fetch_model(source)
+    draft_path = catalog.fetch_model(draft) if draft is not None and not (automatic and not nvidia(self.device)) else None
+    context = args.max_context
+    if context is None:
+      context = loader.fit_context(path, draft_path, self.free) if self.free else 8192
+      print(f"Context for {name}: {context} tokens" + (f" (fits in {self.free / 1e9:.1f} GB of free GPU memory; --max-context overrides)"
+                                                       if self.free else " (default; --max-context overrides)"), file=sys.stderr, flush=True)
+    model, tokenizer = loader.load_model(path, context, self.device)
+    dflash = loader.load_dflash(model, draft_path) if draft_path is not None else None
+    warm = None if args.no_warmup else functools.partial(_serve_warmup, model, dflash)
+    idle = None if args.no_warmup else functools.partial(capture_prompt_graph, model)
+    return loaded(model, tokenizer, name=name, dflash=dflash, block_size=_dflash_block(dflash) if dflash is not None else 16,
+                  enable_thinking=not args.no_thinking, info=loader.model_info(name, path, dflash is not None), warmup=warm, idle=idle)
+
 def serve_command(args: argparse.Namespace) -> int:
-  """Load the model and serve it; warmup runs on a thread after the server starts listening."""
+  """Load the model and serve it, and the other downloaded models on request; warmup runs on a thread after the
+  server starts listening."""
   from infurnace import client
-  from infurnace.serve import serve
+  from infurnace.serve import serve_models
   hostname, port = client.host().rsplit(":", 1)
   hostname, port = args.host or hostname, args.port or int(port)
   if not 1 <= port <= 65535: raise ValueError("port must be between 1 and 65535")
   args.benchmark = None
-  draft, automatic = _dflash_draft(args)
-  path = catalog.fetch_model(args.model)
-  device = select_device(args.device)
-  draft_path = catalog.fetch_model(draft) if draft is not None and not (automatic and not nvidia(device)) else None
-  if args.max_context is None:
-    free = free_vram(device)
-    args.max_context = loader.fit_context(path, draft_path, free) if free else 8192
-    print(f"Context: {args.max_context} tokens" + (f" (fits in {free / 1e9:.1f} GB of free GPU memory; --max-context overrides)"
-                                                    if free else " (default; --max-context overrides)"), file=sys.stderr, flush=True)
-  model, tokenizer = loader.load_model(path, args.max_context, device)
-  dflash = loader.load_dflash(model, draft_path) if draft_path is not None else None
-  def warm():
-    start = time.perf_counter()
-    print(f"Warming up {model.device}...", file=sys.stderr, flush=True)
-    _warm(model, dflash, prompt_graph=False)
-    print(f"Ready in {time.perf_counter() - start:.1f}s; {GlobalCounters.mem_used / 1e9:.2f} GB on the GPU.", file=sys.stderr, flush=True)
-  name = _model_name(args.model)
-  serve(model, tokenizer, port, hostname, enable_thinking=not args.no_thinking, dflash=dflash,
-        block_size=_dflash_block(dflash) if dflash is not None else 16, name=name,
-        warmup=None if args.no_warmup else warm, idle=None if args.no_warmup else lambda: capture_prompt_graph(model),
-        info=loader.model_info(name, path, dflash is not None), installed=catalog.installed)
+  models = ServerModels(args, select_device(args.device))
+  # The first model goes straight to the server: no local name here may keep it alive past an unload.
+  serve_models(models(models.first), port, hostname, installed=catalog.installed, loader=models, keep_alive=args.keep_alive)
   return 0
 
 def command(argv: list[str]) -> int:
