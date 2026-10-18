@@ -18,7 +18,10 @@ from typing import Iterator
 
 DEFAULT_HOST = "127.0.0.1:8000"
 
-class ServerError(Exception): pass
+class ServerError(Exception):
+  def __init__(self, message: str, code: str | None = None):
+    super().__init__(message)
+    self.code = code  # the server's machine-readable error code, e.g. context_length_exceeded
 
 def host() -> str:
   """The server's address as host:port."""
@@ -29,10 +32,12 @@ def host() -> str:
 def base_url() -> str: return f"http://{host()}"
 
 def _error(exc: urllib.error.HTTPError) -> ServerError:
-  """The server's {"error": ...} message as a ServerError."""
-  try: message = json.loads(exc.read()).get("error", str(exc))
-  except (ValueError, AttributeError): message = str(exc)
-  return ServerError(message if isinstance(message, str) else json.dumps(message))
+  """The server's {"error": ..., "code": ...} reply as a ServerError."""
+  try: reply = json.loads(exc.read())
+  except ValueError: reply = None
+  if not isinstance(reply, dict): reply = {}
+  message, code = reply.get("error", str(exc)), reply.get("code")
+  return ServerError(message if isinstance(message, str) else json.dumps(message), code if isinstance(code, str) else None)
 
 def request(method: str, path: str, body: dict | None = None, timeout: float | None = 10) -> dict:
   data = json.dumps(body).encode() if body is not None else None
@@ -191,7 +196,7 @@ def chat(model: str, think: bool | None, options: dict) -> int:
         answer = _reply(history + [message], model, think, options, show_thinking=True)
         break
       except ServerError as exc:
-        if "context" in str(exc) and history:
+        if exc.code == "context_length_exceeded" and history:
           history = history[2:]
           print("[Context window: discarded the oldest turn; earlier details are no longer remembered.]", file=sys.stderr)
           continue
@@ -224,6 +229,9 @@ def ps() -> int:
   if (current := status()) is None:
     print(f"No infurnace server is running at {host()}.")
     return 0
+  if current.get("status") == "busy":
+    print(f"The infurnace server at {host()} is busy and not answering.")
+    return 0
   for loaded in request("GET", "/api/ps").get("models", []):
     details = loaded.get("details", {})
     flags = ["DFlash"] if loaded.get("infurnace", {}).get("dflash") else []
@@ -235,8 +243,8 @@ def stop() -> int:
   if status() is None:
     print(f"No infurnace server is running at {host()}.")
     return 0
-  # The server handles one thing at a time: a reply in progress, or its warmup and the prompt graph it captures
-  # after it (about a minute on a fresh start), finishes first; it stops listening once the GPU is free.
+  # Whatever is on the GPU (a reply in progress, or the warmup and the prompt graph after it: about a minute on a
+  # fresh start) finishes first; the server stops listening once the GPU is free.
   print("Stopping the server (it finishes what it is doing first)...", file=sys.stderr, flush=True)
   request("POST", "/api/shutdown", {}, timeout=120)
   deadline = time.monotonic() + 300

@@ -298,6 +298,11 @@ def _looks_like_model(value: str) -> bool:
   if "://" in value: return False  # a URL is prompt text, never a model to download
   return value in loader.MODELS or value.endswith(".gguf") or (" " not in value and ":" in value and not value.endswith(":"))
 
+def _check_model(model: str | None) -> None:
+  """A model `run` or `launch` asks for must be a catalog name or a GGUF file: say so before any server is involved."""
+  if model is None or model in loader.MODELS or model.endswith(".gguf"): return
+  raise ValueError(f"unknown model {model!r}; available: {', '.join(loader.MODELS)}, or a path to a GGUF file")
+
 def _model_name(model: str) -> str:
   return model if model in loader.MODELS else Path(model).stem
 
@@ -338,6 +343,7 @@ def command(argv: list[str]) -> int:
   if args.command == "serve": return serve_command(args)
   if args.command == "run":
     if args.model is not None and not _looks_like_model(args.model): args.model, args.prompt = None, [args.model, *args.prompt]
+    _check_model(args.model)
     options = {**({"temperature": args.temperature} if args.temperature is not None else {}),
                **({"num_predict": args.max_tokens} if args.max_tokens else {})}
     status = client.run(args.model, " ".join(args.prompt) or None, args.think, options, _forward(args))
@@ -362,6 +368,7 @@ def command(argv: list[str]) -> int:
   if args.command == "stop": return client.stop()
   if args.command == "launch":
     extra = args.extra[1:] if args.extra[:1] == ["--"] else args.extra
+    _check_model(args.model)
     return client.launch(args.integration, args.model, _forward(args), extra, configure_only=args.config)
   raise AssertionError(args.command)
 

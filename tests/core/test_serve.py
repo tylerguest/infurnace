@@ -1,5 +1,6 @@
 import http.client
 import json
+import socket
 import threading
 import time
 from types import SimpleNamespace
@@ -156,6 +157,77 @@ def test_shutdown_waits_for_warmup():
     release.set()
     assert server.closed.wait(5) and calls == []
   finally: stop()
+
+def test_bad_requests_get_400():
+  # Unrenderable messages, an oversized prompt and a malformed Content-Length are answered, not dropped.
+  model, tok = Model(), Tokenizer()
+  template = ChatTemplate({'tokenizer.chat_template': "{% if messages[-1].role != 'user' %}{{ raise_exception('No user query') }}"
+                                                      "{% endif %}{{ messages[-1].content }}"}, tok)
+  server, call, stop = serving(model, tok, template)
+  try:
+    status, data = call('POST', '/api/chat', {'messages': [{'role': 'assistant', 'content': 'hi'}]})
+    assert status == 400 and 'No user query' in json.loads(data)['error']
+    status, data = call('POST', '/api/chat', {'messages': ['not an object']})
+    assert status == 400
+    model.config = SimpleNamespace(context_length=2)  # the fake tokenizer always encodes two tokens
+    server.model.max_context = 2
+    status, data = call('POST', '/api/chat', {'messages': [{'role': 'user', 'content': 'x'}]})
+    assert status == 400 and json.loads(data)['code'] == 'context_length_exceeded'
+    conn = http.client.HTTPConnection(*server.server_address)
+    conn.putrequest('POST', '/api/chat')
+    conn.putheader('Content-Length', 'abc')
+    conn.endheaders()
+    assert conn.getresponse().status == 400
+    conn.close()
+  finally: stop()
+
+class SlowModel(Model):
+  """Yields a token every 10 ms until `release` is set (or 500 tokens)."""
+  def __init__(self):
+    super().__init__()
+    self.started, self.release, self.count = threading.Event(), threading.Event(), 0
+
+  def generate(self, ids, limit, temperature=0):
+    self.started.set()
+    try:
+      while not self.release.is_set() and self.count < 500:
+        self.count += 1
+        time.sleep(0.01)
+        yield ord('a')
+    finally:
+      self.closed = True
+
+def test_status_answers_during_a_reply():
+  # Requests have their own threads: status and ps answer while another request generates.
+  model, tok = SlowModel(), Tokenizer()
+  template = ChatTemplate({'tokenizer.chat_template': '{% for m in messages %}{{ m.content }}{% endfor %}'}, tok)
+  server, call, stop = serving(model, tok, template)
+  reply = threading.Thread(target=call, args=('POST', '/api/chat', {'messages': [{'role': 'user', 'content': 'x'}], 'stream': False}))
+  reply.start()
+  try:
+    assert model.started.wait(5)
+    assert json.loads(call('GET', '/api/status')[1])['status'] == 'ready' and not model.closed
+    assert json.loads(call('GET', '/api/ps')[1])['models'][0]['name'] == 'test'
+  finally:
+    model.release.set()
+    reply.join(5)
+    stop()
+
+def test_non_streamed_reply_stops_when_the_client_leaves():
+  model, tok = SlowModel(), Tokenizer()
+  template = ChatTemplate({'tokenizer.chat_template': '{% for m in messages %}{{ m.content }}{% endfor %}'}, tok)
+  server, call, stop = serving(model, tok, template)
+  try:
+    body = json.dumps({'messages': [{'role': 'user', 'content': 'x'}], 'stream': False}).encode()
+    with socket.create_connection(server.server_address) as conn:
+      conn.sendall(b'POST /api/chat HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n' % len(body) + body)
+      assert model.started.wait(5)
+    deadline = time.monotonic() + 3
+    while not model.closed and time.monotonic() < deadline: time.sleep(0.02)
+    assert model.closed and model.count < 500
+  finally:
+    model.release.set()
+    stop()
 
 def serving(model, tok, template, **kwargs):
   server = Server(('127.0.0.1', 0), ServerModel(model), 'test', tok, template, **kwargs)

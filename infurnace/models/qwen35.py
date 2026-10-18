@@ -67,7 +67,8 @@ def file_identity(path: str | Path) -> str:
   return f'{Path(path).resolve()} {stat.st_size} {stat.st_mtime_ns}'
 
 def prune_cache(directory: Path, keep: int) -> None:
-  for old in sorted(directory.glob('*'), key=lambda p: p.stat().st_mtime)[:-keep]: old.unlink(missing_ok=True)
+  # Finished entries only: a .tmp may be another process's write in progress.
+  for old in sorted(directory.glob('*.bin'), key=lambda p: p.stat().st_mtime)[:-keep]: old.unlink(missing_ok=True)
 
 _ALIGN, _MAGIC = 256, b'INFTENS1'
 

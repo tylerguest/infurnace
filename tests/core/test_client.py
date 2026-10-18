@@ -96,7 +96,7 @@ def test_interactive_chat_commands(monkeypatch, capsys):
 
 def test_chat_survives_server_errors(monkeypatch, capsys):
   # A message the server rejects (here: too long even without history) is reported; the chat goes on.
-  replies = iter([client.ServerError('prompt has 9000 tokens, but the model context is 8192'), 'fine'])
+  replies = iter([client.ServerError('prompt has 9000 tokens, but the model context is 8192', 'context_length_exceeded'), 'fine'])
   def reply(*args, **kwargs):
     value = next(replies)
     if isinstance(value, Exception): raise value
@@ -107,6 +107,22 @@ def test_chat_survives_server_errors(monkeypatch, capsys):
   monkeypatch.setattr('builtins.input', lambda prompt='': next(lines))
   assert client.chat('qwen3.5:4b', None, {}) == 0
   assert 'prompt has 9000 tokens' in capsys.readouterr().err
+
+def test_chat_keeps_history_on_other_errors(monkeypatch, capsys):
+  # Only a context overflow drops old turns; another error that mentions "context" leaves the conversation alone.
+  seen = []
+  replies = iter(['first', client.ServerError('the server failed to warm up: CUDA context lost'), 'second'])
+  def reply(messages, *args, **kwargs):
+    seen.append(len(messages))
+    value = next(replies)
+    if isinstance(value, Exception): raise value
+    return value
+  monkeypatch.setattr(client, '_reply', reply)
+  monkeypatch.setattr(client, 'wait_ready', lambda: None)
+  lines = iter(['a', 'b', 'c', '/bye'])
+  monkeypatch.setattr('builtins.input', lambda prompt='': next(lines))
+  assert client.chat('qwen3.5:4b', None, {}) == 0
+  assert seen == [1, 3, 3] and 'CUDA context lost' in capsys.readouterr().err
 
 def test_empty_piped_input_starts_no_server(monkeypatch):
   monkeypatch.setattr('sys.stdin', io.StringIO(''))

@@ -1,13 +1,16 @@
 """Single-user HTTP serving: tinygrad's OpenAI-compatible server (/v1), with DFlash and per-request thinking, plus
 infurnace's own API (/api: chat, generate, tags, ps, show, version, status, shutdown), which the CLI uses.
 
-The server listens before its warmup ends: warmup (and then the prompt graph) runs on a thread while the main
-thread answers the endpoints that don't touch the GPU; generation takes the GPU lock (tinygrad is not
-thread-safe), so it waits for whichever of them is running."""
+The server listens before its warmup ends: warmup (and then the prompt graph) runs on a thread. Each request has
+its own thread, so the endpoints that don't touch the GPU (status, ps, shutdown) answer at any time; generation
+takes the GPU lock (tinygrad is not thread-safe), so it waits for the warmup or another reply."""
 from __future__ import annotations
 import datetime
 import io
 import json
+import select
+import socket
+import socketserver
 import sys
 import threading
 import time
@@ -97,7 +100,10 @@ class RequestHandler(Handler):
     else: super().do_GET()
 
   def do_POST(self):
-    raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+    try: length = int(self.headers.get("Content-Length", "0"))
+    except ValueError: length = -1
+    if length < 0: return self.send_json({'error': 'invalid Content-Length'}, 400)
+    raw = self.rfile.read(length)
     try: body = json.loads(raw) if raw else {}
     except ValueError: body = None
     route = self.path.split('?')[0]
@@ -106,6 +112,7 @@ class RequestHandler(Handler):
       if route == '/api/shutdown':
         self.send_json({'status': 'stopping'})
         def close(server=self.server):
+          server.stopping = True  # no new GPU work (the prompt graph) from now on
           server.shutdown()
           server.finish()
         threading.Thread(target=close, daemon=True).start()
@@ -118,10 +125,10 @@ class RequestHandler(Handler):
     if not self.wait_usable(): return
     self.rfile = io.BytesIO(raw)  # tinygrad's handler reads the body again
     template = self.server.template
-    template.request_thinking = request_thinking(body)
-    try:
-      with self.server.gpu: super().do_POST()
-    finally: template.request_thinking = None
+    with self.server.gpu:  # the template's switch is shared: set it only while this request holds the GPU
+      template.request_thinking = request_thinking(body)
+      try: super().do_POST()
+      finally: template.request_thinking = None
 
   def wait_usable(self) -> bool:
     """Wait for warmup; after a failed one, answer 503 with its error instead of running a half-set-up model."""
@@ -129,6 +136,11 @@ class RequestHandler(Handler):
     if self.server.failure is None: return True
     self.send_json({'error': f'the server failed to warm up: {self.server.failure}'}, 503)
     return False
+
+  def client_gone(self) -> bool:
+    """The client closed its connection (a readable socket with nothing to read)."""
+    try: return bool(select.select([self.connection], [], [], 0)[0]) and not self.connection.recv(1, socket.MSG_PEEK)
+    except OSError: return True
 
   def api_generate(self, body: dict, chat: bool):
     """/api/chat or /api/generate: tinygrad's streamed chunks as newline-delimited JSON records."""
@@ -139,17 +151,21 @@ class RequestHandler(Handler):
       messages = ([{'role': 'system', 'content': body['system']}] if body.get('system') else []) + \
                  [{'role': 'user', 'content': body.get('prompt') or ''}]
     else: messages = body.get('messages')
-    if not isinstance(messages, list): return self.send_json({'error': 'messages must be a list'}, 400)
-    normalize_messages(messages)
+    if not isinstance(messages, list) or not all(isinstance(m, dict) for m in messages):
+      return self.send_json({'error': 'messages must be a list of objects'}, 400)
     template = server.template
     template.request_thinking = _think(body)
     try:
+      normalize_messages(messages)
       rendered = (body.get('prompt') or '') if generate and body.get('raw') else \
                  template.render(messages=messages, tools=body.get('tools'), add_generation_prompt=True, preserve_thinking=True)
+    except Exception as exc:  # the chat template's raise_exception, or messages it can't render
+      return self.send_json({'error': f'could not render the chat template: {exc}'}, 400)
     finally: template.request_thinking = None
     ids = server.tok.encode(rendered)
     if len(ids) >= server.model.max_context:
-      return self.send_json({'error': f'prompt has {len(ids)} tokens, but the model context is {server.model.max_context}'}, 400)
+      return self.send_json({'error': f'prompt has {len(ids)} tokens, but the model context is {server.model.max_context}',
+                             'code': 'context_length_exceeded'}, 400)
     options = body.get('options') if isinstance(body.get('options'), dict) else {}
     limit = options.get('num_predict')
     max_tokens = limit if isinstance(limit, int) and limit > 0 else None
@@ -193,6 +209,9 @@ class RequestHandler(Handler):
       return
     merged: dict = {}
     for record in records():
+      if self.client_gone():  # nobody is waiting for the reply: free the GPU
+        chunks.close()
+        return
       part = record if generate else record['message']
       if record['done']:
         final = record
@@ -209,16 +228,17 @@ def _arguments(value):
     except ValueError: return value
   return value
 
-class Server(LLMServer):
+class Server(socketserver.ThreadingMixIn, LLMServer):
   """`warmup` runs on a thread from the start, then `idle` (work a request may wait for, e.g. the prompt graph);
   generating requests wait for `ready` and take the `gpu` lock. `info` describes the loaded model for /api/ps and
   /api/show; `installed()` lists downloaded models for /api/tags."""
+  daemon_threads = True  # finish() waits for the GPU instead
   def __init__(self, server_address: tuple, model, model_name: str, tok, template, idle=None, *, warmup=None, info=None,
                installed=None):
     self.model, self.model_name, self.tok, self.template, self.idle = model, model_name, tok, template, idle
     self.info, self.installed = info or {}, installed or (lambda: [])
     self.ready, self.failure, self.warmup_seconds, self.gpu = threading.Event(), None, None, threading.Lock()
-    self.stopping, self.closed = False, threading.Event()
+    self.stopping, self.closed, self._finishing = False, threading.Event(), threading.Lock()
     TCPServerWithReuse.__init__(self, server_address, RequestHandler)
     if warmup is None and idle is None: self.ready.set()
     else: threading.Thread(target=self._warm, args=(warmup, idle), name='infurnace-warmup', daemon=True).start()
@@ -243,13 +263,14 @@ class Server(LLMServer):
     """Stop listening once the warmup thread is off the GPU (it skips the prompt graph if that has not started),
     so the process never exits in the middle of GPU work. Until then connections wait rather than being refused,
     so clients see a busy server, not a stopped one. The lock stays held: nothing starts on the GPU afterwards."""
-    if self.stopping: return self.closed.wait()
     self.stopping = True
-    if not self.gpu.acquire(blocking=False):
-      print("Waiting for the GPU work in progress to finish...", file=sys.stderr, flush=True)
-      self.gpu.acquire()
-    self.server_close()
-    self.closed.set()
+    with self._finishing:  # once: /api/shutdown and the end of serve() can both get here
+      if self.closed.is_set(): return
+      if not self.gpu.acquire(blocking=False):
+        print("Waiting for the GPU work in progress to finish...", file=sys.stderr, flush=True)
+        self.gpu.acquire()
+      self.server_close()
+      self.closed.set()
 
   def status(self) -> dict:
     state = 'failed' if self.failure else 'ready' if self.ready.is_set() else 'warming up'

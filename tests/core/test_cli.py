@@ -34,3 +34,9 @@ def test_cli_device_timeout_diagnostic_does_not_swallow_other_errors(monkeypatch
                                          ('https://example.com/notes.txt', False), ('note:', False)])
 def test_run_tells_models_from_prompts(value, model):
   assert cli._looks_like_model(value) is model
+
+def test_unknown_models_are_rejected_before_any_server(monkeypatch):
+  monkeypatch.setattr('infurnace.client.run', lambda *args: pytest.fail('must not contact a server'))
+  with pytest.raises(ValueError, match="unknown model 'qwen3:4b'"): cli.command(['run', 'qwen3:4b', 'hi'])
+  cli._check_model('qwen3.5:4b')
+  cli._check_model('~/m/x.gguf')
