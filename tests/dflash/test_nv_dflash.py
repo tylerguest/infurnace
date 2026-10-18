@@ -2,7 +2,7 @@ import pytest
 from tinygrad import Context, Tensor, UOp
 from tinygrad.nn.state import get_state_dict
 from infurnace.dflash import DFlashDraft, DFlashGenerator
-from infurnace.models.qwen35 import Qwen35Model
+from infurnace.engine import Model
 from test_dflash import tiny_draft
 from test_qwen35 import checkpoint
 
@@ -11,7 +11,7 @@ pytestmark = pytest.mark.nv
 @pytest.mark.parametrize('block', [1, 4])
 def test_nv_verified_output_rng_and_replay(tmp_path, block, verifier='sequential'):
   with Context(DEV='CPU'): checkpoint(tmp_path)
-  model = Qwen35Model.from_gguf(tmp_path / 'model.gguf', device='NV')
+  model = Model.from_gguf(tmp_path / 'model.gguf', device='NV')
   with Context(DEV='NV'):
     draft = tiny_draft(model)
     Tensor.manual_seed(123)
@@ -29,11 +29,11 @@ def test_nv_verified_output_rng_and_replay(tmp_path, block, verifier='sequential
 def test_nv_denoise_matches_cpu_hidden_and_transient_cache(tmp_path):
   with Context(DEV='CPU'):
     checkpoint(tmp_path)
-    cpu = Qwen35Model.from_gguf(tmp_path / 'model.gguf', device='CPU')
+    cpu = Model.from_gguf(tmp_path / 'model.gguf', device='CPU')
     reference = tiny_draft(cpu)
     weights = get_state_dict(reference.weights)
     inputs = [(Tensor.randn(1, n, 8).realize(), Tensor.randn(1, 4, 8).realize(), pos) for n, pos in [(3, 3), (2, 5), (1, 6)]]
-  gpu = Qwen35Model.from_gguf(tmp_path / 'model.gguf', device='NV')
+  gpu = Model.from_gguf(tmp_path / 'model.gguf', device='NV')
   with Context(DEV='NV'): draft = DFlashDraft(reference.config, gpu, weights)
   for features, noise, pos in inputs:
     position = UOp.variable('cross_position', features.shape[1], 12).bind(pos)

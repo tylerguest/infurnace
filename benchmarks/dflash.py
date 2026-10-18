@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import time
 from tinygrad import Device, Tensor, dtypes
+from infurnace.chat import user_prompt
 from infurnace.loader import load_model as _build
 from infurnace.dflash import DFlashDraft, DFlashGenerator
 
@@ -46,7 +47,7 @@ def main():
     draft = DFlashDraft.from_gguf(args.draft, model, legacy_noncausal=args.legacy_noncausal)
     engine = DFlashGenerator(model, draft, verifier=args.verifier)
     if args.block_size > draft.config.block_size: raise ValueError('block exceeds trained draft size')
-    text = tokenizer.render_chat([{'role': 'user', 'content': args.prompt}], enable_thinking=False) if args.chat else args.prompt
+    text = user_prompt(model, tokenizer, args.prompt) if args.chat else args.prompt
     prompt = tokenizer.encode(text)
     if len(prompt) + args.output > model.config.context_length: raise ValueError('prompt plus output exceeds context')
     report.update(stage='requests', prompt=text, prompt_tokens=prompt, feature_layers=draft.config.feature_layers,

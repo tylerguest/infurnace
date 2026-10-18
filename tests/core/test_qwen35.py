@@ -4,7 +4,7 @@ import pytest
 from tinygrad import Context, Tensor
 from tinygrad.llm.model import Transformer, TransformerConfig, SSMConfig, GatedDeltaNetBlock, TransformerBlock
 from tinygrad.nn.state import get_state_dict
-from infurnace.models.qwen35 import Qwen35Model
+from infurnace.engine import Model
 
 def checkpoint(path, *, permuted_head=False, context=16):
   """Small native GGUF fixture using upstream block/tensor names, no HF adapter."""
@@ -57,7 +57,7 @@ def checkpoint(path, *, permuted_head=False, context=16):
 def test_upstream_loader_and_exact_block_types(tmp_path):
   with Context(DEV='CPU'):
     path = checkpoint(tmp_path)
-    model = Qwen35Model.from_gguf(path, max_context=8, device='CPU')
+    model = Model.from_gguf(path, max_context=8, device='CPU')
     assert type(model.transformer) is Transformer
     assert type(model.transformer.blk[0]) is GatedDeltaNetBlock
     assert type(model.transformer.blk[1]) is TransformerBlock
@@ -65,7 +65,7 @@ def test_upstream_loader_and_exact_block_types(tmp_path):
     assert model.config.context_length == 8 and model.config.rope_dimension_count == 2
     assert model.transformer.output.weight.uop.key == model.transformer.token_embd.weight.uop.key
     for cap in (0, -1, True):
-      with pytest.raises(ValueError): Qwen35Model.from_gguf(path, max_context=cap)
+      with pytest.raises(ValueError): Model.from_gguf(path, max_context=cap)
 
 @pytest.mark.parametrize('tied_head', [False, True])
 @pytest.mark.parametrize('head_type', [0, 12])
@@ -74,18 +74,18 @@ def test_packed_loader_preserves_embedding_aliases(monkeypatch, tied_head, head_
   from types import SimpleNamespace
   from tinygrad import nn, dtypes
   from infurnace.gguf import PackedTensor
-  import infurnace.models.qwen35 as qwen35
+  from infurnace import engine
 
   embedding = Tensor.ones(16, 256, device='CPU').realize()
   output = embedding if tied_head else Tensor.full((16, 256), 2, device='CPU').realize()
   transformer = SimpleNamespace(token_embd=nn.Embedding(16, 256), output=nn.Linear(256, 16, bias=False))
   transformer.token_embd.weight, transformer.output.weight = embedding, output
-  model = Qwen35Model.__new__(Qwen35Model)
+  model = Model.__new__(Model)
   model.transformer, model.device, model.nv_quant_linears = transformer, 'CPU', 0
   entry = PackedTensor(Tensor(bytes(1), device='CPU', dtype=dtypes.uint8), (16, 256), head_type)
   entries = {'token_embd.weight': entry}
   if not tied_head: entries['output.weight'] = entry
-  monkeypatch.setattr(qwen35, 'parse_gguf', lambda path: ({}, entries))
+  monkeypatch.setattr(engine, 'parse_gguf', lambda path: ({}, entries))
   adapters = []
 
   class Adapter:
@@ -96,7 +96,7 @@ def test_packed_loader_preserves_embedding_aliases(monkeypatch, tied_head, head_
       self.packed = Tensor.zeros(1, device='CPU').realize()
       adapters.append(self)
 
-  monkeypatch.setattr(qwen35, '_PackedLinear', Adapter)
+  monkeypatch.setattr(engine, '_PackedLinear', Adapter)
   model._enable_packed('unused.gguf', prefill=False)
   assert model._tied_head is tied_head
   assert transformer.token_embd.weight.tolist() == embedding.tolist()
@@ -117,7 +117,7 @@ def test_bounded_wrapper_matches_direct_upstream_rng_and_cache(tmp_path):
   with Context(DEV='CPU'):
     path = checkpoint(tmp_path)
     direct, metadata = Transformer.from_gguf(path, max_context=16, realize=False)
-    model = Qwen35Model.from_gguf(path, device='CPU')
+    model = Model.from_gguf(path, device='CPU')
     assert model.metadata == metadata
     Tensor.manual_seed(123)
     stream = direct.generate([1, 2], temperature=0.0)
@@ -141,7 +141,7 @@ def test_cli_packed_projection_flags_require_nv_before_loading(tmp_path, monkeyp
   path = tmp_path / 'model.gguf'
   path.touch()
   monkeypatch.setattr(loader, 'read_gguf_metadata', lambda path: {'general.architecture': 'qwen35'})
-  monkeypatch.setattr(Qwen35Model, 'from_gguf', lambda *a, **kw: pytest.fail('loaded target without NV packed support'))
+  monkeypatch.setattr(Model, 'from_gguf', lambda *a, **kw: pytest.fail('loaded target without NV packed support'))
   with pytest.raises(ValueError, match='requires (NV|an NVIDIA)'):
     loader.load_model(str(path), 16, 'CPU', **{flag: True})
 
@@ -179,8 +179,8 @@ def test_tokenizer_reference(tmp_path):
 def test_cold_short_prompt_does_not_capture():
   # A short one-shot prompt on a fresh model reads its prompt one row at a time rather than
   # spending ~19 s capturing the 16-row graph.
-  from infurnace.models import qwen35
-  model = qwen35.Qwen35Model.__new__(qwen35.Qwen35Model)
+  from infurnace import engine
+  model = engine.Model.__new__(engine.Model)
   model._prompt_jit = type('J', (), {'captured': None, 'cnt': 0})()
   model._multirow_prefill, model._warming = True, False
   assert not model._multirow_ready(39) and model._prompt_jit.cnt == 0

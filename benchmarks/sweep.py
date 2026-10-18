@@ -13,14 +13,14 @@ import pathlib
 import time
 
 from infurnace import loader
+from infurnace.chat import user_prompt
 
 TEXT = pathlib.Path(__file__).parent / "quality" / "eval.txt"
 MARK = "\x00DOCUMENT\x00"
 
-def prompt_ids(tokenizer, length: int) -> list[int]:
+def prompt_ids(model, tokenizer, length: int) -> list[int]:
   """A `length`-token chat prompt: the document cut to fit, then the request."""
-  head, tail = tokenizer.render_chat([{"role": "user", "content": MARK + "\n\nSummarize the text above."}],
-                                     enable_thinking=False).split(MARK)
+  head, tail = user_prompt(model, tokenizer, MARK + "\n\nSummarize the text above.").split(MARK)
   head, tail, doc = tokenizer.encode(head), tokenizer.encode(tail), tokenizer.encode(TEXT.read_text())
   room = length - len(head) - len(tail)
   if room < 1: raise ValueError(f"prompts need at least {len(head) + len(tail) + 1} tokens")
@@ -60,7 +60,7 @@ def main():
     return measure(model.generate(ids, args.tokens), len(ids))
   if not args.json: print(f"{'prompt':>7} {'TTFT':>8} {'prefill tok/s':>14} {'decode tok/s':>13}", flush=True)
   for n in lengths:
-    ids = prompt_ids(tokenizer, n)
+    ids = prompt_ids(model, tokenizer, n)
     if not args.once: run(ids)
     row = run(ids)
     if args.json: print(json.dumps(row), flush=True)

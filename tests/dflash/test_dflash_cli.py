@@ -6,7 +6,6 @@ class Tokenizer:
   bos_id = None
   eos_id, eot_id = 9, 10
   def encode(self, text): return [1, 2]
-  def render_chat(self, messages, **kwargs): return 'chat'
   def is_end(self, token): return token in (9, 10)
   def stream_decoder(self): return lambda token: '!' if token is None else str(token)
 

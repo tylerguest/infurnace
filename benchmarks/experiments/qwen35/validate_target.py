@@ -14,6 +14,7 @@ import urllib.error
 import urllib.request
 
 from tinygrad import Device
+from infurnace.chat import user_prompt
 from infurnace.loader import load_model as _build
 
 
@@ -64,7 +65,7 @@ def main():
       if time.monotonic() > deadline: raise TimeoutError("llama-server startup timed out")
       time.sleep(0.1)
     prompts = ["The capital of France is", "One, two, three,", "A bicycle has two wheels because",
-      tokenizer.render_chat([{"role": "user", "content": "What is 2 + 2? Answer briefly."}], enable_thinking=False)]
+      user_prompt(model, tokenizer, "What is 2 + 2? Answer briefly.")]
     for index, prompt in enumerate(prompts):
       ids = tokenizer.encode(prompt)
       reference = post(url + "/completion", {"prompt": ids, "n_predict": args.output, "temperature": 0.0,

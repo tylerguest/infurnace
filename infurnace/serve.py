@@ -18,6 +18,7 @@ from importlib import metadata as _metadata
 
 from tinygrad.llm.serve import Handler, LLMServer, normalize_messages
 from tinygrad.viz.serve import TCPServerWithReuse
+from infurnace.chat import ChatTemplate
 
 try: VERSION = _metadata.version('infurnace')
 except _metadata.PackageNotFoundError: VERSION = '0.0.0'
@@ -45,31 +46,6 @@ class ServerModel:
       yield from stream
     finally:
       stream.close()
-
-class ChatTemplate:
-  def __init__(self, metadata, tokenizer, enable_thinking=True):
-    try:
-      import jinja2
-    except ImportError as exc:
-      raise ValueError("HTTP serving requires Jinja2: python3 -m pip install jinja2 (or reinstall infurnace)") from exc
-    source = metadata.get('tokenizer.chat_template')
-    if not isinstance(source, str) or not source:
-      raise ValueError("HTTP serving requires a GGUF chat template (no tool-unsafe fallback)")
-    env = jinja2.Environment()
-    env.filters['tojson'] = lambda obj, **kwargs: json.dumps(obj, **kwargs)
-    env.globals['raise_exception'] = lambda msg: (_ for _ in ()).throw(RuntimeError(msg))
-    env.globals['strftime_now'] = lambda fmt: time.strftime(fmt)
-    env.globals['bos_token'] = tokenizer.decode([tokenizer.bos_id]) if tokenizer.bos_id is not None else ''
-    env.globals['eos_token'] = tokenizer.decode([tokenizer.eos_id])
-    self.template = env.from_string(source)
-    self.enable_thinking = enable_thinking
-    self.request_thinking: bool | None = None  # the current request's switch, if it sent one
-
-  def render(self, messages, **kwargs):
-    # OpenAI clients send the system prompt as `developer` to reasoning models; Qwen's template only knows `system`.
-    messages = [{**m, 'role': 'system'} if isinstance(m, dict) and m.get('role') == 'developer' else m for m in messages]
-    thinking = self.enable_thinking if self.request_thinking is None else self.request_thinking
-    return self.template.render(messages=messages, **kwargs, enable_thinking=thinking)
 
 def request_thinking(body) -> bool | None:
   """A request's thinking switch: `chat_template_kwargs.enable_thinking` (vLLM and sglang's convention,

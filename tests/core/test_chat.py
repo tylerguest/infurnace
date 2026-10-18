@@ -6,9 +6,11 @@ from infurnace import cli
 class Tokenizer:
   bos_id = eos_id = eot_id = None
   def encode(self, text): return [1, 2]
-  def render_chat(self, messages, **kwargs): return "chat"
   def is_end(self, token): return token == 9
   def stream_decoder(self): return lambda token: "!" if token is None else str(token)
+
+class Template:
+  def render(self, messages, **kwargs): return "chat"
 
 class Model:
   config = SimpleNamespace(context_length=16)
@@ -48,14 +50,15 @@ def test_chat_default_uses_remaining_context(capsys):
 
 def test_chat_rolls_old_turns(monkeypatch, capsys):
   class CountingTokenizer(Tokenizer):
-    def render_chat(self, messages, **kwargs): return "x " * (len(messages)*3)
     def encode(self, text): return [1]*len(text.split())
+  class CountingTemplate:
+    def render(self, messages, **kwargs): return "x " * (len(messages)*3)
   values = iter(["one", "two", "three"])
   def input_line(prompt):
     try: return next(values)
     except StopIteration: raise EOFError
   monkeypatch.setattr("builtins.input", input_line)
-  assert cli.chat(Model().generate, CountingTokenizer(), 16, None) == 0
+  assert cli.chat(Model().generate, CountingTokenizer(), CountingTemplate(), 16, None) == 0
   assert capsys.readouterr().err.count("discarded 1 oldest turn") == 2
 
 def test_context_generation_stop(capsys):
@@ -70,7 +73,7 @@ def test_chat_eof(monkeypatch, capsys):
     try: return next(values)
     except StopIteration: raise EOFError
   monkeypatch.setattr("builtins.input", input_line)
-  assert cli.chat(Model().generate, Tokenizer(), 16, 3) == 0
+  assert cli.chat(Model().generate, Tokenizer(), Template(), 16, 3) == 0
   assert capsys.readouterr().out == "3!\n"
 
 def test_context_error_keeps_history(monkeypatch, capsys):
@@ -81,7 +84,7 @@ def test_context_error_keeps_history(monkeypatch, capsys):
     try: return next(values)
     except StopIteration: raise EOFError
   monkeypatch.setattr("builtins.input", input_line)
-  cli.chat(model.generate, Tokenizer(), 2, 1)
+  cli.chat(model.generate, Tokenizer(), Template(), 2, 1)
   assert "History was not truncated" in capsys.readouterr().err
   assert not model.closed
 
@@ -107,7 +110,7 @@ def test_chat_waits_for_warmup_before_each_reply(monkeypatch, capsys):
     try: return next(values)
     except StopIteration: raise EOFError
   monkeypatch.setattr("builtins.input", input_line)
-  assert cli.chat(generate, Tokenizer(), 16, 3, ready=lambda: events.append("ready")) == 0
+  assert cli.chat(generate, Tokenizer(), Template(), 16, 3, ready=lambda: events.append("ready")) == 0
   assert events == ["input", "ready", "generate", "input"]
 
 def test_background_warmup_runs_off_the_main_thread_and_reraises(capsys):

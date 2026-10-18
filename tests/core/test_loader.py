@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from infurnace import loader
+from infurnace.models import Family, family_for
 
 @pytest.fixture
 def tiny_models(monkeypatch, tmp_path):
@@ -49,11 +50,13 @@ def model_loader(monkeypatch):
   monkeypatch.setattr(loader, 'fast_path_problem', lambda device: None)
   calls = []
   model = SimpleNamespace(metadata=metadata)
-  def load(path, **kwargs):
+  family = Family('qwen35', ('qwen35',), tokenizer=lambda md: md)
+  def load(path, family, **kwargs):
+    assert family.name == 'qwen35'
     calls.append((path, kwargs))
     return model
-  monkeypatch.setattr(loader.Qwen35Model, 'from_gguf', load)
-  monkeypatch.setattr(loader.Qwen35Tokenizer, 'from_gguf', lambda md: md)
+  monkeypatch.setattr(loader.Model, 'from_gguf', load)
+  monkeypatch.setattr(loader, 'family_for', lambda arch: family if arch == 'qwen35' else family_for(arch))
   return metadata, model, calls
 
 def test_build_uses_validated_metadata(model_loader):
@@ -66,7 +69,7 @@ def test_build_uses_validated_metadata(model_loader):
 def test_rejects_other_architectures_before_loading(model_loader, architecture):
   metadata, _, calls = model_loader
   metadata['general.architecture'] = architecture
-  with pytest.raises(ValueError, match='only dense Qwen3.5'):
+  with pytest.raises(ValueError, match='unsupported model architecture'):
     loader.load_model('model', 16, 'CPU')
   assert not calls
 

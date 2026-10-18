@@ -12,7 +12,7 @@ from infurnace.gguf import parse_gguf
 from infurnace.models.linear import _NVLinear
 from infurnace.kernels.quant_gemv import QUANT_SIZES
 from infurnace.kernels.quant_gemm import nv_prefill_supported
-from infurnace.models.qwen35 import Qwen35Model
+from infurnace.engine import Model
 from infurnace.dflash.jit import captured
 from infurnace.kernels.attention import attention, store_rows
 from infurnace.device import nvidia
@@ -40,7 +40,7 @@ class DFlashConfig:
     return self.sliding[index] if self.causal is None else self.causal
 
   @classmethod
-  def from_gguf(cls, metadata: dict, target: Qwen35Model):
+  def from_gguf(cls, metadata: dict, target: Model):
     if metadata.get('general.architecture') != 'dflash': raise ValueError('expected DFlash GGUF')
     def integer(key):
       value = metadata.get('dflash.' + key)
@@ -99,7 +99,7 @@ class DraftWeights:
     self.blk = [DraftBlock(config) for _ in range(config.layers)]
 
 class DFlashDraft:
-  def __init__(self, config: DFlashConfig, target: Qwen35Model, weights: dict[str, Tensor]):
+  def __init__(self, config: DFlashConfig, target: Model, weights: dict[str, Tensor]):
     self.config, self.target, self.device = config, target, target.device
     self.capacity = target.config.context_length
     self.length = 0
@@ -141,8 +141,8 @@ class DFlashDraft:
       self._offset = UOp.variable('dflash_stage_offset', 0, config.block_size - 1)
 
   @classmethod
-  def from_gguf(cls, path: str | Path, target: Qwen35Model, *, packed: bool = True, legacy_noncausal: bool = False):
-    if not isinstance(target, Qwen35Model): raise ValueError('DFlash currently requires a Qwen3.5 target')
+  def from_gguf(cls, path: str | Path, target: Model, *, packed: bool = True, legacy_noncausal: bool = False):
+    if not isinstance(target, Model): raise ValueError('DFlash requires an infurnace Model target')
     metadata, entries = parse_gguf(path)
     config = DFlashConfig.from_gguf(metadata, target)
     if type(legacy_noncausal) is not bool: raise ValueError('invalid legacy attention policy')

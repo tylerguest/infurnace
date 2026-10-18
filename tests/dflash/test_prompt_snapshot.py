@@ -2,8 +2,8 @@
 import pytest
 from tinygrad import Context
 from infurnace.dflash import DFlashGenerator
-from infurnace.models import qwen35
-from infurnace.models.qwen35 import SNAPSHOTS, Qwen35Model
+from infurnace import engine
+from infurnace.engine import SNAPSHOTS, Model
 from test_dflash import tiny_draft
 from test_qwen35 import checkpoint
 
@@ -13,7 +13,7 @@ SECOND = FIRST[:4] + [TURN, 11, 12, TURN, 13, 2]    # the next turn: same prefix
 OTHER = [1, 9, 3, 4, TURN, 5, 6]                    # diverges before the snapshot point
 
 def model_with_spy(tmp_path, context=16):
-  model = Qwen35Model.from_gguf(checkpoint(tmp_path, context=context), device='CPU')
+  model = Model.from_gguf(checkpoint(tmp_path, context=context), device='CPU')
   model.turn_token, model.user_turn, model.tool_marker, resumed = TURN, (TURN, USER), TOOL, []
   restore = model.restore_snapshot
   def spy(*args, **kwargs):
@@ -97,7 +97,7 @@ def test_retrying_an_earlier_turn_resumes_from_its_snapshot(tmp_path):
 
 @pytest.mark.parametrize('verifier', ['sequential', 'parallel'])
 def test_dflash_new_user_message_resumes_after_a_tool_loop(tmp_path, monkeypatch, verifier):
-  monkeypatch.setattr(qwen35, 'SNAPSHOTS', 3)
+  monkeypatch.setattr(engine, 'SNAPSHOTS', 3)
   with Context(DEV='CPU'):
     model, resumed = model_with_spy(tmp_path, context=96)
     generator = DFlashGenerator(model, tiny_draft(model), verifier=verifier)

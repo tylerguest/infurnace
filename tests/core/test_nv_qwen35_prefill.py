@@ -2,9 +2,13 @@
 
 Marked nv (INFURNACE_TEST_NV=1); needs the model file below; loads ~3 GB once.
 """
+import functools
 from pathlib import Path
 import pytest
-from infurnace.models.qwen35 import PROMPT_ROWS
+from types import SimpleNamespace
+from infurnace.chat import user_prompt
+from infurnace.gguf import read_gguf_metadata
+from infurnace.engine import PROMPT_ROWS
 
 TARGET = Path('models/qwen35-validation/Qwen3.5-4B-Q4_K_M.gguf')
 pytestmark = [pytest.mark.nv, pytest.mark.skipif(not TARGET.is_file(), reason='needs the Qwen3.5-4B target under models/')]
@@ -19,8 +23,13 @@ def loaded():
   assert model._prompt_jit.captured is not None
   return model, tokenizer
 
+@functools.cache
+def target():
+  """The target's metadata, for its chat template."""
+  return SimpleNamespace(metadata=read_gguf_metadata(TARGET))
+
 def ids(tokenizer, text):
-  return tokenizer.encode(tokenizer.render_chat([{'role': 'user', 'content': text}], enable_thinking=False))
+  return tokenizer.encode(user_prompt(target(), tokenizer, text))
 
 def run(model, tokens, count=16, *, multirow=True, reuse_cache=False):
   model._multirow_prefill = multirow

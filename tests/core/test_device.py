@@ -2,6 +2,7 @@ import pytest
 
 from infurnace import device
 from infurnace import loader
+from infurnace.models import Family
 
 def test_prefer_gpu(monkeypatch):
   monkeypatch.delenv("DEV", raising=False)
@@ -33,12 +34,12 @@ def test_auto_acceleration(monkeypatch):
   calls = []
   class Model:
     metadata = {}
-  def build(path, **kwargs):
+  def build(path, family, **kwargs):
     calls.append(kwargs)
     return Model()
   monkeypatch.setattr(loader, 'read_gguf_metadata', lambda path: {'general.architecture': 'qwen35'})
-  monkeypatch.setattr(loader.Qwen35Model, "from_gguf", build)
-  monkeypatch.setattr(loader.Qwen35Tokenizer, "from_gguf", lambda metadata: None)
+  monkeypatch.setattr(loader.Model, "from_gguf", build)
+  monkeypatch.setattr(loader, "family_for", lambda arch: Family('qwen35', ('qwen35',), tokenizer=lambda metadata: None))
   loader.load_model("model", 16, None)
   assert calls[-1] == {"max_context": 16, "device": "NV", "nv_quant": True, "nv_prefill": True}
   loader.load_model("model", 16, None, False)

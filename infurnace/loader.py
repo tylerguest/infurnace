@@ -1,6 +1,6 @@
-"""Choosing and loading Qwen3.5-4B and its optional DFlash draft.
+"""Choosing and loading a model and its optional DFlash draft.
 
-`--model` takes a name from MODELS or a path to a local Qwen3.5 GGUF file. A named model and
+`--model` takes a name from MODELS or a path to a local GGUF file of a supported family (infurnace/models). A named model and
 its DFlash draft are downloaded into user storage ($XDG_DATA_HOME/infurnace/models) on first
 use; a copy already there, or in an editable checkout's models/ directory, is used as is.
 """
@@ -14,8 +14,8 @@ from tinygrad.helpers import fetch
 from infurnace.device import fast_path_problem, nvidia, select_device, supports_nv_quant
 from infurnace.gguf import read_gguf_metadata
 from infurnace.kernels.quant_gemm import nv_prefill_supported
-from infurnace.models.qwen35 import Qwen35Model
-from infurnace.tokenizer import Qwen35Tokenizer
+from infurnace.engine import Model
+from infurnace.models import family_for
 
 # name: (model URL, DFlash draft URL). The first entry is the default.
 MODELS = {
@@ -119,15 +119,14 @@ def is_qwen35(path: str | Path) -> bool:
   return Path(path).is_file() and read_gguf_metadata(path).get("general.architecture") == "qwen35"
 
 def load_model(path: str | Path, max_context: int, device: str | None = None, nv_quant: bool | None = None, *,
-               nv_prefill: bool | None = None) -> tuple[Qwen35Model, Qwen35Tokenizer]:
-  """Load a dense Qwen3.5 GGUF and tokenizer; NV packed acceleration is automatic when supported.
+               nv_prefill: bool | None = None) -> tuple[Model, object]:
+  """Load a GGUF model of a supported family and its tokenizer; NV packed acceleration is automatic when supported.
 
   nv_quant/nv_prefill overrides exist for benchmarks comparing packed and generic execution.
-  Tinygrad owns attention and recurrence; no other model architecture is supported.
   """
   if Path(path).is_dir(): raise ValueError("--model must name a local GGUF file")
   metadata = read_gguf_metadata(path)
-  if metadata.get("general.architecture") != "qwen35": raise ValueError("only dense Qwen3.5 GGUF models are supported")
+  family = family_for(metadata.get("general.architecture"))
   device = select_device(device)
   # On NVIDIA, the generic path is far too slow to use: say what is missing instead of falling back to it.
   if nv_quant is None and (problem := fast_path_problem(device)): raise ValueError(problem)
@@ -136,12 +135,10 @@ def load_model(path: str | Path, max_context: int, device: str | None = None, nv
   if nv_prefill and not packed: raise ValueError("NV prefill requires NV quantized acceleration")
   prefill = packed and nv_prefill_supported(device) if nv_prefill is None else nv_prefill
   if prefill and not nv_prefill_supported(device): raise ValueError("NV prefill requires CUDA-C FP16 tensor cores")
-  tokenizer = Qwen35Tokenizer.from_gguf(metadata)
-  model = Qwen35Model.from_gguf(path, max_context=max_context, device=device, nv_quant=packed, nv_prefill=prefill)
-  # Prompt snapshots go just before the last turn header (see Qwen35Model.save_snapshot).
-  if (backend := getattr(tokenizer, "_backend", None)) is not None:
-    model.turn_token, model.tool_marker = backend._special_tokens.get("<|im_start|>"), backend._special_tokens.get("<tool_response>")
-    if model.turn_token is not None: model.user_turn = (model.turn_token, *tokenizer.encode("user\n"))
+  tokenizer = family.tokenizer(metadata)
+  model = Model.from_gguf(path, max_context=max_context, device=device, nv_quant=packed, nv_prefill=prefill, family=family)
+  # Prompt snapshots go just before the last turn header (see Model.save_snapshot).
+  model.turn_token, model.user_turn, model.tool_marker = family.turn_markers(tokenizer)
   return model, tokenizer
 
 def load_dflash(model, draft_path: str | Path):

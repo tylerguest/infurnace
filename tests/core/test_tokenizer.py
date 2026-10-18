@@ -79,58 +79,6 @@ def test_missing_eos(metadata):
   del metadata['tokenizer.ggml.eos_token_id']
   with pytest.raises(ValueError, match='eos_token_id'): Qwen35Tokenizer.from_gguf(metadata)
 
-def test_chat_single_turn(metadata):
-  tokenizer = Qwen35Tokenizer.from_gguf(metadata)
-  messages = [{'role': 'system', 'content': 'Be concise.'}, {'role': 'user', 'content': 'Hello'}]
-  expected = '<|im_start|>system\nBe concise.<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n'
-  assert tokenizer.render_chat(messages) == expected + '<|im_start|>assistant\n<think>\n'
-  assert tokenizer.render_chat(messages, enable_thinking=False) == expected + '<|im_start|>assistant\n<think>\n\n</think>\n\n'
-  assert tokenizer.render_chat(messages, add_generation_prompt=False) == expected
-  assert messages[0]['content'] == 'Be concise.'
-
-def test_chat_historical_reasoning(metadata):
-  tokenizer = Qwen35Tokenizer.from_gguf(metadata)
-  messages = [{'role': 'user', 'content': 'one'},
-              {'role': 'assistant', 'content': '<think>old secret</think>\n\nanswer'},
-              {'role': 'user', 'content': 'two'}]
-  rendered = tokenizer.render_chat(messages)
-  assert 'old secret' not in rendered
-  assert '<|im_start|>assistant\nanswer<|im_end|>' in rendered
-  messages.append({'role': 'assistant', 'content': '\nnew answer', 'reasoning_content': '\nnew thought\n'})
-  assert '<think>\nnew thought\n</think>\n\nnew answer<|im_end|>' in tokenizer.render_chat(messages)
-
-@pytest.mark.parametrize('messages', [[], [None], [{'role': 'tool', 'content': 'x'}],
-                                     [{'role': 'user', 'content': ['x']}], [{'role': 'user', 'content': None}],
-                                     [{'role': 'assistant', 'content': 'x', 'tool_calls': [{'name': 'foo'}]}],
-                                     [{'role': 'assistant', 'content': 'x', 'reasoning_content': 1}],
-                                     [{'role': 'user', 'content': '<tool_response>x</tool_response>'}]])
-def test_invalid_chat(metadata, messages):
-  with pytest.raises(ValueError): Qwen35Tokenizer.from_gguf(metadata).render_chat(messages)
-
-def test_invalid_chat_flags(metadata):
-  with pytest.raises(ValueError, match='boolean'):
-    Qwen35Tokenizer.from_gguf(metadata).render_chat([{'role': 'user', 'content': 'x'}], enable_thinking=0)
-
-@pytest.mark.skipif(not os.environ.get('INFURNACE_TEST_MODEL'), reason='set INFURNACE_TEST_MODEL for Qwen3.5 template parity')
-def test_bundled_chat_template_parity():
-  from infurnace.serve import ChatTemplate
-  model_metadata = read_gguf_metadata(os.environ['INFURNACE_TEST_MODEL'])
-  tokenizer = Qwen35Tokenizer.from_gguf(model_metadata)
-  cases = [
-    [{'role': 'user', 'content': 'Hello'}],
-    [{'role': 'system', 'content': 'Be concise.'}, {'role': 'user', 'content': '你好'}],
-    [{'role': 'user', 'content': 'one'}, {'role': 'assistant', 'content': '<think>old</think>\n\nanswer'},
-     {'role': 'user', 'content': 'two'}],
-  ]
-  for messages in cases:
-    for thinking in (False, True):
-      for prefix in (False, True):
-        template = ChatTemplate(model_metadata, tokenizer, enable_thinking=thinking)
-        expected = template.render(messages=messages, tools=[], add_generation_prompt=prefix)
-        actual = tokenizer.render_chat(messages, enable_thinking=thinking, add_generation_prompt=prefix)
-        assert actual == expected
-        assert tokenizer.encode(actual) == tokenizer.encode(expected)
-
 @pytest.mark.skipif(not (os.environ.get('INFURNACE_TEST_MODEL') and os.environ.get('INFURNACE_LLAMA_TOKENIZE')),
                     reason='set INFURNACE_TEST_MODEL and INFURNACE_LLAMA_TOKENIZE for live reference parity')
 def test_live_llama_parity():

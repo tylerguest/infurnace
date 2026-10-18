@@ -8,7 +8,7 @@ from tinygrad import Tensor, TinyJit, dtypes
 from infurnace.gguf import PackedTensor
 from tinygrad.llm.gguf import ggml_data_to_tensor as _dequant
 from infurnace.models.linear import _NVLinear
-from infurnace.models.qwen35 import Qwen35Model
+from infurnace.engine import Model
 from infurnace.kernels.quant_gemv import quant_gemv, QuantGemvError
 
 def test_submission_link_reinitializes_reused_signal_storage():
@@ -64,12 +64,12 @@ def test_nv_adapter_preserves_embedding_ties(typ, size, tied, monkeypatch):
   old_embedding = embedding.weight
   output = nn.Linear(256, 16, bias=False)
   output.weight = old_embedding if tied else output_entry.decode().half()
-  runner = object.__new__(Qwen35Model)
+  runner = object.__new__(Model)
   runner.device, runner.nv_quant_linears = "NV", 0
   runner.transformer = SimpleNamespace(output=output, token_embd=embedding, blk=[])
   entries = {'token_embd.weight': embedding_entry}
   if not tied: entries['output.weight'] = output_entry
-  monkeypatch.setattr('infurnace.models.qwen35.parse_gguf', lambda path: ({}, entries))
+  monkeypatch.setattr('infurnace.engine.parse_gguf', lambda path: ({}, entries))
   runner._enable_packed('unused.gguf', prefill=False)
   adapter = runner.transformer.output
   assert runner._tied_head is tied

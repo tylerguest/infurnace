@@ -1,4 +1,4 @@
-"""Qwen3.5 GGUF BPE encoding, byte-stream decoding and text-only chat formatting."""
+"""Qwen3.5 GGUF BPE encoding and byte-stream decoding. Chat prompts come from the GGUF's template (chat.py)."""
 from __future__ import annotations
 from typing import Callable, Mapping
 from tinygrad.llm.cli import SimpleTokenizer
@@ -74,46 +74,3 @@ class Qwen35Tokenizer:
 
   def is_end(self, token_id: int) -> bool:
     return token_id in (self.eos_id, self.eot_id)
-
-  def render_chat(self, messages: list[dict], *, enable_thinking: bool = True, add_generation_prompt: bool = True) -> str:
-    """Render Qwen3.5 text chat without executing arbitrary Jinja.
-
-    Historical reasoning before the latest user turn is omitted. Thinking is
-    enabled by default; tool use belongs to the GGUF template in HTTP serving.
-    """
-    if type(enable_thinking) is not bool or type(add_generation_prompt) is not bool:
-      raise ValueError("chat rendering flags must be boolean")
-    if not isinstance(messages, list) or not messages: raise ValueError("chat requires a nonempty message list")
-    for message in messages:
-      if not isinstance(message, dict): raise ValueError("chat messages must be dictionaries")
-      role, content = message.get("role"), message.get("content")
-      if role not in ("system", "user", "assistant"): raise ValueError(f"unsupported chat role: {role!r}")
-      if not isinstance(content, str): raise ValueError("chat content must be text")
-      if message.get("tool_calls") or message.get("tool_call_id"):
-        raise ValueError("tool calls are not supported")
-      if "<tool_response>" in content and "</tool_response>" in content:
-        raise ValueError("tool responses are not supported")
-      reasoning = message.get("reasoning_content")
-      if reasoning is not None and (role != "assistant" or not isinstance(reasoning, str)):
-        raise ValueError("reasoning_content must be assistant text")
-    for marker in ("<|im_start|>", "<|im_end|>"):
-      if marker not in self._backend._special_tokens: raise ValueError(f"chat vocabulary is missing {marker}")
-
-    last_query = next((i for i in range(len(messages)-1, -1, -1) if messages[i]["role"] == "user"), len(messages)-1)
-    parts = []
-    for i, message in enumerate(messages):
-      role, content = message["role"], message["content"]
-      if role == "assistant":
-        reasoning = message.get("reasoning_content")
-        if reasoning is None:
-          reasoning = ""
-          if "</think>" in content:
-            reasoning = content.split("</think>")[0].rstrip("\n").split("<think>")[-1].lstrip("\n")
-            content = content.split("</think>")[-1].lstrip("\n")
-        if i > last_query and (i == len(messages)-1 or reasoning):
-          content = "<think>\n" + reasoning.strip("\n") + "\n</think>\n\n" + content.lstrip("\n")
-      parts.append(f"<|im_start|>{role}\n{content}<|im_end|>\n")
-    if add_generation_prompt:
-      parts.append("<|im_start|>assistant\n")
-      parts.append("<think>\n" if enable_thinking else "<think>\n\n</think>\n\n")
-    return "".join(parts)

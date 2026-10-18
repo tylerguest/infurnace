@@ -7,12 +7,12 @@ from tinygrad.nn.state import get_state_dict
 from infurnace.dflash import DFlashDraft, DFlashGenerator
 from infurnace.dflash.draft import DFlashConfig, DraftWeights
 from infurnace.dflash.target import TargetObserver
-from infurnace.models.qwen35 import Qwen35Model
+from infurnace.engine import Model
 from test_qwen35 import checkpoint
 
 def tiny_target(path):
   checkpoint(path)
-  return Qwen35Model.from_gguf(path / 'model.gguf', device='CPU')
+  return Model.from_gguf(path / 'model.gguf', device='CPU')
 
 def tiny_draft(model):
   config = DFlashConfig(2, 8, 12, 2, 1, 4, 1e-6, 10000000, 4, 15, (1,), (True, False), 8)
@@ -219,7 +219,7 @@ def full_cache_draft(model, source):
 def test_ring_cache_matches_a_full_cache(tmp_path):
   # The sliding layer keeps window + 2 blocks = 16 slots; 60 positions wrap it several times.
   with Context(DEV='CPU'):
-    model = Qwen35Model.from_gguf(checkpoint(tmp_path, context=64), device='CPU')
+    model = Model.from_gguf(checkpoint(tmp_path, context=64), device='CPU')
     ring = tiny_draft(model)
     full = full_cache_draft(model, ring)
     assert ring.ring == [True, False] and ring.cache[0].shape[3] == ring.ring_length == 16
@@ -235,7 +235,7 @@ def test_ring_cache_matches_a_full_cache(tmp_path):
 
 def test_restoring_past_a_wrapped_ring_hides_overwritten_slots(tmp_path):
   with Context(DEV='CPU'):
-    model = Qwen35Model.from_gguf(checkpoint(tmp_path, context=64), device='CPU')
+    model = Model.from_gguf(checkpoint(tmp_path, context=64), device='CPU')
     draft = tiny_draft(model)
     rows = Tensor.randn(1, 50, 8).realize()
     draft.observe(rows[:, :10].contiguous().realize())
@@ -253,7 +253,7 @@ def test_restoring_past_a_wrapped_ring_hides_overwritten_slots(tmp_path):
 
 def test_shorter_proposals_reuse_the_full_block_graph(tmp_path):
   with Context(DEV='CPU'):
-    model = Qwen35Model.from_gguf(checkpoint(tmp_path, context=64), device='CPU')
+    model = Model.from_gguf(checkpoint(tmp_path, context=64), device='CPU')
     draft, rows = tiny_draft(model), Tensor.randn(1, 40, 8).realize()
     full, done = draft.config.block_size - 1, 0
     for count in (full, 1, 2, full):

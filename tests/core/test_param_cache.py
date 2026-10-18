@@ -1,5 +1,5 @@
 from tinygrad import Context, Tensor, dtypes
-from infurnace.models.qwen35 import _load_tensors, _save_tensors
+from infurnace.engine import _load_tensors, _save_tensors
 
 def test_tensors_round_trip_as_views_of_one_buffer(tmp_path):
   with Context(DEV='CPU'):

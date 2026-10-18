@@ -1,7 +1,8 @@
 # Architecture
 
-Infurnace runs **Qwen3.5-4B** on tinygrad's own Qwen3.5 implementation (`tinygrad.llm.model`), and
-replaces its hot paths with infurnace's kernels on NVIDIA GPUs. It is a single-user application, not
+Infurnace runs models on tinygrad's own implementation (`tinygrad.llm.model`), today **Qwen3.5-4B**, and
+replaces its hot paths with infurnace's kernels on NVIDIA GPUs. The engine is shared; what differs between model
+families lives in `models/` (see the [multi-model plan](multi-model.md)). It is a single-user application, not
 a general inference engine.
 
 ## Modules
@@ -11,11 +12,13 @@ a general inference engine.
 | `cli.py` | Commands (`serve`, `run`, `ps`, `stop`, `pull`, `list`, `rm`, `launch`) and the original in-process flags |
 | `client.py` | Talking to the server: finding or starting it, chat and one-shot replies, `ps`/`stop`, `launch pi` |
 | `serve.py` | tinygrad's OpenAI-compatible server (`/v1`) plus infurnace's `/api`; DFlash, per-request thinking, warmup on a thread |
-| `loader.py` | Named models, downloads (`pull`, `list`, `rm`), architecture checks, device dispatch, DFlash loading, context from free VRAM |
+| `loader.py` | Named models, downloads (`pull`, `list`, `rm`), the family for a GGUF's architecture, device dispatch, DFlash loading, context from free VRAM |
 | `device.py` | Device probing, the fast-path check, NVIDIA's pip-installed compiler, free VRAM |
 | `gguf.py` | GGUF parsing (tinygrad's parser) and metadata |
-| `tokenizer.py` | Qwen3.5 BPE, streaming decode, text-only chat formatting |
-| `models/qwen35.py` | Upstream model loading, packed weights, fused layers, multirow prefill, prompt snapshots |
+| `chat.py` | Chat prompts from the GGUF's Jinja template (server and local chat) |
+| `tokenizer.py` | Qwen3.5 BPE and streaming decode |
+| `engine.py` | `Model`: upstream model loading, packed weights, fused attention and feed-forward, prompt chunks, generation, prompt snapshots |
+| `models/` | Model families (`Family`: tokenizer, extra passes, snapshots); `models/qwen35.py` adds the fused GDN layers |
 | `models/linear.py` | `_NVLinear`: packed projection used by both the target and the draft |
 | `dflash/` | Draft model, target observation, parallel verification, adaptive drafting |
 | `kernels/` | Custom tinygrad UOp kernels (below) |
@@ -51,7 +54,7 @@ Small parameters (norms, gates) are cached under `~/.cache/infurnace/params/`.
 
 ## Plain decoding
 
-- **Prompt:** read 64 rows at a time (`Qwen35Model._prompt_chunk`) with `quant_gemm` projections, `gdn_prefill`
+- **Prompt:** read 64 rows at a time (`Model._prompt_chunk`) with `quant_gemm` projections, `gdn_prefill`
   (four 16-row scans) and the `attention` kernel. The graph always runs 64 rows and takes the real row count
   as a value: with a symbolic count, hundreds of kernels get runtime launch sizes, which the GPU patches on
   every replay (65 instead of 33 ms a chunk). The prompt is uploaded once and sliced inside the graph. With

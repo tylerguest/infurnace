@@ -2,7 +2,7 @@ import pytest
 from tinygrad import Context, Tensor
 from infurnace.dflash import DFlashGenerator
 from infurnace.dflash.parallel import _decays, _unit_lower_inverse
-from infurnace.models.qwen35 import Qwen35Model
+from infurnace.engine import Model
 from test_dflash import RecordedDraft, tiny_draft
 from test_qwen35 import checkpoint
 
@@ -41,7 +41,7 @@ def test_parallel_verifier_reproduces_greedy_decoding(tmp_path, kind, block):
   # Exercises multirow prefill, held/flush of verified blocks and the
   # closed-form commit on CPU; drafting is forced on (no timing fallback).
   with Context(DEV='CPU'):
-    model = Qwen35Model.from_gguf(checkpoint(tmp_path), device='CPU')
+    model = Model.from_gguf(checkpoint(tmp_path), device='CPU')
     prompt = [1, 2, 3]
     expected = list(model.generate(list(prompt), 9, reuse_cache=False))
     draft = tiny_draft(model) if kind == 'random' else RecordedDraft(model, prompt, expected, wrong=kind == 'wrong')
@@ -55,7 +55,7 @@ def test_parallel_verifier_reproduces_greedy_decoding(tmp_path, kind, block):
 
 def test_timing_fallback_decodes_plain_rows_when_drafting_loses(tmp_path):
   with Context(DEV='CPU'):
-    model = Qwen35Model.from_gguf(checkpoint(tmp_path), device='CPU')
+    model = Model.from_gguf(checkpoint(tmp_path), device='CPU')
     prompt = [1, 2, 3]
     expected = list(model.generate(list(prompt), 9, reuse_cache=False))
     generator = DFlashGenerator(model, RecordedDraft(model, prompt, expected, wrong=True), verifier='parallel')

@@ -2,8 +2,12 @@
 
 Marked nv (INFURNACE_TEST_NV=1); needs the model files below; loads ~3 GB once.
 """
+import functools
 from pathlib import Path
 import pytest
+from types import SimpleNamespace
+from infurnace.chat import user_prompt
+from infurnace.gguf import read_gguf_metadata
 
 TARGET = Path('models/qwen35-validation/Qwen3.5-4B-Q4_K_M.gguf')
 DRAFT = Path('models/dflash-qwen35/qwen35-4b-dflash-Q4_K_M.gguf')
@@ -24,8 +28,13 @@ def configure(generator, *, fused=True, plain_cost=float('inf')):
   generator.min_tau, generator.plain_cost, generator.fused = 0.0, plain_cost, fused  # inf: always draft
   return generator
 
+@functools.cache
+def target():
+  """The target's metadata, for its chat template."""
+  return SimpleNamespace(metadata=read_gguf_metadata(TARGET))
+
 def prompt(tokenizer, text, thinking=False):
-  return tokenizer.encode(tokenizer.render_chat([{'role': 'user', 'content': text}], enable_thinking=thinking))
+  return tokenizer.encode(user_prompt(target(), tokenizer, text, thinking))
 
 def test_cold_first_request_matches_plain_decoding_prefix(loaded):
   # Must run first in this module: DFlash is the model's first work, as for a
@@ -97,7 +106,7 @@ def test_chunked_prompt_matches_one_row_prompt(loaded):
   # their caches and states never saw the prompt. Easy prompts still decode the same tokens without them, so
   # every layer's state is compared with one-row prompt reading.
   from tinygrad import Tensor
-  from infurnace.models.qwen35 import PROMPT_ROWS
+  from infurnace.engine import PROMPT_ROWS
   model, tokenizer, generator = loaded
   configure(generator)
   generator.warmup(16)

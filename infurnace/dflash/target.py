@@ -2,7 +2,7 @@
 from tinygrad import Context, Tensor, UOp, dtypes
 from tinygrad.uop.ops import Ops
 from infurnace.dflash.jit import captured
-from infurnace.models.qwen35 import Qwen35Model
+from infurnace.engine import Model
 
 def detach_rng(device: str):
   """Detach a captured graph's RNG counter update in place (buffer identity kept): live lazy graphs
@@ -11,8 +11,8 @@ def detach_rng(device: str):
   if counter.uop.op is not Ops.BUFFER: counter.replace(Tensor(counter.uop.buf_uop).reshape(counter.shape))
 
 class TargetObserver:
-  def __init__(self, model: Qwen35Model, feature_layers: tuple[int, ...]):
-    if not isinstance(model, Qwen35Model): raise ValueError('DFlash requires Qwen3.5 target support')
+  def __init__(self, model: Model, feature_layers: tuple[int, ...]):
+    if not isinstance(model, Model): raise ValueError('DFlash requires an infurnace Model target')
     if (not feature_layers or tuple(sorted(set(feature_layers))) != feature_layers
         or any(type(i) is not int or not 0 < i < model.config.block_count for i in feature_layers)):
       raise ValueError('invalid DFlash target feature taps')

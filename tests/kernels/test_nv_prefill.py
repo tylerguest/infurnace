@@ -47,9 +47,9 @@ def test_paired_prefill_graph_issues_one_mma_per_tile_step(typ, words):
   assert len([u for u in ops if u.op is Ops.PARAM and u.addrspace == AddrSpace.GLOBAL]) == 3
 
 def test_prefill_requires_nv_quant_before_loading():
-  from infurnace.models.qwen35 import Qwen35Model
+  from infurnace.engine import Model
   with pytest.raises(ValueError, match="requires NV quantized"):
-    Qwen35Model.from_gguf("does-not-exist.gguf", nv_prefill=True)
+    Model.from_gguf("does-not-exist.gguf", nv_prefill=True)
 
 def test_prefill_rejects_single_token_and_bad_packed_storage():
   with pytest.raises(QuantGemmError, match="multi-token"):

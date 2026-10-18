@@ -3,13 +3,13 @@ import os
 import pytest
 from tinygrad import Context, Tensor, dtypes
 from tinygrad.llm.model import Transformer
-from infurnace.models.qwen35 import Qwen35Model
+from infurnace.engine import Model
 from test_qwen35 import checkpoint
 
 @pytest.fixture
 def runner(tmp_path):
   with Context(DEV='CPU'):
-    return Qwen35Model.from_gguf(checkpoint(tmp_path), device='CPU')
+    return Model.from_gguf(checkpoint(tmp_path), device='CPU')
 
 def test_reference_generation_and_tied_storage(runner, tmp_path):
   with Context(DEV='CPU'):
@@ -68,12 +68,13 @@ def test_loaded_config(runner):
                     reason='set INFURNACE_TEST_MODEL and INFURNACE_TEST_GENERATION=1 for real-model generation')
 def test_local_generation():
   from infurnace.tokenizer import Qwen35Tokenizer
-  model = Qwen35Model.from_gguf(os.environ['INFURNACE_TEST_MODEL'], max_context=2048,
+  model = Model.from_gguf(os.environ['INFURNACE_TEST_MODEL'], max_context=2048,
                               device=os.environ.get('INFURNACE_GENERATION_DEVICE', 'NV'),
                               nv_quant=bool(os.environ.get('INFURNACE_TEST_NV_QUANT')),
                               nv_prefill=bool(os.environ.get('INFURNACE_TEST_NV_PREFILL')))
   tokenizer = Qwen35Tokenizer.from_gguf(model.metadata)
-  prompt = tokenizer.encode(tokenizer.render_chat([{'role': 'user', 'content': 'Reply with just the word hello.'}], enable_thinking=False))
+  from infurnace.chat import user_prompt
+  prompt = tokenizer.encode(user_prompt(model, tokenizer, 'Reply with just the word hello.'))
   ids = []
   stream = model.generate(prompt, 32)
   try:

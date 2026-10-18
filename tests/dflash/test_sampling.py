@@ -9,7 +9,7 @@ import math
 import pytest
 from tinygrad import Context, Tensor
 from infurnace.dflash import DFlashGenerator
-from infurnace.models.qwen35 import Qwen35Model
+from infurnace.engine import Model
 from test_dflash import RecordedDraft
 from test_qwen35 import checkpoint
 
@@ -17,7 +17,7 @@ PROMPT = [1, 2, 3]
 
 def model_and_generator(tmp_path, verifier, seed=0):
   Tensor.manual_seed(seed)
-  model = Qwen35Model.from_gguf(checkpoint(tmp_path), device='CPU')
+  model = Model.from_gguf(checkpoint(tmp_path), device='CPU')
   greedy = list(model.generate(list(PROMPT), 8, reuse_cache=False))
   # Proposes the greedy continuation whatever was sampled: a deterministic draft is all the rule needs.
   generator = DFlashGenerator(model, RecordedDraft(model, PROMPT, greedy), verifier=verifier)

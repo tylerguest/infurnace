@@ -156,7 +156,7 @@ class DFlashGenerator:
   def _prefill(self, tokens: list[int], block: int) -> int:
     """Run the prompt through the target; returns its decision for the first output. Resumes from
     the model's prompt snapshot when the prompt still matches it (restoring the draft with it), and
-    saves a new one before the prompt's last turn header (see Qwen35Model.save_snapshot)."""
+    saves a new one before the prompt's last turn header (see Model.save_snapshot)."""
     done = self.model.restore_snapshot(tokens, 0, draft=self.draft)
     self.observer.position = done
     point = self.model.snapshot_point(tokens, done)

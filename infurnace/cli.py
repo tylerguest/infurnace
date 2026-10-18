@@ -167,9 +167,10 @@ def reply(generate, tokenizer, ids: list[int], max_tokens: int | None, context: 
           file=sys.stderr)
   return text
 
-def chat(generate, tokenizer, context: int, max_tokens: int | None, thinking: bool = True, ready: Callable[[], None] | None = None) -> int:
-  """Interactive chat. When a new message would not fit, the oldest turns are dropped.
-  `ready()` is called before each reply (it waits for a background warmup)."""
+def chat(generate, tokenizer, template, context: int, max_tokens: int | None, thinking: bool = True,
+         ready: Callable[[], None] | None = None) -> int:
+  """Interactive chat, prompts rendered by `template` (a ChatTemplate). When a new message would not fit, the oldest
+  turns are dropped. `ready()` is called before each reply (it waits for a background warmup)."""
   history: list[dict] = []
   reserve = min(max_tokens or 1024, max(1, context // 2))  # room left for the reply
   while True:
@@ -177,7 +178,7 @@ def chat(generate, tokenizer, context: int, max_tokens: int | None, thinking: bo
     except EOFError: return 0
     retained = list(history)
     while True:
-      ids = encode(tokenizer, tokenizer.render_chat(retained + [message], enable_thinking=thinking))
+      ids = encode(tokenizer, template.render(retained + [message], thinking=thinking, add_generation_prompt=True))
       if len(ids) < context - reserve or not retained: break
       retained = retained[2:]  # history is user/assistant pairs; keep the newest
     if len(ids) >= context:
@@ -213,10 +214,12 @@ def run(args: argparse.Namespace) -> int:
           info=loader.model_info(_model_name(args.model), loader.fetch_model(args.model), dflash is not None), installed=loader.installed)
     return 0
   window, thinking = min(args.max_context, context), not args.no_thinking
-  if args.no_warmup: return chat(generate, tokenizer, window, args.max_tokens, thinking)
+  from infurnace.chat import ChatTemplate
+  template = ChatTemplate(model.metadata, tokenizer)
+  if args.no_warmup: return chat(generate, tokenizer, template, window, args.max_tokens, thinking)
   print(f"Warming up {model.device} in the background; you can type your first message now.", file=sys.stderr, flush=True)
   background = BackgroundWarmup(model, dflash)
-  try: return chat(generate, tokenizer, window, args.max_tokens, thinking, ready=background.wait)
+  try: return chat(generate, tokenizer, template, window, args.max_tokens, thinking, ready=background.wait)
   finally: background.thread.join()  # never exit while the warmup thread is using the GPU
 
 def main(argv: list[str] | None = None) -> int:

@@ -52,13 +52,16 @@ path, goes away.
 
 ### P0: split the engine from Qwen3.5 (no behavior change)
 
-- [ ] `engine.py`: move the model-neutral parts of `models/qwen35.py` there; rename `Qwen35Model` to `Model`
+- [x] `engine.py`: move the model-neutral parts of `models/qwen35.py` there; rename `Qwen35Model` to `Model`
       (tests, benchmarks and `dflash/` follow)
-- [ ] Family registry in `models/__init__.py`; `models/qwen35.py` keeps only the GDN pass and snapshot markers
-- [ ] `loader.py` dispatches on `general.architecture`; an unsupported one names the supported families
-- [ ] Legacy `--prompt` path renders through the GGUF template; `render_chat` removed
-- [ ] Gate: CPU and NV tests pass; perplexity unchanged (16-row 16.986, verifier 16.986); `benchmarks/sweep.py`
+- [x] Family registry in `models/__init__.py`; `models/qwen35.py` keeps only the GDN pass and snapshot markers
+- [x] `loader.py` dispatches on `general.architecture`; an unsupported one names the supported families
+- [x] The in-process chat (legacy flags) renders through the GGUF template (`chat.py`); `render_chat` removed
+- [x] Gate: CPU and NV tests pass; perplexity unchanged (16-row 16.986, verifier 16.986); `benchmarks/sweep.py`
       within noise of the current numbers
+      (2026-10-18: one-row 17.006, 16-row 16.9860, verifier 16.9861; plain 1k/4k prompts 1,828/2,305 tok/s read,
+      105/104 tok/s decode; DFlash 1,368/1,677 read, 223/197 decode. `test_multirow_logits_match_one_row` reads
+      its prompt eagerly and no longer finishes in 5 minutes, at the previous commit too)
 
 ### P1: catalog
 
