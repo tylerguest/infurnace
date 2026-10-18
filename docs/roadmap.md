@@ -1,7 +1,8 @@
 # Roadmap
 
-**Goal:** fast, easy local inference for people with modest GPUs. One user, one model (Qwen3.5-4B
-Q4_K_M with its DFlash draft), on tinygrad. No batching, scheduler, multi-GPU or other model families.
+**Goal:** fast, easy local inference for people with modest GPUs. One user, one model at a time, on
+tinygrad: today Qwen3.5-4B Q4_K_M with its DFlash draft; more small models next ([multi-model plan](multi-model.md)).
+No batching, scheduler or multi-GPU.
 
 Every change needs three checks: a correctness check (tokens or logits), an end-to-end speed gain
 (not only a kernel microbenchmark), and a memory check on the 8 GB card.
