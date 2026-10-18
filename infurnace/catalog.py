@@ -28,6 +28,9 @@ ENTRIES = [
   Entry("qwen3.5:4b", "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/e87f176479d0855a907a41277aca2f8ee7a09523/Qwen3.5-4B-Q4_K_M.gguf",
         "qwen35", "https://huggingface.co/Anbeeld/Qwen3.5-4B-DFlash-GGUF/resolve/a79bafa7f383f8627f925250f547fe1ebbc43ff6/qwen35-4b-dflash-Q4_K_M.gguf"),
   Entry("qwen3:4b", "https://huggingface.co/Qwen/Qwen3-4B-GGUF/resolve/bc640142c66e1fdd12af0bd68f40445458f3869b/Qwen3-4B-Q4_K_M.gguf", "qwen3"),
+  # Ternary weights (Q2_0) with Hadamard-rotated inputs, fine-tuned from Qwen3.5-4B
+  Entry("bonsai:4b", "https://huggingface.co/prism-ml/Ternary-Bonsai-2-4B-gguf/resolve/8d6557168168f91ea6697a4a49ed2ef622b53adb/"
+        "Ternary-Bonsai-2-4B-Q2_0.gguf", "qwen35"),
 ]
 CATALOG = {entry.name: entry for entry in ENTRIES}
 DEFAULT = ENTRIES[0].name

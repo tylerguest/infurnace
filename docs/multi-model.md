@@ -11,7 +11,7 @@ Less than it looks. tinygrad's `Transformer.from_gguf` already loads `llama`, `q
 
 | Piece | Where | Model-neutral? |
 |---|---|---|
-| Packed Q4_K/Q5_K/Q6_K matmuls (`_enable_packed`, `_NVLinear`) | `models/qwen35.py`, `models/linear.py` | yes: per GGUF weight |
+| Packed Q4_K/Q5_K/Q6_K matmuls (`_enable_packed`, `_NVLinear`) | `models/qwen35.py`, `models/linear.py` (now `linear.py`) | yes: per GGUF weight |
 | Fused attention, one-row and 64-row chunks (`_fused_attention`) | `models/qwen35.py`, `kernels/attention.py` | yes: QK norm, optional output gate, any `head_dim % 32 == 0` |
 | Fused feed-forward, embedding gather, sampling, parameter cache | `models/qwen35.py`, `kernels/` | yes |
 | 64-row prompt graph (`_prompt_chunk`) | `models/qwen35.py` | mostly: its GDN masks apply only to GDN layers |
@@ -27,12 +27,13 @@ Less than it looks. tinygrad's `Transformer.from_gguf` already loads `llama`, `q
 infurnace/
   engine.py         Model: upstream Transformer + infurnace's passes, generate, prompt reading, warmup,
                     parameter cache (most of today's qwen35.py; Qwen35Model becomes Model)
+  linear.py         _NVLinear: packed projections (models/ holds model families only)
   tokenizer.py      BPETokenizer: HF tokenizers built from the GGUF, with the pretokenizer regex chosen
                     by tokenizer.ggml.pre (qwen35, qwen2, llama-bpe, ...)
   models/
     __init__.py     FAMILIES: general.architecture -> family
     qwen35.py       Qwen3.5: the fused GDN pass, snapshot markers
-    attention.py    attention-only models: qwen3, llama, ... (no extra passes)
+    qwen3.py        Qwen3: attention-only (no extra passes)
   catalog.py        name -> model URL, optional DFlash draft URL, family (replaces loader.MODELS)
   loader.py         reads general.architecture, picks the family, builds the Model and tokenizer
 ```
@@ -78,7 +79,7 @@ tokenizer preset. A failure points at the split, not at the kernels.
 
 - [x] Generic `BPETokenizer`; encodings match llama.cpp's on the quality texts (eval.txt 10,098 tokens and
       multilingual.txt 3,936 tokens identical; llama.cpp skips the NFC step Qwen's tokenizer.json specifies)
-- [x] Multirow prompt reading without GDN: the attention family turns prompt chunks on; `tests/core/test_nv_prompt.py`
+- [x] Multirow prompt reading without GDN: the Qwen3 family turns prompt chunks on; `tests/core/test_nv_prompt.py`
       checks chunked against one-row prompts, prefix reuse and a later graph capture on both models
 - [x] Prefix reuse through the KV cache; no snapshots for non-recurrent families
 - [x] Perplexity against llama.cpp and the speed sweep (below)

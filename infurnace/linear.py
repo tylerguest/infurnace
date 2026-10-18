@@ -1,16 +1,24 @@
-"""Packed NV projection adapter shared by the Qwen3.5 target and DFlash draft."""
+"""Packed NV projection adapter shared by the target models and the DFlash draft."""
 from tinygrad import Tensor, dtypes
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from infurnace.gguf import PackedTensor
-from infurnace.kernels.quant_gemv import (quant_gemv, prepare_q6, prepare_q4, dequant_prepared_q4, dequant_prepared_q6, untile)
+from infurnace.kernels.quant_gemv import (quant_gemv, prepare_q2, prepare_q6, prepare_q4, dequant_prepared_q2, dequant_prepared_q4,
+                                          dequant_prepared_q6, untile)
 from infurnace.kernels.quant_gemm import quant_gemm, nv_prefill_supported
 
+GEMM_TYPES = (12, 13, 14)       # Q4_K, Q5_K, Q6_K: tensor-core GEMM for prompt chunks, and the packed row gather
+KERNEL_TYPES = (12, 13, 14, 42)  # and Q2_0: the one-row GEMV (multirow inputs go through it row by row)
+
 class _NVLinear:
-  """Single-token fast path using explicit GGUF identity, never graph-size guessing."""
+  """Single-token fast path using explicit GGUF identity, never graph-size guessing.
+
+  `rotation` (hadamard.py) is the transform a Hadamard-folded weight's input needs."""
+  rotation = None
+
   def __init__(self, original, entry: PackedTensor, *, prefill: bool = False, q6_aligned: bool = False,
                q6_tiled: bool = True, q4_tiled: bool = True, realize: bool = True):
     self.original = original
-    if prefill and entry.ggml_type not in (12, 13, 14): raise ValueError("NV packed prefill supports only Q4_K/Q5_K/Q6_K")
+    if prefill and entry.ggml_type not in GEMM_TYPES: raise ValueError("NV packed prefill supports only Q4_K/Q5_K/Q6_K")
     self.prefill = prefill
     if prefill and not nv_prefill_supported(entry.data.device):
       raise ValueError("NV prefill requires CUDA-C FP16 tensor cores")
@@ -25,13 +33,15 @@ class _NVLinear:
     self.q6_aligned = q6_aligned and entry.ggml_type == 14
     self.q6_tiled = self.q6_aligned and q6_tiled and self.out_features % 16 == 0
     # realize=False leaves `packed` lazy so a caller can realize many adapters in one schedule.
-    self.packed = (prepare_q4(entry.data, in_features=self.in_features, realize=realize, ggml_type=entry.ggml_type) if self.q4_tiled else
+    self.packed = (prepare_q2(entry.data, realize=realize) if self.ggml_type == 42 else
+                   prepare_q4(entry.data, in_features=self.in_features, realize=realize, ggml_type=entry.ggml_type) if self.q4_tiled else
                    prepare_q6(entry.data, in_features=self.in_features, tiled=self.q6_tiled, realize=realize) if self.q6_aligned else
                    entry.data.contiguous().bitcast(dtype).flatten())
     if realize: self.packed.realize()
     # Generic consumers decode fields directly from the same padded allocation.
     # Neither the original GGUF bytes nor a second dense weight copy is retained.
-    decoded = (dequant_prepared_q4(self.packed, in_features=self.in_features) if self.q4_tiled and self.ggml_type == 12 else
+    decoded = (dequant_prepared_q2(self.packed, in_features=self.in_features) if self.ggml_type == 42 else
+               dequant_prepared_q4(self.packed, in_features=self.in_features) if self.q4_tiled and self.ggml_type == 12 else
                ggml_data_to_tensor(untile(self.packed, in_features=self.in_features, block_bytes=176), self.in_features*self.out_features,
                                    self.ggml_type) if self.q4_tiled else
                dequant_prepared_q6(self.packed, in_features=self.in_features, tiled=self.q6_tiled) if self.q6_aligned else
@@ -40,6 +50,8 @@ class _NVLinear:
     self.weight, self.bias = original.weight, original.bias
 
   def decode(self, x: Tensor, q8: tuple[Tensor, Tensor, Tensor] | None = None) -> Tensor:
+    """With `q8`, `x` is already in this weight's input basis (one rotation for the projections sharing it)."""
+    if q8 is None and self.rotation is not None: x = self.rotation(x)
     result = quant_gemv(x, self.packed, out_features=self.out_features, in_features=self.in_features, ggml_type=self.ggml_type,
                         q6_aligned=self.q6_aligned, q6_tiled=self.q6_tiled, q4_tiled=self.q4_tiled, q8=q8)
     return result if self.bias is None else result+self.bias
@@ -47,6 +59,7 @@ class _NVLinear:
   def __call__(self, x: Tensor) -> Tensor:
     if isinstance(x.numel(), int) and x.numel() == self.in_features:
       return self.decode(x)
+    if self.rotation is not None: x = self.rotation(x)
     if self.prefill:
       # Upstream prefill uses a symbolic token count. Pad to its fixed maximum
       # for capture, then slice valid rows; the kernel handles the final 16-row tile.

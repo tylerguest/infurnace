@@ -20,7 +20,7 @@ class Family:
   # tokenizer -> (turn header token, user turn header tokens, tool result marker) for placing snapshots
   turn_markers: Callable[[Any], tuple[int | None, tuple[int, ...], int | None]] = lambda tokenizer: (None, (), None)
 
-FAMILIES = {'qwen35': 'infurnace.models.qwen35', 'qwen3': 'infurnace.models.attention'}
+FAMILIES = {'qwen35': 'infurnace.models.qwen35', 'qwen3': 'infurnace.models.qwen3'}
 
 def family_for(architecture: str | None) -> Family:
   if architecture not in FAMILIES:

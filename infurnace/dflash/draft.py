@@ -9,7 +9,7 @@ from tinygrad import Context, Tensor, UOp, nn, dtypes
 from tinygrad.llm.model import apply_rope, precompute_freqs_cis
 from tinygrad.nn.state import get_parameters, get_state_dict, load_state_dict
 from infurnace.gguf import parse_gguf
-from infurnace.models.linear import _NVLinear
+from infurnace.linear import _NVLinear
 from infurnace.kernels.quant_gemv import QUANT_SIZES
 from infurnace.kernels.quant_gemm import nv_prefill_supported
 from infurnace.engine import Model

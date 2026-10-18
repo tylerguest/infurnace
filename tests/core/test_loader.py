@@ -48,7 +48,7 @@ def test_dflash_draft_for_names_and_paths(tiny_models, monkeypatch, tmp_path):
   assert loader.dflash_draft("tiny:1b") == Path.home() / "draft.gguf"
 
 def test_catalog():
-  assert list(catalog.CATALOG) == ['qwen3.5:4b', 'qwen3:4b'] and catalog.DEFAULT == 'qwen3.5:4b'
+  assert list(catalog.CATALOG) == ['qwen3.5:4b', 'qwen3:4b', 'bonsai:4b'] and catalog.DEFAULT == 'qwen3.5:4b'
   entry = catalog.CATALOG['qwen3.5:4b']
   assert entry.architecture == 'qwen35' and entry.draft.endswith('qwen35-4b-dflash-Q4_K_M.gguf')
   qwen3 = catalog.CATALOG['qwen3:4b']

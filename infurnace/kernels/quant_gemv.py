@@ -10,11 +10,12 @@ from infurnace.device import nvidia
 Q4_K = 12
 Q5_K = 13
 Q6_K = 14
+Q2_0 = 42  # ternary: 64 two-bit codes (0, 1, 2 mean -1, 0, +1) and an FP16 scale per block
 GGML_BLOCK_SIZE = 256
 Q8_GROUP_SIZE = 32
 Q4_WORDS = 36
 Q6_BYTES = 210
-QUANT_SIZES = {Q4_K:Q4_WORDS*4, Q5_K:176, Q6_K:Q6_BYTES}
+QUANT_SIZES = {Q4_K:Q4_WORDS*4, Q5_K:176, Q6_K:Q6_BYTES, Q2_0:72}  # bytes per 256 values
 
 class QuantGemvError(ValueError):
   """Quant-GEMV inputs do not satisfy the kernel contract."""
@@ -98,6 +99,23 @@ def prepare_q6_tiled(raw: Tensor, *, in_features: int, realize: bool = True) -> 
   result = padded.reshape(rows//16, 16, blocks, Q6_PREPARED_BYTES).permute(0, 2, 1, 3).contiguous().flatten().bitcast(dtypes.uint32)
   return result.realize() if realize else result
 
+def prepare_q2(raw: Tensor, *, realize: bool = True) -> Tensor:
+  """Q2_0 blocks (FP16 scale, 16 code bytes) as words: every code byte, rows in order, then every scale. A lane's
+  32 codes are 8 aligned bytes, adjacent lanes read adjacent ones, and nothing is padded (2.25 bits a weight)."""
+  if raw.dtype != dtypes.uint8 or raw.numel() <= 0 or raw.numel() % 18 or (raw.numel() // 18) % 2:
+    raise QuantGemvError("Q2_0 preparation requires whole uint8 blocks, an even number of them")
+  blocks = raw.flatten().reshape(-1, 18)
+  result = blocks[:, 2:].flatten().cat(blocks[:, :2].flatten()).bitcast(dtypes.uint32)
+  return result.realize() if realize else result
+
+def dequant_prepared_q2(packed: Tensor, *, in_features: int) -> Tensor:
+  """FP32 weights straight from prepare_q2's words."""
+  n = packed.numel() * 4 // 18 * 64
+  codes = packed[:n // 16].bitcast(dtypes.uint8).reshape(-1, 1).cast(dtypes.int32)
+  values = ((codes // Tensor([1, 4, 16, 64], dtype=dtypes.int32, device=packed.device)) % 4 - 1).reshape(-1, 64)
+  scales = packed[n // 16:].bitcast(dtypes.float16).float().reshape(-1, 1)
+  return (values.float() * scales).flatten()
+
 def dequant_prepared_q4(packed: Tensor, *, in_features: int) -> Tensor:
   """FP32 weights straight from prepare_q4's tiled words (GGUF Q4_K field math)."""
   blocks = untile(packed, in_features=in_features, block_bytes=Q4_WORDS*4)
@@ -178,6 +196,9 @@ def _decode_warps(ggml_type: int, in_features: int, out_features: int) -> int:
   # RTX 5060: the Qwen3.5-4B Q6 output head (tied to the embedding) takes 1.31 ms with 4 or 8 warps
   # against 1.45-1.48 ms with 1; FFN-down was screened earlier and stays at 1.
   if ggml_type == Q6_K and (out_features, in_features) == (248320, 2560): return 8
+  # RTX 5060, Bonsai-4B Q2_0: the 248320-row head reads at 165 GB/s with 1 warp, 315 with 2, 363 with 4; decode
+  # 73 -> 94.6 tok/s with 4 (93.7 with 2).
+  if ggml_type == Q2_0: return 4
   return 1
 
 def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot:Callable[[UOp, UOp, UOp], UOp], name:str,
@@ -277,8 +298,24 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, out_features:
       # dot((q-32), x) == dot(q, x) - 32*sum(x), independently for each 16-value scale group.
       corrected = [(dots[half] - 32*xs[token, group, half].load()).float() for half in range(2)]
       return (corrected[0]*scales[0] + corrected[1]*scales[1]) * xd[token, group] * _half(raw[d_index].load())
+    if ggml_type == Q2_0:
+      # prepare_q2: this lane's 32 codes are two words; four codes per byte, the first in the low bits.
+      words = _load_lanes(raw[(output*in_features + group*32)//16], 2)
+      dot = UOp.const(0, dtypes.int32)
+      for word_idx in range(2):
+        for byte_idx in range(4):
+          b = (words[word_idx] >> (byte_idx*8)) & 255
+          # Spread the byte's four 2-bit codes into four bytes, in activation order.
+          spread = (b | (b << 6) | (b << 12) | (b << 18)) & 0x03030303
+          dot = _dp4a(spread, xwords[word_idx*4+byte_idx], dot)
+      scale_index = output*(in_features//64) + group//2
+      scale_word = raw[out_features*in_features//16 + scale_index//2].load()
+      d = _half((scale_word >> ((scale_index%2)*16).cast(dtypes.uint32)) & 65535)
+      # dot(q - 1, x) == dot(q, x) - sum(x)
+      qsum = xs[token, group, 0].load() + xs[token, group, 1].load()
+      return (dot - qsum).float() * d * xd[token, group]
     raise QuantGemvError(f"unsupported quant type {ggml_type}")
-  names = {Q4_K: "linear_q4_k", Q5_K: "linear_q5_k", Q6_K: "linear_q6"}
+  names = {Q4_K: "linear_q4_k", Q5_K: "linear_q5_k", Q6_K: "linear_q6", Q2_0: "linear_q2_0"}
   # Keep CTA-local batches small: one output warp per token, at most 256
   # threads. Tokens share the SM's weight cache without unrolled registers.
   warps = 1 if local_tokens else _decode_warps(ggml_type, in_features, out_features)
@@ -301,7 +338,7 @@ def quant_gemv(x:Tensor, packed:Tensor, *, out_features:int, in_features:int, gg
   if q4_tiled and (ggml_type not in (Q4_K, Q5_K) or out_features%16): raise QuantGemvError("tiled Q4/Q5 requires Q4_K/Q5_K and 16-row tiles")
   if q6_tiled and (not q6_aligned or out_features%16): raise QuantGemvError("tiled Q6 requires prepared storage and 16-row tiles")
   if q6_aligned and ggml_type != Q6_K: raise QuantGemvError("aligned Q6 layout requires Q6_K")
-  expected_dtype = dtypes.uint32 if ggml_type in (Q4_K, Q5_K) or q6_aligned else dtypes.uint16
+  expected_dtype = dtypes.uint32 if ggml_type in (Q4_K, Q5_K, Q2_0) or q6_aligned else dtypes.uint16
   expected_bytes = out_features * in_features // GGML_BLOCK_SIZE * (Q6_PREPARED_BYTES if q6_aligned else QUANT_SIZES[ggml_type])
   if packed.dtype != expected_dtype or packed.numel() * packed.dtype.itemsize != expected_bytes:
     raise QuantGemvError("packed weight dtype/size does not match the quantization contract")

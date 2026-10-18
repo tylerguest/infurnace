@@ -19,14 +19,14 @@ from typing import Iterator
 from tinygrad import Context, Tensor, TinyJit, UOp, dtypes
 from tinygrad.device import Buffer
 import tinygrad.llm.model as upstream_model
-from tinygrad.llm.gguf import ggml_data_to_tensor
 from tinygrad.llm.model import Transformer, TransformerBlock, apply_rope
 from tinygrad.nn.state import get_state_dict
-from infurnace.gguf import parse_gguf, read_gguf_metadata
+from infurnace.gguf import Q2_0, decode as decode_packed, parse_gguf, read_gguf_metadata
+from infurnace.hadamard import rotations
 from infurnace.kernels.attention import attention
 from infurnace.kernels.quant_gemm import nv_prefill_supported
-from infurnace.kernels.quant_gemv import q8_quantize
-from infurnace.models.linear import _NVLinear
+from infurnace.kernels.quant_gemv import dequant_prepared_q2, q8_quantize
+from infurnace.linear import GEMM_TYPES, _NVLinear
 from infurnace.device import nvidia
 from infurnace.models import Family, family_for
 
@@ -113,7 +113,7 @@ class _PackedLinear(_NVLinear):
   the packed GEMM when available, otherwise the multirow packed GEMV.
   """
   def __init__(self, original, entry, *, prefill: bool, keep_weight: bool = False, realize: bool = True):
-    super().__init__(original, entry, prefill=prefill, q6_aligned=True, realize=realize)
+    super().__init__(original, entry, prefill=prefill and entry.ggml_type in GEMM_TYPES, q6_aligned=True, realize=realize)
     if not keep_weight: self.weight = original.weight = None
 
   def __call__(self, x):
@@ -134,7 +134,9 @@ def _one_row(x: Tensor, *layers) -> tuple[Tensor, ...]:
   """One-row outputs of projections that read the same input, quantizing it to Q8 once: each packed
   GEMV would otherwise quantize it again. Other inputs or layers go through their own call."""
   width = getattr(layers[0], 'in_features', None)
-  if _SHARED_Q8 and all(isinstance(layer, _NVLinear) for layer in layers) and isinstance(x.numel(), int) and x.numel() == width:
+  if _SHARED_Q8 and all(isinstance(layer, _NVLinear) and layer.rotation is layers[0].rotation for layer in layers) and \
+     isinstance(x.numel(), int) and x.numel() == width:
+    if layers[0].rotation is not None: x = layers[0].rotation(x)  # Hadamard-folded weights: one rotation for all of them
     q8 = q8_quantize(x, 1, width)
     return tuple(layer.decode(x, q8) for layer in layers)
   return tuple(layer(x) for layer in layers)
@@ -198,11 +200,29 @@ def _lazy_upstream_weights(path):
     return metadata, {name: (entry.data, entry.shape, entry.ggml_type) for name, entry in entries.items()}
   def lazy_shard(entries, devices, shard_map=None):
     if shard_map or len(devices) != 1: return shard(entries, devices, shard_map)
-    return {name: ggml_data_to_tensor(data.to(devices[0]).flatten(), math.prod(shape), typ).reshape(shape)
+    return {name: decode_packed(data.to(devices[0]).flatten(), math.prod(shape), typ).reshape(shape)
             for name, (data, shape, typ) in entries.items()}
   upstream_model.gguf_parse, upstream_model.gguf_shard = cached_parse, lazy_shard
   try: yield
   finally: upstream_model.gguf_parse, upstream_model.gguf_shard = parse, shard
+
+class _PackedEmbedding:
+  """Token embedding read from a packed Q2_0 table (prepare_q2's layout): only the looked-up rows are decoded,
+  then restored from a Hadamard-latent basis when the table is rotated."""
+  def __init__(self, table: _NVLinear):
+    self.table, self.rotation = table, None  # the table's Hadamard rotation: rows are restored with its inverse
+
+  @property
+  def weight(self) -> Tensor:  # upstream's forward places the token ids on token_embd.weight's device
+    return self.table.packed
+
+  def __call__(self, ids: Tensor) -> Tensor:
+    t, flat = self.table, ids.flatten()
+    code_words = t.out_features * t.in_features // 16
+    codes = t.packed[:code_words].reshape(t.out_features, t.in_features // 16)[flat]
+    scales = t.packed[code_words:].reshape(t.out_features, t.in_features // 128)[flat]  # two FP16 scales a word
+    x = dequant_prepared_q2(codes.flatten().cat(scales.flatten()), in_features=t.in_features).reshape(*ids.shape, t.in_features)
+    return (self.rotation.inverse(x) if self.rotation is not None else x).half()
 
 SNAPSHOTS = 8  # prompt snapshots kept (recurrent families), about 50 MB of host memory each for Qwen3.5-4B
 
@@ -561,6 +581,26 @@ class Model:
       counter.replace(Tensor.zeros(*counter.shape, dtype=counter.dtype, device='CPU').contiguous().realize())
     return result
 
+  def _attach_rotations(self, path):
+    """Hadamard-folded weights (hadamard.py): each projection rotates its input; the embedding restores its rows."""
+    metadata, entries = parse_gguf(path)
+    arch = metadata.get('general.architecture')
+    widths = {name: entry.shape[-1] for name, entry in entries.items() if len(entry.shape) == 2}
+    widths.setdefault('output.weight', widths.get('token_embd.weight', 0))
+    forward, inverse = rotations(metadata, widths, self.device, value_heads=metadata.get(f'{arch}.ssm.time_step_rank', 0),
+                                 key_heads=metadata.get(f'{arch}.ssm.group_count', 0))
+    for name, rotation in forward.items():
+      owner, attribute = (self.transformer, 'output') if name == 'output.weight' else \
+                         (self.transformer.blk[int(name.split('.')[1])], name.split('.')[2])
+      layer = getattr(owner, attribute, None)
+      # A folded weight computed without its rotation would silently be a different model.
+      if not isinstance(layer, _NVLinear): raise ValueError(f'Hadamard-folded weight {name} has no packed projection to rotate its input')
+      layer.rotation = rotation
+    if inverse is not None:
+      embedding = self.transformer.token_embd
+      if not isinstance(embedding, _PackedEmbedding): raise ValueError('a Hadamard-latent token embedding needs the packed lookup')
+      embedding.rotation = inverse
+
   def _param_cache_path(self, path):
     if os.environ.get('INFURNACE_PARAM_CACHE', '1') == '0': return None
     key = hashlib.sha256(f'{source_hash()} {file_identity(path)} {self.device}'.encode()).hexdigest()[:32]
@@ -576,7 +616,7 @@ class Model:
     with Context(DEV=self.device):
       for name, entry in entries.items():
         if name == 'token_embd.weight' or len(entry.shape) != 2 or entry.shape[1] % 256 or entry.shape[0] % 16: continue
-        if entry.ggml_type not in (12, 13, 14): continue
+        if entry.ggml_type not in (12, 13, 14, Q2_0): continue
         if name == 'output.weight': owner, attribute = self.transformer, 'output'
         elif name.startswith('blk.'):
           _, layer, attribute, _ = name.split('.')
@@ -590,11 +630,15 @@ class Model:
         layers.setdefault(name.split('.')[1] if name.startswith('blk.') else name, []).append(adapter.packed)
         setattr(owner, attribute, adapter)
         packed.add(name)
-        if tied:
+        if tied and entry.ggml_type not in GEMM_TYPES:
+          # No row-gather kernel (Q2_0): lookups decode their rows from the packed table.
+          self.transformer.token_embd = _PackedEmbedding(adapter)
+        elif tied:
           # Embedding lookups read rows from the same packed allocation.
           self.transformer.token_embd.weight = adapter.weight
           adapter.weight = adapter.original.weight = None
         self.nv_quant_linears += 1
+      self._attach_rotations(path)
       # Batches of ~512 MB of raw weights: few schedules, and the staged raw
       # copies of the whole file never coexist on the GPU.
       group, size = [], 0

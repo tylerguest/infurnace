@@ -1,13 +1,37 @@
-"""GGUF files through tinygrad's parser, kept packed: our NV kernels read the quantized blocks directly."""
+"""GGUF files, kept packed: our NV kernels read the quantized blocks directly.
+
+The header is read here, with tinygrad's readers, so that types tinygrad doesn't know (Q2_0, Bonsai's ternary
+weights) still get their tensor views; decode() handles those and leaves the rest to tinygrad."""
 import functools
+import io
 import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from tinygrad import Tensor
-from tinygrad.llm.gguf import _GGML_NATIVE, _GGML_QUANT, ggml_data_to_tensor, gguf_parse
+from tinygrad import Tensor, dtypes
+from tinygrad.helpers import round_up
+from tinygrad.llm.gguf import _GGML_NATIVE, _GGML_QUANT, TensorIO, ggml_data_to_tensor, read_int32, read_int64, read_str, read_uint32, \
+  read_uint64, readers
 
-Q8_0, Q4_K, Q5_K, Q6_K = 8, 12, 13, 14
+Q8_0, Q4_K, Q5_K, Q6_K, Q2_0 = 8, 12, 13, 14, 42
+# Types beyond tinygrad's: (values per block, bytes per block)
+_EXTRA_QUANT = {Q2_0: (64, 18)}  # FP16 scale, then 64 two-bit codes, four per byte from the low bits: 0 -> -1, 1 -> 0, 2 -> +1
+
+def block_size(ggml_type: int) -> tuple[int, int]:
+  """(values per block, bytes per block) of a GGML type."""
+  if ggml_type in _GGML_NATIVE: return 1, _GGML_NATIVE[ggml_type].itemsize
+  if ggml_type in _GGML_QUANT: return _GGML_QUANT[ggml_type]
+  if ggml_type in _EXTRA_QUANT: return _EXTRA_QUANT[ggml_type]
+  raise ValueError(f"GGML type {ggml_type} is not supported")
+
+def decode(data: Tensor, n: int, ggml_type: int) -> Tensor:
+  """`n` values of packed GGML bytes as a float tensor (tinygrad's decoders, plus the types it lacks)."""
+  if ggml_type == Q2_0:
+    blocks = data[:n // 64 * 18].reshape(-1, 18).contiguous()  # bitcasting a strided or lazy view isn't safe
+    scale = blocks[:, :2].bitcast(dtypes.float16).float()
+    codes = (blocks[:, 2:].unsqueeze(-1).cast(dtypes.int32) // Tensor([1, 4, 16, 64], dtype=dtypes.int32, device=data.device)) % 4
+    return ((codes.flatten(-2) - 1).float() * scale).flatten()[:n]
+  return ggml_data_to_tensor(data, n, ggml_type)
 
 @dataclass(frozen=True)
 class PackedTensor:
@@ -21,15 +45,35 @@ class PackedTensor:
     return PackedTensor(data.realize() if realize else data, self.shape, self.ggml_type)
 
   def decode(self) -> Tensor:
-    return ggml_data_to_tensor(self.data, math.prod(self.shape), self.ggml_type).reshape(self.shape)
+    return decode(self.data, math.prod(self.shape), self.ggml_type).reshape(self.shape)
+
+def _gguf_parse(path: Path) -> tuple[dict[str, Any], dict[str, tuple[Tensor, tuple[int, ...], int]]]:
+  """tinygrad's gguf_parse for one file, with the types it lacks."""
+  tensor = Tensor(path)
+  r = io.BufferedReader(TensorIO(tensor), 1_000_000)
+  magic, version, n_tensors, n_kv = r.read(4), read_int32(r), read_int64(r), read_int64(r)
+  if magic != b"GGUF" or version not in (2, 3): raise ValueError(f"invalid GGUF file: {path}")
+  kv = {}
+  for _ in range(n_kv):
+    key, typ = read_str(r), read_int32(r)
+    kv[key] = readers[typ](r)
+  if kv.get('split.count', 1) > 1: raise ValueError(f"multi-part GGUF files are not supported: {path}")
+  infos = [(read_str(r), tuple(read_uint64(r) for _ in range(read_uint32(r))), read_int32(r), read_uint64(r)) for _ in range(n_tensors)]
+  start = round_up(r.tell(), kv.get("general.alignment", 32))
+  entries = {}
+  for name, dims, typ, offset in infos:
+    values, nbytes = block_size(typ)
+    begin, size = start + offset, math.prod(dims) // values * nbytes
+    entries[name] = (tensor[begin:begin + size], tuple(reversed(dims)), typ)
+  return kv, entries
 
 @functools.lru_cache(maxsize=8)
 def _parse(path: Path, size: int, mtime_ns: int) -> tuple[dict[str, Any], dict[str, tuple[Tensor, tuple[int, ...], int]]]:
   # Metadata holds the whole vocabulary (~0.5M strings for Qwen3.5) and one load reads it from several places.
-  kv, entries = gguf_parse(path)
-  for name, (data, shape, typ) in entries.items():  # tinygrad's slices silently stop at the end of a truncated file
-    block, size = (1, _GGML_NATIVE[typ].itemsize) if typ in _GGML_NATIVE else _GGML_QUANT[typ]
-    if data.numel() != math.prod(shape) // block * size: raise ValueError(f"truncated GGUF: tensor {name!r} extends beyond {path}")
+  kv, entries = _gguf_parse(path)
+  for name, (data, shape, typ) in entries.items():  # tensor slices silently stop at the end of a truncated file
+    values, nbytes = block_size(typ)
+    if data.numel() != math.prod(shape) // values * nbytes: raise ValueError(f"truncated GGUF: tensor {name!r} extends beyond {path}")
   return kv, entries
 
 def parse_gguf(path: str | Path) -> tuple[dict[str, Any], dict[str, PackedTensor]]:
