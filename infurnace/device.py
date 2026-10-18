@@ -1,16 +1,54 @@
 """Prefer a usable accelerator; hardware preference is not a performance benchmark."""
+import importlib.util
 import os
 import shutil
 import subprocess
+import sys
+from pathlib import Path
 
 from tinygrad import Device, Tensor
 from tinygrad.renderer.cstyle import CUDARenderer
 
 # infurnace's kernels are CUDA C, compiled by NVRTC (tinygrad's CUDA C renderer). NVRTC and the cuda_fp16.h
 # header ship with the CUDA toolkit, not the driver; without them tinygrad picks its PTX renderer and infurnace
-# would run the generic path, far too slow to use. How to provide them is the user's choice (see _cuda.py).
+# would run the generic path, far too slow to use. How to provide them is the user's choice: the toolkit, or the
+# pip packages nvidia-cuda-nvrtc-cu12 and nvidia-cuda-runtime-cu12, which tinygrad finds through NVRTC_PATH and
+# CUDA_PATH. use_pip_compiler sets those when only the pip packages are there; it runs on import, before tinygrad
+# loads its CUDA compiler (tinygrad reads CUDA_PATH once, then).
 NVRTC_HELP = ("infurnace's fast kernels need NVIDIA's CUDA compiler (NVRTC) and headers. Install the CUDA toolkit, "
               "or just those two pieces: python3 -m pip install nvidia-cuda-nvrtc-cu12 nvidia-cuda-runtime-cu12")
+
+def _toolkit() -> bool:
+  """A toolkit tinygrad finds by itself: NVRTC where it looks for it, and cuda_fp16.h in its include paths."""
+  if sys.platform == "win32": return False  # tinygrad finds NVRTC on Windows through PATH only
+  libraries = [Path(p) for p in os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep) if p]
+  libraries += [Path(prefix) / "cuda/targets" / f"{os.uname().machine}-linux" / "lib" for prefix in ("/opt", "/usr/local")]
+  libraries += [Path(p) for p in ("/usr/lib64", "/usr/lib", "/usr/local/lib", "/lib", "/lib64", f"/lib/{os.uname().machine}-linux-gnu",
+                                  f"/usr/lib/{os.uname().machine}-linux-gnu")]
+  nvrtc = any(any(d.glob("libnvrtc.so*")) for d in libraries if d.is_dir())
+  headers = any((Path(d) / "cuda_fp16.h").is_file() for d in ("/usr/local/cuda/include", "/usr/include", "/opt/cuda/include"))
+  return nvrtc and headers
+
+def _package(name: str) -> Path | None:
+  try: spec = importlib.util.find_spec(f"nvidia.{name}")
+  except (ImportError, ValueError): return None
+  locations = list(spec.submodule_search_locations or []) if spec else []
+  return Path(locations[0]) if locations else None
+
+def use_pip_compiler() -> bool:
+  """Set NVRTC_PATH and CUDA_PATH to NVIDIA's pip packages when they are installed and nothing else is set up.
+  True when it did."""
+  if os.environ.get("NVRTC_PATH") or os.environ.get("CUDA_PATH") or _toolkit(): return False
+  nvrtc, runtime = _package("cuda_nvrtc"), _package("cuda_runtime")
+  if nvrtc is None or runtime is None or not (runtime / "include" / "cuda_fp16.h").is_file(): return False
+  # The regular library: the package also ships libnvrtc-builtins (which NVRTC loads itself) and .alt variants.
+  pattern = "bin/nvrtc64_*.dll" if sys.platform == "win32" else "lib/libnvrtc.so*"
+  library = next((p for p in sorted(nvrtc.glob(pattern)) if "builtins" not in p.name and ".alt" not in p.name), None)
+  if library is None: return False
+  os.environ["NVRTC_PATH"], os.environ["CUDA_PATH"] = str(library), str(runtime)
+  return True
+
+use_pip_compiler()
 
 def _probe(device: str) -> None:
   # Check actual execution, not just that a driver module can be imported.
