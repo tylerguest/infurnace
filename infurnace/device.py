@@ -8,10 +8,9 @@ from tinygrad.renderer.cstyle import CUDARenderer
 
 # infurnace's kernels are CUDA C, compiled by NVRTC (tinygrad's CUDA C renderer). NVRTC and the cuda_fp16.h
 # header ship with the CUDA toolkit, not the driver; without them tinygrad picks its PTX renderer and infurnace
-# would run the generic path, far too slow to use. How to provide them is the user's choice.
-NVRTC_HELP = ("infurnace's fast kernels need NVIDIA's NVRTC compiler and CUDA headers. Install the CUDA toolkit, "
-              "or point tinygrad at an existing copy: NVRTC_PATH=/path/to/libnvrtc.so CUDA_PATH=/dir/containing/include "
-              "(for example from the nvidia-cuda-nvrtc-cu12 and nvidia-cuda-runtime-cu12 pip packages)")
+# would run the generic path, far too slow to use. How to provide them is the user's choice (see _cuda.py).
+NVRTC_HELP = ("infurnace's fast kernels need NVIDIA's CUDA compiler (NVRTC) and headers. Install the CUDA toolkit, "
+              "or just those two pieces: python3 -m pip install nvidia-cuda-nvrtc-cu12 nvidia-cuda-runtime-cu12")
 
 def _probe(device: str) -> None:
   # Check actual execution, not just that a driver module can be imported.
@@ -26,7 +25,7 @@ def select_device(requested: str | None = None) -> str:
     try:
       _probe(backend)
       return backend
-    except (RuntimeError, OSError, ImportError, AssertionError, MemoryError) as exc:
+    except Exception as exc:  # any failure (tinygrad raises ExceptionGroups for missing interfaces) means: try the next
       failures.append(f"{backend}: {exc}")
   raise RuntimeError("no usable compute device: " + "; ".join(failures))
 

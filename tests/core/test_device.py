@@ -48,10 +48,19 @@ def test_fast_path_problem_names_what_is_missing(monkeypatch):
   assert device.fast_path_problem("CPU") is None
   monkeypatch.setattr(device, "supports_nv_quant", lambda name: False)
   problem = device.fast_path_problem("NV")
-  assert "NVRTC not found" in problem and "NVRTC_PATH" in problem and "CUDA toolkit" in problem
+  assert "NVRTC not found" in problem and "nvidia-cuda-nvrtc-cu12" in problem and "CUDA toolkit" in problem
   def failing_compile(*args, **kwargs):
     raise RuntimeError('Nvrtc Error 6, NVRTC_ERROR_COMPILATION\n<null>(5): catastrophic error: cannot open source file "cuda_fp16.h"\n')
   monkeypatch.setattr(device, "supports_nv_quant", lambda name: True)
   monkeypatch.setattr(device, "Tensor", failing_compile)
   problem = device.fast_path_problem("NV")
-  assert 'cannot open source file "cuda_fp16.h"' in problem and "CUDA_PATH" in problem
+  assert 'cannot open source file "cuda_fp16.h"' in problem and "nvidia-cuda-runtime-cu12" in problem
+
+def test_probe_failures_of_any_kind_move_on(monkeypatch):
+  # tinygrad reports a missing interface as an ExceptionGroup; probing must try the next backend, not crash.
+  monkeypatch.delenv("DEV", raising=False)
+  def probe(name):
+    if name == "NV": raise RuntimeError("no compiler")
+    if name == "AMD": raise ExceptionGroup("No interface for AMD:0 is available", [FileNotFoundError("/dev/kfd")])
+  monkeypatch.setattr(device, "_probe", probe)
+  assert device.select_device() == "METAL"

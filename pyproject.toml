@@ -9,11 +9,12 @@ description = "Run a single LLM fast on your GPU with tinygrad"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = ["tinygrad @ git+https://github.com/tylerguest/tinygrad@61e7cb08f4d5fe6000d4016746e64b6c2900f409",
-                "tokenizers>=0.22,<0.23"]  # the Qwen3.5 text codec
+                "tokenizers>=0.22,<0.23",  # the Qwen3.5 text codec
+                "jinja2>=3.1,<4"]  # renders the chat template a GGUF carries
 
 [project.optional-dependencies]
-server = ["jinja2>=3.1,<4"]
-dev = ["ruff==0.14.10", "pytest", "jinja2"]
+server = []  # serving needs nothing extra any more; kept so `pip install -e '.[server]'` still works
+dev = ["ruff==0.14.10", "pytest"]
 
 [project.scripts]
 infurnace = "infurnace.cli:main"

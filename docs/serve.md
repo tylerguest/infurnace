@@ -7,7 +7,7 @@ There is no fallback template in server mode. Tools are executed by the client,
 not the server.
 
 ```sh
-pip install -e '.[server]'
+python3 -m pip install -e .
 infurnace serve                  # or let `infurnace run` / `infurnace launch pi` start it
 infurnace launch pi              # writes pi's models.json and settings.json, then starts pi
 ```

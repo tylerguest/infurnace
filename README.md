@@ -19,26 +19,40 @@ everything else runs tinygrad's generic code, which is far too slow to use. See 
 
 ## Install
 
-Requires Python 3.11+, Git, an NVIDIA driver, and NVIDIA's NVRTC compiler with the CUDA headers, which
-compile the kernels. The **CUDA toolkit** provides both. If you'd rather not install it, point tinygrad at any
-other copy, for example NVIDIA's pip packages:
-
 ```sh
-pip install nvidia-cuda-nvrtc-cu12 nvidia-cuda-runtime-cu12
-export NVRTC_PATH=$(python -c "import nvidia.cuda_nvrtc, glob; print(glob.glob(nvidia.cuda_nvrtc.__path__[0] + '/lib/libnvrtc.so.*')[0])")
-export CUDA_PATH=$(python -c "import nvidia.cuda_runtime; print(nvidia.cuda_runtime.__path__[0])")
+git clone https://github.com/tylerguest/infurnace.git
+cd infurnace
+python3 -m pip install -e .
 ```
 
-When either is missing, infurnace stops and says which.
+or directly: `python3 -m pip install git+https://github.com/tylerguest/infurnace.git`
+
+Then run `infurnace`. It needs Python 3.11+ and an NVIDIA GPU with its driver.
+
+### GPU software
+
+infurnace compiles its kernels with NVIDIA's CUDA compiler (NVRTC) and needs the CUDA headers. The CUDA toolkit
+has both. If you don't have it, either install it, or get just those two pieces from pip (~230 MB installed):
 
 ```sh
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e .              # '.[server]' for the HTTP server, '.[dev]' for tests
+python3 -m pip install nvidia-cuda-nvrtc-cu12 nvidia-cuda-runtime-cu12
 ```
 
-The tinygrad dependency is pinned to a fork with one fix for back-to-back GPU submissions. After
-pulling changes, reinstall; if the pin changed, force-reinstall tinygrad.
+infurnace finds them on its own. If neither is there, it stops and says so (without them it could only run
+tinygrad's generic code, which is far too slow).
+
+### Updating
+
+```sh
+git pull
+python3 -m pip install -e .
+```
+
+The tinygrad dependency is pinned to a fork with one fix for back-to-back GPU submissions; if the pin changed,
+also run `python3 -m pip install --force-reinstall --no-deps "tinygrad @ git+https://github.com/tylerguest/tinygrad@<pin>"`
+with the commit from `pyproject.toml`.
+
+For development: `python3 -m pip install -e '.[dev]'` (ruff and pytest).
 
 ## Run
 
