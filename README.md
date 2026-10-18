@@ -43,28 +43,36 @@ pulling changes, reinstall; if the pin changed, force-reinstall tinygrad.
 ## Run
 
 ```sh
-infurnace                                    # chat; downloads ~3.1 GB on first use, warms up while you type
-infurnace --no-thinking
-infurnace --temperature 0.6                  # sample instead of greedy (works with DFlash)
-infurnace --prompt "Hello" --max-tokens 64   # one raw prompt, no chat template
-infurnace --serve 8000 --max-context 32768   # OpenAI-compatible API, e.g. for pi
-infurnace --benchmark 512,32                 # per-step plain decode timing
-infurnace --no-dflash                        # plain decoding
+infurnace                                    # chat with the default model (starts the server if needed)
+infurnace run "Explain RAII in one paragraph"  # one answer, then exit
+cat notes.txt | infurnace run "Summarize this" --nothink
+infurnace serve                              # start the server yourself (keeps the model warm on the GPU)
+infurnace ps                                 # what the server is running
+infurnace stop                               # stop it and free the GPU
+infurnace launch pi                          # point pi at the server and start it
+infurnace pull qwen3.5:4b                    # download a model (and its DFlash draft); also: list, rm
 ```
 
-- **Models:** `--model qwen3.5:4b` (default) downloads the target (2.7 GB) and draft (0.4 GB) into
-  `~/.local/share/infurnace/models/`. `--model PATH` runs a local Qwen3.5 GGUF. See [Qwen3.5](docs/qwen35.md).
-- **Device:** NVIDIA through tinygrad's `NV` backend (Linux, probed first) or `CUDA`; `--device` or
-  `DEV` overrides. Startup takes under a minute (loading plus capturing GPU graphs: ~45 s plain, ~65 s with DFlash; the server
-listens after ~50 s and captures its prompt graph in its first idle moment).
-- **Context:** `--max-context` (default 8,192). Memory with DFlash is about 5.2 GB at 8k and
-  5.5 GB at 32k, plus whatever your desktop uses.
-- **Thinking:** on by default in chat and serving; `--no-thinking` turns it off. Replies run until
-  the model stops or the context fills, unless capped with `--max-tokens` (which counts thinking).
-- **Sampling:** greedy by default; `--temperature T` samples. Qwen suggests about 0.6 with thinking,
-  where greedy can repeat.
-- **Chat history:** when a new message doesn't fit, the oldest turns are dropped with a notice.
-- **Serving:** [server setup and pi configuration](docs/serve.md).
+- **The server:** `infurnace serve` loads a model once and keeps it warm; `run`, `ps`, `stop` and `launch` talk
+  to it, and `run` starts one in the background when none answers (log: `~/.local/state/infurnace/serve.log`).
+  It listens right away and warms up meanwhile: about a minute on a fresh start, then replies start in a
+  fraction of a second. `INFURNACE_HOST` picks the address (default `127.0.0.1:8000`). It serves an
+  OpenAI-compatible API at `/v1` and infurnace's own at `/api` (chat, generate, tags, ps, show, status).
+- **Chat commands:** `/set think`, `/set nothink`, `/set temperature T`, `/clear`, `/bye`, and `"""` for
+  multi-line messages.
+- **Models:** `qwen3.5:4b` (default) downloads the target (2.7 GB) and draft (0.4 GB) into
+  `~/.local/share/infurnace/models/`. `serve --model PATH` runs a local Qwen3.5 GGUF. See [Qwen3.5](docs/qwen35.md).
+- **Context:** the most that fits in free GPU memory, in steps of 8,192 (32,768 on an 8 GB card next to a
+  desktop); `--max-context` overrides. Memory with DFlash is about 4.6 GB plus 36 KB per token of context.
+- **Device:** NVIDIA through tinygrad's `NV` backend (Linux, probed first) or `CUDA`; `--device` or `DEV` overrides.
+- **Thinking:** on by default; `--nothink` (run) or `serve --no-thinking` turns it off. Replies run until the
+  model stops or the context fills, unless capped with `--max-tokens` (which counts thinking).
+- **Sampling:** greedy by default; `--temperature T` samples. Qwen suggests about 0.6 with thinking, where
+  greedy can repeat.
+- **Chat history:** when a conversation no longer fits, the oldest turns are dropped with a notice.
+- **Without the server:** the original flags still run in-process: `infurnace --chat`, `--prompt "..."`
+  (a raw prompt, no chat template), `--serve PORT`, `--benchmark 512,32`, `--no-dflash`.
+- **Serving details and pi:** [serving](docs/serve.md).
 
 ## Docs
 

@@ -122,11 +122,73 @@ def test_http_tool_round_trip():
       server.shutdown()
       thread.join()
 
-def test_idle_work_runs_once():
-  # The server's first free moment runs the work its warmup left out (the prompt graph), and only once.
-  calls = []
-  server = Server.__new__(Server)
-  server.idle = lambda: calls.append(1)
-  server.service_actions()
-  server.service_actions()
-  assert calls == [1]
+def test_background_work_keeps_status_responsive():
+  # Work after warmup (the prompt graph, ~30 s) runs on the warmup thread: status answers meanwhile, generation waits.
+  model, tok = Model(), Tokenizer()
+  model.output = 'ok'
+  template = ChatTemplate({'tokenizer.chat_template': '{% for m in messages %}{{ m.content }}{% endfor %}'}, tok)
+  started, release, calls = threading.Event(), threading.Event(), []
+  def idle():
+    calls.append(1)
+    started.set()
+    release.wait(5)
+  server, call, stop = serving(model, tok, template, idle=idle)
+  try:
+    assert started.wait(5)
+    assert json.loads(call('GET', '/api/status')[1])['status'] == 'ready'  # not blocked by the work
+    threading.Timer(0.2, release.set).start()
+    status, data = call('POST', '/api/chat', {'model': 'test', 'messages': [{'role': 'user', 'content': 'x'}], 'stream': False})
+    assert status == 200 and release.is_set() and calls == [1]  # the reply came after the work
+  finally: stop()
+
+def serving(model, tok, template, **kwargs):
+  server = Server(('127.0.0.1', 0), ServerModel(model), 'test', tok, template, **kwargs)
+  thread = threading.Thread(target=server.serve_forever, daemon=True)
+  thread.start()
+  def call(method, path, body=None):
+    conn = http.client.HTTPConnection(*server.server_address)
+    conn.request(method, path, json.dumps(body) if body is not None else None, {'Content-Type': 'application/json'})
+    response = conn.getresponse()
+    data = response.read().decode()
+    conn.close()
+    return response.status, data
+  def stop():
+    server.shutdown()
+    thread.join()
+    server.server_close()
+  return server, call, stop
+
+def test_api_chat_and_generate():
+  model, tok = Model(), Tokenizer()
+  template = ChatTemplate({'tokenizer.chat_template': '{% for m in messages %}{{ m.content }}{% endfor %}'}, tok)
+  server, call, stop = serving(model, tok, template, info={'details': {'family': 'qwen35'}},
+                               installed=lambda: [{'name': 'qwen3.5:4b', 'size': 1}])
+  try:
+    status, data = call('POST', '/api/chat', {'model': 'test', 'messages': [{'role': 'user', 'content': 'read'}]})
+    lines = [json.loads(line) for line in data.splitlines()]
+    assert status == 200 and lines[-1]['done'] and lines[-1]['done_reason'] == 'stop'
+    calls = [c for line in lines for c in line['message'].get('tool_calls', [])]
+    assert calls == [{'function': {'name': 'read', 'arguments': {'path': 'README.md'}}}]  # arguments as an object
+    model.output = 'hello'
+    status, data = call('POST', '/api/generate', {'model': 'test', 'prompt': 'hi', 'stream': False, 'options': {'num_predict': 3}})
+    reply = json.loads(data)
+    assert reply['response'] == 'hel' and reply['done_reason'] == 'length' and reply['eval_count'] == 3
+    assert json.loads(call('GET', '/api/tags')[1])['models'][0]['name'] == 'qwen3.5:4b'
+    assert json.loads(call('GET', '/api/ps')[1])['models'][0]['details']['family'] == 'qwen35'
+    assert json.loads(call('GET', '/api/version')[1])['version']
+  finally: stop()
+
+def test_requests_wait_for_warmup():
+  # The server answers status during warmup, and generation once warmup has finished.
+  model, tok = Model(), Tokenizer()
+  model.output = 'ok'
+  template = ChatTemplate({'tokenizer.chat_template': '{% for m in messages %}{{ m.content }}{% endfor %}'}, tok)
+  release = threading.Event()
+  server, call, stop = serving(model, tok, template, warmup=lambda: release.wait(5))
+  try:
+    assert json.loads(call('GET', '/api/status')[1])['status'] == 'warming up'
+    threading.Timer(0.2, release.set).start()
+    status, data = call('POST', '/api/chat', {'model': 'test', 'messages': [{'role': 'user', 'content': 'x'}], 'stream': False})
+    assert status == 200 and json.loads(data)['message']['content'] == 'ok'
+    assert json.loads(call('GET', '/api/status')[1])['status'] == 'ready'
+  finally: stop()

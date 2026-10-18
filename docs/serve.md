@@ -8,13 +8,32 @@ not the server.
 
 ```sh
 pip install -e '.[server]'
-infurnace --serve 8000 --max-context 32768
+infurnace serve                  # or let `infurnace run` / `infurnace launch pi` start it
+infurnace launch pi              # writes pi's models.json and settings.json, then starts pi
 ```
 
-Startup warms up before listening unless `--no-warmup` is supplied (~50 s with DFlash on an RTX 5060, loading
-included). The prompt-reading graph is captured in the server's first idle moment after that (~26 s): a
-request arriving meanwhile waits for it, and until then prompts read through DFlash's verifier (~600 tok/s
-instead of ~1,300).
+The server listens at once (`INFURNACE_HOST`, default `127.0.0.1:8000`) and warms up on a thread: loading takes
+~11 s, the warmup ~42 s, then the prompt-reading graph ~27 s more (RTX 5060, DFlash). Until warmup ends,
+`/api/status` says `warming up` and generating requests wait; a request arriving during the prompt-graph capture
+waits for it, and until then prompts read through DFlash's verifier. `--no-warmup` skips both.
+`infurnace stop` (or `POST /api/shutdown`) stops it.
+
+The context is the most that fits in free GPU memory (`loader.fit_context`: the weights, 36 KB per token of KV
+cache for Qwen3.5-4B with its draft, ~1.45 GB of graphs and buffers, a 0.25 GB margin); `--max-context` overrides.
+
+**APIs.** OpenAI-compatible at `/v1` (chat completions, models). infurnace's own at `/api`:
+
+| Endpoint | |
+|---|---|
+| `POST /api/chat` | `{model, messages, stream (default true), think, tools, options: {temperature, num_predict}}`; newline-delimited JSON records with `message.content`, `message.thinking`, `message.tool_calls`, then a final record with `done_reason` and token counts and durations |
+| `POST /api/generate` | the same with `prompt` (and `system`, `raw`), the text in `response` |
+| `GET /api/tags`, `/api/ps`, `POST /api/show` | downloaded models; the loaded one (context, DFlash, readiness); its details |
+| `GET /api/status`, `/api/version` | `warming up`, `ready` or `failed` (with the error); the version |
+| `POST /api/shutdown` | stop the server |
+
+**launch pi** adds an entry for the served model under the `infurnace` provider in `~/.pi/agent/models.json`
+(marked `_launch`; entries you wrote stay as they are), with the server's context window, and makes it pi's
+default in `settings.json`. The previous files are kept as `*.infurnace.bak`.
 
 - **DFlash:** generation uses DFlash whenever the chat would: the installed draft
   on an NVIDIA GPU (`NV` or `CUDA`), or `--dflash PATH`. `--no-dflash` serves plain decoding. One DFlash

@@ -1,5 +1,7 @@
 """Prefer a usable accelerator; hardware preference is not a performance benchmark."""
 import os
+import shutil
+import subprocess
 
 from tinygrad import Device, Tensor
 from tinygrad.renderer.cstyle import CUDARenderer
@@ -48,3 +50,13 @@ def fast_path_problem(device: str) -> str | None:
     detail = next((line for line in lines if "error" in line.lower() and ":" in line), lines[0] if lines else type(exc).__name__)
     return f"compiling a kernel on {device} failed ({detail[:200]}). {NVRTC_HELP}."
   return None
+
+def free_vram(device: str) -> int | None:
+  """Free memory of the NVIDIA GPU in bytes (nvidia-smi, before infurnace allocates anything), or None."""
+  if not nvidia(device): return None
+  if (smi := shutil.which("nvidia-smi")) is None: return None
+  index = device.split(":")[1] if ":" in device else "0"
+  try: out = subprocess.run([smi, "--query-gpu=memory.free", "--format=csv,noheader,nounits", "-i", index],
+                            capture_output=True, text=True, timeout=10).stdout.strip()
+  except (OSError, subprocess.SubprocessError): return None
+  return int(out.splitlines()[0]) * 2**20 if out[:1].isdigit() else None

@@ -75,10 +75,12 @@ comparing engines on the same tokens, not for absolute perplexity.
 
 ### 2. Fit any card without flags
 
-The default context is a fixed 8,192 tokens (about 5.2 GB with DFlash). A 6 GB card with a desktop
-running runs out of memory, and a 12 GB card wastes room.
+`serve` picks the context from free VRAM (`loader.fit_context`: weights + 36 KB a token + ~1.45 GB of graphs and
+buffers + a 0.25 GB margin; measured 4.68 GB at 8k, 5.57 GB at 32k, 5.83 GB at 40k after warmup, ~0.2 GB more
+after the prompt graph). On the 8 GB card next to a desktop that is 24-32k.
 
-- [ ] Choose `--max-context` from free VRAM at startup; turn DFlash off when memory is tight.
+- [x] Choose the context from free VRAM at startup.
+- [ ] Turn DFlash off when memory is tight (below ~5 GB free the 4B model with its draft does not fit at all).
 - [ ] Publish a measured "what fits" table (card size × context × DFlash).
 - [ ] If smaller Qwen3.5 GGUFs exist (with or without drafts), add presets for 4–6 GB cards.
 
@@ -212,6 +214,12 @@ More in [benchmarks](../benchmarks/README.md). Rules that have caught mistakes b
 
 ## Done
 
+- 2026-10-17: the user side, after Ollama's workflow. `infurnace serve` keeps the model warm (listens at once,
+  warms up on a thread, generation behind a GPU lock); `run` (interactive with /set, /clear, """, or one prompt
+  and piped input) talks to it and starts one in the background when none answers; `ps`, `stop`, `pull`, `list`,
+  `rm`, `launch pi` (pi's models.json and settings.json, entries marked `_launch`). infurnace's API at `/api`
+  (chat, generate, tags, ps, show, status, version, shutdown) beside the OpenAI-compatible `/v1`. The context
+  comes from free VRAM. A warm `run` answers in ~0.6 s end to end.
 - 2026-10-17: the GDN chunk kernel (`gdn_chunk`, `gdn_prefill`) splits a head over 4 blocks of 32 state rows and,
   inside, 4 warps of 32 key columns (one 128-thread block a head left one warp per scheduler and thousands of
   dependent steps a thread); S0 staged coalesced, K/Q rows padded against bank conflicts, the state update as a

@@ -1,4 +1,7 @@
-"""infurnace command line: chat (default), one raw prompt, an HTTP server, or a decode benchmark."""
+"""infurnace command line: `serve` keeps a model warm on the GPU; `run`, `ps`, `stop` and `launch`
+talk to it (starting it when needed); `pull`, `list` and `rm` manage downloads.
+
+The original flags still work: `--prompt`, `--serve [PORT]`, `--benchmark` and in-process chat (`--chat`)."""
 from __future__ import annotations
 import argparse
 import sys
@@ -8,7 +11,7 @@ from pathlib import Path
 from typing import Callable, Iterator
 from tinygrad.helpers import GlobalCounters, Timing, profile_marker
 from infurnace import loader
-from infurnace.device import nvidia
+from infurnace.device import free_vram, nvidia, select_device
 
 PROMPT_MAX_TOKENS = 64
 
@@ -115,7 +118,9 @@ def warmup(model, dflash=None, prompt_graph: bool = True) -> None:
 def capture_prompt_graph(model) -> None:
   """The server's first idle moment: the prompt-chunk graph its warmup left out (a request waits for it)."""
   start = time.perf_counter()
-  if model.capture_prompt_graph(): print(f"Prompt reading graph ready in {time.perf_counter() - start:.1f}s.", file=sys.stderr, flush=True)
+  if model.capture_prompt_graph():
+    print(f"Prompt reading graph ready in {time.perf_counter() - start:.1f}s; {GlobalCounters.mem_used / 1e9:.2f} GB on the GPU.",
+          file=sys.stderr, flush=True)
 
 class BackgroundWarmup:
   """Warm up on a thread while the user types the first message. tinygrad is not thread-safe, but
@@ -200,11 +205,12 @@ def run(args: argparse.Namespace) -> int:
     return 0
   if args.serve is not None:
     from infurnace.serve import serve
-    # Once per server start, before it listens; the prompt graph follows in its first idle moment.
-    if not args.no_warmup: warmup(model, dflash, prompt_graph=False)
+    # Warmup runs on a thread once the server listens (requests wait for it); the prompt graph follows in its first idle moment.
     block = _dflash_block(dflash) if dflash is not None else 16
     serve(model, tokenizer, args.serve, args.host, enable_thinking=not args.no_thinking, dflash=dflash, block_size=block,
-          idle=None if args.no_warmup else lambda: capture_prompt_graph(model))
+          warmup=None if args.no_warmup else lambda: warmup(model, dflash, prompt_graph=False),
+          idle=None if args.no_warmup else lambda: capture_prompt_graph(model), name=_model_name(args.model),
+          info=loader.model_info(_model_name(args.model), loader.fetch_model(args.model), dflash is not None), installed=loader.installed)
     return 0
   window, thinking = min(args.max_context, context), not args.no_thinking
   if args.no_warmup: return chat(generate, tokenizer, window, args.max_tokens, thinking)
@@ -214,9 +220,14 @@ def run(args: argparse.Namespace) -> int:
   finally: background.thread.join()  # never exit while the warmup thread is using the GPU
 
 def main(argv: list[str] | None = None) -> int:
-  args = parse_args(argv)
+  argv = sys.argv[1:] if argv is None else argv
+  from infurnace.client import ServerError
   try:
-    return run(args)
+    if not argv or argv[0] in COMMANDS: return command(argv or ["run"])
+    return run(parse_args(argv))
+  except ServerError as exc:
+    print(f"infurnace: {exc}", file=sys.stderr)
+    return 1
   except KeyboardInterrupt:
     print("\nInterrupted.", file=sys.stderr)
     return 130
@@ -234,6 +245,124 @@ def main(argv: list[str] | None = None) -> int:
   except (ValueError, OSError) as exc:
     print(f"infurnace: {exc}", file=sys.stderr)
     return 1
+
+COMMANDS = ("serve", "run", "pull", "list", "ls", "rm", "ps", "stop", "launch")
+
+def _server_options(parser: argparse.ArgumentParser) -> None:
+  parser.add_argument("--max-context", type=_positive, help="context window in tokens (default: the most that fits in free GPU memory)")
+  parser.add_argument("--no-dflash", action="store_true", help="decode without the DFlash draft")
+  parser.add_argument("--device", help="override automatic device selection, e.g. NV or CPU")
+
+def command_parser() -> argparse.ArgumentParser:
+  ap = argparse.ArgumentParser(prog="infurnace", description="Run local LLMs fast on your GPU with tinygrad. "
+                               "Without a command: run the default model.")
+  sub = ap.add_subparsers(dest="command", required=True, metavar="COMMAND")
+  default = next(iter(loader.MODELS))
+  serve = sub.add_parser("serve", help="start the server: keeps the model warm; OpenAI-compatible API at /v1, infurnace API at /api")
+  serve.add_argument("--model", "-m", default=default, help=f"model name ({', '.join(loader.MODELS)}) or a local GGUF file")
+  serve.add_argument("--host", help="bind address (default from INFURNACE_HOST, else 127.0.0.1)")
+  serve.add_argument("--port", type=int, help="port (default from INFURNACE_HOST, else 8000)")
+  _server_options(serve)
+  serve.add_argument("--dflash", type=Path, metavar="GGUF", help="DFlash draft file (the named model's is used automatically)")
+  serve.add_argument("--no-thinking", action="store_true", help="disable thinking unless a request asks for it")
+  serve.add_argument("--no-warmup", action="store_true", help="skip the warmup (the first replies are then slower)")
+  run_ = sub.add_parser("run", help="chat with a model, or answer one prompt (an argument or piped input)")
+  run_.add_argument("model", nargs="?", help=f"model name (default: the server's, else {default})")
+  run_.add_argument("prompt", nargs="*", help="answer this and exit")
+  thinking = run_.add_mutually_exclusive_group()
+  thinking.add_argument("--think", dest="think", action="store_const", const=True, help="think before answering")
+  thinking.add_argument("--nothink", dest="think", action="store_const", const=False, help="answer without thinking")
+  run_.add_argument("--temperature", type=_temperature, help="sampling temperature (default 0: greedy)")
+  run_.add_argument("--max-tokens", type=_positive, help="reply length cap, including thinking")
+  _server_options(run_)
+  sub.add_parser("pull", help="download a model (and its DFlash draft)").add_argument("model", help=f"one of {', '.join(loader.MODELS)}")
+  sub.add_parser("list", aliases=["ls"], help="list downloaded models")
+  sub.add_parser("rm", help="delete downloaded models").add_argument("models", nargs="+")
+  sub.add_parser("ps", help="show the running server and its model")
+  sub.add_parser("stop", help="stop the server (frees the GPU)")
+  launch = sub.add_parser("launch", help="point a coding agent at the server and start it (pi)")
+  launch.add_argument("integration", choices=["pi"])
+  launch.add_argument("--model", "-m", help="model for a server this starts")
+  launch.add_argument("--config", action="store_true", help="only write the agent's configuration")
+  launch.add_argument("extra", nargs=argparse.REMAINDER, help="arguments for the agent, after --")
+  _server_options(launch)
+  return ap
+
+def _forward(args: argparse.Namespace) -> list[str]:
+  """Options of run/launch that shape a server they start."""
+  return ((["--max-context", str(args.max_context)] if args.max_context else []) + (["--no-dflash"] if args.no_dflash else [])
+          + (["--device", args.device] if args.device else []))
+
+def _looks_like_model(value: str) -> bool:
+  """`run`'s first argument names a model (a catalog name, name:tag or a GGUF file); anything else starts the prompt."""
+  return value in loader.MODELS or value.endswith(".gguf") or (" " not in value and ":" in value and not value.endswith(":"))
+
+def _model_name(model: str) -> str:
+  return model if model in loader.MODELS else Path(model).stem
+
+def serve_command(args: argparse.Namespace) -> int:
+  """Load the model and serve it; warmup runs on a thread after the server starts listening."""
+  from infurnace import client
+  from infurnace.serve import serve
+  hostname, port = client.host().rsplit(":", 1)
+  hostname, port = args.host or hostname, args.port or int(port)
+  if not 1 <= port <= 65535: raise ValueError("port must be between 1 and 65535")
+  args.benchmark = None
+  draft, automatic = _dflash_draft(args)
+  path = loader.fetch_model(args.model)
+  device = select_device(args.device)
+  draft_path = loader.fetch_model(draft) if draft is not None and not (automatic and not nvidia(device)) else None
+  if args.max_context is None:
+    free = free_vram(device)
+    args.max_context = loader.fit_context(path, draft_path, free) if free else 8192
+    print(f"Context: {args.max_context} tokens" + (f" (fits in {free / 1e9:.1f} GB of free GPU memory; --max-context overrides)"
+                                                    if free else " (default; --max-context overrides)"), file=sys.stderr, flush=True)
+  model, tokenizer = loader.load_model(path, args.max_context, device)
+  dflash = loader.load_dflash(model, draft_path) if draft_path is not None else None
+  def warm():
+    start = time.perf_counter()
+    print(f"Warming up {model.device}...", file=sys.stderr, flush=True)
+    _warm(model, dflash, prompt_graph=False)
+    print(f"Ready in {time.perf_counter() - start:.1f}s; {GlobalCounters.mem_used / 1e9:.2f} GB on the GPU.", file=sys.stderr, flush=True)
+  name = _model_name(args.model)
+  serve(model, tokenizer, port, hostname, enable_thinking=not args.no_thinking, dflash=dflash,
+        block_size=_dflash_block(dflash) if dflash is not None else 16, name=name,
+        warmup=None if args.no_warmup else warm, idle=None if args.no_warmup else lambda: capture_prompt_graph(model),
+        info=loader.model_info(name, path, dflash is not None), installed=loader.installed)
+  return 0
+
+def command(argv: list[str]) -> int:
+  from infurnace import client
+  args = command_parser().parse_args(argv)
+  if args.command == "serve": return serve_command(args)
+  if args.command == "run":
+    if args.model is not None and not _looks_like_model(args.model): args.model, args.prompt = None, [args.model, *args.prompt]
+    options = {**({"temperature": args.temperature} if args.temperature is not None else {}),
+               **({"num_predict": args.max_tokens} if args.max_tokens else {})}
+    status = client.run(args.model, " ".join(args.prompt) or None, args.think, options, _forward(args))
+    if sys.stdin.isatty(): print("(The server keeps the model on the GPU; `infurnace stop` frees it.)", file=sys.stderr)
+    return status
+  if args.command == "pull":
+    for path in loader.pull(args.model): print(f"{args.model}: {path}")
+    return 0
+  if args.command in ("list", "ls"):
+    models = loader.installed()
+    if not models: print(f"No models downloaded yet. `infurnace pull {next(iter(loader.MODELS))}` downloads one.")
+    for m in models:
+      print(f"{m['name']:<16} {m['details']['quantization_level']:<8} {m['size'] / 1e9:5.1f} GB  "
+            f"{'with DFlash draft' if m['draft'] else ''}")
+    return 0
+  if args.command == "rm":
+    for name in args.models:
+      removed = loader.remove(name)
+      print(f"Deleted {name} ({len(removed)} file{'s' if len(removed) != 1 else ''})." if removed else f"{name} has no downloads in user storage.")
+    return 0
+  if args.command == "ps": return client.ps()
+  if args.command == "stop": return client.stop()
+  if args.command == "launch":
+    extra = args.extra[1:] if args.extra[:1] == ["--"] else args.extra
+    return client.launch(args.integration, args.model, _forward(args), extra, configure_only=args.config)
+  raise AssertionError(args.command)
 
 if __name__ == "__main__":
   raise SystemExit(main())
