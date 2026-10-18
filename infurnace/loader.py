@@ -1,79 +1,20 @@
-"""Choosing and loading a model and its optional DFlash draft.
+"""Loading a model of a supported family (infurnace/models) and its optional DFlash draft, and sizing its context.
 
-`--model` takes a name from MODELS or a path to a local GGUF file of a supported family (infurnace/models). A named model and
-its DFlash draft are downloaded into user storage ($XDG_DATA_HOME/infurnace/models) on first
-use; a copy already there, or in an editable checkout's models/ directory, is used as is.
+Names and downloads are in catalog.py.
 """
 from __future__ import annotations
-import datetime
-import os
-import re
 import sys
 from pathlib import Path
-from tinygrad.helpers import fetch
+from infurnace.catalog import details, draft_for
 from infurnace.device import fast_path_problem, nvidia, select_device, supports_nv_quant
 from infurnace.gguf import read_gguf_metadata
 from infurnace.kernels.quant_gemm import nv_prefill_supported
 from infurnace.engine import Model
 from infurnace.models import family_for
 
-# name: (model URL, DFlash draft URL). The first entry is the default.
-MODELS = {
-  "qwen3.5:4b": ("https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/e87f176479d0855a907a41277aca2f8ee7a09523/Qwen3.5-4B-Q4_K_M.gguf",
-                 "https://huggingface.co/Anbeeld/Qwen3.5-4B-DFlash-GGUF/resolve/a79bafa7f383f8627f925250f547fe1ebbc43ff6/qwen35-4b-dflash-Q4_K_M.gguf"),
-}
-
-def _user_models() -> Path:
-  return Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local/share"))).expanduser() / "infurnace/models"
-
-def _local(url: str) -> Path | None:
-  """An existing copy of a download: user storage first, then an editable checkout's models/."""
-  name, checkout = url.rsplit("/", 1)[1], Path(__file__).resolve().parent.parent / "models"
-  for path in (_user_models() / name, *(checkout / sub / name for sub in ("", "qwen35-validation", "dflash-qwen35"))):
-    if path.is_file(): return path
-  return None
-
-def fetch_model(model: str | Path) -> Path:
-  """A MODELS name or download URL as a local file, downloaded on first use; a path is returned as is."""
-  url = MODELS[model][0] if model in MODELS else str(model)
-  if not url.startswith("https://"): return Path(url).expanduser()
-  return _local(url) or fetch(url, name=_user_models() / url.rsplit("/", 1)[1])
-
-def _details(name: str, url: str) -> dict:
-  quant = re.search(r"(Q\d_K(?:_[SML])?|Q\d_\d|F16|BF16)", url.rsplit("/", 1)[1], re.IGNORECASE)
-  return {'format': 'gguf', 'family': 'qwen35', 'parameter_size': name.split(':')[-1].upper(),
-          'quantization_level': quant.group(1).upper() if quant else ''}
-
-def installed() -> list[dict]:
-  """Downloaded models, as /api/tags lists them (sizes include the DFlash draft)."""
-  out = []
-  for name, (url, draft_url) in MODELS.items():
-    if (path := _local(url)) is None: continue
-    draft = _local(draft_url) if draft_url else None
-    modified = datetime.datetime.fromtimestamp(path.stat().st_mtime, datetime.timezone.utc).isoformat()
-    out.append({'name': name, 'model': name, 'size': path.stat().st_size + (draft.stat().st_size if draft else 0), 'modified_at': modified,
-                'digest': '', 'details': _details(name, url), 'path': str(path), 'draft': str(draft) if draft else None})
-  return out
-
-def pull(name: str) -> list[Path]:
-  """Download a named model and its DFlash draft (each only if missing)."""
-  if name not in MODELS: raise ValueError(f"unknown model {name!r}; available: {', '.join(MODELS)}")
-  return [fetch_model(url) for url in MODELS[name] if url]
-
-def remove(name: str) -> list[Path]:
-  """Delete a named model's downloads from user storage (an editable checkout's models/ is left alone)."""
-  if name not in MODELS: raise ValueError(f"unknown model {name!r}; available: {', '.join(MODELS)}")
-  removed = []
-  for url in MODELS[name]:
-    if url and (path := _user_models() / url.rsplit("/", 1)[1]).is_file():
-      path.unlink()
-      removed.append(path)
-  return removed
-
 def model_info(name: str, path: Path, dflash: bool) -> dict:
   """What the server reports for the loaded model (/api/ps, /api/show)."""
-  url = MODELS[name][0] if name in MODELS else str(path)
-  return {'size': Path(path).stat().st_size, 'dflash': dflash, 'details': _details(name, url)}
+  return {'size': Path(path).stat().st_size, 'dflash': dflash, 'details': details(name, path)}
 
 # Beyond the weights and the caches: a fixed runtime (the CUDA context ~0.47 GB, tinygrad's ~0.39 GB) and graph
 # scratch and working buffers, which grow with the model; measured together as ~1.45 GB for Qwen3.5-4B with its
@@ -109,14 +50,13 @@ def fit_context(model_path: str | Path, draft_path: str | Path | None, free: int
           "or use --max-context.", file=sys.stderr)
   return min(limit, steps * CONTEXT_STEP) if steps else 4096
 
-def dflash_draft(model: str) -> str | Path | None:
-  """The draft override, named model's download URL, or an installed draft for a local Qwen3.5 file."""
-  if path := os.environ.get("INFURNACE_DFLASH_DRAFT"): return Path(path).expanduser()
-  if model in MODELS: return MODELS[model][1]
-  return _local(MODELS["qwen3.5:4b"][1]) if is_qwen35(model) else None
-
-def is_qwen35(path: str | Path) -> bool:
-  return Path(path).is_file() and read_gguf_metadata(path).get("general.architecture") == "qwen35"
+def dflash_draft(model: str | Path) -> str | Path | None:
+  """The draft override, a catalog model's draft (a download URL), or an installed draft for a local GGUF of the
+  same architecture."""
+  path = Path(model).expanduser()
+  def architecture():
+    return read_gguf_metadata(path).get("general.architecture") if path.suffix == ".gguf" and path.is_file() else None
+  return draft_for(str(model), architecture)
 
 def load_model(path: str | Path, max_context: int, device: str | None = None, nv_quant: bool | None = None, *,
                nv_prefill: bool | None = None) -> tuple[Model, object]:

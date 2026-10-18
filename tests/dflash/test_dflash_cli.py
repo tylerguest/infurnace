@@ -55,7 +55,6 @@ def test_installed_draft_is_used_automatically(monkeypatch, tmp_path, device, fl
   target.touch()
   draft.touch()
   monkeypatch.setenv('INFURNACE_DFLASH_DRAFT', str(draft))
-  monkeypatch.setattr(loader, 'is_qwen35', lambda path: True)
   plain = []
   def generate(ids, n, **kwargs): return (t for t in plain.append(ids) or ())
   model = SimpleNamespace(config=SimpleNamespace(context_length=16), device=device, generate=generate)

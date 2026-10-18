@@ -40,3 +40,14 @@ def test_unknown_models_are_rejected_before_any_server(monkeypatch):
   with pytest.raises(ValueError, match="unknown model 'qwen3:4b'"): cli.command(['run', 'qwen3:4b', 'hi'])
   cli._check_model('qwen3.5:4b')
   cli._check_model('~/m/x.gguf')
+
+def test_list_shows_downloaded_and_available_models(monkeypatch, capsys):
+  details = {'quantization_level': 'Q4_K_M'}
+  monkeypatch.setattr('infurnace.catalog.listing', lambda: [
+    {'name': 'qwen3.5:4b', 'details': details, 'size': 3.4e9, 'downloaded': True, 'has_draft': True},
+    {'name': 'other:3b', 'details': details, 'size': 0, 'downloaded': False, 'has_draft': False}])
+  assert cli.command(['list']) == 0
+  header, downloaded, available = capsys.readouterr().out.splitlines()
+  assert header.split() == ['NAME', 'QUANT', 'SIZE', 'DFLASH', 'STATUS']
+  assert downloaded.split() == ['qwen3.5:4b', 'Q4_K_M', '3.4', 'GB', 'yes', 'downloaded']
+  assert available.split()[:4] == ['other:3b', 'Q4_K_M', '-', 'no'] and 'infurnace pull other:3b' in available

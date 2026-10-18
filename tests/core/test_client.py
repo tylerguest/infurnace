@@ -4,7 +4,7 @@ import threading
 
 import pytest
 
-from infurnace import client, loader
+from infurnace import catalog, client
 from infurnace.chat import ChatTemplate
 from infurnace.serve import Server, ServerModel
 from test_serve import Model, Tokenizer
@@ -40,19 +40,23 @@ def test_configure_pi_keeps_user_entries(tmp_path, monkeypatch):
 
 def test_list_pull_and_remove_use_user_storage(tmp_path, monkeypatch):
   monkeypatch.setenv('XDG_DATA_HOME', str(tmp_path))
-  monkeypatch.setattr(loader, 'MODELS', {'tiny:1b': ('https://example.com/m/tiny-Q4_K_M.gguf', 'https://example.com/m/tiny-draft.gguf')})
-  monkeypatch.setattr(loader, '_local', lambda url: p if (p := tmp_path / 'infurnace/models' / url.rsplit('/', 1)[1]).is_file() else None)
+  tiny = catalog.Entry('tiny:1b', 'https://example.com/m/tiny-Q4_K_M.gguf', 'qwen35', 'https://example.com/m/tiny-draft.gguf')
+  monkeypatch.setattr(catalog, 'ENTRIES', [tiny])
+  monkeypatch.setattr(catalog, 'CATALOG', {tiny.name: tiny})
+  monkeypatch.setattr(catalog, 'local', lambda url: p if (p := tmp_path / 'infurnace/models' / url.rsplit('/', 1)[1]).is_file() else None)
   def fake_fetch(url, name):
     name.parent.mkdir(parents=True, exist_ok=True)
     name.write_bytes(b'x' * 10)
     return name
-  monkeypatch.setattr(loader, 'fetch', fake_fetch)
-  assert loader.installed() == []
-  assert len(loader.pull('tiny:1b')) == 2
-  [entry] = loader.installed()
+  monkeypatch.setattr(catalog, 'fetch', fake_fetch)
+  assert catalog.installed() == []
+  [available] = catalog.listing()
+  assert not available['downloaded'] and available['has_draft'] and available['details']['family'] == 'qwen35'
+  assert len(catalog.pull('tiny:1b')) == 2
+  [entry] = catalog.installed()
   assert entry['name'] == 'tiny:1b' and entry['size'] == 20 and entry['details']['quantization_level'] == 'Q4_K_M'
-  assert len(loader.remove('tiny:1b')) == 2 and loader.installed() == []
-  with pytest.raises(ValueError, match='unknown model'): loader.pull('nope')
+  assert len(catalog.remove('tiny:1b')) == 2 and catalog.installed() == []
+  with pytest.raises(ValueError, match='unknown model'): catalog.pull('nope')
 
 def test_run_one_prompt_through_a_server(monkeypatch, capsys):
   model, tok = Model(), Tokenizer()

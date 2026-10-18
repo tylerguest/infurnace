@@ -12,7 +12,7 @@ import json
 import pathlib
 import time
 
-from infurnace import loader
+from infurnace import catalog, loader
 from infurnace.chat import user_prompt
 
 TEXT = pathlib.Path(__file__).parent / "quality" / "eval.txt"
@@ -37,7 +37,7 @@ def measure(stream, prompt: int) -> dict:
 
 def main():
   ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-  ap.add_argument("--model", default=next(iter(loader.MODELS)))
+  ap.add_argument("--model", default=catalog.DEFAULT)
   ap.add_argument("--lengths", default="25,124,524,1024,2024,4024,8024,16024")
   ap.add_argument("--tokens", type=int, default=128, help="output tokens per run (default 128; EOS is ignored)")
   ap.add_argument("--dflash", action="store_true", help="decode with the DFlash draft, as chat and the server do by default")
@@ -46,9 +46,9 @@ def main():
   args = ap.parse_args()
   lengths = [int(n) for n in args.lengths.split(",")]
   began = time.perf_counter()
-  path = loader.fetch_model(args.model)
+  path = catalog.fetch_model(args.model)
   model, tokenizer = loader.load_model(path, max(lengths) + args.tokens + 256)  # headroom, as a real context has
-  dflash = loader.load_dflash(model, loader.fetch_model(loader.dflash_draft(args.model))) if args.dflash else None
+  dflash = loader.load_dflash(model, catalog.fetch_model(loader.dflash_draft(args.model))) if args.dflash else None
   # As chat and the server do before their first reply: captures the prompt graph (and DFlash's rounds).
   if dflash is not None: dflash.warmup()
   else: model.warmup()

@@ -65,9 +65,11 @@ path, goes away.
 
 ### P1: catalog
 
-- [ ] `catalog.py`: entries carry the family and an optional draft
-- [ ] `infurnace list` shows available models as well as downloaded ones; `pull` takes any entry
-- [ ] DFlash stays automatic for entries that have a draft and off for the rest
+- [x] `catalog.py`: entries carry the architecture (the family that runs them) and an optional draft; downloads
+      (`pull`, `rm`, what is installed) moved there from `loader.py`
+- [x] `infurnace list` shows available models as well as downloaded ones; `pull` takes any entry
+- [x] DFlash stays automatic for entries that have a draft and off for the rest; a local GGUF gets a downloaded
+      draft of a catalog model with the same architecture
 
 ### P2: second model, attention-only (Qwen3-4B Q4_K_M)
 

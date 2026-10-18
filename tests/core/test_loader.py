@@ -3,42 +3,55 @@ from types import SimpleNamespace
 
 import pytest
 
-from infurnace import loader
+from infurnace import catalog, loader
 from infurnace.models import Family, family_for
 
 @pytest.fixture
 def tiny_models(monkeypatch, tmp_path):
   monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
-  monkeypatch.setattr(loader, "MODELS", {"tiny:1b": ("https://example.com/m/tiny.gguf", "https://example.com/m/tiny-draft.gguf")})
+  tiny = catalog.Entry("tiny:1b", "https://example.com/m/tiny.gguf", "qwen35", "https://example.com/m/tiny-draft.gguf")
+  monkeypatch.setattr(catalog, "ENTRIES", [tiny])
+  monkeypatch.setattr(catalog, "CATALOG", {tiny.name: tiny})
   fetched = []
-  monkeypatch.setattr(loader, "fetch", lambda url, name: fetched.append((url, name)) or name)
+  monkeypatch.setattr(catalog, "fetch", lambda url, name: fetched.append((url, name)) or name)
   return tmp_path / "infurnace/models", fetched
 
 def test_name_downloads_into_user_storage(tiny_models):
   storage, fetched = tiny_models
-  assert loader.fetch_model("tiny:1b") == storage / "tiny.gguf"
+  assert catalog.fetch_model("tiny:1b") == storage / "tiny.gguf"
   assert fetched == [("https://example.com/m/tiny.gguf", storage / "tiny.gguf")]
 
 def test_name_reuses_existing_download(tiny_models):
   storage, fetched = tiny_models
   storage.mkdir(parents=True)
   (storage / "tiny.gguf").touch()
-  assert loader.fetch_model("tiny:1b") == storage / "tiny.gguf" and not fetched
+  assert catalog.fetch_model("tiny:1b") == storage / "tiny.gguf" and not fetched
 
 def test_path_is_used_as_is(tiny_models):
   _, fetched = tiny_models
-  assert loader.fetch_model("~/custom.gguf") == Path.home() / "custom.gguf" and not fetched
+  assert catalog.fetch_model("~/custom.gguf") == Path.home() / "custom.gguf" and not fetched
 
 def test_dflash_draft_for_names_and_paths(tiny_models, monkeypatch, tmp_path):
   monkeypatch.delenv("INFURNACE_DFLASH_DRAFT")
   assert loader.dflash_draft("tiny:1b") == "https://example.com/m/tiny-draft.gguf"
   assert loader.dflash_draft(str(tmp_path / "missing.gguf")) is None
+  # A local GGUF gets a downloaded draft of the same architecture, and none of another one.
+  storage, _ = tiny_models
+  storage.mkdir(parents=True)
+  (storage / "tiny-draft.gguf").touch()
+  local = tmp_path / "mine.gguf"
+  local.touch()
+  for architecture, draft in (("qwen35", storage / "tiny-draft.gguf"), ("llama", None)):
+    monkeypatch.setattr(loader, "read_gguf_metadata", lambda path, a=architecture: {"general.architecture": a})
+    assert loader.dflash_draft(str(local)) == draft
   monkeypatch.setenv("INFURNACE_DFLASH_DRAFT", "~/draft.gguf")
   assert loader.dflash_draft("tiny:1b") == Path.home() / "draft.gguf"
 
-def test_only_supported_preset():
-  assert list(loader.MODELS) == ['qwen3.5:4b']
-  assert loader.MODELS['qwen3.5:4b'][1].endswith('qwen35-4b-dflash-Q4_K_M.gguf')
+def test_catalog():
+  assert list(catalog.CATALOG) == ['qwen3.5:4b'] and catalog.DEFAULT == 'qwen3.5:4b'
+  entry = catalog.CATALOG['qwen3.5:4b']
+  assert entry.architecture == 'qwen35' and entry.draft.endswith('qwen35-4b-dflash-Q4_K_M.gguf')
+  with pytest.raises(ValueError, match='unknown model'): catalog.entry('nope')
 
 @pytest.fixture
 def model_loader(monkeypatch):

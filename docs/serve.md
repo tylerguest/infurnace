@@ -9,7 +9,7 @@
 | `infurnace serve` | start the server yourself; `run`, `ps`, `stop` and `launch` talk to it, and `run` starts one in the background when none answers (log: `~/.local/state/infurnace/serve.log`) |
 | `infurnace ps` | the running server: model, context, readiness, DFlash |
 | `infurnace stop` | stop the server and free the GPU |
-| `infurnace pull MODEL`, `list`, `rm MODEL` | download a model (and its DFlash draft), list downloads, delete them |
+| `infurnace pull MODEL`, `list`, `rm MODEL` | download a model (and its DFlash draft), list the models (downloaded and available), delete downloads |
 | `infurnace launch pi` | point the pi coding agent at the server and start it |
 
 In a chat: `/set think`, `/set nothink`, `/set temperature T`, `/clear`, `/bye`, and `"""` for multi-line messages.

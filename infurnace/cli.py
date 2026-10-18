@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 from typing import Callable, Iterator
 from tinygrad.helpers import GlobalCounters, Timing, profile_marker
-from infurnace import loader
+from infurnace import catalog, loader
 from infurnace.device import free_vram, nvidia, select_device
 
 PROMPT_MAX_TOKENS = 64
@@ -23,8 +23,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
   mode.add_argument("--serve", nargs="?", type=int, const=8000, metavar="PORT", help="OpenAI-compatible HTTP server (default port 8000)")
   mode.add_argument("--benchmark", nargs="?", type=_benchmark_spec, const=(512, 20), metavar="[PROMPT,]COUNT",
                     help="time plain decoding per step: COUNT outputs (default 20) after a PROMPT-token prompt (default 512)")
-  ap.add_argument("--model", "-m", default=next(iter(loader.MODELS)),
-                  help=f"model name ({', '.join(loader.MODELS)}; downloaded on first use) or a path to a local GGUF file")
+  ap.add_argument("--model", "-m", default=catalog.DEFAULT,
+                  help=f"model name ({catalog.names()}; downloaded on first use) or a path to a local GGUF file")
   ap.add_argument("--max-tokens", type=_positive, help="reply length cap, including thinking (default: chat uses the remaining "
                                                        f"context, --prompt {PROMPT_MAX_TOKENS})")
   ap.add_argument("--max-context", type=_positive, default=8192, help="context window in tokens (default 8192)")
@@ -192,12 +192,12 @@ def chat(generate, tokenizer, template, context: int, max_tokens: int | None, th
 
 def run(args: argparse.Namespace) -> int:
   draft, automatic = _dflash_draft(args)
-  model, tokenizer = loader.load_model(loader.fetch_model(args.model), args.max_context, args.device)
+  model, tokenizer = loader.load_model(catalog.fetch_model(args.model), args.max_context, args.device)
   if args.benchmark is not None: return benchmark(model, tokenizer, *args.benchmark, warmup=not args.no_warmup)
 
   dflash = None
   if draft is not None and not (automatic and not nvidia(model.device)):  # the CPU reference is slower than plain
-    dflash = loader.load_dflash(model, loader.fetch_model(draft))
+    dflash = loader.load_dflash(model, catalog.fetch_model(draft))
     print(f"DFlash speculative decoding{' on (--no-dflash turns it off)' if automatic else ''}.", file=sys.stderr, flush=True)
   generate, context = generator(model, tokenizer, dflash, args.temperature), model.config.context_length
 
@@ -211,7 +211,7 @@ def run(args: argparse.Namespace) -> int:
     serve(model, tokenizer, args.serve, args.host, enable_thinking=not args.no_thinking, dflash=dflash, block_size=block,
           warmup=None if args.no_warmup else lambda: warmup(model, dflash, prompt_graph=False),
           idle=None if args.no_warmup else lambda: capture_prompt_graph(model), name=_model_name(args.model),
-          info=loader.model_info(_model_name(args.model), loader.fetch_model(args.model), dflash is not None), installed=loader.installed)
+          info=loader.model_info(_model_name(args.model), catalog.fetch_model(args.model), dflash is not None), installed=catalog.installed)
     return 0
   window, thinking = min(args.max_context, context), not args.no_thinking
   from infurnace.chat import ChatTemplate
@@ -242,7 +242,7 @@ def main(argv: list[str] | None = None) -> int:
     print("infurnace: out of memory. Stop other model processes or reduce --max-context.", file=sys.stderr)
     return 1
   except FileNotFoundError as exc:
-    print(f"infurnace: file not found: {exc.filename}\nPass --model with a name ({', '.join(loader.MODELS)}) or a path to a GGUF file.",
+    print(f"infurnace: file not found: {exc.filename}\nPass --model with a name ({catalog.names()}) or a path to a GGUF file.",
           file=sys.stderr)
     return 1
   except (ValueError, OSError) as exc:
@@ -260,9 +260,9 @@ def command_parser() -> argparse.ArgumentParser:
   ap = argparse.ArgumentParser(prog="infurnace", description="Run local LLMs fast on your GPU with tinygrad. "
                                "Without a command: run the default model.")
   sub = ap.add_subparsers(dest="command", required=True, metavar="COMMAND")
-  default = next(iter(loader.MODELS))
+  default = catalog.DEFAULT
   serve = sub.add_parser("serve", help="start the server: keeps the model warm; OpenAI-compatible API at /v1, infurnace API at /api")
-  serve.add_argument("--model", "-m", default=default, help=f"model name ({', '.join(loader.MODELS)}) or a local GGUF file")
+  serve.add_argument("--model", "-m", default=default, help=f"model name ({catalog.names()}) or a local GGUF file")
   serve.add_argument("--host", help="bind address (default from INFURNACE_HOST, else 127.0.0.1)")
   serve.add_argument("--port", type=int, help="port (default from INFURNACE_HOST, else 8000)")
   _server_options(serve)
@@ -278,8 +278,8 @@ def command_parser() -> argparse.ArgumentParser:
   run_.add_argument("--temperature", type=_temperature, help="sampling temperature (default 0: greedy)")
   run_.add_argument("--max-tokens", type=_positive, help="reply length cap, including thinking")
   _server_options(run_)
-  sub.add_parser("pull", help="download a model (and its DFlash draft)").add_argument("model", help=f"one of {', '.join(loader.MODELS)}")
-  sub.add_parser("list", aliases=["ls"], help="list downloaded models")
+  sub.add_parser("pull", help="download a model (and its DFlash draft)").add_argument("model", help=f"one of {catalog.names()}")
+  sub.add_parser("list", aliases=["ls"], help="list the models, downloaded and available")
   sub.add_parser("rm", help="delete downloaded models").add_argument("models", nargs="+")
   sub.add_parser("ps", help="show the running server and its model")
   sub.add_parser("stop", help="stop the server (frees the GPU)")
@@ -299,15 +299,15 @@ def _forward(args: argparse.Namespace) -> list[str]:
 def _looks_like_model(value: str) -> bool:
   """`run`'s first argument names a model (a catalog name, name:tag or a GGUF file); anything else starts the prompt."""
   if "://" in value: return False  # a URL is prompt text, never a model to download
-  return value in loader.MODELS or value.endswith(".gguf") or (" " not in value and ":" in value and not value.endswith(":"))
+  return value in catalog.CATALOG or value.endswith(".gguf") or (" " not in value and ":" in value and not value.endswith(":"))
 
 def _check_model(model: str | None) -> None:
   """A model `run` or `launch` asks for must be a catalog name or a GGUF file: say so before any server is involved."""
-  if model is None or model in loader.MODELS or model.endswith(".gguf"): return
-  raise ValueError(f"unknown model {model!r}; available: {', '.join(loader.MODELS)}, or a path to a GGUF file")
+  if model is None or model in catalog.CATALOG or model.endswith(".gguf"): return
+  raise ValueError(f"unknown model {model!r}; available: {catalog.names()}, or a path to a GGUF file")
 
 def _model_name(model: str) -> str:
-  return model if model in loader.MODELS else Path(model).stem
+  return model if model in catalog.CATALOG else Path(model).stem
 
 def serve_command(args: argparse.Namespace) -> int:
   """Load the model and serve it; warmup runs on a thread after the server starts listening."""
@@ -318,9 +318,9 @@ def serve_command(args: argparse.Namespace) -> int:
   if not 1 <= port <= 65535: raise ValueError("port must be between 1 and 65535")
   args.benchmark = None
   draft, automatic = _dflash_draft(args)
-  path = loader.fetch_model(args.model)
+  path = catalog.fetch_model(args.model)
   device = select_device(args.device)
-  draft_path = loader.fetch_model(draft) if draft is not None and not (automatic and not nvidia(device)) else None
+  draft_path = catalog.fetch_model(draft) if draft is not None and not (automatic and not nvidia(device)) else None
   if args.max_context is None:
     free = free_vram(device)
     args.max_context = loader.fit_context(path, draft_path, free) if free else 8192
@@ -337,7 +337,7 @@ def serve_command(args: argparse.Namespace) -> int:
   serve(model, tokenizer, port, hostname, enable_thinking=not args.no_thinking, dflash=dflash,
         block_size=_dflash_block(dflash) if dflash is not None else 16, name=name,
         warmup=None if args.no_warmup else warm, idle=None if args.no_warmup else lambda: capture_prompt_graph(model),
-        info=loader.model_info(name, path, dflash is not None), installed=loader.installed)
+        info=loader.model_info(name, path, dflash is not None), installed=catalog.installed)
   return 0
 
 def command(argv: list[str]) -> int:
@@ -353,18 +353,18 @@ def command(argv: list[str]) -> int:
     if sys.stdin.isatty(): print("(The server keeps the model on the GPU; `infurnace stop` frees it.)", file=sys.stderr)
     return status
   if args.command == "pull":
-    for path in loader.pull(args.model): print(f"{args.model}: {path}")
+    for path in catalog.pull(args.model): print(f"{args.model}: {path}")
     return 0
   if args.command in ("list", "ls"):
-    models = loader.installed()
-    if not models: print(f"No models downloaded yet. `infurnace pull {next(iter(loader.MODELS))}` downloads one.")
-    for m in models:
-      print(f"{m['name']:<16} {m['details']['quantization_level']:<8} {m['size'] / 1e9:5.1f} GB  "
-            f"{'with DFlash draft' if m['draft'] else ''}")
+    print(f"{'NAME':<16} {'QUANT':<8} {'SIZE':>8}  {'DFLASH':<7} STATUS")
+    for m in catalog.listing():
+      size = f"{m['size'] / 1e9:5.1f} GB" if m['downloaded'] else "-"
+      state = "downloaded" if m['downloaded'] else f"available (infurnace pull {m['name']})"
+      print(f"{m['name']:<16} {m['details']['quantization_level']:<8} {size:>8}  {'yes' if m['has_draft'] else 'no':<7} {state}")
     return 0
   if args.command == "rm":
     for name in args.models:
-      removed = loader.remove(name)
+      removed = catalog.remove(name)
       print(f"Deleted {name} ({len(removed)} file{'s' if len(removed) != 1 else ''})." if removed else f"{name} has no downloads in user storage.")
     return 0
   if args.command == "ps": return client.ps()

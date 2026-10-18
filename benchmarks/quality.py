@@ -20,7 +20,7 @@ import subprocess
 import time
 
 from tinygrad import Tensor, TinyJit, UOp, dtypes
-from infurnace import loader
+from infurnace import catalog, loader
 from infurnace.dflash.jit import captured
 from infurnace.dflash.parallel import ParallelVerifier
 from infurnace.dflash.target import TargetObserver
@@ -96,7 +96,7 @@ def main():
   ap.add_argument("--paths", default="one-row,16-row,verifier")
   ap.add_argument("--llama-perplexity", help="path to llama.cpp's llama-perplexity, for the reference number")
   args = ap.parse_args()
-  path = loader.fetch_model(args.model)
+  path = catalog.fetch_model(args.model)
   if args.llama_perplexity:  # first, so the two models never share the GPU
     ppl, n = llama_cpp(args.llama_perplexity, str(path), args.ctx, args.chunks, args.text)
     print(f"llama.cpp          PPL {ppl:.4f}" + (f"  ({n} tokens)" if n > 0 else ""), flush=True)

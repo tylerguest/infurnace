@@ -12,7 +12,8 @@ a general inference engine.
 | `cli.py` | Commands (`serve`, `run`, `ps`, `stop`, `pull`, `list`, `rm`, `launch`) and the original in-process flags |
 | `client.py` | Talking to the server: finding or starting it, chat and one-shot replies, `ps`/`stop`, `launch pi` |
 | `serve.py` | tinygrad's OpenAI-compatible server (`/v1`) plus infurnace's `/api`; DFlash, per-request thinking, warmup on a thread |
-| `loader.py` | Named models, downloads (`pull`, `list`, `rm`), the family for a GGUF's architecture, device dispatch, DFlash loading, context from free VRAM |
+| `catalog.py` | Named models (GGUF, architecture, optional DFlash draft) and their downloads (`pull`, `list`, `rm`) |
+| `loader.py` | The family for a GGUF's architecture, device dispatch, model and DFlash loading, context from free VRAM |
 | `device.py` | Device probing, the fast-path check, NVIDIA's pip-installed compiler, free VRAM |
 | `gguf.py` | GGUF parsing (tinygrad's parser) and metadata |
 | `chat.py` | Chat prompts from the GGUF's Jinja template (server and local chat) |
