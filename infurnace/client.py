@@ -235,28 +235,32 @@ def stop() -> int:
   if status() is None:
     print(f"No infurnace server is running at {host()}.")
     return 0
-  # The server handles one thing at a time: a reply in progress, or the prompt graph it captures after its warmup
-  # (~30 s), finishes first.
+  # The server handles one thing at a time: a reply in progress, or its warmup and the prompt graph it captures
+  # after it (about a minute on a fresh start), finishes first; it stops listening once the GPU is free.
   print("Stopping the server (it finishes what it is doing first)...", file=sys.stderr, flush=True)
   request("POST", "/api/shutdown", {}, timeout=120)
-  for _ in range(40):
+  deadline = time.monotonic() + 300
+  while time.monotonic() < deadline:
     if status() is None:
       print("Stopped the infurnace server.")
       return 0
     time.sleep(0.25)
-  raise ServerError("the server did not stop")
+  raise ServerError(f"the server did not stop within 5 minutes; see {log_path()}")
 
 # --- launch: point an agent at the server -----------------------------------------------------------------------
 
 def _write_with_backup(path: Path, value: dict) -> None:
-  if path.is_file(): shutil.copy2(path, path.with_name(path.name + ".infurnace.bak"))
+  """Write `value` as JSON, first keeping the file as it was before infurnace ever changed it: an existing backup
+  is never replaced, so later launches don't overwrite the original with infurnace's own edits."""
+  backup = path.with_name(path.name + ".infurnace.bak")
+  if path.is_file() and not backup.exists(): shutil.copy2(path, backup)
   path.parent.mkdir(parents=True, exist_ok=True)
   path.write_text(json.dumps(value, indent=2) + "\n")
 
 def configure_pi(model: str, context: int, home: Path | None = None) -> Path:
   """Add (or refresh) this server's model in pi's models.json under the `infurnace` provider: entries this writes
-  are marked `_launch`; others (yours) are left as they are. Also makes it pi's default model. The previous files
-  are kept as *.infurnace.bak."""
+  are marked `_launch`; others (yours) are left as they are. Also makes it pi's default model. The files as they
+  were before the first launch are kept as *.infurnace.bak."""
   agent = (home or Path.home()) / ".pi" / "agent"
   models_path, settings_path = agent / "models.json", agent / "settings.json"
   config = json.loads(models_path.read_text()) if models_path.is_file() else {}

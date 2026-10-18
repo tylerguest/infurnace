@@ -105,9 +105,9 @@ class RequestHandler(Handler):
       if not isinstance(body, dict): return self.send_json({'error': 'invalid JSON body'}, 400)
       if route == '/api/shutdown':
         self.send_json({'status': 'stopping'})
-        def close(server=self.server):  # stop serving, then stop listening: connections are refused, not left hanging
+        def close(server=self.server):
           server.shutdown()
-          server.server_close()
+          server.finish()
         threading.Thread(target=close, daemon=True).start()
       elif route == '/api/show': self.send_json(self.server.show())
       elif route in ('/api/chat', '/api/generate'):
@@ -218,6 +218,7 @@ class Server(LLMServer):
     self.model, self.model_name, self.tok, self.template, self.idle = model, model_name, tok, template, idle
     self.info, self.installed = info or {}, installed or (lambda: [])
     self.ready, self.failure, self.warmup_seconds, self.gpu = threading.Event(), None, None, threading.Lock()
+    self.stopping, self.closed = False, threading.Event()
     TCPServerWithReuse.__init__(self, server_address, RequestHandler)
     if warmup is None and idle is None: self.ready.set()
     else: threading.Thread(target=self._warm, args=(warmup, idle), name='infurnace-warmup', daemon=True).start()
@@ -234,8 +235,21 @@ class Server(LLMServer):
       self.ready.set()
     if idle is not None and not self.failure:
       with self.gpu:  # a request that arrives meanwhile waits for it
+        if self.stopping: return
         try: idle()
         except BaseException as exc: print(f"Background work failed: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+
+  def finish(self):
+    """Stop listening once the warmup thread is off the GPU (it skips the prompt graph if that has not started),
+    so the process never exits in the middle of GPU work. Until then connections wait rather than being refused,
+    so clients see a busy server, not a stopped one. The lock stays held: nothing starts on the GPU afterwards."""
+    if self.stopping: return self.closed.wait()
+    self.stopping = True
+    if not self.gpu.acquire(blocking=False):
+      print("Waiting for the GPU work in progress to finish...", file=sys.stderr, flush=True)
+      self.gpu.acquire()
+    self.server_close()
+    self.closed.set()
 
   def status(self) -> dict:
     state = 'failed' if self.failure else 'ready' if self.ready.is_set() else 'warming up'
@@ -260,4 +274,5 @@ def serve(model, tokenizer, port=8000, host='127.0.0.1', *, enable_thinking=True
               idle, warmup=warmup, info=info, installed=installed) as server:
     print(f"Serving {name} at http://{host}:{server.server_address[1]} (OpenAI-compatible API at /v1, infurnace API at /api)"
           f"{' with DFlash' if dflash is not None else ''}{'; warming up' if warmup is not None else ''}", flush=True)
-    server.serve_forever()
+    try: server.serve_forever()
+    finally: server.finish()  # after /api/shutdown or Ctrl-C

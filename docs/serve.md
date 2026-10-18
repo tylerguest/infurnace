@@ -60,7 +60,7 @@ cache for Qwen3.5-4B with its draft, ~1.45 GB of graphs and buffers, a 0.25 GB m
 
 **launch pi** adds an entry for the served model under the `infurnace` provider in `~/.pi/agent/models.json`
 (marked `_launch`; entries you wrote stay as they are), with the server's context window, and makes it pi's
-default in `settings.json`. The previous files are kept as `*.infurnace.bak`.
+default in `settings.json`. The files as they were before the first launch are kept as `*.infurnace.bak`.
 
 - **DFlash:** generation uses DFlash whenever the chat would: the installed draft
   on an NVIDIA GPU (`NV` or `CUDA`), or `--dflash PATH`. `--no-dflash` serves plain decoding. One DFlash

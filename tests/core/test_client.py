@@ -33,7 +33,9 @@ def test_configure_pi_keeps_user_entries(tmp_path, monkeypatch):
   assert 'other' in config['providers']
   settings = json.loads((agent / 'settings.json').read_text())
   assert settings == {'theme': 'dark', 'defaultModel': 'qwen3.5:4b', 'defaultProvider': 'infurnace'}
-  assert (agent / 'models.json.infurnace.bak').is_file() and (agent / 'settings.json.infurnace.bak').is_file()
+  # The backups hold the files as they were before the first launch, not the first launch's edits.
+  assert json.loads((agent / 'models.json.infurnace.bak').read_text())['providers']['infurnace']['models'] == [mine]
+  assert json.loads((agent / 'settings.json.infurnace.bak').read_text()) == {'theme': 'dark', 'defaultModel': 'x'}
 
 def test_list_pull_and_remove_use_user_storage(tmp_path, monkeypatch):
   monkeypatch.setenv('XDG_DATA_HOME', str(tmp_path))

@@ -1,6 +1,7 @@
 import http.client
 import json
 import threading
+import time
 from types import SimpleNamespace
 
 from infurnace.serve import ChatTemplate, Server, ServerModel
@@ -139,6 +140,21 @@ def test_background_work_keeps_status_responsive():
     threading.Timer(0.2, release.set).start()
     status, data = call('POST', '/api/chat', {'model': 'test', 'messages': [{'role': 'user', 'content': 'x'}], 'stream': False})
     assert status == 200 and release.is_set() and calls == [1]  # the reply came after the work
+  finally: stop()
+
+def test_shutdown_waits_for_warmup():
+  # /api/shutdown during warmup: the server keeps listening until the warmup is off the GPU, and the prompt graph
+  # (idle) never starts, so the process never exits in the middle of GPU work.
+  model, tok = Model(), Tokenizer()
+  template = ChatTemplate({'tokenizer.chat_template': '{% for m in messages %}{{ m.content }}{% endfor %}'}, tok)
+  release, calls = threading.Event(), []
+  server, call, stop = serving(model, tok, template, warmup=lambda: release.wait(5), idle=lambda: calls.append(1))
+  try:
+    assert json.loads(call('POST', '/api/shutdown', {})[1])['status'] == 'stopping'
+    time.sleep(0.3)
+    assert not server.closed.is_set()  # still listening: clients see a busy server, not a stopped one
+    release.set()
+    assert server.closed.wait(5) and calls == []
   finally: stop()
 
 def serving(model, tok, template, **kwargs):
