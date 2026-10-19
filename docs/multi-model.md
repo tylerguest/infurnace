@@ -123,7 +123,31 @@ present a failed open is retried and reported instead of falling back to the CPU
 ### P5: more families
 
 - [ ] Llama 3.2 3B: a different tokenizer and chat template, a test of the generic pieces
-- [ ] Bonsai (Ternary-Bonsai-2-2B): Q2_0 ternary weights need new GEMV/GEMM kernels; its own project
+- [x] Bonsai-4B (`bonsai:4b`, Ternary-Bonsai-2-4B Q2_0): Qwen3.5-4B's architecture with ternary weights whose
+      inputs are Hadamard-rotated (`prism.hadamard` metadata, `hadamard.py`)
+  - [x] GGUF parsing in infurnace for types tinygrad lacks; Q2_0 decoding; the rotations before each folded
+        projection and the inverse after embedding lookups, checked against llama.cpp's graph
+  - [x] Decode: a Q2_0 one-row GEMV (dp4a over 2-bit codes, codes then scales as packed words, 4 warps) and a
+        blockwise Walsh-Hadamard kernel (`kernels/hadamard.py`; tinygrad's matmul fused into each rotation's
+        producer cost 21-125 us a rotation). 6.6 -> ~140 tok/s
+  - [x] Prompt chunks: a Q2_0 tensor-core GEMM over a k order matching the packed codes. ~350 -> 1,340-1,610 tok/s;
+        at 64 rows it runs at ~25 TFLOPS, near the FP16 tensor cores' FP32-accumulation ceiling on this card
+  - [ ] Faster prompt reading: ternary weights are exact in int8, and int8 tensor cores (mma.sync s8, through
+        inline PTX) have several times the throughput; activations quantized per 32 values as decode already does
+  - [ ] Faster decode: the transform (warp shuffles for the first five stages, Q8 quantization fused in) and the
+        GEMV (316 GB/s of ~450)
+  - [ ] DFlash2 draft (`Ternary-Bonsai-2-4B-DFlash2-BF16.gguf`, 1.58 GB): check its format against DFlash, requantize
+- [ ] Bonsai-2B and its third-party Qwen3.5-2B drafts
+
+Measured 2026-10-18 (RTX 5060), Bonsai-4B against llama.cpp on the same GGUF: eval.txt (512 × 8) llama.cpp
+25.4209, one-row 25.4294 (+0.03%), 16-row 25.4304 (+0.04%); multilingual.txt (512 × 5) llama.cpp 15.2132, one-row
+15.2253, 16-row 15.2242. Plain decoding:
+
+| Prompt | TTFT | Prompt reading | Decode |
+|---|---|---|---|
+| 124 | 255 ms | 485 tok/s | 140.3 tok/s |
+| 1,024 | 766 ms | 1,337 tok/s | 138.3 tok/s |
+| 4,024 | 2.51 s | 1,605 tok/s | 139.3 tok/s |
 
 ## Risks
 

@@ -6,8 +6,8 @@ from infurnace.kernels.quant_gemv import (quant_gemv, prepare_q2, prepare_q6, pr
                                           dequant_prepared_q6, untile)
 from infurnace.kernels.quant_gemm import quant_gemm, nv_prefill_supported
 
-GEMM_TYPES = (12, 13, 14)       # Q4_K, Q5_K, Q6_K: tensor-core GEMM for prompt chunks, and the packed row gather
-KERNEL_TYPES = (12, 13, 14, 42)  # and Q2_0: the one-row GEMV (multirow inputs go through it row by row)
+KERNEL_TYPES = (12, 13, 14, 42)  # Q4_K, Q5_K, Q6_K, Q2_0: the one-row GEMV and the tensor-core GEMM for prompt chunks
+GATHER_TYPES = (12, 13, 14)      # the packed row gather (embedding lookups); Q2_0 tables decode their rows in tensor ops
 
 class _NVLinear:
   """Single-token fast path using explicit GGUF identity, never graph-size guessing.
@@ -18,7 +18,7 @@ class _NVLinear:
   def __init__(self, original, entry: PackedTensor, *, prefill: bool = False, q6_aligned: bool = False,
                q6_tiled: bool = True, q4_tiled: bool = True, realize: bool = True):
     self.original = original
-    if prefill and entry.ggml_type not in GEMM_TYPES: raise ValueError("NV packed prefill supports only Q4_K/Q5_K/Q6_K")
+    if prefill and entry.ggml_type not in KERNEL_TYPES: raise ValueError("NV packed prefill supports only Q4_K/Q5_K/Q6_K/Q2_0")
     self.prefill = prefill
     if prefill and not nv_prefill_supported(entry.data.device):
       raise ValueError("NV prefill requires CUDA-C FP16 tensor cores")

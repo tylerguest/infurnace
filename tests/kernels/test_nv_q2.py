@@ -33,3 +33,14 @@ def test_fwht_matches_the_dense_transform(rows, width, perm):
   reordered = x.reshape(rows, *perm).transpose(1, 2).reshape(rows, width) if perm else x  # tiled (rep, nk, hd) -> grouped
   assert (fwht(x, signs, block=512, perm=perm) - dense(reordered * signs)).abs().max().item() < 1e-4
   assert (fwht(x, signs, block=512, signs_after=True) - dense(x) * signs).abs().max().item() < 1e-4
+
+@pytest.mark.parametrize("out_features,in_features,tokens", [(64, 2560, 64), (96, 9216, 17)])
+def test_q2_0_prefill_gemm_matches_dense(out_features, in_features, tokens):
+  from infurnace.kernels.quant_gemm import quant_gemm
+  raw, values = q2_blocks(out_features * in_features // 64, seed=tokens)
+  dense = Tensor(values, device="NV").reshape(out_features, in_features)
+  x = Tensor.randn(tokens, in_features, device="NV").realize()
+  reference = x.half().float() @ dense.T  # the GEMM multiplies FP16 activations and weights, accumulating in FP32
+  got = quant_gemm(x, prepare_q2(Tensor(raw, dtype=dtypes.uint8, device="NV")), out_features=out_features, in_features=in_features,
+                   ggml_type=Q2_0)
+  assert ((got - reference).abs().max() / reference.abs().max()).item() < 1e-3

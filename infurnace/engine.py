@@ -26,7 +26,7 @@ from infurnace.hadamard import rotations
 from infurnace.kernels.attention import attention
 from infurnace.kernels.quant_gemm import nv_prefill_supported
 from infurnace.kernels.quant_gemv import dequant_prepared_q2, q8_quantize
-from infurnace.linear import GEMM_TYPES, _NVLinear
+from infurnace.linear import GATHER_TYPES, _NVLinear
 from infurnace.device import nvidia
 from infurnace.models import Family, family_for
 
@@ -113,7 +113,7 @@ class _PackedLinear(_NVLinear):
   the packed GEMM when available, otherwise the multirow packed GEMV.
   """
   def __init__(self, original, entry, *, prefill: bool, keep_weight: bool = False, realize: bool = True):
-    super().__init__(original, entry, prefill=prefill and entry.ggml_type in GEMM_TYPES, q6_aligned=True, realize=realize)
+    super().__init__(original, entry, prefill=prefill, q6_aligned=True, realize=realize)
     if not keep_weight: self.weight = original.weight = None
 
   def __call__(self, x):
@@ -630,7 +630,7 @@ class Model:
         layers.setdefault(name.split('.')[1] if name.startswith('blk.') else name, []).append(adapter.packed)
         setattr(owner, attribute, adapter)
         packed.add(name)
-        if tied and entry.ggml_type not in GEMM_TYPES:
+        if tied and entry.ggml_type not in GATHER_TYPES:
           # No row-gather kernel (Q2_0): lookups decode their rows from the packed table.
           self.transformer.token_embd = _PackedEmbedding(adapter)
         elif tied:
