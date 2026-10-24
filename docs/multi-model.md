@@ -132,22 +132,30 @@ present a failed open is retried and reported instead of falling back to the CPU
         producer cost 21-125 us a rotation). 6.6 -> ~140 tok/s
   - [x] Prompt chunks: a Q2_0 tensor-core GEMM over a k order matching the packed codes. ~350 -> 1,340-1,610 tok/s;
         at 64 rows it runs at ~25 TFLOPS, near the FP16 tensor cores' FP32-accumulation ceiling on this card
-  - [ ] Faster prompt reading: ternary weights are exact in int8, and int8 tensor cores (mma.sync s8, through
-        inline PTX) have several times the throughput; activations quantized per 32 values as decode already does
+  - [x] Int8 tensor cores for prompt chunks: ternary weights are exact in int8, and m16n8k32 s8 MMA (inline PTX:
+        tinygrad's tensor cores are FP16/BF16/TF32/FP8) runs at 140 T ops/s on this card against 35 TFLOPS for FP16
+        with FP32 accumulation. Activations take one int8 scale per 64 values (a Q2_0 block), so a block's two MMAs
+        chain in int32 and are scaled once; four 16-token tiles a warp share each decoded weight register. The
+        matmuls of a 64-row chunk: 20.0 ms (FP16) -> 10.5 ms; prompt reading 1,337-1,605 -> 1,609-2,052 tok/s;
+        perplexity 25.4245 (llama.cpp 25.4209)
   - [ ] Faster decode: the transform (warp shuffles for the first five stages, Q8 quantization fused in) and the
         GEMV (316 GB/s of ~450)
   - [ ] DFlash2 draft (`Ternary-Bonsai-2-4B-DFlash2-BF16.gguf`, 1.58 GB): check its format against DFlash, requantize
 - [ ] Bonsai-2B and its third-party Qwen3.5-2B drafts
 
 Measured 2026-10-18 (RTX 5060), Bonsai-4B against llama.cpp on the same GGUF: eval.txt (512 × 8) llama.cpp
-25.4209, one-row 25.4294 (+0.03%), 16-row 25.4304 (+0.04%); multilingual.txt (512 × 5) llama.cpp 15.2132, one-row
+25.4209, one-row 25.4294 (+0.03%), 16-row 25.4245 (+0.01%, int8 tensor cores); multilingual.txt (512 × 5) llama.cpp 15.2132, one-row
 15.2253, 16-row 15.2242. Plain decoding:
 
 | Prompt | TTFT | Prompt reading | Decode |
 |---|---|---|---|
-| 124 | 255 ms | 485 tok/s | 140.3 tok/s |
-| 1,024 | 766 ms | 1,337 tok/s | 138.3 tok/s |
-| 4,024 | 2.51 s | 1,605 tok/s | 139.3 tok/s |
+| 124 | 245 ms | 505 tok/s | 137.8 tok/s |
+| 1,024 | 636 ms | 1,609 tok/s | 140.1 tok/s |
+| 4,024 | 1.97 s | 2,047 tok/s | 132.8 tok/s |
+| 8,024 | 3.91 s | 2,052 tok/s | 123.4 tok/s |
+
+The rest of a 64-row chunk (~14 of ~25 ms): the Hadamard transforms (4.0 ms) and int8 quantization (1.2 ms), which
+could be one kernel, GDN (4.1 ms, as Qwen3.5's) and ~1,000 small generated kernels.
 
 ## Risks
 

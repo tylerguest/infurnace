@@ -14,7 +14,8 @@ from tinygrad.dtype import AddrSpace
 from tinygrad.renderer.cstyle import CUDARenderer
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops
 
-from infurnace.kernels.quant_gemv import Q2_0, Q4_K, Q5_K, Q6_K, Q6_PREPARED_BYTES, QUANT_SIZES, _half, _load_lanes, _q4_scales, _q4_word
+from infurnace.kernels.quant_gemv import (Q2_0, Q4_K, Q5_K, Q6_K, Q6_PREPARED_BYTES, QUANT_SIZES, _half, _load_lanes, _q4_scales, _q4_word,
+                                          q8_quantize64)
 from infurnace.device import nvidia
 
 class QuantGemmError(ValueError):
@@ -549,6 +550,81 @@ def _prefill_q2_mma(out: UOp, raw: UOp, x: UOp, *, tokens: int, width: int, rows
             for t, acc in enumerate(accs) for i, (r, c) in enumerate(((0, 0), (0, 1), (8, 0), (8, 1)))]
   return UOp.group(*stores).end(block, warp, lane).sink(arg=KernelInfo(name="prefill_q2_0_mma", opts_to_apply=()))
 
+# One int8 tensor-core MMA (m16n8k32, int32 accumulation) through inline PTX: tinygrad's tensor cores are FP16, BF16,
+# TF32 and FP8 only. It is four pure expressions, one per output register: the asm isn't volatile and has identical
+# inputs, so the compiler merges them into one instruction (a void statement would be dropped as having no effect).
+# RTX 5060: 140 T ops/s, against 35 TFLOPS for FP16 with FP32 accumulation.
+_IMMA = ('[&]() {{ int d0, d1, d2, d3; asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {{%0,%1,%2,%3}}, {{%4,%5,%6,%7}}, '
+         '{{%8,%9}}, {{%10,%11,%12,%13}};" : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3) : "r"({0}), "r"({1}), "r"({2}), "r"({3}), '
+         '"r"({4}), "r"({5}), "r"({6}), "r"({7}), "r"({8}), "r"({9})); return d{index}; }}()')
+
+def _imma(a: list[UOp], b: list[UOp], c: list[UOp]) -> list[UOp]:
+  """D = A x B + C: A four words of 4 int8 (rows g, g+8 at k 4t..; then k 16+4t..), B two (k 4t.., 16+4t.. of column
+  g), C and D four int32 (rows g, g+8; columns 2t, 2t+1), for g = lane / 4 and t = lane % 4."""
+  return [UOp(Ops.CUSTOMI, src=(*a, *b, *c), arg=(_IMMA.replace('{index}', str(i)), dtypes.int32)) for i in range(4)]
+
+@functools.cache
+def _prefill_q2_imma(out: UOp, raw: UOp, xq: UOp, xd: UOp, *, tokens: int, width: int, rows: int, tiles: int = 1,
+                     splits: int = 1, mtiles: int = 1) -> UOp:
+  """Q2_0 (prepare_q2's layout) against int8 activations (q8_quantize64: one scale per 64 values, a Q2_0 block) on
+  int8 tensor cores.
+
+  The weights are exact in int8. A block is two m16n8k32 steps in their natural k order: a thread's A words are
+  words t and t+4 of each 32-value half, and its B values are byte t of the half's two code words, spread to bytes
+  and made signed with a per-byte subtract (__vsub4). Both steps accumulate in int32; the block's sums are then
+  scaled by the activation scale (per token) and the weight block's scale (per output) into FP32. Each warp covers
+  `mtiles` 16-token tiles, so a decoded weight register feeds `mtiles` MMAs: the integer and scale work around the
+  MMAs, not the tensor cores, bounds this kernel."""
+  warps = math.gcd(rows//(8*tiles), 4)
+  output_blocks = rows//(warps*8*tiles)
+  blocks = width//64//splits
+  block = UOp.range((tokens//(16*mtiles))*output_blocks*splits, 0, axis_type=AxisType.GLOBAL)
+  lane = UOp.range(32, -1, axis_type=AxisType.WARP)
+  warp = UOp.range(warps, 1, axis_type=AxisType.LOCAL)
+  split, rest = block%splits, block//splits
+  token_base = (rest//output_blocks)*16*mtiles
+  output_base = (rest%output_blocks)*warps*8*tiles+warp*8*tiles
+  group, thread = lane//4, lane%4
+  accs = {}
+  for m in range(mtiles):
+    for t in range(tiles):
+      acc = UOp.placeholder((4,), dtypes.float32, slot=3+m*tiles+t, addrspace=AddrSpace.REG)
+      accs[m, t] = acc.after(acc.store(acc.const_like(0)))
+  kb = UOp.range(blocks, 2, axis_type=getattr(AxisType, 'REDUCE', AxisType.LOOP))
+  qblock = split*blocks+kb
+  def weight_scale(row: UOp) -> UOp:
+    index = row*(width//64)+qblock
+    return _half((raw[rows*width//16+index//2].load() >> ((index%2)*16).cast(dtypes.uint32)) & 65535)
+  weights = []
+  for t in range(tiles):
+    words = _load_lanes(raw[((output_base+t*8+group)*width+qblock*64)//16], 4)  # this lane's weight row, the whole block
+    b = []
+    for step in range(2):
+      pair = []
+      for half in range(2):
+        byte = (words[step*2+half] >> (thread*8).cast(dtypes.uint32)) & 255
+        spread = (byte | (byte << 6) | (byte << 12) | (byte << 18)) & 0x03030303
+        pair.append(UOp(Ops.CUSTOMI, src=(spread,), arg=("__vsub4({0}, 0x01010101u)", dtypes.uint32)))  # codes 0-2 -> -1..1
+      b.append(pair)
+    weights.append((b, [weight_scale(output_base+t*8+thread*2+c) for c in (0, 1)]))  # this lane's two output columns
+  values = {key: [acc.after(kb)[i].load() for i in range(4)] for key, acc in accs.items()}
+  zero = UOp.const(0, dtypes.int32)
+  for m in range(mtiles):
+    tokens_m = [token_base+m*16+group+r for r in (0, 8)]
+    # (row g, k 4t), (row g+8, k 4t), (row g, k 16+4t), (row g+8, k 16+4t) of each 32-value step
+    a = [[xq[tokens_m[r], qblock, step*8+thread+w].load() for w in (0, 4) for r in (0, 1)] for step in range(2)]
+    row_scales = [xd[tokens_m[r], qblock].load() for r in (0, 1)]
+    for t, (b, columns) in enumerate(weights):
+      d = _imma(a[0], b[0], [zero]*4)
+      d = _imma(a[1], b[1], d)
+      for i, (r, c) in enumerate(((0, 0), (0, 1), (1, 0), (1, 1))):
+        values[m, t][i] = values[m, t][i] + d[i].float()*(row_scales[r]*columns[c])
+  updates = [acc.store(UOp.stack(*values[key])) for key, acc in accs.items()]
+  done = UOp.group(*updates).end(kb)
+  stores = [out[split, token_base+m*16+group+r, output_base+t*8+thread*2+c].store(acc.after(done)[i].load())
+            for (m, t), acc in accs.items() for i, (r, c) in enumerate(((0, 0), (0, 1), (8, 0), (8, 1)))]
+  return UOp.group(*stores).end(block, warp, lane).sink(arg=KernelInfo(name="prefill_q2_0_imma", opts_to_apply=()))
+
 def _schedule(rows: int, width: int, tokens: int) -> tuple[int, int, int]:
   """(tiles per warp, K splits, k unroll), tuned on an RTX 5060 from profiler GPU
   times: four tiles always win; split K only until there are ~64 blocks (each
@@ -594,6 +670,19 @@ def quant_gemm(x: Tensor, packed: Tensor, *, out_features: int, in_features: int
   tiles, splits, unroll = _schedule(out_features, in_features, padded_tokens)
   out = Tensor.empty(splits, padded_tokens, out_features, dtype=dtypes.float32, device=x.device)
   paired = os.environ.get('INFURNACE_Q4_PAIRED', '1') != '0'
+  if ggml_type == Q2_0 and os.environ.get('INFURNACE_Q2_INT8', '1') != '0':
+    xq, xd = q8_quantize64(activation, padded_tokens, in_features)
+    # RTX 5060, Bonsai-4B 64-row chunks: the int8 matmuls take 11.8 ms with two 16-token tiles a warp, 10.5 with four
+    mtiles = next(m for m in (4, 2, 1) if (padded_tokens//16) % m == 0)
+    warps = math.gcd(out_features//(8*tiles), 4)
+    grid, kblocks = (padded_tokens//(16*mtiles))*(out_features//(warps*8*tiles)), in_features//64
+    # Split K only until there are about two blocks per SM (30 on an RTX 5060)
+    splits = next(s for s in range(1, kblocks+1) if kblocks % s == 0 and (grid*s >= 60 or s == kblocks))
+    out = Tensor.empty(splits, padded_tokens, out_features, dtype=dtypes.float32, device=x.device)
+    result = Tensor.custom_kernel(out, packed.flatten().contiguous(), xq, xd, fxn=functools.partial(
+      _prefill_q2_imma, tokens=padded_tokens, width=in_features, rows=out_features, tiles=tiles, splits=splits, mtiles=mtiles))[0]
+    result = result[0] if splits == 1 else result.sum(0)
+    return result[:tokens].reshape(*x.shape[:-1], out_features)
   if ggml_type == Q2_0:
     result = Tensor.custom_kernel(out, packed.flatten().contiguous(), activation, fxn=functools.partial(
       _prefill_q2_mma, tokens=padded_tokens, width=in_features, rows=out_features, tiles=tiles, splits=splits))[0]

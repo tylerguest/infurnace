@@ -189,6 +189,30 @@ def q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor, 
   q, scale, xsum = Tensor.custom_kernel(q, scale, xsum, x, fxn=functools.partial(_q8_quantize_kernel, tokens=tokens, in_features=in_features))[:3]
   return q, scale, xsum
 
+def _q8_quantize64_kernel(q: UOp, scale: UOp, x: UOp, tokens: int, in_features: int) -> UOp:
+  """Int8 activations with one FP32 scale per 64 values (a Q2_0 block): a warp per group, two values a lane; lanes
+  0-15 each pack four into a word."""
+  groups = in_features // 64
+  token_group, lane = UOp.range(tokens * groups, 0), UOp.range(32, 1, axis_type=AxisType.LOCAL)
+  token, group = token_group // groups, token_group % groups
+  x = x.reshape(tokens, groups, 64)
+  biggest = x[token, group, lane].float().abs().maximum(x[token, group, lane + 32].float().abs())
+  group_scale = (warp_reduce(biggest, maximum=True, full_wave=True) / 127).maximum(1e-8)
+  word_lane = lane.minimum(15)
+  xs = tuple(x[token, group, word_lane * 4 + i].float() for i in range(4))
+  word = sum(((v / group_scale).round().clip(-127, 127).cast(dtypes.int8).cast(dtypes.uint8).cast(dtypes.uint32)
+              << (i * 8) for i, v in enumerate(xs)), UOp.const(0, dtypes.uint32))
+  stores = (q[token, group, lane.valid(lane < 16)].store(word), scale[token, group.valid(lane.eq(0))].store(group_scale))
+  return UOp.group(*stores).end(token_group, lane).sink(arg=KernelInfo(name="q8_quantize64", opts_to_apply=()))
+
+def q8_quantize64(x: Tensor, tokens: int, in_features: int) -> tuple[Tensor, Tensor]:
+  """(tokens, in_features / 64, 16) words of int8 values and (tokens, in_features / 64) scales."""
+  groups = in_features // 64
+  q = Tensor.empty(tokens, groups, 16, dtype=dtypes.uint32, device=x.device)
+  scale = Tensor.empty(tokens, groups, dtype=dtypes.float32, device=x.device)
+  q, scale = Tensor.custom_kernel(q, scale, x, fxn=functools.partial(_q8_quantize64_kernel, tokens=tokens, in_features=in_features))[:2]
+  return q, scale
+
 def _decode_warps(ggml_type: int, in_features: int, out_features: int) -> int:
   # RTX 5060, tiled Q4_K: 8 warps (eight adjacent rows, 1,152 contiguous bytes per block) 3.72 ms for all
   # projections against 3.98-4.23 ms with 4.

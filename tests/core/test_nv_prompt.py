@@ -1,5 +1,5 @@
 """Real-model checks for multirow prompt reading, on each family: Qwen3.5-4B (GDN and attention) and Qwen3-4B
-(attention only), both Q4_K_M on NV.
+(attention only), both Q4_K_M, and Bonsai-4B (Qwen3.5 with ternary Q2_0 weights and Hadamard-rotated inputs), on NV.
 
 Marked nv (INFURNACE_TEST_NV=1); needs the model files below; loads each (~3 GB) once.
 """
@@ -9,7 +9,8 @@ import pytest
 from infurnace.chat import user_prompt
 from infurnace.engine import PROMPT_ROWS
 
-TARGETS = [Path('models/qwen35-validation/Qwen3.5-4B-Q4_K_M.gguf'), Path('models/Qwen3-4B-Q4_K_M.gguf')]
+TARGETS = [Path('models/qwen35-validation/Qwen3.5-4B-Q4_K_M.gguf'), Path('models/Qwen3-4B-Q4_K_M.gguf'),
+           Path.home() / '.local/share/infurnace/models/Ternary-Bonsai-2-4B-Q2_0.gguf']
 pytestmark = pytest.mark.nv
 
 @pytest.fixture(scope='module', params=TARGETS, ids=lambda path: path.stem)
