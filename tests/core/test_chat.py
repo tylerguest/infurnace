@@ -2,12 +2,49 @@ import pytest
 from types import SimpleNamespace
 
 from infurnace import cli
+from infurnace.chat import ChatTemplate
+from jinja2.exceptions import SecurityError
 
 class Tokenizer:
   bos_id = eos_id = eot_id = None
   def encode(self, text): return [1, 2]
   def is_end(self, token): return token == 9
   def stream_decoder(self): return lambda token: "!" if token is None else str(token)
+
+@pytest.mark.parametrize('source', [
+  '{{ cycler.__init__.__globals__.os.popen("printf TEMPLATE_EXECUTED").read() }}',
+  '{{ strftime_now.__globals__["time"].time() }}',
+  '{{ messages.__class__.__mro__ }}',
+])
+def test_chat_template_blocks_python_internals(source):
+  tok = SimpleNamespace(bos_id=None, eos_id=0, decode=lambda ids: '<eos>')
+  template = ChatTemplate({'tokenizer.chat_template': source}, tok)
+  with pytest.raises(SecurityError): template.render([{'role': 'user', 'content': 'hello'}])
+
+@pytest.mark.parametrize('source', [
+  '{{ messages.append({"role": "assistant", "content": "injected"}) }}',
+  '{{ messages[0].update({"content": "changed"}) }}',
+  '{{ tools.clear() }}',
+])
+def test_chat_template_cannot_mutate_inputs(source):
+  tok = SimpleNamespace(bos_id=None, eos_id=0, decode=lambda ids: '<eos>')
+  template = ChatTemplate({'tokenizer.chat_template': source}, tok)
+  messages, tools = [{'role': 'user', 'content': 'hello'}], [{'name': 'read'}]
+  with pytest.raises(SecurityError): template.render(messages, tools=tools)
+  assert messages == [{'role': 'user', 'content': 'hello'}]
+  assert tools == [{'name': 'read'}]
+
+@pytest.mark.parametrize('thinking', [False, True])
+def test_sandboxed_chat_template_renders_conversation_and_tools(thinking):
+  tok = SimpleNamespace(bos_id=1, eos_id=0, decode=lambda ids: '<bos>' if ids == [1] else '<eos>')
+  source = ('{{ bos_token }}{% for m in messages %}{{ m.role }}:{{ m.content }};{% endfor %}'
+            '{{ tools | tojson }}{{ "<think>" if enable_thinking else "plain" }}{{ eos_token }}')
+  template = ChatTemplate({'tokenizer.chat_template': source}, tok)
+  messages = [{'role': 'developer', 'content': 'help'}, {'role': 'user', 'content': 'hello'},
+              {'role': 'assistant', 'content': 'hi'}, {'role': 'user', 'content': 'read'}]
+  assert template.render(messages, thinking=thinking, tools=[{'name': 'read'}]) == (
+    '<bos>system:help;user:hello;assistant:hi;user:read;[{"name": "read"}]'
+    + ('<think>' if thinking else 'plain') + '<eos>')
 
 class Template:
   def render(self, messages, **kwargs): return "chat"

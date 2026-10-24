@@ -6,13 +6,14 @@ import time
 class ChatTemplate:
   def __init__(self, metadata, tokenizer, enable_thinking=True):
     try:
-      import jinja2
+      from jinja2.sandbox import ImmutableSandboxedEnvironment
     except ImportError as exc:
       raise ValueError("chat requires Jinja2: python3 -m pip install jinja2 (or reinstall infurnace)") from exc
     source = metadata.get('tokenizer.chat_template')
     if not isinstance(source, str) or not source:
       raise ValueError("chat requires the GGUF's chat template (tokenizer.chat_template)")
-    env = jinja2.Environment()
+    # GGUF templates are model-supplied code: block Python internals and input mutation.
+    env = ImmutableSandboxedEnvironment()
     env.filters['tojson'] = lambda obj, **kwargs: json.dumps(obj, **kwargs)
     env.globals['raise_exception'] = lambda msg: (_ for _ in ()).throw(RuntimeError(msg))
     env.globals['strftime_now'] = lambda fmt: time.strftime(fmt)
