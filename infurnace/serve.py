@@ -36,12 +36,15 @@ except _metadata.PackageNotFoundError: VERSION = '0.0.0'
 def _now() -> str:
   return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
+class ClientDisconnected(Exception):
+  """Abort a request without attempting to write a response to its closed socket."""
 class ServerModel:
   """What tinygrad's server generates with: DFlash when a draft is loaded (one generator serves every
   temperature), else plain decoding, bounded by the context and closed when a client goes away."""
   def __init__(self, model, dflash=None, *, eos_token_ids: tuple[int, ...] = (), block_size: int = 16):
     self.model, self.dflash, self.eos, self.block = model, dflash, eos_token_ids, block_size
     self.max_context = model.config.context_length
+    self.cancelled: Callable[[], bool] | None = None
 
   def get_start_pos(self, ids):  # only for the server's log line: the reused prefix, counting the prompt snapshot
     snapshots = getattr(self.model, 'snapshot_length', None)
@@ -53,7 +56,13 @@ class ServerModel:
       stream = self.dflash.stream(list(ids), max_new_tokens=budget, block_size=self.block, eos_token_ids=self.eos, temperature=temperature)
     else: stream = self.model.generate(ids, budget, temperature=temperature)
     try:
-      yield from stream
+      # Check every token, including text the upstream handler buffers for tool calls.
+      while True:
+        if self.cancelled is not None and self.cancelled(): raise ClientDisconnected()
+        try: token = next(stream)
+        except StopIteration: return
+        if self.cancelled is not None and self.cancelled(): raise ClientDisconnected()
+        yield token
     finally:
       stream.close()
 
@@ -134,8 +143,12 @@ class RequestHandler(Handler):
       if not self.usable() or not self.use_model(body.get('model') if isinstance(body, dict) else None, strict=False): return
       template = self.server.template
       template.request_thinking = request_thinking(body)
+      model = self.server.model
+      model.cancelled = self.client_gone  # shared model is protected by the GPU lock
       try: super().do_POST()
+      except ClientDisconnected: pass
       finally:
+        model.cancelled = None
         template.request_thinking = None
         self.server.last_used = time.monotonic()
 

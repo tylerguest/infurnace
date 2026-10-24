@@ -1,6 +1,7 @@
 import http.client
 import json
 import os
+import pytest
 import socket
 import threading
 import time
@@ -228,6 +229,33 @@ def test_non_streamed_reply_stops_when_the_client_leaves():
     deadline = time.monotonic() + 3
     while not model.closed and time.monotonic() < deadline: time.sleep(0.02)
     assert model.closed and model.count < 500
+  finally:
+    model.release.set()
+    stop()
+
+@pytest.mark.parametrize('prefix', ['', '<tool_call>'])
+def test_openai_non_streamed_reply_stops_when_the_client_leaves(prefix):
+  class BufferedModel(SlowModel):
+    def generate(self, ids, limit, temperature=0):
+      yield from map(ord, prefix)
+      yield from super().generate(ids, limit, temperature)
+  model, tok = BufferedModel(), Tokenizer()
+  template = ChatTemplate({'tokenizer.chat_template': '{% for m in messages %}{{ m.content }}{% endfor %}'}, tok)
+  server, call, stop = serving(model, tok, template)
+  try:
+    body = json.dumps({'model': 'test', 'messages': [{'role': 'user', 'content': 'x'}], 'stream': False}).encode()
+    with socket.create_connection(server.server_address) as conn:
+      conn.sendall(b'POST /v1/chat/completions HTTP/1.1\r\nContent-Length: %d\r\n\r\n' % len(body) + body)
+      assert model.started.wait(5)
+    deadline = time.monotonic() + 3
+    while not model.closed and time.monotonic() < deadline: time.sleep(0.02)
+    assert model.closed and model.count < 500
+    # Cancellation must release the GPU lock and not leak into the next request.
+    model.release.set()
+    status, data = call('POST', '/v1/chat/completions',
+                        {'model': 'test', 'messages': [{'role': 'user', 'content': 'next'}], 'stream': False})
+    assert status == 200 and json.loads(data)['choices']
+    assert server.model.cancelled is None
   finally:
     model.release.set()
     stop()
