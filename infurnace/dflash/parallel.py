@@ -81,6 +81,7 @@ class ParallelVerifier:
     self._count = UOp.variable('dflash_commit_rows', 1, rows)
     self._forward_jit, self._commit_jit = captured(self._forward_store), captured(self._commit)
     self._round_jit = None
+    self._draft_anchor = None  # the draft's anchor buffer, which the fused round's pick also writes (see _round_graphs)
     self._fused = rows == 16 and nvidia(self.device) and all(
       b.head_k_dim == 128 and b.head_v_dim == 128 for b in model.transformer.blk if isinstance(b, GatedDeltaNetBlock))
 
@@ -187,6 +188,7 @@ class ParallelVerifier:
     index = Tensor.arange(self.rows)
     anchor = (_raw(self._decisions)[0] * (index == Tensor(count) - 1)).sum().cast(dtypes.int32).reshape(1)
     anchor = _stored(self._anchor, anchor).realize()
+    if self._draft_anchor is not None: _stored(self._draft_anchor, anchor).realize()  # DFlash2's selector starts from it
     masks = Tensor.full((self.rows - 1,), mask, dtype=dtypes.int32)
     noise_ids = _stored(self._noise_ids, anchor.cat(masks)).realize()
     return _stored(self._noise, self._gather(noise_ids).reshape(1, self.rows, -1)).realize()
@@ -291,6 +293,7 @@ class ParallelVerifier:
   def _round_graphs(self, draft):
     """The fused round's captured graphs (created once, idempotent)."""
     if self._round_jit is None:
+      self._draft_anchor = draft.anchor
       self._round_jit = (captured(functools.partial(self._pick, mask=draft.config.mask_token)), captured(self._ids),
                          captured(self._pack))
       self._draft_position = UOp.variable('dflash_position', 1, draft.capacity - self.rows)

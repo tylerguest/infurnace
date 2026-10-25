@@ -1,4 +1,10 @@
-"""Tinygrad DFlash GGUF block-diffusion drafter (no external model runtime)."""
+"""Tinygrad DFlash GGUF block-diffusion drafter (no external model runtime).
+
+DFlash2 drafts (`dflash.conv_kernel_size`, `dflash.selector_rank`; llama.cpp's src/models/dflash.cpp) add to each
+layer a short convolution over the block's positions around attention and the feed-forward, whose per-position
+weights are a learned base plus coefficients projected from the hidden state, and replace the argmax per position
+with a selector: the top candidates of each position, chosen greedily by a learned score of each candidate given
+the token chosen before it."""
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
@@ -8,13 +14,16 @@ from pathlib import Path
 from tinygrad import Context, Tensor, UOp, nn, dtypes
 from tinygrad.llm.model import apply_rope, precompute_freqs_cis
 from tinygrad.nn.state import get_parameters, get_state_dict, load_state_dict
-from infurnace.gguf import parse_gguf
+from infurnace.gguf import PackedTensor, parse_gguf
+from infurnace.quantize import Q4_K, quantize_q4_k
 from infurnace.linear import _NVLinear
 from infurnace.kernels.quant_gemv import QUANT_SIZES
 from infurnace.kernels.quant_gemm import nv_prefill_supported
 from infurnace.engine import Model
 from infurnace.dflash.jit import captured
 from infurnace.kernels.attention import attention, store_rows
+from infurnace.kernels.embedding import dense_gather
+from infurnace.kernels.topk import topk
 from infurnace.device import nvidia
 
 @dataclass(frozen=True)
@@ -33,6 +42,10 @@ class DFlashConfig:
   sliding: tuple[bool, ...]
   window: int
   causal: bool | None = None
+  conv_kernel: int = 0     # DFlash2: positions each convolution reaches back (0: no convolutions)
+  conv_group: int = 0      # channels sharing a dynamic coefficient
+  selector_rank: int = 0   # DFlash2: the selector's rank (0: argmax drafting)
+  selector_top_k: int = 0  # candidates per position
 
   def layer_causal(self, index: int) -> bool:
     # Current z-lab/dflash defaults: sliding layers causal, full layers
@@ -68,12 +81,20 @@ class DFlashConfig:
       raise ValueError('invalid DFlash norm/RoPE parameters')
     causal = metadata.get('dflash.attention.causal')
     if causal is not None and type(causal) is not bool: raise ValueError('invalid DFlash causal flag')
-    for key in ('expert_count', 'conv_kernel_size', 'selector_rank', 'sample_from_anchor'):
+    for key in ('expert_count', 'sample_from_anchor', 'logit_scale', 'final_logit_softcapping', 'embedding_scale', 'attention.scale',
+                'attention.value_scale', 'lilicorr.hidden_size'):
       if metadata.get('dflash.' + key, 0): raise ValueError(f'unsupported DFlash feature: {key}')
+    def optional(key):
+      value = metadata.get('dflash.' + key, 0)
+      if type(value) is not int or value < 0: raise ValueError(f'invalid dflash.{key}')
+      return value
+    conv_kernel, conv_group, rank, top_k = (optional(k) for k in ('conv_kernel_size', 'conv_group_size', 'selector_rank', 'selector_top_k'))
+    if conv_kernel and (not conv_group or dim % conv_group): raise ValueError('invalid DFlash2 convolution groups')
+    if bool(rank) != bool(top_k): raise ValueError('invalid DFlash2 selector')
     if metadata.get('dflash.rope.scaling.type', 'none') not in ('none', 'default'):
       raise ValueError('unsupported DFlash RoPE scaling')
     return cls(layers, dim, integer('feed_forward_length'), heads, kv_heads, hd, epsilon, theta,
-               integer('block_size'), mask, tuple(features), tuple(pattern), window, causal)
+               integer('block_size'), mask, tuple(features), tuple(pattern), window, causal, conv_kernel, conv_group, rank, top_k)
 
 def projection(layer, x):
   # Draft rows are simultaneous. Multirow packed GEMM reads weights once;
@@ -90,13 +111,20 @@ class DraftBlock:
     self.attn_output = nn.Linear(c.heads * c.head_dim, c.dim, bias=False)
     self.ffn_gate, self.ffn_up = (nn.Linear(c.dim, c.hidden, bias=False) for _ in range(2))
     self.ffn_down = nn.Linear(c.hidden, c.dim, bias=False)
+    if c.conv_kernel:  # DFlash2: (side: before/after, tap, channel) bases and their per-position coefficients
+      for part in ('attn', 'ffn'):
+        setattr(self, f'{part}_conv_proj', nn.Linear(c.dim, c.dim // c.conv_group * c.conv_kernel * 2, bias=False))
+        setattr(self, f'{part}_conv_base', Tensor.zeros(2, c.conv_kernel, c.dim))
 
 class DraftWeights:
-  def __init__(self, config):
+  def __init__(self, config, vocab: int = 0):
     self.fc = nn.Linear(config.dim * len(config.feature_layers), config.dim, bias=False)
     self.enc = {'output_norm': nn.RMSNorm(config.dim, config.epsilon)}
     self.output_norm = nn.RMSNorm(config.dim, config.epsilon)
     self.blk = [DraftBlock(config) for _ in range(config.layers)]
+    if config.selector_rank:  # DFlash2: a gate from each position's hidden state, and token tables for the scores
+      self.selector_hidden = nn.Linear(config.dim, config.selector_rank, bias=False)
+      self.selector_predecessor, self.selector_successor = (nn.Embedding(vocab, config.selector_rank) for _ in range(2))
 
 class DFlashDraft:
   def __init__(self, config: DFlashConfig, target: Model, weights: dict[str, Tensor]):
@@ -112,12 +140,12 @@ class DFlashDraft:
     # warmup): a callable returning (graph, its noise buffer), set by the parallel verifier.
     self.full_block_graph = None
     with Context(DEV=self.device):
-      self.weights = DraftWeights(config)
+      self.weights = DraftWeights(config, target.config.vocab_size)
       expected = get_state_dict(self.weights)
       if set(weights) != set(expected): raise ValueError('DFlash weight keys mismatch')
       for name, value in weights.items():
         if value.shape != expected[name].shape: raise ValueError(f'invalid DFlash shape: {name}, {value.shape}')
-      state = {name: value.to(self.device).cast(dtypes.float32 if name.endswith('norm.weight') else dtypes.float16)
+      state = {name: value.to(self.device).cast(dtypes.float32 if name.endswith(('norm.weight', 'conv_base')) else dtypes.float16)
                for name, value in weights.items()}
       load_state_dict(self.weights, state, verbose=False, realize=False)
       # One extra chunk of rows lets a padded context chunk end past capacity.
@@ -135,6 +163,9 @@ class DFlashDraft:
       self._start = UOp.variable('dflash_context_start', 0, self.capacity - 1)
       self._absorb_jit = captured(self._absorb)
       self._noise_inputs: dict[int, Tensor] = {}
+      # The block's anchor token id, read by DFlash2's selector inside the captured graphs (written by propose and
+      # by the fused round's pick)
+      self.anchor = Tensor.zeros(1, dtype=dtypes.int32, device=self.device).contiguous().realize()
       # Fixed-shape staging for observed rows; stores use a variable offset, so
       # only the row count (1..block) selects a kernel, never the history shape.
       self._context = Tensor.empty(1, config.block_size, config.dim * len(config.feature_layers), device=self.device).realize()
@@ -148,12 +179,20 @@ class DFlashDraft:
     if type(legacy_noncausal) is not bool: raise ValueError('invalid legacy attention policy')
     if legacy_noncausal: config = replace(config, causal=False)
     # Validate names/shapes before copying bytes to GPU.
-    with Context(DEV=target.device): expected = get_state_dict(DraftWeights(config))
+    with Context(DEV=target.device): expected = get_state_dict(DraftWeights(config, target.config.vocab_size))
     if set(entries) != set(expected): raise ValueError('DFlash GGUF weight keys mismatch')
     for name, entry in entries.items():
       if entry.shape != expected[name].shape: raise ValueError(f'invalid DFlash shape: {name}, {entry.shape}')
     # Lazy copies: everything is realized in one schedule at the end.
     resident = {name: entry.to(target.device, realize=False) for name, entry in entries.items()}
+    if packed and nvidia(target.device):
+      # Floating-point projections (DFlash2 ships in BF16) become Q4_K, so they run on the packed kernels: tinygrad's
+      # generic matmuls over 1.56 GB of FP16 weights took ~17 ms of a ~23 ms draft step. Row-lookup tables stay.
+      for name, entry in resident.items():
+        if (entry.ggml_type in (0, 1, 30) and len(entry.shape) == 2 and entry.shape[0] % 16 == 0 and entry.shape[1] % 256 == 0
+            and not name.startswith(('selector_predecessor', 'selector_successor'))):
+          # One at a time: all at once, the FP32 intermediates of 782M parameters would coexist (~3 GB)
+          resident[name] = PackedTensor(quantize_q4_k(entry.decode()).realize(), entry.shape, Q4_K)
     result = cls(config, target, {name: entry.decode() for name, entry in resident.items()})
     result.metadata, result.path = metadata, Path(path)
     result.packed_linears = 0
@@ -163,7 +202,7 @@ class DFlashDraft:
         if name.startswith('blk.'):
           _, layer, attr, _ = name.split('.')
           owner = result.weights.blk[int(layer)]
-        elif name == 'fc.weight': owner, attr = result.weights, 'fc'
+        elif name in ('fc.weight', 'selector_hidden.weight'): owner, attr = result.weights, name.split('.')[0]
         else: continue
         adapter = _NVLinear(getattr(owner, attr), entry, q6_aligned=True,
                             prefill=entry.ggml_type in (12, 13, 14) and nv_prefill_supported(target.device), realize=False)
@@ -251,11 +290,29 @@ class DFlashDraft:
       stored.append(store_rows(self.cache[i], Tensor.stack(k, v).half(), start, ring=self.ring[i]))
     Tensor.realize(*stored)
 
+  def _conv(self, x: Tensor, coefficients: Tensor, base: Tensor, side: int) -> Tensor:
+    """DFlash2's block convolution (llama.cpp's build_dflash2_conv): position p mixes rows p, p-1, ... of `x` (zero
+    before the block's first row), each tap weighted per channel by the base plus that position's coefficient for
+    the channel's group. `side` 0 runs before a sublayer, 1 after it."""
+    c, rows = self.config, x.shape[1]
+    groups = c.dim // c.conv_group
+    coeffs = coefficients.reshape(1, rows, 2, c.conv_kernel, groups)[:, :, side].float()             # (1, rows, taps, groups)
+    weight = coeffs.reshape(1, rows, c.conv_kernel, groups, 1).expand(1, rows, c.conv_kernel, groups, c.conv_group)
+    weight = weight.reshape(1, rows, c.conv_kernel, c.dim) + base[side].reshape(1, 1, c.conv_kernel, c.dim)
+    x, out = x.float(), None
+    for tap in range(min(c.conv_kernel, rows)):  # later taps only read the zeros before the block
+      term = weight[:, :, tap] * (x if tap == 0 else x.pad(((0, 0), (tap, 0), (0, 0)))[:, :rows])
+      out = term if out is None else out + term
+    return out
+
   def _denoise(self, noise: Tensor, position: UOp):
     c, weights = self.config, self.weights
     rows, x = noise.shape[1], noise
     for i, block in enumerate(weights.blk):
       residual, norm = x, block.attn_norm(x)
+      if c.conv_kernel:
+        attn_coeffs = projection(block.attn_conv_proj, norm)
+        norm = self._conv(norm, attn_coeffs, block.attn_conv_base, 0)
       q = block.attn_q_norm(projection(block.attn_q, norm).reshape(1, rows, c.heads, c.head_dim)).transpose(1, 2)
       k = block.attn_k_norm(projection(block.attn_k, norm).reshape(1, rows, c.kv_heads, c.head_dim)).transpose(1, 2)
       v = projection(block.attn_v, norm).reshape(1, rows, c.kv_heads, c.head_dim).transpose(1, 2)
@@ -265,9 +322,16 @@ class DFlashDraft:
       # within the window on sliding layers.
       attended = attention(q, cache, position, causal=c.layer_causal(i), window=c.window if c.sliding[i] else 0,
                            ring=self.ring[i], floor=self._floor if self.ring[i] else None).cast(q.dtype)
-      x = residual + projection(block.attn_output, attended.transpose(1, 2).reshape(1, rows, -1))
+      out = projection(block.attn_output, attended.transpose(1, 2).reshape(1, rows, -1))
+      if c.conv_kernel: out = self._conv(out, attn_coeffs, block.attn_conv_base, 1)
+      x = residual + out
       norm = block.ffn_norm(x)
-      x = x + projection(block.ffn_down, projection(block.ffn_gate, norm).silu() * projection(block.ffn_up, norm))
+      if c.conv_kernel:
+        ffn_coeffs = projection(block.ffn_conv_proj, norm)
+        norm = self._conv(norm, ffn_coeffs, block.ffn_conv_base, 0)
+      out = projection(block.ffn_down, projection(block.ffn_gate, norm).silu() * projection(block.ffn_up, norm))
+      if c.conv_kernel: out = self._conv(out, ffn_coeffs, block.ffn_conv_base, 1)
+      x = x + out
     return weights.output_norm(x[:, 1:])
 
   def _observe(self, features: Tensor, noise: Tensor, position: UOp | int, *, tokens: bool = False) -> Tensor:
@@ -279,8 +343,27 @@ class DFlashDraft:
     return self._forward(noise, position) if tokens else self._denoise(noise, position)
 
   def _forward(self, noise: Tensor, position: UOp):
-    logits = projection(self.target.transformer.output, self._denoise(noise, position))
-    return logits.argmax(-1).contiguous()
+    hidden = self._denoise(noise, position)
+    logits = projection(self.target.transformer.output, hidden)
+    if not self.config.selector_rank: return logits.argmax(-1).contiguous()
+    return self._select(logits.float().reshape(hidden.shape[1], -1), hidden.reshape(hidden.shape[1], -1))
+
+  def _select(self, logits: Tensor, hidden: Tensor) -> Tensor:
+    """DFlash2's selector, walked greedily (llama.cpp's build_dflash2_selector and its walk): each position's top
+    candidates score their logit plus successor(candidate) . (predecessor(previous choice) * gate(position)); the
+    best is chosen and becomes the next position's predecessor, starting from the anchor (`self.anchor`)."""
+    c, w = self.config, self.weights
+    rows = logits.shape[0]
+    values, candidates = topk(logits, c.selector_top_k)                                                   # (rows, k)
+    successors = dense_gather(candidates, w.selector_successor.weight)                                     # (rows, k, rank)
+    gates = projection(w.selector_hidden, hidden).float()                                                  # (rows, rank)
+    previous, chosen = self.anchor.reshape(1), []
+    for i in range(rows):
+      condition = dense_gather(previous, w.selector_predecessor.weight).reshape(c.selector_rank) * gates[i]
+      scores = (successors[i] * condition).sum(-1) + values[i]
+      previous = candidates[i][scores.argmax().reshape(1)].reshape(1)
+      chosen.append(previous)
+    return Tensor.cat(*chosen).reshape(1, rows).contiguous()
 
   def _denoise_graph(self, count: int):
     """The captured denoise graph for `count` proposals and its persistent noise
@@ -313,6 +396,7 @@ class DFlashDraft:
       graph, noise = self._denoise_graph(rows)
       embedded = self.target.embed([anchor] + [c.mask_token] * rows)
       Tensor(noise.uop.after(noise.uop.store(embedded.uop))).realize()
+      Tensor(self.anchor.uop.after(self.anchor.uop.store(Tensor([anchor], dtype=dtypes.int32, device=self.device).uop))).realize()
       pos = UOp.variable('dflash_position', 1, self.capacity - rows - 1).bind(position)
       decisions = graph(noise, pos).realize()
       output = [int(v) for v in Tensor(decisions.uop.buf_uop).reshape(rows).tolist()][:count]

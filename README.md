@@ -38,6 +38,7 @@ Other apps can use it as an OpenAI-compatible API at `http://127.0.0.1:8000/v1`.
 |---|---|---|
 | Qwen3.5-4B | `qwen3.5:4b` (default) | ~110 tokens/s, 200–340 with DFlash |
 | Qwen3-4B | `qwen3:4b` | ~108 tokens/s |
+| Bonsai-4B (ternary weights, 1.2 GB) | `bonsai:4b` | ~148 tokens/s, ~200–290 with DFlash2 |
 
 `infurnace run qwen3:4b` runs another one; `infurnace list` shows them all. More small models are coming.
 

@@ -138,9 +138,24 @@ present a failed open is retried and reported instead of falling back to the CPU
         chain in int32 and are scaled once; four 16-token tiles a warp share each decoded weight register. The
         matmuls of a 64-row chunk: 20.0 ms (FP16) -> 10.5 ms; prompt reading 1,337-1,605 -> 1,609-2,052 tok/s;
         perplexity 25.4245 (llama.cpp 25.4209)
+  - [x] One embedding lookup for every caller (`Model.lookup`): the Q2_0 token embedding, `Model.embed` and DFlash's
+        verifier once used three implementations, and DFlash on Bonsai embedded through the K-quant gather with no
+        inverse rotation (wrong replies). `packed_gather` decodes Q2_0 and rejects types it can't decode; a local GGUF
+        gets a catalog draft only if it is that model's file, and is served under its catalog name. Decode ~138 ->
+        ~148 tok/s, prompt reading ~2,050 -> ~2,240 (no whole-table scan per lookup)
   - [ ] Faster decode: the transform (warp shuffles for the first five stages, Q8 quantization fused in) and the
         GEMV (316 GB/s of ~450)
-  - [ ] DFlash2 draft (`Ternary-Bonsai-2-4B-DFlash2-BF16.gguf`, 1.58 GB): check its format against DFlash, requantize
+  - [x] DFlash2 draft (`Ternary-Bonsai-2-4B-DFlash2-BF16.gguf`, PrismML's, in the catalog entry): DFlash v1 plus a
+        block convolution around attention and the feed-forward (kernel 2, coefficients projected per position) and
+        a selector replacing argmax (top-16 candidates, chosen greedily by a rank-256 score given the previous choice;
+        the walk runs on the GPU inside the draft graph, from an anchor buffer the fused round writes). Its BF16
+        projections are quantized to Q4_K at load (`quantize.py`: 1.56 GB -> 0.44 GB, acceptance unchanged), and a
+        top-k kernel (`kernels/topk.py`) replaces 16 argmax passes (3.9 -> ~0.3 ms). Output identical to plain
+        decoding; accepted tokens per round ~2.9 on prose, ~9.7 on code; decode ~181-209 tok/s on the sweep (148
+        plain), ~290 on code
+  - [ ] Faster DFlash2 rounds (~30 ms each): the 16-row verification runs the int8 Q2_0 GEMM at one 16-token tile,
+        where each decoded weight register feeds one MMA (~140 GB/s, ~8.4 ms a forward); the Hadamard transforms and
+        ~1,000 small kernels add the rest
 - [ ] Bonsai-2B and its third-party Qwen3.5-2B drafts
 
 Measured 2026-10-18 (RTX 5060), Bonsai-4B against llama.cpp on the same GGUF: eval.txt (512 × 8) llama.cpp

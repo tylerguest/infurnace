@@ -45,3 +45,22 @@ def packed_gather(ids: Tensor, packed: Tensor, *, width: int, ggml_type: int, q6
     _gather_kernel, count=flat.numel(), width=width, typ=ggml_type, q6_aligned=q6_aligned, q6_tiled=q6_tiled,
     q4_tiled=q4_tiled, rows=rows))[0]
   return out.reshape(*ids.shape, width)
+
+@functools.cache
+def _dense_gather_kernel(out: UOp, table: UOp, ids: UOp, *, count: int, width: int) -> UOp:
+  block = UOp.range(count*(width//128), 0, axis_type=AxisType.GLOBAL)
+  lane = UOp.range(128, 1, axis_type=AxisType.LOCAL)
+  index, column = block//(width//128), (block%(width//128))*128+lane
+  row = ids[index].load().cast(dtypes.int32)
+  return out[index, column].store(table[row, column].load().float()).end(block, lane).sink(
+    arg=KernelInfo(name="dense_gather", opts_to_apply=()))
+
+def dense_gather(ids: Tensor, table: Tensor) -> Tensor:
+  """Rows `ids` (int32, any shape) of a dense (rows, width) table as FP32: one read per value, where tensor indexing
+  would compare each id against every row (248k for a vocabulary table)."""
+  width = table.shape[-1]
+  if width % 128: raise ValueError("gather width must be a multiple of 128")
+  flat = ids.flatten().cast(dtypes.int32).contiguous()
+  out = Tensor.empty(flat.numel(), width, dtype=dtypes.float32, device=table.device)
+  out = Tensor.custom_kernel(out, table.contiguous(), flat, fxn=functools.partial(_dense_gather_kernel, count=flat.numel(), width=width))[0]
+  return out.reshape(*ids.shape, width)
