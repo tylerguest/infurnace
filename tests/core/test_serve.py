@@ -398,6 +398,9 @@ def test_requests_switch_between_models():
     # A load-only request (an empty prompt), as the client sends to switch before chatting
     status, reply = call('POST', '/api/generate', {'model': 'a:1b'})
     assert status == 200 and reply['done_reason'] == 'load' and models.loads == ['b:1b', 'a:1b'] and server.model_name == 'a:1b'
+    assert call('POST', '/api/chat', {'model': 'a:1b', 'messages': []})[1]['done_reason'] == 'load'  # an empty list loads too
+    status, reply = call('POST', '/api/chat', {'model': 'a:1b'})  # no `messages` at all is malformed, not a load
+    assert status == 400 and 'messages' in reply['error']
   finally: stop()
 
 def test_a_failed_load_puts_the_previous_model_back():

@@ -162,3 +162,17 @@ def test_stop_waits_for_the_server_process(monkeypatch):
   monkeypatch.setenv('INFURNACE_HOST', '127.0.0.1:8124')
   assert client.stop() == 0
   assert next(alive, 'done') == 'done'  # it waited through both checks that found the process alive
+
+def test_a_remote_server_is_not_given_local_downloads(monkeypatch):
+  # Only a server on this machine can use this machine's downloads: a remote one is asked directly
+  pulls, requests = [], []
+  monkeypatch.setattr(client, 'status', lambda: {'status': 'ready', 'model': 'other:1b'})
+  monkeypatch.setattr(client, 'wait_ready', lambda: None)
+  monkeypatch.setattr(client, 'request', lambda *args, **kwargs: requests.append(args) or {})
+  monkeypatch.setattr(catalog, 'pull', lambda name: pulls.append(name))
+  monkeypatch.setattr(catalog, 'local', lambda url: None)
+  for host, pulled in (('gpu-box:8000', []), ('127.0.0.1:8124', ['qwen3.5:4b'])):
+    pulls.clear()
+    monkeypatch.setenv('INFURNACE_HOST', host)
+    client.connect('qwen3.5:4b', [])
+    assert pulls == pulled and requests[-1][:2] == ('POST', '/api/generate')

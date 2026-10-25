@@ -99,7 +99,8 @@ def connect(model: str | None, serve_args: list[str]) -> dict:
     current = status() or {}
   if model and (current.get("model") != _served_name(model) or current.get("status") == "unloaded"):
     from infurnace import catalog
-    if model in catalog.CATALOG and not catalog.local(catalog.CATALOG[model].url): catalog.pull(model)
+    # A server on this machine reads this machine's downloads; a remote one has its own
+    if _local_host() and model in catalog.CATALOG and not catalog.local(catalog.CATALOG[model].url): catalog.pull(model)
     wait_ready()
     print(f"Loading {model} on the server (about a minute)...", file=sys.stderr, flush=True)
     request("POST", "/api/generate", {"model": _served_name(model)}, timeout=600)
@@ -251,9 +252,13 @@ def ps() -> int:
           f"context {loaded.get('context_length')}  {current.get('status')}  {' '.join(flags)}  {base_url()}")
   return 0
 
+def _local_host() -> bool:
+  """Whether the server runs on this machine."""
+  return host().rsplit(":", 1)[0] in ("127.0.0.1", "localhost", "::1", "[::1]")
+
 def _exited(pid: int | None) -> bool:
   """Whether a local server process is gone (True when it isn't local, its pid is unknown, or it is this process)."""
-  if not pid or pid == os.getpid() or host().rsplit(":", 1)[0] not in ("127.0.0.1", "localhost", "::1", "[::1]"): return True
+  if not pid or pid == os.getpid() or not _local_host(): return True
   try: os.kill(pid, 0)
   except ProcessLookupError: return True
   except PermissionError: return False

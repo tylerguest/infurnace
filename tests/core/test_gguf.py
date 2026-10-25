@@ -100,3 +100,26 @@ def test_local_model_samples_match_scalar_decode():
       packed = gguf.PackedTensor(entry.data[offset:offset+size], (256,), entry.ggml_type).to("CPU")
       assert packed.decode().tolist() == pytest.approx(scalar_decode(bytes(packed.data.tolist()), entry.ggml_type), rel=1e-5, abs=1e-6)
   assert sampled == {gguf.Q4_K, gguf.Q6_K}
+
+def write_part(path, kv: dict[str, int], tensors: list[tuple[str, bytes]]):
+  """A GGUF file with uint32 metadata and F32 tensors (one dimension each)."""
+  def string(s): return struct.pack("<Q", len(s)) + s.encode()
+  header = b"GGUF" + struct.pack("<IQQ", 3, len(tensors), len(kv))
+  for key, value in kv.items(): header += string(key) + struct.pack("<iI", 4, value)
+  payload, offsets = b"", []
+  for _, data in tensors:
+    offsets.append(len(payload))
+    payload += data + bytes(-len(data) % 32)
+  for (name, data), offset in zip(tensors, offsets):
+    header += string(name) + struct.pack("<IQ", 1, len(data) // 4) + struct.pack("<iQ", 0, offset)
+  path.write_bytes(header + bytes(-len(header) % 32) + payload)
+
+def test_split_files_are_merged(tmp_path):
+  # A split model's first part holds the metadata; every part holds some tensors
+  first, second = tmp_path / "m-00001-of-00002.gguf", tmp_path / "m-00002-of-00002.gguf"
+  write_part(first, {"split.count": 2, "split.no": 0}, [("a", struct.pack("<ff", 1.0, 2.0))])
+  write_part(second, {"split.count": 2, "split.no": 1}, [("b", struct.pack("<fff", 3.0, 4.0, 5.0))])
+  metadata, entries = gguf.parse_gguf(first)
+  assert metadata["split.count"] == 2 and set(entries) == {"a", "b"}
+  assert entries["a"].to("CPU").decode().tolist() == [1.0, 2.0] and entries["b"].to("CPU").decode().tolist() == [3.0, 4.0, 5.0]
+  with pytest.raises(ValueError, match="first part"): gguf.parse_gguf(second)

@@ -180,8 +180,9 @@ class RequestHandler(Handler):
     generate = not chat
     server, started = self.server, time.perf_counter_ns()
     name = server.model_name
-    if (body.get('prompt') if generate else body.get('messages')) in (None, '', []):
-      # Nothing to answer: the request only loads the model, or unloads it with keep_alive 0
+    if (generate and body.get('prompt') in (None, '')) or (not generate and body.get('messages') == []):
+      # Nothing to answer (as in Ollama: no prompt, or an empty message list): the request only loads the model, or
+      # unloads it with keep_alive 0. A chat request without `messages` is malformed, below.
       unload = body.get('keep_alive') in (0, '0', '0s')
       if unload: server.unload()
       return self.send_json({'model': name, 'created_at': _now(), **({'response': ''} if generate else

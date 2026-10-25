@@ -5,6 +5,7 @@ weights) still get their tensor views; decode() handles those and leaves the res
 import functools
 import io
 import math
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -48,24 +49,32 @@ class PackedTensor:
     return decode(self.data, math.prod(self.shape), self.ggml_type).reshape(self.shape)
 
 def _gguf_parse(path: Path) -> tuple[dict[str, Any], dict[str, tuple[Tensor, tuple[int, ...], int]]]:
-  """tinygrad's gguf_parse for one file, with the types it lacks."""
-  tensor = Tensor(path)
-  r = io.BufferedReader(TensorIO(tensor), 1_000_000)
-  magic, version, n_tensors, n_kv = r.read(4), read_int32(r), read_int64(r), read_int64(r)
-  if magic != b"GGUF" or version not in (2, 3): raise ValueError(f"invalid GGUF file: {path}")
-  kv = {}
-  for _ in range(n_kv):
-    key, typ = read_str(r), read_int32(r)
-    kv[key] = readers[typ](r)
-  if kv.get('split.count', 1) > 1: raise ValueError(f"multi-part GGUF files are not supported: {path}")
-  infos = [(read_str(r), tuple(read_uint64(r) for _ in range(read_uint32(r))), read_int32(r), read_uint64(r)) for _ in range(n_tensors)]
-  start = round_up(r.tell(), kv.get("general.alignment", 32))
-  entries = {}
-  for name, dims, typ, offset in infos:
-    values, nbytes = block_size(typ)
-    begin, size = start + offset, math.prod(dims) // values * nbytes
-    entries[name] = (tensor[begin:begin + size], tuple(reversed(dims)), typ)
-  return kv, entries
+  """tinygrad's gguf_parse, with the types it lacks: metadata from the first file, tensors from every file of a
+  split model (name-00001-of-0000N.gguf and its parts), as tinygrad merges them."""
+  files, metadata, entries = [path], None, {}
+  for i, file in enumerate(files):
+    tensor = Tensor(file)
+    r = io.BufferedReader(TensorIO(tensor), 1_000_000)
+    magic, version, n_tensors, n_kv = r.read(4), read_int32(r), read_int64(r), read_int64(r)
+    if magic != b"GGUF" or version not in (2, 3): raise ValueError(f"invalid GGUF file: {file}")
+    kv = {}
+    for _ in range(n_kv):
+      key, typ = read_str(r), read_int32(r)
+      kv[key] = readers[typ](r)
+    if i == 0:
+      metadata = kv
+      if (total := kv.get('split.count', 1)) > 1:
+        if kv.get('split.no', 0) != 0: raise ValueError(f"load a split GGUF from its first part, not part {kv['split.no'] + 1}: {file}")
+        if not (m := re.match(r"^(.*)-00001-of-\d{5}\.gguf$", str(file))):
+          raise ValueError(f"a split GGUF's first part must end in -00001-of-NNNNN.gguf: {file}")
+        files.extend(Path(f"{m.group(1)}-{part:05d}-of-{total:05d}.gguf") for part in range(2, total + 1))
+    infos = [(read_str(r), tuple(read_uint64(r) for _ in range(read_uint32(r))), read_int32(r), read_uint64(r)) for _ in range(n_tensors)]
+    start = round_up(r.tell(), kv.get("general.alignment", 32))
+    for name, dims, typ, offset in infos:
+      values, nbytes = block_size(typ)
+      begin, size = start + offset, math.prod(dims) // values * nbytes
+      entries[name] = (tensor[begin:begin + size], tuple(reversed(dims)), typ)
+  return metadata, entries
 
 @functools.lru_cache(maxsize=8)
 def _parse(path: Path, size: int, mtime_ns: int) -> tuple[dict[str, Any], dict[str, tuple[Tensor, tuple[int, ...], int]]]:
