@@ -321,7 +321,7 @@ def _check_model(model: str | None) -> None:
   raise ValueError(f"unknown model {model!r}; available: {catalog.names()}, or a path to a GGUF file")
 
 def _model_name(model: str) -> str:
-  return model if model in catalog.CATALOG else Path(model).stem
+  return catalog.served_name(model)
 
 def _serve_warmup(model, dflash) -> None:
   start = time.perf_counter()

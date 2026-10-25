@@ -140,7 +140,7 @@ def test_cli_packed_projection_flags_require_nv_before_loading(tmp_path, monkeyp
   from infurnace import loader
   path = tmp_path / 'model.gguf'
   path.touch()
-  monkeypatch.setattr(loader, 'read_gguf_metadata', lambda path: {'general.architecture': 'qwen35'})
+  monkeypatch.setattr(loader, 'parse_gguf', lambda path: ({'general.architecture': 'qwen35'}, {}))
   monkeypatch.setattr(Model, 'from_gguf', lambda *a, **kw: pytest.fail('loaded target without NV packed support'))
   with pytest.raises(ValueError, match='requires (NV|an NVIDIA)'):
     loader.load_model(str(path), 16, 'CPU', **{flag: True})

@@ -112,3 +112,14 @@ def test_capturing_the_prompt_graph_later_keeps_the_conversation(loaded):
   assert model.capture_prompt_graph() and model._prompt_jit.captured is not None
   assert model.transformer._cached_tokens == cached and state() == before
   assert not model.capture_prompt_graph()  # already captured
+
+def test_every_embedding_path_agrees(loaded):
+  # Model.embed (DFlash's draft and verifier) and the decoding token embedding must give the same rows: for Bonsai
+  # they once didn't (the gather kernel had no Q2_0 and no inverse Hadamard rotation), so DFlash ran on garbage.
+  from tinygrad import Tensor, dtypes
+  model, tokenizer = loaded
+  tokens = tokenizer.encode('Hello, world! 你好')
+  embedded = model.embed(tokens).reshape(len(tokens), -1)
+  token_embd = model.transformer.token_embd(Tensor([tokens], dtype=dtypes.int32, device=model.device)).float().reshape(len(tokens), -1)
+  scale = token_embd.abs().max().item()
+  assert (embedded - token_embd).abs().max().item() <= 1e-3 * scale

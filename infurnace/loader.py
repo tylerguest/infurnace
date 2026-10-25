@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 from infurnace.catalog import details, draft_for
 from infurnace.device import fast_path_problem, nvidia, select_device, supports_nv_quant
-from infurnace.gguf import read_gguf_metadata
+from infurnace.gguf import Q2_0, parse_gguf, read_gguf_metadata
 from infurnace.kernels.quant_gemm import nv_prefill_supported
 from infurnace.engine import Model
 from infurnace.models import family_for
@@ -51,12 +51,8 @@ def fit_context(model_path: str | Path, draft_path: str | Path | None, free: int
   return min(limit, steps * CONTEXT_STEP) if steps else 4096
 
 def dflash_draft(model: str | Path) -> str | Path | None:
-  """The draft override, a catalog model's draft (a download URL), or an installed draft for a local GGUF of the
-  same architecture."""
-  path = Path(model).expanduser()
-  def architecture():
-    return read_gguf_metadata(path).get("general.architecture") if path.suffix == ".gguf" and path.is_file() else None
-  return draft_for(str(model), architecture)
+  """The draft override, or the draft of a catalog model (by name, or by the path of its file)."""
+  return draft_for(str(model))
 
 def load_model(path: str | Path, max_context: int, device: str | None = None, nv_quant: bool | None = None, *,
                nv_prefill: bool | None = None) -> tuple[Model, object]:
@@ -65,13 +61,18 @@ def load_model(path: str | Path, max_context: int, device: str | None = None, nv
   nv_quant/nv_prefill overrides exist for benchmarks comparing packed and generic execution.
   """
   if Path(path).is_dir(): raise ValueError("--model must name a local GGUF file")
-  metadata = read_gguf_metadata(path)
+  metadata, entries = parse_gguf(path)
   family = family_for(metadata.get("general.architecture"))
   device = select_device(device)
   # On NVIDIA, the generic path is far too slow to use: say what is missing instead of falling back to it.
   if nv_quant is None and (problem := fast_path_problem(device)): raise ValueError(problem)
   packed = supports_nv_quant(device) if nv_quant is None else nv_quant
   if packed and not supports_nv_quant(device): raise ValueError("packed acceleration requires an NVIDIA device (NV or CUDA) with the CUDA C renderer")
+  # Ternary (Q2_0) weights and Hadamard-folded inputs exist only in infurnace's packed path: tinygrad's generic
+  # model can't read Q2_0, and without the rotations it would compute a different model.
+  if not packed and (metadata.get("prism.hadamard.version") is not None or any(e.ggml_type == Q2_0 for e in entries.values())):
+    raise ValueError(f"{Path(path).name} has ternary (Q2_0) weights with Hadamard-rotated inputs, which need an NVIDIA GPU "
+                     "with infurnace's kernels (the NV or CUDA device and NVIDIA's CUDA compiler)")
   if nv_prefill and not packed: raise ValueError("NV prefill requires NV quantized acceleration")
   prefill = packed and nv_prefill_supported(device) if nv_prefill is None else nv_prefill
   if prefill and not nv_prefill_supported(device): raise ValueError("NV prefill requires CUDA-C FP16 tensor cores")

@@ -54,7 +54,7 @@ def test_auto_acceleration(monkeypatch):
   def build(path, family, **kwargs):
     calls.append(kwargs)
     return Model()
-  monkeypatch.setattr(loader, 'read_gguf_metadata', lambda path: {'general.architecture': 'qwen35'})
+  monkeypatch.setattr(loader, 'parse_gguf', lambda path: ({'general.architecture': 'qwen35'}, {}))
   monkeypatch.setattr(loader.Model, "from_gguf", build)
   monkeypatch.setattr(loader, "family_for", lambda arch: Family('qwen35', ('qwen35',), tokenizer=lambda metadata: None))
   loader.load_model("model", 16, None)

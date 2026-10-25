@@ -11,7 +11,6 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 from tinygrad.helpers import fetch
 
 @dataclass(frozen=True)
@@ -96,10 +95,23 @@ def remove(name: str) -> list[Path]:
       removed.append(path)
   return removed
 
-def draft_for(model: str, architecture: Callable[[], str | None]) -> str | Path | None:
-  """The DFlash draft for a model: INFURNACE_DFLASH_DRAFT, its catalog entry's (a download URL), or for a local GGUF
-  an already downloaded draft of a catalog model of the same architecture (asked of `architecture()` only then)."""
+def catalog_name(model: str | Path) -> str | None:
+  """The catalog name of a model: a catalog name itself, or a GGUF path to a catalog model's file (pinned file
+  names are unique: Qwen3.5-4B-Q4_K_M.gguf is qwen3.5:4b wherever it is), else None."""
+  if str(model) in CATALOG: return str(model)
+  name = Path(model).name
+  return next((e.name for e in ENTRIES if _file_name(e.url) == name), None)
+
+def served_name(model: str) -> str:
+  """The name a server serves a model under: its catalog name, else a GGUF's file name without .gguf."""
+  return catalog_name(model) or Path(model).stem
+
+def draft_for(model: str) -> str | Path | None:
+  """The DFlash draft for a model: INFURNACE_DFLASH_DRAFT, a catalog model's draft (a download URL), or for a GGUF
+  path to a catalog model's file that model's draft, if downloaded. Another GGUF gets none: a draft is trained for
+  one model (Bonsai-4B is Qwen3.5-4B's architecture, but not Qwen3.5-4B)."""
   if path := os.environ.get("INFURNACE_DFLASH_DRAFT"): return Path(path).expanduser()
   if model in CATALOG: return CATALOG[model].draft
-  arch = architecture()
-  return next((found for e in ENTRIES if e.architecture == arch and e.draft and (found := local(e.draft))), None)
+  name = catalog_name(model)
+  draft = CATALOG[name].draft if name is not None else None
+  return local(draft) if draft else None

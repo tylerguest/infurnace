@@ -86,8 +86,9 @@ def start_server(serve_args: list[str]) -> None:
   raise ServerError(f"the server did not start within 5 minutes; see {log}")
 
 def _served_name(model: str) -> str:
-  """The name a server gives a model: a catalog name as is, a GGUF path its file name's stem."""
-  return Path(model).stem if model.endswith(".gguf") else model
+  """The name a server gives a model (catalog.served_name): a catalog model's file is served as its catalog name."""
+  from infurnace import catalog
+  return catalog.served_name(model)
 
 def connect(model: str | None, serve_args: list[str]) -> dict:
   """The running server's status, starting one when none answers. When it serves another model (or has unloaded

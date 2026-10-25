@@ -48,3 +48,15 @@ def test_q2_0_prefill_gemm_matches_dense(out_features, in_features, tokens, int8
   # int8 tensor cores take int8 activations (one scale per 32 values, ~1% of the output scale, as the decode GEMV);
   # the FP16 kernel multiplies FP16 activations and accumulates in FP32
   assert ((got - reference).abs().max() / reference.abs().max()).item() < (0.02 if int8 else 1e-3)
+
+def test_q2_0_row_gather_matches_decoding_the_rows():
+  from infurnace.kernels.embedding import packed_gather
+  rows, width = 40, 2560
+  raw, values = q2_blocks(rows * width // 64, seed=5)
+  packed = prepare_q2(Tensor(raw, dtype=dtypes.uint8, device="NV"))
+  ids = Tensor([[3, 39, 0], [17, 3, 21]], dtype=dtypes.int32, device="NV")
+  got = packed_gather(ids, packed, width=width, ggml_type=Q2_0, rows=rows).tolist()
+  for i, row in enumerate([[3, 39, 0], [17, 3, 21]]):
+    for j, r in enumerate(row): assert got[i][j] == pytest.approx(values[r * width:(r + 1) * width], abs=1e-6)
+  with pytest.raises(ValueError, match="row count"): packed_gather(ids, packed, width=width, ggml_type=Q2_0)
+  with pytest.raises(ValueError, match="cannot decode"): packed_gather(ids, packed, width=width, ggml_type=8)

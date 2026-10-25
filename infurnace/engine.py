@@ -25,8 +25,9 @@ from infurnace.gguf import Q2_0, decode as decode_packed, parse_gguf, read_gguf_
 from infurnace.hadamard import rotations
 from infurnace.kernels.attention import attention
 from infurnace.kernels.quant_gemm import nv_prefill_supported
-from infurnace.kernels.quant_gemv import dequant_prepared_q2, q8_quantize
-from infurnace.linear import GATHER_TYPES, _NVLinear
+from infurnace.kernels.quant_gemv import q8_quantize
+from infurnace.kernels.embedding import packed_gather
+from infurnace.linear import _NVLinear
 from infurnace.device import nvidia
 from infurnace.models import Family, family_for
 
@@ -207,8 +208,10 @@ def _lazy_upstream_weights(path):
   finally: upstream_model.gguf_parse, upstream_model.gguf_shard = parse, shard
 
 class _PackedEmbedding:
-  """Token embedding read from a packed Q2_0 table (prepare_q2's layout): only the looked-up rows are decoded,
-  then restored from a Hadamard-latent basis when the table is rotated."""
+  """The token embedding of a tied packed table (the output head's storage), and the one place rows are looked up:
+  rows() decodes only the requested ones (kernels/embedding.py) and restores them from a Hadamard-latent basis when
+  the table is rotated. Model.lookup (Model.embed, DFlash's verifier) uses it for every tied table; Q2_0 tables also
+  take it as transformer.token_embd, called like upstream's embedding."""
   def __init__(self, table: _NVLinear):
     self.table, self.rotation = table, None  # the table's Hadamard rotation: rows are restored with its inverse
 
@@ -216,13 +219,15 @@ class _PackedEmbedding:
   def weight(self) -> Tensor:  # upstream's forward places the token ids on token_embd.weight's device
     return self.table.packed
 
+  def rows(self, ids: Tensor) -> Tensor:
+    """FP32 rows for `ids` (int32, any shape)."""
+    t = self.table
+    x = packed_gather(ids, t.packed, width=t.in_features, ggml_type=t.ggml_type, q6_aligned=t.q6_aligned, q6_tiled=t.q6_tiled,
+                      q4_tiled=t.q4_tiled, rows=t.out_features)
+    return self.rotation.inverse(x) if self.rotation is not None else x
+
   def __call__(self, ids: Tensor) -> Tensor:
-    t, flat = self.table, ids.flatten()
-    code_words = t.out_features * t.in_features // 16
-    codes = t.packed[:code_words].reshape(t.out_features, t.in_features // 16)[flat]
-    scales = t.packed[code_words:].reshape(t.out_features, t.in_features // 128)[flat]  # two FP16 scales a word
-    x = dequant_prepared_q2(codes.flatten().cat(scales.flatten()), in_features=t.in_features).reshape(*ids.shape, t.in_features)
-    return (self.rotation.inverse(x) if self.rotation is not None else x).half()
+    return self.rows(ids).half()  # FP16, like upstream's token embedding
 
 SNAPSHOTS = 8  # prompt snapshots kept (recurrent families), about 50 MB of host memory each for Qwen3.5-4B
 
@@ -249,6 +254,7 @@ class Model:
     self.nv_prefill = False
     self._path, self._host_embedding = None, None
     self._tied_head = False  # the packed output head is the token embedding table
+    self._embedding: _PackedEmbedding | None = None  # its lookup, when it is (see lookup)
     self._multirow_prefill = False  # prompts are read PROMPT_ROWS rows at a time (see _prefill)
     self._warming = False
     # Prompt chunks: a captured step that slices the prompt from a persistent device buffer (see _prompt_chunk)
@@ -526,13 +532,9 @@ class Model:
         return Tensor.cat(*(self.transformer.token_embd(ids[:, r:r+1]) for r in range(len(tokens))), dim=1).float()
     from tinygrad import dtypes
     dim = self.config.embedding_length
-    if self._tied_head:
-      from infurnace.kernels.embedding import packed_gather
-      head = self.transformer.output
+    if self._embedding is not None:
       with Context(DEV=self.device):
-        ids = Tensor(tokens, dtype=dtypes.int32, device=self.device)
-        rows = packed_gather(ids, head.packed, width=head.in_features, ggml_type=head.ggml_type, q6_aligned=head.q6_aligned,
-                             q6_tiled=head.q6_tiled, q4_tiled=head.q4_tiled)
+        rows = self.lookup(Tensor(tokens, dtype=dtypes.int32, device=self.device))
         return rows.half().float().reshape(1, len(tokens), dim)
     if self._host_embedding is None:
       _, entries = parse_gguf(self._path)
@@ -542,6 +544,13 @@ class Model:
     view, width = self._host_embedding[1], dim * 2
     rows = b''.join(view[t * width:(t + 1) * width] for t in tokens)
     return Tensor(rows, device=self.device).bitcast(dtypes.float16).reshape(1, len(tokens), dim).float()
+
+  def lookup(self, ids: Tensor) -> Tensor:
+    """FP32 token embedding rows for `ids` (int32 on the device, any shape), from the tied packed table: decoded and,
+    for Hadamard-folded models, restored to the model's basis. Every embedding of tokens on the device goes through
+    here or the token embedding it is, so a table's format or transform is handled once."""
+    if self._embedding is None: raise ValueError('lookup needs a packed output head tied to the token embedding')
+    return self._embedding.rows(ids)
 
   @classmethod
   def from_gguf(cls, path: str | Path, max_context: int | None = None, device: str = 'CPU', *,
@@ -597,9 +606,9 @@ class Model:
       if not isinstance(layer, _NVLinear): raise ValueError(f'Hadamard-folded weight {name} has no packed projection to rotate its input')
       layer.rotation = rotation
     if inverse is not None:
-      embedding = self.transformer.token_embd
-      if not isinstance(embedding, _PackedEmbedding): raise ValueError('a Hadamard-latent token embedding needs the packed lookup')
-      embedding.rotation = inverse
+      if self._embedding is None or self.transformer.token_embd is not self._embedding:
+        raise ValueError('a Hadamard-latent token embedding needs the packed lookup')
+      self._embedding.rotation = inverse
 
   def _param_cache_path(self, path):
     if os.environ.get('INFURNACE_PARAM_CACHE', '1') == '0': return None
@@ -630,9 +639,10 @@ class Model:
         layers.setdefault(name.split('.')[1] if name.startswith('blk.') else name, []).append(adapter.packed)
         setattr(owner, attribute, adapter)
         packed.add(name)
-        if tied and entry.ggml_type not in GATHER_TYPES:
-          # No row-gather kernel (Q2_0): lookups decode their rows from the packed table.
-          self.transformer.token_embd = _PackedEmbedding(adapter)
+        if tied: self._embedding = _PackedEmbedding(adapter)
+        if tied and entry.ggml_type == Q2_0:
+          # Upstream's embedding would decode the whole table: the packed lookup is the token embedding too.
+          self.transformer.token_embd = self._embedding
         elif tied:
           # Embedding lookups read rows from the same packed allocation.
           self.transformer.token_embd.weight = adapter.weight

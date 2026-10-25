@@ -35,17 +35,23 @@ def test_dflash_draft_for_names_and_paths(tiny_models, monkeypatch, tmp_path):
   monkeypatch.delenv("INFURNACE_DFLASH_DRAFT")
   assert loader.dflash_draft("tiny:1b") == "https://example.com/m/tiny-draft.gguf"
   assert loader.dflash_draft(str(tmp_path / "missing.gguf")) is None
-  # A local GGUF gets a downloaded draft of the same architecture, and none of another one.
   storage, _ = tiny_models
   storage.mkdir(parents=True)
+  # The catalog model's own file, wherever it is, gets that model's draft once it is downloaded
+  elsewhere = tmp_path / "copies" / "tiny.gguf"
+  assert loader.dflash_draft(str(elsewhere)) is None
   (storage / "tiny-draft.gguf").touch()
-  local = tmp_path / "mine.gguf"
-  local.touch()
-  for architecture, draft in (("qwen35", storage / "tiny-draft.gguf"), ("llama", None)):
-    monkeypatch.setattr(loader, "read_gguf_metadata", lambda path, a=architecture: {"general.architecture": a})
-    assert loader.dflash_draft(str(local)) == draft
+  assert loader.dflash_draft(str(elsewhere)) == storage / "tiny-draft.gguf"
+  # Any other GGUF gets none, even of the same architecture: a draft is trained for one model
+  assert loader.dflash_draft(str(tmp_path / "other-of-the-same-architecture.gguf")) is None
   monkeypatch.setenv("INFURNACE_DFLASH_DRAFT", "~/draft.gguf")
   assert loader.dflash_draft("tiny:1b") == Path.home() / "draft.gguf"
+
+def test_a_catalog_models_file_is_served_under_its_catalog_name(tiny_models):
+  assert catalog.served_name("tiny:1b") == "tiny:1b"
+  assert catalog.served_name("/anywhere/tiny.gguf") == "tiny:1b"
+  assert catalog.served_name("/anywhere/mine.gguf") == "mine"
+  assert catalog.catalog_name("/anywhere/mine.gguf") is None
 
 def test_catalog():
   assert list(catalog.CATALOG) == ['qwen3.5:4b', 'qwen3:4b', 'bonsai:4b'] and catalog.DEFAULT == 'qwen3.5:4b'
@@ -59,7 +65,7 @@ def test_catalog():
 @pytest.fixture
 def model_loader(monkeypatch):
   metadata = {'general.architecture': 'qwen35'}
-  monkeypatch.setattr(loader, 'read_gguf_metadata', lambda path: metadata)
+  monkeypatch.setattr(loader, 'parse_gguf', lambda path: (metadata, {}))
   monkeypatch.setattr(loader, 'select_device', lambda device: device)
   monkeypatch.setattr(loader, 'supports_nv_quant', lambda device: device == 'NV')
   monkeypatch.setattr(loader, 'nv_prefill_supported', lambda device: device == 'NV')
@@ -128,3 +134,11 @@ def test_missing_compiler_stops_instead_of_running_the_slow_path(model_loader, m
     loader.load_model('model', 64, 'NV')
   assert not calls
   assert loader.load_model('model', 64, 'NV', nv_quant=False)[0] is model  # an explicit request still runs it
+
+def test_ternary_models_need_the_packed_path(model_loader, monkeypatch):
+  metadata, _, calls = model_loader
+  monkeypatch.setattr(loader, 'parse_gguf', lambda path: (metadata, {'blk.0.ffn_up.weight': SimpleNamespace(ggml_type=42)}))
+  with pytest.raises(ValueError, match='ternary'): loader.load_model('bonsai.gguf', 16, 'CPU')
+  monkeypatch.setattr(loader, 'parse_gguf', lambda path: ({**metadata, 'prism.hadamard.version': 2}, {}))
+  with pytest.raises(ValueError, match='ternary'): loader.load_model('bonsai.gguf', 16, 'CPU')
+  assert not calls

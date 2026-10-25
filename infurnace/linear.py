@@ -6,8 +6,7 @@ from infurnace.kernels.quant_gemv import (quant_gemv, prepare_q2, prepare_q6, pr
                                           dequant_prepared_q6, untile)
 from infurnace.kernels.quant_gemm import quant_gemm, nv_prefill_supported
 
-KERNEL_TYPES = (12, 13, 14, 42)  # Q4_K, Q5_K, Q6_K, Q2_0: the one-row GEMV and the tensor-core GEMM for prompt chunks
-GATHER_TYPES = (12, 13, 14)      # the packed row gather (embedding lookups); Q2_0 tables decode their rows in tensor ops
+KERNEL_TYPES = (12, 13, 14, 42)  # Q4_K, Q5_K, Q6_K, Q2_0: the one-row GEMV, the tensor-core GEMM and the row gather
 
 class _NVLinear:
   """Single-token fast path using explicit GGUF identity, never graph-size guessing.

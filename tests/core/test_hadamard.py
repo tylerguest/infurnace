@@ -61,3 +61,8 @@ def test_rotations_reject_what_they_cannot_apply():
               {'prism.hadamard.sign_values': [1] * 7}):
     with pytest.raises(ValueError): rotations(metadata(**bad), widths, 'CPU', value_heads=4, key_heads=2)
   with pytest.raises(ValueError, match='GDN head geometry'): rotations(metadata(), widths, 'CPU', value_heads=3, key_heads=2)
+  # A listed weight the GGUF lacks, or a missing field, is a ValueError the CLI reports (not a KeyError traceback)
+  with pytest.raises(ValueError, match='blk.0.ffn_down.weight'):
+    rotations(metadata(), {k: v for k, v in widths.items() if k != 'blk.0.ffn_down.weight'}, 'CPU', value_heads=4, key_heads=2)
+  without_block = {k: v for k, v in metadata().items() if k != 'prism.hadamard.block_size'}
+  with pytest.raises(ValueError, match='block_size'): rotations(without_block, widths, 'CPU', value_heads=4, key_heads=2)

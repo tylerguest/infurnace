@@ -27,7 +27,6 @@ from infurnace.dflash.target import TargetObserver, detach_rng
 from infurnace.kernels.attention import attention
 from infurnace.kernels.gdn import gdn_chunk, gdn_gates
 from infurnace.kernels.sampling import Sampler
-from infurnace.kernels.embedding import packed_gather
 from infurnace.device import nvidia
 
 def _raw(tensor):
@@ -181,9 +180,7 @@ class ParallelVerifier:
     return decisions, features
 
   def _gather(self, ids: Tensor) -> Tensor:
-    head = self.observer.model.transformer.output
-    return packed_gather(ids, head.packed, width=head.in_features, ggml_type=head.ggml_type, q6_aligned=head.q6_aligned,
-                         q6_tiled=head.q6_tiled, q4_tiled=head.q4_tiled)
+    return self.observer.model.lookup(ids)
 
   def _pick(self, count: UOp, *, mask: int):
     # Anchor = the held block's last accepted decision, then noise embeddings.

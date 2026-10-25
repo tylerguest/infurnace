@@ -64,15 +64,18 @@ def rotations(metadata: dict, widths: dict[str, int], device: str, *, value_head
   weight's input width. The tied output head is listed as output.weight. Empty without prism.hadamard metadata."""
   if (version := metadata.get("prism.hadamard.version")) is None: return {}, None
   if version not in (1, 2): raise ValueError(f"unsupported prism.hadamard.version {version}")
-  block = metadata["prism.hadamard.block_size"]
+  def field(key: str, kind: type):
+    if not isinstance(value := metadata.get(f"prism.hadamard.{key}"), kind): raise ValueError(f"missing or invalid prism.hadamard.{key}")
+    return value
+  block, names = field("block_size", int), field("weight_names", list)
   if metadata.get("prism.hadamard.transform") != "normalized-sylvester-walsh-hadamard" or \
      metadata.get("prism.hadamard.axis") != "input-last-dimension" or block <= 0 or block & (block - 1):
     raise ValueError("unsupported prism.hadamard transform")
   matrix = Tensor(hadamard_matrix(block), dtype=dtypes.float32, device=device).reshape(block, block).contiguous()
   signs: dict[int, Tensor] = {}
   if metadata.get("prism.hadamard.sign_mode") == "explicit":
-    values, offset = metadata["prism.hadamard.sign_values"], 0
-    for width in metadata["prism.hadamard.sign_widths"]:
+    values, offset = field("sign_values", list), 0
+    for width in field("sign_widths", list):
       signs[width] = Tensor([float(v) for v in values[offset:offset + width]], dtype=dtypes.float32, device=device).contiguous()
       offset += width
     if offset != len(values): raise ValueError("prism.hadamard.sign_values length mismatch")
@@ -80,7 +83,8 @@ def rotations(metadata: dict, widths: dict[str, int], device: str, *, value_head
   grouped = metadata.get("prism.hadamard.gdn_v_grouped", False)
 
   shared: dict[tuple, Rotation] = {}  # one object per distinct transform: projections of one input rotate it once
-  def rotation(name: str, width: int) -> Rotation:
+  def rotation(name: str, width: int | None) -> Rotation:
+    if width is None: raise ValueError(f"prism.hadamard lists {name}, which the GGUF has no 2-D tensor for")
     if width % block: raise ValueError(f"prism.hadamard block {block} does not divide {name}'s input width {width}")
     if signs and width not in signs: raise ValueError(f"prism.hadamard has no sign vector for width {width} ({name})")
     perm = None
@@ -89,9 +93,9 @@ def rotations(metadata: dict, widths: dict[str, int], device: str, *, value_head
       perm = (value_heads // key_heads, key_heads, width // value_heads)
     return shared.setdefault((width, perm), Rotation(matrix, signs.get(width), perm))
 
-  forward = {name: rotation(name, widths[name]) for name in metadata["prism.hadamard.weight_names"]}
+  forward = {name: rotation(name, widths.get(name)) for name in names}
   inverse = None
   if "token_embd.weight" in metadata.get("prism.hadamard.inverse_weight_names", []):
-    inverse = rotation("token_embd.weight", widths["token_embd.weight"])
+    inverse = rotation("token_embd.weight", widths.get("token_embd.weight"))
     if metadata.get("prism.hadamard.tied_output"): forward["output.weight"] = inverse
   return forward, inverse
