@@ -99,22 +99,38 @@ def prepare_q6_tiled(raw: Tensor, *, in_features: int, realize: bool = True) -> 
   result = padded.reshape(rows//16, 16, blocks, Q6_PREPARED_BYTES).permute(0, 2, 1, 3).contiguous().flatten().bitcast(dtypes.uint32)
   return result.realize() if realize else result
 
+# prepare_q2's code words: a Q2_0 block's 64 codes of a row are 4 words, word t holding the 16 codes thread t of an
+# m16n8k32 int8 MMA needs for the block's two 32-value steps: register r = 2*step + half (half: k 0-15 or 16-31 of the
+# step) has code j (k = 32*step + 16*half + 4t + j) at bits 8j + 2r, so a register is (word >> 2r) & 0x03030303.
+def q2_code_position(k: int) -> tuple[int, int]:
+  """(word within the block, bit) of code k (0-63) of a Q2_0 block in prepare_q2's layout."""
+  step, half, t, j = k // 32, (k % 32) // 16, (k % 16) // 4, k % 4
+  return t, 8 * j + 2 * (2 * step + half)
+
 def prepare_q2(raw: Tensor, *, realize: bool = True) -> Tensor:
-  """Q2_0 blocks (FP16 scale, 16 code bytes) as words: every code byte, rows in order, then every scale. A lane's
-  32 codes are 8 aligned bytes, adjacent lanes read adjacent ones, and nothing is padded (2.25 bits a weight)."""
+  """Q2_0 blocks (FP16 scale, 16 code bytes) as words: every block's 4 code words (q2_code_position), rows in order,
+  then every scale. Each word holds 16 codes ready to mask into dp4a/MMA registers in two operations; nothing is
+  padded (2.25 bits a weight)."""
   if raw.dtype != dtypes.uint8 or raw.numel() <= 0 or raw.numel() % 18 or (raw.numel() // 18) % 2:
     raise QuantGemvError("Q2_0 preparation requires whole uint8 blocks, an even number of them")
   blocks = raw.flatten().reshape(-1, 18)
-  result = blocks[:, 2:].flatten().cat(blocks[:, :2].flatten()).bitcast(dtypes.uint32)
+  codes = ((blocks[:, 2:].reshape(-1, 16, 1).cast(dtypes.uint32) // Tensor([1, 4, 16, 64], dtype=dtypes.uint32)) % 4).reshape(-1, 64)
+  # (block, step, half, t, j) -> word t gets code << (8j + 2(2 step + half))
+  codes = codes.reshape(-1, 2, 2, 4, 4).permute(0, 3, 1, 2, 4).reshape(-1, 4, 16)
+  shifts = Tensor([2 ** (8 * j + 2 * (2 * step + half)) for step in range(2) for half in range(2) for j in range(4)], dtype=dtypes.uint32)
+  words = (codes * shifts).sum(-1, dtype=dtypes.uint32)  # the codes' bits never overlap: the sum is a bitwise or
+  result = words.flatten().cat(blocks[:, :2].flatten().bitcast(dtypes.uint32))
   return result.realize() if realize else result
 
 def dequant_prepared_q2(packed: Tensor, *, in_features: int) -> Tensor:
   """FP32 weights straight from prepare_q2's words."""
   n = packed.numel() * 4 // 18 * 64
-  codes = packed[:n // 16].bitcast(dtypes.uint8).reshape(-1, 1).cast(dtypes.int32)
-  values = ((codes // Tensor([1, 4, 16, 64], dtype=dtypes.int32, device=packed.device)) % 4 - 1).reshape(-1, 64)
+  words = packed[:n // 16].reshape(-1, 4, 1)
+  shifts = Tensor([2 ** (8 * j + 2 * (2 * step + half)) for step in range(2) for half in range(2) for j in range(4)], dtype=dtypes.uint32)
+  codes = (words // shifts.reshape(1, 1, 16)) % 4                                   # (block, t, (step, half, j))
+  codes = codes.reshape(-1, 4, 2, 2, 4).permute(0, 2, 3, 1, 4).reshape(-1, 64)     # back to k order
   scales = packed[n // 16:].bitcast(dtypes.float16).float().reshape(-1, 1)
-  return (values.float() * scales).flatten()
+  return ((codes.cast(dtypes.int32) - 1).float() * scales).flatten()
 
 def dequant_prepared_q4(packed: Tensor, *, in_features: int) -> Tensor:
   """FP32 weights straight from prepare_q4's tiled words (GGUF Q4_K field math)."""
@@ -323,15 +339,14 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, out_features:
       corrected = [(dots[half] - 32*xs[token, group, half].load()).float() for half in range(2)]
       return (corrected[0]*scales[0] + corrected[1]*scales[1]) * xd[token, group] * _half(raw[d_index].load())
     if ggml_type == Q2_0:
-      # prepare_q2: this lane's 32 codes are two words; four codes per byte, the first in the low bits.
-      words = _load_lanes(raw[(output*in_features + group*32)//16], 2)
+      # prepare_q2: this lane's group is one 32-value step of its block, whose 4 code words hold its 8 registers
+      words = _load_lanes(raw[(output*(in_features//64) + group//2)*4], 4)
+      step = (group % 2).cast(dtypes.uint32)
       dot = UOp.const(0, dtypes.int32)
-      for word_idx in range(2):
-        for byte_idx in range(4):
-          b = (words[word_idx] >> (byte_idx*8)) & 255
-          # Spread the byte's four 2-bit codes into four bytes, in activation order.
-          spread = (b | (b << 6) | (b << 12) | (b << 18)) & 0x03030303
-          dot = _dp4a(spread, xwords[word_idx*4+byte_idx], dot)
+      for t in range(4):
+        for half in range(2):  # codes k = 16*half + 4t + j of the step, against activation word 4*half + t
+          codes = (words[t] >> (step*4 + half*2)) & 0x03030303
+          dot = _dp4a(codes, xwords[half*4+t], dot)
       scale_index = output*(in_features//64) + group//2
       scale_word = raw[out_features*in_features//16 + scale_index//2].load()
       d = _half((scale_word >> ((scale_index%2)*16).cast(dtypes.uint32)) & 65535)

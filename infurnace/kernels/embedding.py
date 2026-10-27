@@ -15,8 +15,12 @@ from infurnace.kernels.quant_gemv import Q2_0, Q4_K, Q5_K, Q6_K, _half
 GATHER_TYPES = (Q4_K, Q5_K, Q6_K, Q2_0)
 
 def _q2_weight(raw: UOp, row: UOp, col: UOp, width: int, rows: int) -> UOp:
-  """A Q2_0 value from prepare_q2's words: every code word (16 codes each, rows in order), then FP16 scales two a word."""
-  code = (raw[(row*width+col)//16].load() >> ((col%16)*2).cast(dtypes.uint32)) & 3
+  """A Q2_0 value from prepare_q2's words (q2_code_position): each block's 4 code words, rows in order, then FP16
+  scales two a word."""
+  k = col % 64
+  step, half, t, j = k // 32, (k % 32) // 16, (k % 16) // 4, k % 4
+  shift = (8*j + 2*(2*step + half)).cast(dtypes.uint32)
+  code = (raw[(row*(width//64)+col//64)*4+t].load() >> shift) & 3
   index = row*(width//64)+col//64
   scale = _half((raw[rows*width//16+index//2].load() >> ((index%2)*16).cast(dtypes.uint32)) & 65535)
   return (code.cast(dtypes.int32)-1).float()*scale

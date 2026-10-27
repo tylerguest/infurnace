@@ -153,9 +153,16 @@ present a failed open is retried and reported instead of falling back to the CPU
         top-k kernel (`kernels/topk.py`) replaces 16 argmax passes (3.9 -> ~0.3 ms). Output identical to plain
         decoding; accepted tokens per round ~2.9 on prose, ~9.7 on code; decode ~181-209 tok/s on the sweep (148
         plain), ~290 on code
-  - [ ] Faster DFlash2 rounds (~30 ms each): the 16-row verification runs the int8 Q2_0 GEMM at one 16-token tile,
-        where each decoded weight register feeds one MMA (~140 GB/s, ~8.4 ms a forward); the Hadamard transforms and
-        ~1,000 small kernels add the rest
+  - [x] Faster 16-row verification, first pass: prepare_q2 now packs each block's codes as 4 words, one per MMA
+        thread, with register r's codes at bits 8j + 2r (2 operations a register instead of ~10; the decode GEMV reads
+        the same words), and one 16-row tile splits K until ~120 blocks are in flight (ffn_down 48.7 -> 22.7 us).
+        The int8 GEMM's share of 6 profiled rounds: 76.8 -> 58.5 ms. DFlash2 decode ~181-209 -> ~205-222 tok/s; plain
+        ~148 -> ~149-157
+  - [x] Split-K partial sums are stored in FP32 (`_sum_splits`): left lazy, the sum fused into its consumers and lost
+        precision (Bonsai's 16-row perplexity moved with the split count, 25.418 -> 25.462). Now 25.4180 against
+        llama.cpp's 25.4209; Qwen3.5's 16-row and verifier perplexities unchanged (16.9861, 16.9858)
+  - [ ] Faster DFlash2 rounds (~20 ms each): the int8 GEMM still ~6.5 ms a 16-row forward (~250 GB/s), the Hadamard
+        transforms ~2 ms, and ~1,000 small generated kernels
 - [ ] Bonsai-2B and its third-party Qwen3.5-2B drafts
 
 Measured 2026-10-18 (RTX 5060), Bonsai-4B against llama.cpp on the same GGUF: eval.txt (512 × 8) llama.cpp
