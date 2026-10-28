@@ -107,30 +107,58 @@ def q2_code_position(k: int) -> tuple[int, int]:
   step, half, t, j = k // 32, (k % 32) // 16, (k % 16) // 4, k % 4
   return t, 8 * j + 2 * (2 * step + half)
 
-def prepare_q2(raw: Tensor, *, realize: bool = True) -> Tensor:
-  """Q2_0 blocks (FP16 scale, 16 code bytes) as words: every block's 4 code words (q2_code_position), rows in order,
-  then every scale. Each word holds 16 codes ready to mask into dp4a/MMA registers in two operations; nothing is
-  padded (2.25 bits a weight)."""
-  if raw.dtype != dtypes.uint8 or raw.numel() <= 0 or raw.numel() % 18 or (raw.numel() // 18) % 2:
-    raise QuantGemvError("Q2_0 preparation requires whole uint8 blocks, an even number of them")
-  blocks = raw.flatten().reshape(-1, 18)
-  codes = ((blocks[:, 2:].reshape(-1, 16, 1).cast(dtypes.uint32) // Tensor([1, 4, 16, 64], dtype=dtypes.uint32)) % 4).reshape(-1, 64)
+# prepare_q2 tiles rows by 8 and blocks by 2: for each 8-row tile and pair of 64-value blocks, each row's 8 code words
+# (block 2p's 4, then 2p+1's: 32 contiguous bytes, the sector the one-row GEMV reads), then the tile's 16 FP16 scales
+# (8 words: block 2p's rows 0-7, then 2p+1's). An MMA warp's 8 rows of one block are 16 bytes of each row's 32;
+# the pair's two loads cover 256 contiguous bytes.
+Q2_TILE_ROWS, Q2_TILE_WORDS = 8, 72
+
+def q2_word(row, block, word, blocks: int):
+  """Index of code word `word` (0-3) of `row`'s Q2_0 block `block` (of `blocks` a row) in prepare_q2's words."""
+  return ((row // Q2_TILE_ROWS) * (blocks // 2) + block // 2) * Q2_TILE_WORDS + (row % Q2_TILE_ROWS) * 8 + (block % 2) * 4 + word
+
+def q2_scale_word(row, block, blocks: int):
+  """Index of the word holding `row`'s scale of block `block`, in its half (row % 2)."""
+  return ((row // Q2_TILE_ROWS) * (blocks // 2) + block // 2) * Q2_TILE_WORDS + 64 + (block % 2) * 4 + (row % Q2_TILE_ROWS) // 2
+
+def q2_scale(raw: UOp, row: UOp, block, blocks: int) -> UOp:
+  """`row`'s FP32 scale of Q2_0 block `block` from prepare_q2's words."""
+  return _half((raw[q2_scale_word(row, block, blocks)].load() >> ((row % 2) * 16).cast(dtypes.uint32)) & 65535)
+
+def prepare_q2(raw: Tensor, *, in_features: int, realize: bool = True) -> Tensor:
+  """Q2_0 blocks (FP16 scale, 16 code bytes) as words in 8-row tiles of block pairs (q2_word, q2_scale_word): each
+  word holds 16 codes ready to mask into dp4a/MMA registers in two operations; nothing is padded (2.25 bits a weight)."""
+  blocks = in_features // 64
+  if raw.dtype != dtypes.uint8 or in_features % 128 or raw.numel() <= 0 or raw.numel() % (18 * blocks * Q2_TILE_ROWS):
+    raise QuantGemvError("Q2_0 preparation requires whole uint8 blocks, rows of a multiple of 128 values and a multiple of 8 rows")
+  rows, pairs = raw.numel() // (18 * blocks), blocks // 2
+  data = raw.flatten().reshape(-1, 18)
+  quarters = Tensor([1, 4, 16, 64], dtype=dtypes.uint32, device=raw.device)
+  codes = ((data[:, 2:].reshape(-1, 16, 1).cast(dtypes.uint32) // quarters) % 4).reshape(-1, 64)
   # (block, step, half, t, j) -> word t gets code << (8j + 2(2 step + half))
   codes = codes.reshape(-1, 2, 2, 4, 4).permute(0, 3, 1, 2, 4).reshape(-1, 4, 16)
-  shifts = Tensor([2 ** (8 * j + 2 * (2 * step + half)) for step in range(2) for half in range(2) for j in range(4)], dtype=dtypes.uint32)
-  words = (codes * shifts).sum(-1, dtype=dtypes.uint32)  # the codes' bits never overlap: the sum is a bitwise or
-  result = words.flatten().cat(blocks[:, :2].flatten().bitcast(dtypes.uint32))
+  words = (codes * _q2_shifts(raw.device)).sum(-1, dtype=dtypes.uint32)  # the codes' bits never overlap: the sum is a bitwise or
+  words = words.reshape(rows // 8, 8, pairs, 8).permute(0, 2, 1, 3).reshape(rows // 8, pairs, 64)
+  scales = data[:, :2].reshape(rows // 8, 8, pairs, 2, 2).permute(0, 2, 3, 1, 4).contiguous().reshape(rows // 8, pairs, 32).bitcast(dtypes.uint32)
+  result = words.cat(scales, dim=-1).flatten()
   return result.realize() if realize else result
+
+def _q2_shifts(device) -> Tensor:
+  """Each code's multiplier in its word, in (step, half, j) order (q2_code_position)."""
+  shifts = [2 ** (8 * j + 2 * (2 * step + half)) for step in range(2) for half in range(2) for j in range(4)]
+  return Tensor(shifts, dtype=dtypes.uint32, device=device)
 
 def dequant_prepared_q2(packed: Tensor, *, in_features: int) -> Tensor:
   """FP32 weights straight from prepare_q2's words."""
-  n = packed.numel() * 4 // 18 * 64
-  words = packed[:n // 16].reshape(-1, 4, 1)
-  shifts = Tensor([2 ** (8 * j + 2 * (2 * step + half)) for step in range(2) for half in range(2) for j in range(4)], dtype=dtypes.uint32)
-  codes = (words // shifts.reshape(1, 1, 16)) % 4                                   # (block, t, (step, half, j))
-  codes = codes.reshape(-1, 4, 2, 2, 4).permute(0, 2, 3, 1, 4).reshape(-1, 64)     # back to k order
-  scales = packed[n // 16:].bitcast(dtypes.float16).float().reshape(-1, 1)
-  return ((codes.cast(dtypes.int32) - 1).float() * scales).flatten()
+  pairs = in_features // 128
+  tiles = packed.numel() // (pairs * Q2_TILE_WORDS)
+  data = packed.reshape(tiles, pairs, Q2_TILE_WORDS)
+  words = data[..., :64].reshape(tiles, pairs, 8, 2, 4, 1)                              # (tile, pair, row, block, t)
+  codes = (words // _q2_shifts(packed.device).reshape(1, 1, 1, 1, 1, 16)) % 4
+  codes = codes.reshape(tiles, pairs, 8, 2, 4, 2, 2, 4).permute(0, 2, 1, 3, 5, 6, 4, 7)  # (tile, row, pair, block, step, half, t, j)
+  scales = data[..., 64:].contiguous().bitcast(dtypes.float16).float().reshape(tiles, pairs, 2, 8).permute(0, 3, 1, 2)  # (tile, row, pair, block)
+  values = (codes.reshape(tiles, 8, pairs, 2, 64).cast(dtypes.int32) - 1).float() * scales.unsqueeze(-1)
+  return values.flatten()
 
 def dequant_prepared_q4(packed: Tensor, *, in_features: int) -> Tensor:
   """FP32 weights straight from prepare_q4's tiled words (GGUF Q4_K field math)."""
@@ -294,6 +322,53 @@ def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot:Callabl
     name=name+('_reuse' if reuse_tokens else '_local' if local_tokens else '')+('_loop' if loop_chunks else '')
          +('_sum' if fuse_chunks else ''), opts_to_apply=()))
 
+def _q2_slices(out_features: int, in_features: int) -> int:
+  """K slices for _q2_decode_kernel: the fewest that give ~960 warps (32 per SM on an RTX 5060), each a whole
+  number of 4-pair steps."""
+  tiles, pairs = out_features // Q2_TILE_ROWS, in_features // 128
+  fits = [s for s in range(1, pairs//4 + 1) if pairs % (4*s) == 0]
+  return next((s for s in fits if tiles*s >= 960), fits[-1])
+
+@functools.cache
+def _q2_decode_kernel(out: UOp, raw: UOp, xq: UOp, xd: UOp, xs: UOp, *, tokens: int, out_features: int, in_features: int,
+                      slices: int) -> UOp:
+  """One-row Q2_0 GEMV over prepare_q2's tiles: a warp per 8-row tile (and K slice), lane = (block pair % 4, row), so
+  each step reads four consecutive pair units, ~1 KB contiguous; the dp4a dots are the generic path's. Rows' sums
+  meet over two shuffles; slices write partial sums (the last axis of `out`) for the caller to add."""
+  tiles, pairs = out_features // Q2_TILE_ROWS, in_features // 128
+  per, items = pairs // slices, tokens * tiles * slices
+  warps = math.gcd(items, 4)
+  block = UOp.range(items // warps, 0, axis_type=AxisType.GLOBAL)
+  warp = UOp.range(warps, 1, axis_type=AxisType.LOCAL)
+  lane = UOp.range(32, -1, axis_type=AxisType.WARP)
+  item = block * warps + warp
+  token, tile, piece = item // (tiles * slices), (item // slices) % tiles, item % slices
+  row, quarter = lane % Q2_TILE_ROWS, lane // Q2_TILE_ROWS
+  acc = UOp.placeholder((1,), dtypes.float32, slot=5, addrspace=AddrSpace.REG)
+  acc = acc.after(acc[0].store(acc.const_like(0)))
+  step = UOp.range(per // 4, 2, axis_type=AxisType.LOOP)
+  pair = piece * per + step * 4 + quarter
+  unit = (tile * pairs + pair) * Q2_TILE_WORDS
+  total = acc.after(step)[0].load()
+  for b in range(2):  # blocks 2 pair and 2 pair + 1: this row's 32 contiguous bytes, and its two scales
+    words = _load_lanes(raw[unit + row * 8 + b * 4], 4)
+    d = _half((raw[unit + 64 + b * 4 + row // 2].load() >> ((row % 2) * 16).cast(dtypes.uint32)) & 65535)
+    for half32 in range(2):  # the block's two 32-value groups
+      group = pair * 4 + b * 2 + half32
+      xwords = _load_lanes(xq[token, group, 0], 8)
+      dot = UOp.const(0, dtypes.int32)
+      for t in range(4):
+        for half in range(2):  # codes k = 16*half + 4t + j of the group, against activation word 4*half + t
+          dot = _dp4a((words[t] >> (half32 * 4 + half * 2)) & 0x03030303, xwords[half * 4 + t], dot)
+      qsum = xs[token, group, 0].load() + xs[token, group, 1].load()  # dot(q - 1, x) == dot(q, x) - sum(x)
+      total = total + (dot - qsum).float() * d * xd[token, group]
+  done = acc[0].store(total).end(step)
+  value = acc.after(done)[0].load()
+  for offset in (16, 8):  # the row's four pair quarters
+    value = value + UOp(Ops.CUSTOM, src=(value,), arg=(f"__shfl_xor_sync(0xffffffff, {{0}}, {offset})", dtypes.float))
+  store = out[token, tile * Q2_TILE_ROWS + row, piece.valid(lane < Q2_TILE_ROWS)].store(value)
+  return store.end(block, warp, lane).sink(arg=KernelInfo(name="q2_0_decode_tiled", opts_to_apply=()))
+
 def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, out_features:int, in_features:int, ggml_type:int,
                          q6_aligned: bool = False, q6_tiled: bool = False, q4_tiled: bool = False,
                          interleave_tokens:bool=False, reuse_tokens:bool=False, local_tokens:bool=False,
@@ -346,16 +421,14 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, out_features:
       return (corrected[0]*scales[0] + corrected[1]*scales[1]) * xd[token, group] * _half(raw[d_index].load())
     if ggml_type == Q2_0:
       # prepare_q2: this lane's group is one 32-value step of its block, whose 4 code words hold its 8 registers
-      words = _load_lanes(raw[(output*(in_features//64) + group//2)*4], 4)
+      words = _load_lanes(raw[q2_word(output, group//2, 0, in_features//64)], 4)
       step = (group % 2).cast(dtypes.uint32)
       dot = UOp.const(0, dtypes.int32)
       for t in range(4):
         for half in range(2):  # codes k = 16*half + 4t + j of the step, against activation word 4*half + t
           codes = (words[t] >> (step*4 + half*2)) & 0x03030303
           dot = _dp4a(codes, xwords[half*4+t], dot)
-      scale_index = output*(in_features//64) + group//2
-      scale_word = raw[out_features*in_features//16 + scale_index//2].load()
-      d = _half((scale_word >> ((scale_index%2)*16).cast(dtypes.uint32)) & 65535)
+      d = q2_scale(raw, output, group//2, in_features//64)
       # dot(q - 1, x) == dot(q, x) - sum(x)
       qsum = xs[token, group, 0].load() + xs[token, group, 1].load()
       return (dot - qsum).float() * d * xd[token, group]
@@ -406,6 +479,15 @@ def quant_gemv(x:Tensor, packed:Tensor, *, out_features:int, in_features:int, gg
                                (xd, (tokens, groups), dtypes.float32), (xs, (tokens, groups, 2), dtypes.int32)):
     if tensor.shape != shape or tensor.dtype != dtype or tensor.device != x.device:
       raise QuantGemvError("shared Q8 activation dtype/shape/device does not match the projection")
+  if ggml_type == Q2_0 and in_features % 512 == 0 and not (interleave_tokens or reuse_tokens or local_tokens or loop_chunks or fuse_chunks
+                                                           or exact_rows):
+    # prepare_q2's tiles, read a tile at a time, four pairs a step (the generic path below reads one row's blocks)
+    slices = _q2_slices(out_features, in_features)
+    out = Tensor.empty(tokens, out_features, slices, dtype=dtypes.float32, device=x.device)
+    result = Tensor.custom_kernel(out, packed, xq, xd, xs, fxn=functools.partial(
+      _q2_decode_kernel, tokens=tokens, out_features=out_features, in_features=in_features, slices=slices))[0]
+    if return_parts: return result
+    return result.sum(-1).reshape(*x.shape[:-1], out_features)
   decode = functools.partial(_quant_decode_kernel, ggml_type=ggml_type, q6_aligned=q6_aligned, q6_tiled=q6_tiled,
                              q4_tiled=q4_tiled, interleave_tokens=interleave_tokens, reuse_tokens=reuse_tokens,
                              local_tokens=local_tokens, loop_chunks=loop_chunks or fuse_chunks, fuse_chunks=fuse_chunks)

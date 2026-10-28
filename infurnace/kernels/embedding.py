@@ -10,20 +10,15 @@ from tinygrad import Tensor, UOp, dtypes
 from tinygrad.uop.ops import AxisType, KernelInfo
 
 from infurnace.kernels.quant_gemm import _weight
-from infurnace.kernels.quant_gemv import Q2_0, Q4_K, Q5_K, Q6_K, _half
+from infurnace.kernels.quant_gemv import Q2_0, Q4_K, Q5_K, Q6_K, q2_code_position, q2_scale, q2_word
 
 GATHER_TYPES = (Q4_K, Q5_K, Q6_K, Q2_0)
 
 def _q2_weight(raw: UOp, row: UOp, col: UOp, width: int, rows: int) -> UOp:
-  """A Q2_0 value from prepare_q2's words (q2_code_position): each block's 4 code words, rows in order, then FP16
-  scales two a word."""
-  k = col % 64
-  step, half, t, j = k // 32, (k % 32) // 16, (k % 16) // 4, k % 4
-  shift = (8*j + 2*(2*step + half)).cast(dtypes.uint32)
-  code = (raw[(row*(width//64)+col//64)*4+t].load() >> shift) & 3
-  index = row*(width//64)+col//64
-  scale = _half((raw[rows*width//16+index//2].load() >> ((index%2)*16).cast(dtypes.uint32)) & 65535)
-  return (code.cast(dtypes.int32)-1).float()*scale
+  """A Q2_0 value from prepare_q2's words (q2_word, q2_code_position)."""
+  t, shift = q2_code_position(col % 64)
+  code = (raw[q2_word(row, col//64, t, width//64)].load() >> shift.cast(dtypes.uint32)) & 3
+  return (code.cast(dtypes.int32)-1).float()*q2_scale(raw, row, col//64, width//64)
 
 @functools.cache
 def _gather_kernel(out: UOp, raw: UOp, ids: UOp, *, count: int, width: int, typ: int, q6_aligned: bool, q6_tiled: bool,

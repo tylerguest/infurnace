@@ -32,7 +32,7 @@ class _NVLinear:
     self.q6_aligned = q6_aligned and entry.ggml_type == 14
     self.q6_tiled = self.q6_aligned and q6_tiled and self.out_features % 16 == 0
     # realize=False leaves `packed` lazy so a caller can realize many adapters in one schedule.
-    self.packed = (prepare_q2(entry.data, realize=realize) if self.ggml_type == 42 else
+    self.packed = (prepare_q2(entry.data, in_features=self.in_features, realize=realize) if self.ggml_type == 42 else
                    prepare_q4(entry.data, in_features=self.in_features, realize=realize, ggml_type=entry.ggml_type) if self.q4_tiled else
                    prepare_q6(entry.data, in_features=self.in_features, tiled=self.q6_tiled, realize=realize) if self.q6_aligned else
                    entry.data.contiguous().bitcast(dtype).flatten())

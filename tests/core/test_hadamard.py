@@ -20,10 +20,10 @@ def q2_blocks(count: int, seed: int = 0) -> tuple[bytes, list[float]]:
   return raw, values
 
 def test_q2_0_decode_and_prepared_layout():
-  raw, values = q2_blocks(8)
+  raw, values = q2_blocks(16)
   data = Tensor(raw, dtype=dtypes.uint8)
-  assert gguf.decode(data, 512, gguf.Q2_0).tolist() == pytest.approx(values, abs=1e-6)
-  assert dequant_prepared_q2(prepare_q2(data), in_features=128).tolist() == pytest.approx(values, abs=1e-6)  # 4 rows of 128
+  assert gguf.decode(data, 1024, gguf.Q2_0).tolist() == pytest.approx(values, abs=1e-6)
+  assert dequant_prepared_q2(prepare_q2(data, in_features=128), in_features=128).tolist() == pytest.approx(values, abs=1e-6)  # 8 rows of 128
   assert gguf.block_size(gguf.Q2_0) == (64, 18)
 
 def metadata(**extra):

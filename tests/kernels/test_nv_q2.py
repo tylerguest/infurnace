@@ -18,10 +18,11 @@ def test_q2_0_gemv_matches_dense(out_features, in_features, tokens):
   dense = Tensor(values, device="NV").reshape(out_features, in_features)
   x = Tensor.randn(tokens, in_features, device="NV").realize()
   reference = x @ dense.T
-  got = quant_gemv(x, prepare_q2(data), out_features=out_features, in_features=in_features, ggml_type=Q2_0)
+  got = quant_gemv(x, prepare_q2(data, in_features=in_features), out_features=out_features, in_features=in_features, ggml_type=Q2_0)
   # Q8 activations: ~1% of the output scale
   assert ((got - reference).abs().max() / reference.abs().max()).item() < 0.02
-  shared = quant_gemv(x, prepare_q2(data), out_features=out_features, in_features=in_features, ggml_type=Q2_0, q8=q8_quantize(x, tokens, in_features))
+  shared = quant_gemv(x, prepare_q2(data, in_features=in_features), out_features=out_features, in_features=in_features, ggml_type=Q2_0,
+                      q8=q8_quantize(x, tokens, in_features))
   assert (shared - got).abs().max().item() == 0
 
 @pytest.mark.parametrize("rows,width,perm", [(1, 2560, None), (64, 2560, None), (1, 4096, (2, 16, 128)), (3, 9216, None)])
@@ -59,7 +60,8 @@ def test_q2_0_prefill_gemm_matches_dense(out_features, in_features, tokens, int8
   dense = Tensor(values, device="NV").reshape(out_features, in_features)
   x = Tensor.randn(tokens, in_features, device="NV").realize()
   reference = x.half().float() @ dense.T
-  got = quant_gemm(x, prepare_q2(Tensor(raw, dtype=dtypes.uint8, device="NV")), out_features=out_features, in_features=in_features,
+  packed = prepare_q2(Tensor(raw, dtype=dtypes.uint8, device="NV"), in_features=in_features)
+  got = quant_gemm(x, packed, out_features=out_features, in_features=in_features,
                    ggml_type=Q2_0)
   # int8 tensor cores take int8 activations (one scale per 32 values, ~1% of the output scale, as the decode GEMV);
   # the FP16 kernel multiplies FP16 activations and accumulates in FP32
@@ -69,7 +71,7 @@ def test_q2_0_row_gather_matches_decoding_the_rows():
   from infurnace.kernels.embedding import packed_gather
   rows, width = 40, 2560
   raw, values = q2_blocks(rows * width // 64, seed=5)
-  packed = prepare_q2(Tensor(raw, dtype=dtypes.uint8, device="NV"))
+  packed = prepare_q2(Tensor(raw, dtype=dtypes.uint8, device="NV"), in_features=width)
   ids = Tensor([[3, 39, 0], [17, 3, 21]], dtype=dtypes.int32, device="NV")
   got = packed_gather(ids, packed, width=width, ggml_type=Q2_0, rows=rows).tolist()
   for i, row in enumerate([[3, 39, 0], [17, 3, 21]]):
