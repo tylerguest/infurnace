@@ -31,8 +31,8 @@ def chunk_nll(model, step_rows: int):
   """A captured step: rows of token ids at start_pos -> each row's negative log-likelihood of its target."""
   t = model.transformer
   def step(ids: Tensor, targets: Tensor, start_pos: UOp) -> Tensor:
-    x = t.token_embd(ids).float()
-    for block in t.blk: x = block(x, start_pos)
+    x, mask = t.token_embd(ids).float(), None
+    for block in t.blk: x, mask = block(x, start_pos, mask)
     logits = t.output(t.output_norm(x)).reshape(step_rows, -1).float()
     return -logits.log_softmax(-1).gather(-1, targets.reshape(step_rows, 1)).reshape(step_rows).contiguous()
   return TinyJit(step)

@@ -71,7 +71,9 @@ def _fused_gdn(block: GatedDeltaNetBlock):
       state = Tensor(state.uop.after(z.uop))
     z = zs[0].cat(*zs[1:]) if len(zs) > 1 else zs[0]
     return block.ssm_out(z.reshape(1, T_pad, H * V)[:, :T])
-  def attention(x: Tensor, start_pos):
+  def attention(x: Tensor, start_pos, idx_mask=None):
+    # idx_mask: an indexer's token selection (DeepSeek-style sparse attention), which these models don't have
+    if idx_mask is not None: return upstream_attention(x, start_pos, idx_mask)
     B, T, _ = x.shape
     if not isinstance(start_pos, UOp): start_pos = UOp.variable('start_pos', 0, block.config.max_context - 1).bind(start_pos)
     multirow = isinstance(T, UOp) or T > 1  # prompt chunks have a symbolic row count

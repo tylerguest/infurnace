@@ -69,11 +69,11 @@ class TargetObserver:
 
   def _forward(self, token, position, temperature):
     target = self.model.transformer
-    x, features = target.token_embd(Tensor(token).cast(dtypes.int32).reshape(1, 1)).float(), []
+    x, features, mask = target.token_embd(Tensor(token).cast(dtypes.int32).reshape(1, 1)).float(), [], None
     for index, block in enumerate(target.blk):
       # GGUF tap N means HF hidden_states[N], i.e. after target block N-1.
       if index in self.layers: features.append(x)
-      x = block(x, position)
+      x, mask = block(x, position, mask)  # blocks return (output, the indexer's token mask)
     logits = target.output(target.output_norm(x[:, -1:]))[:, -1, :]
     # Identical to ordinary tinygrad target sampling, including greedy RNG
     # consumption and its tie behavior. Draft argmax never consumes this RNG.

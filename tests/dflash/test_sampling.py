@@ -37,8 +37,8 @@ def test_first_token_follows_the_target_probabilities(tmp_path, verifier):
     model, generator = model_and_generator(tmp_path, verifier, seed=3)  # a model with several likely tokens
     t, x = model.transformer, None
     for position, token in enumerate(PROMPT):
-      x = t.token_embd(Tensor([[token]], dtype='int32')).float()
-      for block in t.blk: x = block(x, position)
+      x, mask = t.token_embd(Tensor([[token]], dtype='int32')).float(), None
+      for block in t.blk: x, mask = block(x, position, mask)
       x = x.realize()
     probs = (t.output(t.output_norm(x[:, -1:]))[0, -1].float() / temperature).softmax().tolist()
     assert sum(p > 0.05 for p in probs) >= 2

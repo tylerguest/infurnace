@@ -39,8 +39,8 @@ def last_logits(model, tokens, chunks):
   t, position = model.transformer, 0
   with Context(DEV='NV'):
     for rows in chunks:
-      x = t.token_embd(Tensor([tokens[position:position + rows]], dtype='int32')).float()
-      for block in t.blk: x = block(x, position)
+      x, mask = t.token_embd(Tensor([tokens[position:position + rows]], dtype='int32')).float(), None
+      for block in t.blk: x, mask = block(x, position, mask)
       x, position = x.realize(), position + rows
     return t.output(t.output_norm(x[:, -1:]))[0, -1].float().realize()
 
@@ -50,8 +50,8 @@ def one_row_logits(model, tokens):
   t = model.transformer
   if not hasattr(model, '_test_step'):
     def step(token, position):
-      x = t.token_embd(token).float()
-      for block in t.blk: x = block(x, position)
+      x, mask = t.token_embd(token).float(), None
+      for block in t.blk: x, mask = block(x, position, mask)
       return t.output(t.output_norm(x)).reshape(-1).float().contiguous()
     model._test_step = TinyJit(step)
   position = UOp.variable('start_pos', 0, t.max_context - 1)

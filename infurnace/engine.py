@@ -168,7 +168,9 @@ def _fused_attention(block: TransformerBlock):
   conversation grows (it swaps in its own kernel only on AMD, at this same spot). Other shapes use
   upstream's path."""
   upstream_attention, c = block._attention, block.config
-  def attention_step(x: Tensor, start_pos):
+  def attention_step(x: Tensor, start_pos, idx_mask=None):
+    # idx_mask: an indexer's token selection (DeepSeek-style sparse attention), which these models don't have
+    if idx_mask is not None: return upstream_attention(x, start_pos, idx_mask)
     B, T, _ = x.shape
     if B == 1 and (isinstance(T, UOp) or T > 1) and x.max_shape[1] % PREFILL_ROWS == 0:
       # A prompt chunk (1..16 or 1..64 rows), padded to its maximum like the GDN prefill. The padding rows come
@@ -344,10 +346,10 @@ class Model:
     t, features = self.transformer, []
     for block in t.blk: block._prompt_rows = rows  # recurrent layers mask the rest (see models/qwen35.py)
     try:
-      x = t.token_embd(ids[:, start_pos:start_pos + PROMPT_ROWS]).float()
+      x, mask = t.token_embd(ids[:, start_pos:start_pos + PROMPT_ROWS]).float(), None
       for index, block in enumerate(t.blk):
         if index in self.feature_layers: features.append(x)  # tap N is the input of block N
-        x = block(x, start_pos)
+        x, mask = block(x, start_pos, mask)  # blocks return (output, the indexer's token mask)
     finally:
       for block in t.blk: block._prompt_rows = None
     # The last row's output depends on every layer's cache and state writes; the taps alone would leave out the
