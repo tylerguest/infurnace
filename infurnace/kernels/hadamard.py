@@ -13,7 +13,7 @@ from tinygrad import Tensor, UOp, dtypes
 from tinygrad.dtype import AddrSpace
 from tinygrad.uop.ops import AxisType, KernelInfo
 
-from infurnace.kernels.quant_gemv import warp_reduce
+from infurnace.kernels.quant_gemv import q8_64_slot, warp_reduce
 
 @functools.cache
 def _fwht_kernel(out: UOp, x: UOp, signs: UOp, *, rows: int, width: int, block: int, perm: tuple[int, int, int] | None,
@@ -79,7 +79,8 @@ def _fwht_q8_kernel(q: UOp, scale: UOp, *sources: UOp, rows: int, width: int, bl
   first = lane - lane % 4  # this word's first value
   word = sum((code(current[first + i].load()).cast(dtypes.int8).cast(dtypes.uint8).cast(dtypes.uint32) << (i * 8)
               for i in range(4)), UOp.const(0, dtypes.uint32))
-  stores = [q[row, (position // 4).valid((lane % 4).eq(0))].store(word),
+  slot = position // 4 if group == 32 else position // 64 * 16 + q8_64_slot(position % 64 // 4)  # q8_quantize64's word order
+  stores = [q[row, slot.valid((lane % 4).eq(0))].store(word),
             scale[row, (position // group).valid((lane % group).eq(0))].store(step)]
   if xsum is not None:  # each 16-value half's sum of codes, for the K-quant GEMVs' offsets (exact integers in FP32)
     mine = code(current[lane].load())

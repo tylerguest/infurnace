@@ -205,9 +205,15 @@ def q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor, 
   q, scale, xsum = Tensor.custom_kernel(q, scale, xsum, x, fxn=functools.partial(_q8_quantize_kernel, tokens=tokens, in_features=in_features))[:3]
   return q, scale, xsum
 
+def q8_64_slot(word):
+  """Where q8_quantize64 stores word `word` (values 4 word .. 4 word + 3) of a 64-value group: an int8 MMA thread t
+  needs words t, t + 4 (k 0-31) and 8 + t, 12 + t (k 32-63), so they sit together at slots 4t .. 4t + 3 for one
+  16-byte load: slot 4t + 2 step + w for word 8 step + 4 w + t. Works on ints and UOps."""
+  return 4 * (word % 4) + 2 * (word // 8) + (word % 8) // 4
+
 def _q8_quantize64_kernel(q: UOp, scale: UOp, x: UOp, tokens: int, in_features: int) -> UOp:
   """Int8 activations with one FP32 scale per 64 values (a Q2_0 block): a warp per group, two values a lane; lanes
-  0-15 each pack four into a word."""
+  0-15 each pack four into a word, stored in q8_64_slot order."""
   groups = in_features // 64
   token_group, lane = UOp.range(tokens * groups, 0), UOp.range(32, 1, axis_type=AxisType.LOCAL)
   token, group = token_group // groups, token_group % groups
@@ -218,11 +224,11 @@ def _q8_quantize64_kernel(q: UOp, scale: UOp, x: UOp, tokens: int, in_features: 
   xs = tuple(x[token, group, word_lane * 4 + i].float() for i in range(4))
   word = sum(((v / group_scale).round().clip(-127, 127).cast(dtypes.int8).cast(dtypes.uint8).cast(dtypes.uint32)
               << (i * 8) for i, v in enumerate(xs)), UOp.const(0, dtypes.uint32))
-  stores = (q[token, group, lane.valid(lane < 16)].store(word), scale[token, group.valid(lane.eq(0))].store(group_scale))
+  stores = (q[token, group, q8_64_slot(word_lane).valid(lane < 16)].store(word), scale[token, group.valid(lane.eq(0))].store(group_scale))
   return UOp.group(*stores).end(token_group, lane).sink(arg=KernelInfo(name="q8_quantize64", opts_to_apply=()))
 
 def q8_quantize64(x: Tensor, tokens: int, in_features: int) -> tuple[Tensor, Tensor]:
-  """(tokens, in_features / 64, 16) words of int8 values and (tokens, in_features / 64) scales."""
+  """(tokens, in_features / 64, 16) words of int8 values (q8_64_slot order) and (tokens, in_features / 64) scales."""
   groups = in_features // 64
   q = Tensor.empty(tokens, groups, 16, dtype=dtypes.uint32, device=x.device)
   scale = Tensor.empty(tokens, groups, dtype=dtypes.float32, device=x.device)

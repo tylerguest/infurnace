@@ -605,8 +605,10 @@ def _prefill_q2_imma(out: UOp, raw: UOp, xq: UOp, xd: UOp, *, tokens: int, width
     activations = []
     for m in range(mtiles):
       tokens_m = [token_base+m*16+group+r for r in (0, 8)]
+      # q8_64_slot: this thread's four words of each row are adjacent, (step 0: k 4t, 16+4t; step 1: the same + 32)
+      words = [_load_lanes(xq[tokens_m[r], qblock, thread*4], 4) for r in (0, 1)]
       # (row g, k 4t), (row g+8, k 4t), (row g, k 16+4t), (row g+8, k 16+4t) of each 32-value step
-      a = [[xq[tokens_m[r], qblock, step*8+thread+w].load() for w in (0, 4) for r in (0, 1)] for step in range(2)]
+      a = [[words[r][2*step+w] for w in (0, 1) for r in (0, 1)] for step in range(2)]
       activations.append((a, [xd[tokens_m[r], qblock].load() for r in (0, 1)]))
     loaded.append((weights, activations))
   values = {key: [acc.after(kb)[i].load() for i in range(4)] for key, acc in accs.items()}
@@ -687,8 +689,9 @@ def quant_gemm(x: Tensor, packed: Tensor, *, out_features: int, in_features: int
     xq, xd = q8_quantize64(activation, padded_tokens, in_features) if q8 is None else q8
     if xq.shape != (padded_tokens, in_features//64, 16) or xd.shape != (padded_tokens, in_features//64) or xq.device != x.device:
       raise QuantGemmError("shared int8 activation shape/device does not match the prefill")
-    # RTX 5060, Bonsai-4B 64-row chunks: the int8 matmuls take 11.8 ms with two 16-token tiles a warp, 10.5 with four
-    mtiles = next(m for m in (4, 2, 1) if (padded_tokens//16) % m == 0)
+    # RTX 5060, Bonsai-4B 64-row chunks, cold weights: two 16-token tiles a warp and two blocks an iteration (below)
+    # beat four tiles (qkv 42 vs 71 us, ffn up 48 vs 66): four hold too many registers once activations come in 16-byte loads
+    mtiles = next(m for m in (2, 1) if (padded_tokens//16) % m == 0)
     warps = math.gcd(out_features//(8*tiles), 4)
     grid, kblocks = (padded_tokens//(16*mtiles))*(out_features//(warps*8*tiles)), in_features//64
     # Split K until there are about four blocks per SM (30 on an RTX 5060) for one 16-row tile (a DFlash verification:
@@ -699,9 +702,9 @@ def quant_gemm(x: Tensor, packed: Tensor, *, out_features: int, in_features: int
     # One 16-row tile reads weights from memory with few bytes in flight a warp: unrolling the K loop helps, by how
     # much depending on the shape (cold weights, RTX 5060): the 248320-row head 913 -> 546 us at 10 blocks an
     # iteration (20 is slower, all 40 spills), ffn_down 33.9 -> 28.9 us at 6, attn_qkv 25.3 -> 23.9 at 10; ssm_out
-    # (8 blocks a split) loses at 8. Prompt chunks (four tiles a warp) keep their registers.
+    # (8 blocks a split) loses at 8. Prompt chunks: two blocks an iteration.
     per_split = kblocks // splits
-    unroll = next(u for u in (10, 6, 1) if per_split % u == 0) if padded_tokens == 16 else 1
+    unroll = next(u for u in (10, 6, 1) if per_split % u == 0) if padded_tokens == 16 else 2 if per_split % 2 == 0 else 1
     out = Tensor.empty(splits, padded_tokens, out_features, dtype=dtypes.float32, device=x.device)
     result = Tensor.custom_kernel(out, packed.flatten().contiguous(), xq, xd, fxn=functools.partial(
       _prefill_q2_imma, tokens=padded_tokens, width=in_features, rows=out_features, tiles=tiles, splits=splits, mtiles=mtiles,
