@@ -117,8 +117,8 @@ class _PackedLinear(_NVLinear):
     super().__init__(original, entry, prefill=prefill, q6_aligned=True, realize=realize)
     if not keep_weight: self.weight = original.weight = None
 
-  def __call__(self, x):
-    if self.prefill: return super().__call__(x)
+  def __call__(self, x, q8=None):
+    if self.prefill: return super().__call__(x, q8)
     return self.decode(x)
 
 PREFILL_ROWS = 16  # prompt chunks are padded to a multiple of this (the fused GDN kernel scans 16 rows at a time)
@@ -137,17 +137,27 @@ def _one_row(x: Tensor, *layers) -> tuple[Tensor, ...]:
   width = getattr(layers[0], 'in_features', None)
   if _SHARED_Q8 and all(isinstance(layer, _NVLinear) and layer.rotation is layers[0].rotation for layer in layers) and \
      isinstance(x.numel(), int) and x.numel() == width:
-    if layers[0].rotation is not None: x = layers[0].rotation(x)  # Hadamard-folded weights: one rotation for all of them
-    q8 = q8_quantize(x, 1, width)
+    # Hadamard-folded weights: one rotation for all of them, in the same kernel as the quantization
+    q8 = layers[0].rotation.quantized(x, 32) if layers[0].rotation is not None else q8_quantize(x, 1, width)
     return tuple(layer.decode(x, q8) for layer in layers)
+  return tuple(layer(x) for layer in layers)
+
+def _rows(x: Tensor, *layers) -> tuple[Tensor, ...]:
+  """Multirow outputs of projections that read the same input: Hadamard-folded Q2_0 weights share one rotated
+  int8 input (_NVLinear.rows_q8) instead of each rotating and quantizing it. Other layers go through their own call."""
+  if all(isinstance(layer, _NVLinear) and layer.rows_quantized and layer.rotation is layers[0].rotation for layer in layers):
+    q8 = layers[0].rows_q8(x)
+    return tuple(layer(x, q8) for layer in layers)
   return tuple(layer(x) for layer in layers)
 
 def _fused_feed_forward(block):
   """Upstream's dense feed-forward, with gate and up sharing one Q8 activation for one row."""
   upstream_feed_forward = block._feed_forward
   def feed_forward(x: Tensor) -> Tensor:
-    if hasattr(block, 'ffn_gate_exps') or not isinstance(x.numel(), int) or x.numel() != getattr(block.ffn_gate, 'in_features', None):
-      return upstream_feed_forward(x)
+    if hasattr(block, 'ffn_gate_exps'): return upstream_feed_forward(x)
+    if not isinstance(x.numel(), int) or x.numel() != getattr(block.ffn_gate, 'in_features', None):
+      gate, up = _rows(x, block.ffn_gate, block.ffn_up)
+      return block.ffn_down(gate.silu().contiguous() * up)
     gate, up = _one_row(x, block.ffn_gate, block.ffn_up)
     return block.ffn_down(gate.silu().contiguous() * up)
   return feed_forward
@@ -165,7 +175,7 @@ def _fused_attention(block: TransformerBlock):
       # from zero inputs, so their cached keys and values are finite (the kernel reads every key below the
       # padded end), and the prompt's next rows overwrite them. The prompt reader keeps the padded end in the cache.
       x = x.pad_to((B, x.max_shape[1], x.shape[2]))
-      return rows_attention(x, start_pos, block.attn_q(x), block.attn_k(x), block.attn_v(x))[:, :T]
+      return rows_attention(x, start_pos, *_rows(x, block.attn_q, block.attn_k, block.attn_v))[:, :T]
     if B != 1 or isinstance(T, UOp) or T != 1: return upstream_attention(x, start_pos)
     return rows_attention(x, start_pos, *_one_row(x, block.attn_q, block.attn_k, block.attn_v))
   def rows_attention(x: Tensor, start_pos, q: Tensor, k: Tensor, v: Tensor) -> Tensor:

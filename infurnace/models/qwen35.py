@@ -6,7 +6,7 @@ import functools
 import os
 from tinygrad import Context, Tensor, UOp
 from tinygrad.llm.model import GatedDeltaNetBlock
-from infurnace.engine import PREFILL_ROWS, _one_row
+from infurnace.engine import PREFILL_ROWS, _one_row, _rows
 from infurnace.kernels.gdn import gdn_gates, gdn_decode, gdn_prefill
 from infurnace.models import Family
 from infurnace.tokenizer import BPETokenizer
@@ -27,7 +27,8 @@ def _fused_gdn(block: GatedDeltaNetBlock):
     T_pad = x.max_shape[1]
     initial = Tensor(start_pos).eq(0)
     x = x.half()
-    out_gate = block.attn_gate(x).reshape(B, T, H, V)
+    qkv, out_gate = _rows(x, block.attn_qkv, block.attn_gate)
+    out_gate = out_gate.reshape(B, T, H, V)
     if isinstance(T, int):
       projected = gdn_gates(x.reshape(B * T, -1), gates).reshape(B, T, 2 * H)
       beta_in, alpha_in = projected[..., :H], projected[..., H:]
@@ -35,7 +36,7 @@ def _fused_gdn(block: GatedDeltaNetBlock):
     beta = beta_in.sigmoid().reshape(B, T, H)
     log_alpha = (alpha_in.float() + block.ssm_dt['bias']).softplus().reshape(B, T, H, -1) * block.ssm_a.reshape(H, -1)
     conv_state = initial.where(0, block.conv_state)
-    conv_window = conv_state.cat(block.attn_qkv(x).cast(conv_state.dtype), dim=1)
+    conv_window = conv_state.cat(qkv.cast(conv_state.dtype), dim=1)
     conv_window = conv_window.pad_to((B, block.ssm_conv_kernel - 1 + T_pad, block.conv_channels)).contiguous()
     # A prompt chunk always runs PROMPT_ROWS rows; only the first `live` are prompt (see Model._prompt_chunk).
     live = getattr(block, '_prompt_rows', None)

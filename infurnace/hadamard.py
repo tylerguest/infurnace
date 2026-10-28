@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from tinygrad import Tensor, dtypes
 from infurnace.device import nvidia
-from infurnace.kernels.hadamard import fwht
+from infurnace.kernels.hadamard import fwht, fwht_q8
 
 def hadamard_matrix(n: int) -> list[float]:
   scale = n ** -0.5
@@ -49,6 +49,11 @@ class Rotation:
       x = x.reshape(*x.shape[:-1], rep, nk, hd).transpose(-2, -3).reshape(x.shape)
     if self.signs is not None: x = x * self.signs
     return self._blocks(x).cast(dtype)
+
+  def quantized(self, x: Tensor, group: int) -> tuple[Tensor, ...]:
+    """A folded weight's int8 input in one NV kernel: q8_quantize's tuple for group 32, q8_quantize64's for 64."""
+    signs = self.signs if self.signs is not None else Tensor.ones(x.shape[-1], device=x.device)
+    return fwht_q8(x, signs, block=self.block, perm=self.perm, group=group)
 
   def inverse(self, z: Tensor) -> Tensor:
     """A latent table row in the model's basis."""

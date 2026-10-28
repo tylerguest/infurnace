@@ -4,7 +4,7 @@ from tinygrad.llm.gguf import ggml_data_to_tensor
 from infurnace.gguf import PackedTensor
 from infurnace.kernels.quant_gemv import (quant_gemv, prepare_q2, prepare_q6, prepare_q4, dequant_prepared_q2, dequant_prepared_q4,
                                           dequant_prepared_q6, untile)
-from infurnace.kernels.quant_gemm import quant_gemm, nv_prefill_supported
+from infurnace.kernels.quant_gemm import quant_gemm, nv_prefill_supported, q2_int8
 
 KERNEL_TYPES = (12, 13, 14, 42)  # Q4_K, Q5_K, Q6_K, Q2_0: the one-row GEMV, the tensor-core GEMM and the row gather
 
@@ -49,16 +49,30 @@ class _NVLinear:
     self.weight, self.bias = original.weight, original.bias
 
   def decode(self, x: Tensor, q8: tuple[Tensor, Tensor, Tensor] | None = None) -> Tensor:
-    """With `q8`, `x` is already in this weight's input basis (one rotation for the projections sharing it)."""
-    if q8 is None and self.rotation is not None: x = self.rotation(x)
+    """With `q8`, the input already quantized (in this weight's basis: one rotation for the projections sharing it)."""
+    if q8 is None and self.rotation is not None: q8 = self.rotation.quantized(x, 32)  # rotated and quantized in one kernel
     result = quant_gemv(x, self.packed, out_features=self.out_features, in_features=self.in_features, ggml_type=self.ggml_type,
                         q6_aligned=self.q6_aligned, q6_tiled=self.q6_tiled, q4_tiled=self.q4_tiled, q8=q8)
     return result if self.bias is None else result+self.bias
 
-  def __call__(self, x: Tensor) -> Tensor:
+  @property
+  def rows_quantized(self) -> bool:
+    """Whether multirow inputs are rotated and quantized in one kernel (rows_q8), Hadamard-folded Q2_0 on int8 tensor cores."""
+    return self.prefill and self.rotation is not None and q2_int8(self.ggml_type)
+
+  def rows_q8(self, x: Tensor) -> tuple[Tensor, Tensor]:
+    """The int8 multirow input quant_gemm takes as `q8`: rows padded to a multiple of 16, rotated and quantized."""
+    activation = x.pad_to(x.max_shape) if not isinstance(x.numel(), int) else x
+    tokens = activation.numel() // self.in_features
+    rows = activation.reshape(tokens, self.in_features).pad(((0, -tokens % 16), (0, 0)))
+    return self.rotation.quantized(rows, 64)
+
+  def __call__(self, x: Tensor, q8: tuple[Tensor, Tensor] | None = None) -> Tensor:
+    """`q8`: rows_q8(x), shared by projections of one input."""
     if isinstance(x.numel(), int) and x.numel() == self.in_features:
       return self.decode(x)
-    if self.rotation is not None: x = self.rotation(x)
+    if self.rows_quantized and q8 is None: q8 = self.rows_q8(x)
+    if self.rotation is not None and q8 is None: x = self.rotation(x)
     if self.prefill:
       # Upstream prefill uses a symbolic token count. Pad to its fixed maximum
       # for capture, then slice valid rows; the kernel handles the final 16-row tile.
@@ -66,7 +80,7 @@ class _NVLinear:
       activation = x.pad_to(x.max_shape) if symbolic else x
       result = quant_gemm(activation, self.packed, out_features=self.out_features,
                           in_features=self.in_features, ggml_type=self.ggml_type, q6_aligned=self.q6_aligned, q6_tiled=self.q6_tiled,
-                          q4_tiled=self.q4_tiled)
+                          q4_tiled=self.q4_tiled, q8=q8)
       if symbolic: result = result.shrink(tuple((0, size) for size in (*x.shape[:-1], self.out_features)))
       return result if self.bias is None else result + self.bias
     return self.original(x)

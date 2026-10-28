@@ -564,7 +564,7 @@ def _imma(a: list[UOp], b: list[UOp], c: list[UOp]) -> list[UOp]:
 
 @functools.cache
 def _prefill_q2_imma(out: UOp, raw: UOp, xq: UOp, xd: UOp, *, tokens: int, width: int, rows: int, tiles: int = 1,
-                     splits: int = 1, mtiles: int = 1) -> UOp:
+                     splits: int = 1, mtiles: int = 1, unroll: int = 1) -> UOp:
   """Q2_0 (prepare_q2's layout) against int8 activations (q8_quantize64: one scale per 64 values, a Q2_0 block) on
   int8 tensor cores.
 
@@ -573,7 +573,8 @@ def _prefill_q2_imma(out: UOp, raw: UOp, xq: UOp, xd: UOp, *, tokens: int, width
   made signed with a per-byte subtract, __vsub4). Both steps accumulate in int32; the block's sums are then
   scaled by the activation scale (per token) and the weight block's scale (per output) into FP32. Each warp covers
   `mtiles` 16-token tiles, so a decoded weight register feeds `mtiles` MMAs: the integer and scale work around the
-  MMAs, not the tensor cores, bounds this kernel."""
+  MMAs, not the tensor cores, bounds this kernel. Each loop iteration covers `unroll` blocks, all their loads first,
+  so a warp keeps several in flight instead of waiting on each block's in turn."""
   warps = math.gcd(rows//(8*tiles), 4)
   output_blocks = rows//(warps*8*tiles)
   blocks = width//64//splits
@@ -589,30 +590,36 @@ def _prefill_q2_imma(out: UOp, raw: UOp, xq: UOp, xd: UOp, *, tokens: int, width
     for t in range(tiles):
       acc = UOp.placeholder((4,), dtypes.float32, slot=3+m*tiles+t, addrspace=AddrSpace.REG)
       accs[m, t] = acc.after(acc.store(acc.const_like(0)))
-  kb = UOp.range(blocks, 2, axis_type=getattr(AxisType, 'REDUCE', AxisType.LOOP))
-  qblock = split*blocks+kb
-  def weight_scale(row: UOp) -> UOp:
+  kb = UOp.range(blocks//unroll, 2, axis_type=getattr(AxisType, 'REDUCE', AxisType.LOOP))
+  def weight_scale(row: UOp, qblock: UOp) -> UOp:
     index = row*(width//64)+qblock
     return _half((raw[rows*width//16+index//2].load() >> ((index%2)*16).cast(dtypes.uint32)) & 65535)
-  weights = []
-  for t in range(tiles):
-    # prepare_q2: this lane's word of its weight row's block holds its four B registers (2 * step + half)
-    word = raw[((output_base+t*8+group)*(width//64)+qblock)*4+thread].load()
-    b = [[UOp(Ops.CUSTOMI, src=((word >> (2*(2*step+half))) & 0x03030303,), arg=("__vsub4({0}, 0x01010101u)", dtypes.uint32))
-          for half in range(2)] for step in range(2)]  # codes 0-2 -> -1..1
-    weights.append((b, [weight_scale(output_base+t*8+thread*2+c) for c in (0, 1)]))  # this lane's two output columns
+  loaded = []
+  for u in range(unroll):  # every block's loads before any block's arithmetic
+    qblock = split*blocks+kb*unroll+u
+    weights = []
+    for t in range(tiles):
+      # prepare_q2: this lane's word of its weight row's block holds its four B registers (2 * step + half)
+      word = raw[((output_base+t*8+group)*(width//64)+qblock)*4+thread].load()
+      weights.append((word, [weight_scale(output_base+t*8+thread*2+c, qblock) for c in (0, 1)]))  # this lane's two columns
+    activations = []
+    for m in range(mtiles):
+      tokens_m = [token_base+m*16+group+r for r in (0, 8)]
+      # (row g, k 4t), (row g+8, k 4t), (row g, k 16+4t), (row g+8, k 16+4t) of each 32-value step
+      a = [[xq[tokens_m[r], qblock, step*8+thread+w].load() for w in (0, 4) for r in (0, 1)] for step in range(2)]
+      activations.append((a, [xd[tokens_m[r], qblock].load() for r in (0, 1)]))
+    loaded.append((weights, activations))
   values = {key: [acc.after(kb)[i].load() for i in range(4)] for key, acc in accs.items()}
   zero = UOp.const(0, dtypes.int32)
-  for m in range(mtiles):
-    tokens_m = [token_base+m*16+group+r for r in (0, 8)]
-    # (row g, k 4t), (row g+8, k 4t), (row g, k 16+4t), (row g+8, k 16+4t) of each 32-value step
-    a = [[xq[tokens_m[r], qblock, step*8+thread+w].load() for w in (0, 4) for r in (0, 1)] for step in range(2)]
-    row_scales = [xd[tokens_m[r], qblock].load() for r in (0, 1)]
-    for t, (b, columns) in enumerate(weights):
-      d = _imma(a[0], b[0], [zero]*4)
-      d = _imma(a[1], b[1], d)
-      for i, (r, c) in enumerate(((0, 0), (0, 1), (1, 0), (1, 1))):
-        values[m, t][i] = values[m, t][i] + d[i].float()*(row_scales[r]*columns[c])
+  for weights, activations in loaded:
+    for t, (word, columns) in enumerate(weights):
+      b = [[UOp(Ops.CUSTOMI, src=((word >> (2*(2*step+half))) & 0x03030303,), arg=("__vsub4({0}, 0x01010101u)", dtypes.uint32))
+            for half in range(2)] for step in range(2)]  # codes 0-2 -> -1..1
+      for m, (a, row_scales) in enumerate(activations):
+        d = _imma(a[0], b[0], [zero]*4)
+        d = _imma(a[1], b[1], d)
+        for i, (r, c) in enumerate(((0, 0), (0, 1), (1, 0), (1, 1))):
+          values[m, t][i] = values[m, t][i] + d[i].float()*(row_scales[r]*columns[c])
   updates = [acc.store(UOp.stack(*values[key])) for key, acc in accs.items()]
   done = UOp.group(*updates).end(kb)
   stores = [out[split, token_base+m*16+group+r, output_base+t*8+thread*2+c].store(acc.after(done)[i].load())
@@ -637,6 +644,10 @@ def nv_prefill_supported(device: str) -> bool:
   return isinstance(renderer, CUDARenderer) and any(
     tc.dims == (8, 16, 16) and tc.dtype_in == dtypes.float16 and tc.dtype_out == dtypes.float32 for tc in renderer.tensor_cores)
 
+def q2_int8(ggml_type: int) -> bool:
+  """Whether Q2_0 multirow products run on int8 tensor cores (INFURNACE_Q2_INT8=0: the FP16 kernel)."""
+  return ggml_type == Q2_0 and os.environ.get('INFURNACE_Q2_INT8', '1') != '0'
+
 def _sum_splits(result: Tensor, splits: int) -> Tensor:
   """A split-K GEMM's partial sums (splits, rows, outputs), added in FP32 and stored. Left lazy, the sum fuses into
   its consumers (an FP16 cast, the next layer's input) and loses precision: Bonsai-4B's 16-row perplexity moved
@@ -644,8 +655,9 @@ def _sum_splits(result: Tensor, splits: int) -> Tensor:
   return result[0] if splits == 1 else result.sum(0).contiguous()
 
 def quant_gemm(x: Tensor, packed: Tensor, *, out_features: int, in_features: int, ggml_type: int,
-               q6_aligned: bool = False, q6_tiled: bool = False, q4_tiled: bool = False) -> Tensor:
-  """Concrete multi-token packed linear; symbolic padding belongs to the adapter."""
+               q6_aligned: bool = False, q6_tiled: bool = False, q4_tiled: bool = False, q8: tuple[Tensor, Tensor] | None = None) -> Tensor:
+  """Concrete multi-token packed linear; symbolic padding belongs to the adapter. `q8` is the Q2_0 int8 path's
+  activation (q8_quantize64's, of the rows padded to a multiple of 16), when the caller quantized it already."""
   if ggml_type not in (Q4_K, Q5_K, Q6_K, Q2_0): raise QuantGemmError("only Q4_K/Q5_K/Q6_K/Q2_0 prefill is supported")
   if in_features <= 0 or in_features%256 or out_features <= 0 or out_features%8:
     raise QuantGemmError("prefill requires input width multiple of 256 and output rows multiple of 8")
@@ -670,8 +682,11 @@ def quant_gemm(x: Tensor, packed: Tensor, *, out_features: int, in_features: int
   tiles, splits, unroll = _schedule(out_features, in_features, padded_tokens)
   out = Tensor.empty(splits, padded_tokens, out_features, dtype=dtypes.float32, device=x.device)
   paired = os.environ.get('INFURNACE_Q4_PAIRED', '1') != '0'
-  if ggml_type == Q2_0 and os.environ.get('INFURNACE_Q2_INT8', '1') != '0':
-    xq, xd = q8_quantize64(activation, padded_tokens, in_features)
+  if q8 is not None and not q2_int8(ggml_type): raise QuantGemmError("a shared int8 activation needs the Q2_0 int8 path")
+  if q2_int8(ggml_type):
+    xq, xd = q8_quantize64(activation, padded_tokens, in_features) if q8 is None else q8
+    if xq.shape != (padded_tokens, in_features//64, 16) or xd.shape != (padded_tokens, in_features//64) or xq.device != x.device:
+      raise QuantGemmError("shared int8 activation shape/device does not match the prefill")
     # RTX 5060, Bonsai-4B 64-row chunks: the int8 matmuls take 11.8 ms with two 16-token tiles a warp, 10.5 with four
     mtiles = next(m for m in (4, 2, 1) if (padded_tokens//16) % m == 0)
     warps = math.gcd(out_features//(8*tiles), 4)
@@ -681,9 +696,16 @@ def quant_gemm(x: Tensor, packed: Tensor, *, out_features: int, in_features: int
     # the MMAs (prompt chunks lose ~20% to the partial sums of four per SM)
     target = 120 if padded_tokens == 16 else 60
     splits = next(s for s in range(1, kblocks+1) if kblocks % s == 0 and (grid*s >= target or s == kblocks))
+    # One 16-row tile reads weights from memory with few bytes in flight a warp: unrolling the K loop helps, by how
+    # much depending on the shape (cold weights, RTX 5060): the 248320-row head 913 -> 546 us at 10 blocks an
+    # iteration (20 is slower, all 40 spills), ffn_down 33.9 -> 28.9 us at 6, attn_qkv 25.3 -> 23.9 at 10; ssm_out
+    # (8 blocks a split) loses at 8. Prompt chunks (four tiles a warp) keep their registers.
+    per_split = kblocks // splits
+    unroll = next(u for u in (10, 6, 1) if per_split % u == 0) if padded_tokens == 16 else 1
     out = Tensor.empty(splits, padded_tokens, out_features, dtype=dtypes.float32, device=x.device)
     result = Tensor.custom_kernel(out, packed.flatten().contiguous(), xq, xd, fxn=functools.partial(
-      _prefill_q2_imma, tokens=padded_tokens, width=in_features, rows=out_features, tiles=tiles, splits=splits, mtiles=mtiles))[0]
+      _prefill_q2_imma, tokens=padded_tokens, width=in_features, rows=out_features, tiles=tiles, splits=splits, mtiles=mtiles,
+      unroll=unroll))[0]
     result = _sum_splits(result, splits)
     return result[:tokens].reshape(*x.shape[:-1], out_features)
   if ggml_type == Q2_0:

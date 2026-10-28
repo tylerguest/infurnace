@@ -24,6 +24,7 @@ from tinygrad import Context, Tensor, UOp, dtypes
 from tinygrad.llm.model import GatedDeltaNetBlock, apply_rope
 from infurnace.dflash.jit import captured
 from infurnace.dflash.target import TargetObserver, detach_rng
+from infurnace.engine import _rows
 from infurnace.kernels.attention import attention
 from infurnace.kernels.gdn import gdn_chunk, gdn_gates
 from infurnace.kernels.sampling import Sampler
@@ -96,7 +97,8 @@ class ParallelVerifier:
     H, K, V = block.num_v_heads, block.head_k_dim, block.head_v_dim
     initial = Tensor(start_pos).eq(0)
     x = x.half()
-    out_gate = block.attn_gate(x).reshape(B, T, H, V)
+    qkv, out_gate = _rows(x, block.attn_qkv, block.attn_gate)
+    out_gate = out_gate.reshape(B, T, H, V)
     if (gates := getattr(block, 'gdn_gates', None)) is not None:  # both projections in one launch (models/qwen35.py)
       projected = gdn_gates(x.reshape(B * T, -1), gates).reshape(B, T, 2 * H)
       beta_in, alpha_in = projected[..., :H], projected[..., H:]
@@ -104,7 +106,7 @@ class ParallelVerifier:
     beta = beta_in.sigmoid().reshape(B, T, H)
     log_alpha = (alpha_in.float() + block.ssm_dt['bias']).softplus().reshape(B, T, H, -1) * block.ssm_a.reshape(H, -1)
     conv_state = initial.where(0, _raw(block.conv_state))
-    window = conv_state.float().cat(block.attn_qkv(x).float(), dim=1)
+    window = conv_state.float().cat(qkv.float(), dim=1)
     window = _stored(ops.window, window)
     conv_out = functools.reduce(lambda a, b: a + b,
       (window[:, i:i+T] * block.ssm_conv1d['weight'][:, i] for i in range(block.ssm_conv_kernel))).silu()
@@ -138,7 +140,7 @@ class ParallelVerifier:
     # kernels/attention.py: its cost follows the active length `start_pos+T`, not the allocated
     # cache (tinygrad's own kernels for a runtime length scale badly).
     c, (B, T, _) = block.config, x.shape
-    q, k, v = block.attn_q(x), block.attn_k(x), block.attn_v(x)
+    q, k, v = _rows(x, block.attn_q, block.attn_k, block.attn_v)
     if c.qk_norm and c.qk_norm != c.head_dim: q, k = block.attn_q_norm(q), block.attn_k_norm(k)
     if c.attn_output_gate:
       qg = q.reshape(B, T, c.n_heads, 2, c.head_dim)

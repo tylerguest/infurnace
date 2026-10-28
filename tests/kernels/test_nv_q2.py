@@ -34,6 +34,22 @@ def test_fwht_matches_the_dense_transform(rows, width, perm):
   assert (fwht(x, signs, block=512, perm=perm) - dense(reordered * signs)).abs().max().item() < 1e-4
   assert (fwht(x, signs, block=512, signs_after=True) - dense(x) * signs).abs().max().item() < 1e-4
 
+@pytest.mark.parametrize("rows,width,perm", [(1, 2560, None), (16, 9216, None), (16, 4096, (2, 16, 128))])
+def test_fwht_q8_matches_the_transform_then_quantizing(rows, width, perm):
+  from infurnace.kernels.hadamard import fwht_q8
+  from infurnace.kernels.quant_gemv import q8_quantize64
+  signs = (Tensor.rand(width, device="NV") < 0.5).where(-1.0, 1.0).realize()
+  x = Tensor.randn(rows, width, device="NV").realize()
+  rotated = fwht(x, signs, block=512, perm=perm)
+  def codes(words): return words.flatten().bitcast(dtypes.int8).float()
+  for group, reference in ((32, q8_quantize(rotated, rows, width)), (64, q8_quantize64(rotated, rows, width))):
+    got = fwht_q8(x, signs, block=512, perm=perm, group=group)
+    assert [g.shape for g in got] == [r.shape for r in reference]
+    # The same values up to FP32 rounding of the normalization: a code may round the other way at a tie
+    assert (codes(got[0]) - codes(reference[0])).abs().max().item() <= 1
+    assert ((got[1] - reference[1]).abs() / reference[1]).max().item() < 1e-6
+    if group == 32: assert (got[2] - reference[2]).abs().max().item() <= 1
+
 @pytest.mark.parametrize("int8", [True, False])
 @pytest.mark.parametrize("out_features,in_features,tokens", [(64, 2560, 64), (96, 9216, 17)])
 def test_q2_0_prefill_gemm_matches_dense(out_features, in_features, tokens, int8, monkeypatch):
