@@ -332,17 +332,18 @@ def _q2_slices(out_features: int, in_features: int) -> int:
 @functools.cache
 def _q2_decode_kernel(out: UOp, raw: UOp, xq: UOp, xd: UOp, xs: UOp, *, tokens: int, out_features: int, in_features: int,
                       slices: int) -> UOp:
-  """One-row Q2_0 GEMV over prepare_q2's tiles: a warp per 8-row tile (and K slice), lane = (block pair % 4, row), so
-  each step reads four consecutive pair units, ~1 KB contiguous; the dp4a dots are the generic path's. Rows' sums
-  meet over two shuffles; slices write partial sums (the last axis of `out`) for the caller to add."""
+  """One-row Q2_0 GEMV over prepare_q2's tiles: a warp per 8-row tile and K slice, lane = (block pair % 4, row), so
+  each step reads four consecutive pair units, ~1 KB contiguous; the dp4a dots are the generic path's. A row's sum
+  meets over two shuffles, and a tile's slices (warps of one CTA) add theirs through shared memory, so the output is
+  final: no separate kernel adds partial sums."""
   tiles, pairs = out_features // Q2_TILE_ROWS, in_features // 128
-  per, items = pairs // slices, tokens * tiles * slices
-  warps = math.gcd(items, 4)
-  block = UOp.range(items // warps, 0, axis_type=AxisType.GLOBAL)
-  warp = UOp.range(warps, 1, axis_type=AxisType.LOCAL)
+  per = pairs // slices
+  group_tiles = math.gcd(tiles, max(1, 4 // slices))  # tiles a CTA covers: about four warps
+  block = UOp.range(tokens * tiles // group_tiles, 0, axis_type=AxisType.GLOBAL)
+  warp = UOp.range(group_tiles * slices, 1, axis_type=AxisType.LOCAL)
   lane = UOp.range(32, -1, axis_type=AxisType.WARP)
-  item = block * warps + warp
-  token, tile, piece = item // (tiles * slices), (item // slices) % tiles, item % slices
+  token, tile = block // (tiles // group_tiles), (block % (tiles // group_tiles)) * group_tiles + warp // slices
+  piece, local_tile = warp % slices, warp // slices
   row, quarter = lane % Q2_TILE_ROWS, lane // Q2_TILE_ROWS
   acc = UOp.placeholder((1,), dtypes.float32, slot=5, addrspace=AddrSpace.REG)
   acc = acc.after(acc[0].store(acc.const_like(0)))
@@ -366,7 +367,12 @@ def _q2_decode_kernel(out: UOp, raw: UOp, xq: UOp, xd: UOp, xs: UOp, *, tokens: 
   value = acc.after(done)[0].load()
   for offset in (16, 8):  # the row's four pair quarters
     value = value + UOp(Ops.CUSTOM, src=(value,), arg=(f"__shfl_xor_sync(0xffffffff, {{0}}, {offset})", dtypes.float))
-  store = out[token, tile * Q2_TILE_ROWS + row, piece.valid(lane < Q2_TILE_ROWS)].store(value)
+  if slices > 1:  # each slice's row sums in shared memory; slice 0 adds the others in order
+    shared = UOp.placeholder((group_tiles, slices, Q2_TILE_ROWS), dtypes.float32, slot=6, addrspace=AddrSpace.LOCAL)
+    written = shared[local_tile, piece, row.valid(lane < Q2_TILE_ROWS)].store(value).barrier()
+    shared = shared.after(written)
+    value = functools.reduce(lambda a, b: a + b, (shared[local_tile, i, row].load() for i in range(slices)))
+  store = out[token, (tile * Q2_TILE_ROWS + row).valid((lane < Q2_TILE_ROWS) & piece.eq(0))].store(value)
   return store.end(block, warp, lane).sink(arg=KernelInfo(name="q2_0_decode_tiled", opts_to_apply=()))
 
 def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, out_features:int, in_features:int, ggml_type:int,
@@ -482,12 +488,10 @@ def quant_gemv(x:Tensor, packed:Tensor, *, out_features:int, in_features:int, gg
   if ggml_type == Q2_0 and in_features % 512 == 0 and not (interleave_tokens or reuse_tokens or local_tokens or loop_chunks or fuse_chunks
                                                            or exact_rows):
     # prepare_q2's tiles, read a tile at a time, four pairs a step (the generic path below reads one row's blocks)
-    slices = _q2_slices(out_features, in_features)
-    out = Tensor.empty(tokens, out_features, slices, dtype=dtypes.float32, device=x.device)
-    result = Tensor.custom_kernel(out, packed, xq, xd, xs, fxn=functools.partial(
-      _q2_decode_kernel, tokens=tokens, out_features=out_features, in_features=in_features, slices=slices))[0]
-    if return_parts: return result
-    return result.sum(-1).reshape(*x.shape[:-1], out_features)
+    out = Tensor.empty(tokens, out_features, dtype=dtypes.float32, device=x.device)
+    result = Tensor.custom_kernel(out, packed, xq, xd, xs, fxn=functools.partial(_q2_decode_kernel, tokens=tokens,
+      out_features=out_features, in_features=in_features, slices=_q2_slices(out_features, in_features)))[0]
+    return result.unsqueeze(-1) if return_parts else result.reshape(*x.shape[:-1], out_features)  # parts: one, already summed
   decode = functools.partial(_quant_decode_kernel, ggml_type=ggml_type, q6_aligned=q6_aligned, q6_tiled=q6_tiled,
                              q4_tiled=q4_tiled, interleave_tokens=interleave_tokens, reuse_tokens=reuse_tokens,
                              local_tokens=local_tokens, loop_chunks=loop_chunks or fuse_chunks, fuse_chunks=fuse_chunks)
