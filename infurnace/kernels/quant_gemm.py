@@ -563,7 +563,7 @@ def _imma(a: list[UOp], b: list[UOp], c: list[UOp]) -> list[UOp]:
 
 @functools.cache
 def _prefill_q2_imma(out: UOp, raw: UOp, xq: UOp, xd: UOp, *, tokens: int, width: int, rows: int, tiles: int = 1,
-                     splits: int = 1, mtiles: int = 1, unroll: int = 1) -> UOp:
+                     splits: int = 1, mtiles: int = 1, unroll: int = 1, kc: int = 1) -> UOp:
   """Q2_0 (prepare_q2's layout) against int8 activations (q8_quantize64: one scale per 64 values, a Q2_0 block) on
   int8 tensor cores.
 
@@ -573,13 +573,16 @@ def _prefill_q2_imma(out: UOp, raw: UOp, xq: UOp, xd: UOp, *, tokens: int, width
   scaled by the activation scale (per token) and the weight block's scale (per output) into FP32. Each warp covers
   `mtiles` 16-token tiles, so a decoded weight register feeds `mtiles` MMAs: the integer and scale work around the
   MMAs, not the tensor cores, bounds this kernel. Each loop iteration covers `unroll` blocks, all their loads first,
-  so a warp keeps several in flight instead of waiting on each block's in turn."""
+  so a warp keeps several in flight instead of waiting on each block's in turn. `kc` warps share each warp's outputs
+  inside a CTA, each taking every kc-th iteration's blocks, and add their sums through shared memory at the end: K
+  split without the separate kernel that adds `splits`' partial sums."""
   warps = math.gcd(rows//(8*tiles), 4)
   output_blocks = rows//(warps*8*tiles)
   blocks = width//64//splits
   block = UOp.range((tokens//(16*mtiles))*output_blocks*splits, 0, axis_type=AxisType.GLOBAL)
   lane = UOp.range(32, -1, axis_type=AxisType.WARP)
-  warp = UOp.range(warps, 1, axis_type=AxisType.LOCAL)
+  cta_warp = UOp.range(warps*kc, 1, axis_type=AxisType.LOCAL)
+  warp, part = cta_warp%warps, cta_warp//warps
   split, rest = block%splits, block//splits
   token_base = (rest//output_blocks)*16*mtiles
   output_base = (rest%output_blocks)*warps*8*tiles+warp*8*tiles
@@ -589,10 +592,10 @@ def _prefill_q2_imma(out: UOp, raw: UOp, xq: UOp, xd: UOp, *, tokens: int, width
     for t in range(tiles):
       acc = UOp.placeholder((4,), dtypes.float32, slot=3+m*tiles+t, addrspace=AddrSpace.REG)
       accs[m, t] = acc.after(acc.store(acc.const_like(0)))
-  kb = UOp.range(blocks//unroll, 2, axis_type=getattr(AxisType, 'REDUCE', AxisType.LOOP))
+  kb = UOp.range(blocks//(unroll*kc), 2, axis_type=getattr(AxisType, 'REDUCE', AxisType.LOOP))
   loaded = []
   for u in range(unroll):  # every block's loads before any block's arithmetic
-    qblock = split*blocks+kb*unroll+u
+    qblock = split*blocks+(kb*kc+part)*unroll+u  # the kc parts take turns at unroll-block steps
     weights = []
     for t in range(tiles):
       # prepare_q2: this lane's word of its weight row's block holds its four B registers (2 * step + half); the
@@ -623,9 +626,15 @@ def _prefill_q2_imma(out: UOp, raw: UOp, xq: UOp, xd: UOp, *, tokens: int, width
           values[m, t][i] = values[m, t][i] + d[i].float()*(row_scales[r]*columns[c])
   updates = [acc.store(UOp.stack(*values[key])) for key, acc in accs.items()]
   done = UOp.group(*updates).end(kb)
-  stores = [out[split, token_base+m*16+group+r, output_base+t*8+thread*2+c].store(acc.after(done)[i].load())
-            for (m, t), acc in accs.items() for i, (r, c) in enumerate(((0, 0), (0, 1), (8, 0), (8, 1)))]
-  return UOp.group(*stores).end(block, warp, lane).sink(arg=KernelInfo(name="prefill_q2_0_imma", opts_to_apply=()))
+  sums = [acc.after(done)[i].load() for acc in accs.values() for i in range(4)]
+  if kc > 1:  # parts 1.. leave their sums in shared memory (a buffer each); part 0 adds them in order
+    shared = [UOp.placeholder((warps, len(sums), 32), dtypes.float32, slot=3+len(accs)+j, addrspace=AddrSpace.LOCAL) for j in range(kc-1)]
+    written = UOp.group(*(buf[warp.valid(part.eq(j+1)), n, lane].store(value) for j, buf in enumerate(shared) for n, value in enumerate(sums)))
+    shared = [buf.after(written.barrier()) for buf in shared]
+    sums = [functools.reduce(lambda a, b: a + b, (buf[warp, n, lane].load() for buf in shared), value) for n, value in enumerate(sums)]
+  stores = [out[split, token_base+m*16+group+r, (output_base+t*8+thread*2+c).valid(part.eq(0))].store(sums[n*4+i])
+            for n, (m, t) in enumerate(accs) for i, (r, c) in enumerate(((0, 0), (0, 1), (8, 0), (8, 1)))]
+  return UOp.group(*stores).end(block, cta_warp, lane).sink(arg=KernelInfo(name="prefill_q2_0_imma", opts_to_apply=()))
 
 def _schedule(rows: int, width: int, tokens: int) -> tuple[int, int, int]:
   """(tiles per warp, K splits, k unroll), tuned on an RTX 5060 from profiler GPU
@@ -705,11 +714,22 @@ def quant_gemm(x: Tensor, packed: Tensor, *, out_features: int, in_features: int
     # (8 blocks a split) loses at 8. Prompt chunks, with the tiled weights' coalesced loads, are best at one.
     per_split = kblocks // splits
     unroll = next(u for u in (10, 6, 1) if per_split % u == 0) if padded_tokens == 16 else 1
+    kc = 1
+    if padded_tokens == 16:
+      # One 16-row tile on cold weights, re-measured with the tiled layout (RTX 5060, Bonsai-4B): eight K splits of
+      # one block a step beat the rule above for every layer (ffn_down 21.9 vs 30.3 us, gate 11.2 vs 17.1) despite the
+      # bigger partial sums; the 248320-row head has CTAs enough without splits and gains from two warps per output
+      # sharing its K in the CTA (kc) at five blocks a step (492 vs 540-600 us). A DFlash2 round: 12.9-13.0 ms, from 13.9.
+      if grid >= 960: splits, kc, unroll = 1, 2, next(u for u in (5, 2, 1) if (kblocks//2) % u == 0)
+      elif kblocks % 8 == 0: splits, unroll = 8, 1
     out = Tensor.empty(splits, padded_tokens, out_features, dtype=dtypes.float32, device=x.device)
     result = Tensor.custom_kernel(out, packed.flatten().contiguous(), xq, xd, fxn=functools.partial(
       _prefill_q2_imma, tokens=padded_tokens, width=in_features, rows=out_features, tiles=tiles, splits=splits, mtiles=mtiles,
-      unroll=unroll))[0]
-    result = _sum_splits(result, splits)
+      unroll=unroll, kc=kc))[0]
+    # One 16-row tile's eight partial sums are added where they're consumed (the residual add, the GDN pass, SwiGLU):
+    # ~200 fewer kernels a DFlash2 round (12.7 -> 12.5 ms), and its logits as close to one-row decoding's as with the
+    # sum stored first (Bonsai-4B, three prompts: mean abs error 0.024-0.042 against 0.029-0.037)
+    result = result.sum(0) if padded_tokens == 16 else _sum_splits(result, splits)
     return result[:tokens].reshape(*x.shape[:-1], out_features)
   if ggml_type == Q2_0:
     result = Tensor.custom_kernel(out, packed.flatten().contiguous(), activation, fxn=functools.partial(

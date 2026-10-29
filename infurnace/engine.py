@@ -133,20 +133,20 @@ PREFILL_CAPTURE_TOKENS = 2048
 _SHARED_Q8 = os.environ.get('INFURNACE_SHARED_Q8', '1') != '0'
 
 class _FusibleNorm:
-  """An RMSNorm that remembers the input of its last one-row call, so the consumer it feeds can take that input
-  (take) and norm, rotate and quantize it for Hadamard-folded projections in one kernel (_one_row's norm): the lazy
-  output, then never read, is never computed. Other callers (prompt chunks, DFlash's verifier) just get the output.
-  Tensors can't be weakly referenced, so the input is held only from the call to its consumer's take."""
+  """An RMSNorm that remembers the input of its last call, so the consumer it feeds can take that input (take)
+  and norm, rotate and quantize it for Hadamard-folded projections in one kernel (_one_row's and _rows' norm): the
+  lazy output, then never read, is never computed. Every consumer of a fusible norm takes, so no input outlives its
+  call (tensors can't be weakly referenced, and live lazy graphs are walked on every realize)."""
   def __init__(self, norm):
     self.norm, self.weight, self.eps, self._last = norm, norm.weight, norm.eps, None
 
   def __call__(self, x: Tensor) -> Tensor:
     out = self.norm(x)
-    self._last = (out, x) if isinstance(x.numel(), int) and x.numel() == x.shape[-1] else None
+    self._last = (out, x)
     return out
 
   def take(self, h: Tensor) -> Tensor | None:
-    """The input that produced `h` (its last one-row output), else None; forgets it either way."""
+    """The input that produced `h` (its last output), else None; forgets it either way."""
     last, self._last = self._last, None
     return last[1] if last is not None and last[0] is h else None
 
@@ -177,11 +177,30 @@ def _norm_of(block, name: str) -> _FusibleNorm | None:
   """The block's norm `name` when it is fusible (Model._fuse_norms), else None."""
   return norm if isinstance(norm := getattr(block, name, None), _FusibleNorm) else None
 
-def _rows(x: Tensor, *layers) -> tuple[Tensor, ...]:
+def _norm_rows_q8(layer: _NVLinear, norm: _FusibleNorm, source: Tensor, *, half: bool = False, normed: bool = False):
+  """layer.rows_q8 of norm(source) in one kernel (norm_fwht_q8): rows padded to a multiple of 16 (padding rows
+  normalize to zero), rotated and quantized in 64-value groups; with `normed`, also the FP16 normalized rows in
+  source's shape."""
+  symbolic = not isinstance(source.numel(), int)
+  activation = source.pad_to(source.max_shape) if symbolic else source
+  tokens = activation.numel() // layer.in_features
+  rows = activation.reshape(tokens, layer.in_features).pad(((0, -tokens % 16), (0, 0)))
+  rotation = layer.rotation
+  signs = rotation.signs if rotation.signs is not None else Tensor.ones(layer.in_features, device=source.device)
+  out = norm_fwht_q8(rows, norm.weight, norm.eps, signs, block=rotation.block, group=64, normed=normed, half=half)
+  if not normed: return out
+  rows_normed = out[2][:tokens].reshape(activation.shape)
+  if symbolic: rows_normed = rows_normed.shrink(tuple((0, size) for size in source.shape))
+  return out[:2], rows_normed
+
+def _rows(x: Tensor, *layers, norm: _FusibleNorm | None = None, source: Tensor | None = None) -> tuple[Tensor, ...]:
   """Multirow outputs of projections that read the same input: Hadamard-folded Q2_0 weights share one rotated
-  int8 input (_NVLinear.rows_q8) instead of each rotating and quantizing it. Other layers go through their own call."""
+  int8 input (_NVLinear.rows_q8) instead of each rotating and quantizing it. Other layers go through their own call.
+  With `norm`, `x` may be that norm's output (or `source` its input): the shared input is then normalized, rotated
+  and quantized in one kernel."""
+  if source is None and norm is not None: source = norm.take(x)
   if all(isinstance(layer, _NVLinear) and layer.rows_quantized and layer.rotation is layers[0].rotation for layer in layers):
-    q8 = layers[0].rows_q8(x)
+    q8 = _norm_rows_q8(layers[0], norm, source) if source is not None else layers[0].rows_q8(x)
     return tuple(layer(x, q8) for layer in layers)
   return tuple(layer(x) for layer in layers)
 
@@ -191,7 +210,7 @@ def _fused_feed_forward(block):
   def feed_forward(x: Tensor) -> Tensor:
     if hasattr(block, 'ffn_gate_exps'): return upstream_feed_forward(x)
     if not isinstance(x.numel(), int) or x.numel() != getattr(block.ffn_gate, 'in_features', None):
-      gate, up = _rows(x, block.ffn_gate, block.ffn_up)
+      gate, up = _rows(x, block.ffn_gate, block.ffn_up, norm=_norm_of(block, 'ffn_norm'))
       return block.ffn_down(gate.silu().contiguous() * up)
     gate, up = _one_row(x, block.ffn_gate, block.ffn_up, norm=_norm_of(block, 'ffn_norm'))
     return block.ffn_down(gate.silu().contiguous() * up)
@@ -212,8 +231,11 @@ def _fused_attention(block: TransformerBlock):
       # A prompt chunk (1..16 or 1..64 rows), padded to its maximum like the GDN prefill. The padding rows come
       # from zero inputs, so their cached keys and values are finite (the kernel reads every key below the
       # padded end), and the prompt's next rows overwrite them. The prompt reader keeps the padded end in the cache.
+      norm = _norm_of(block, 'attn_norm')
+      source = norm.take(x) if norm is not None else None
       x = x.pad_to((B, x.max_shape[1], x.shape[2]))
-      return rows_attention(x, start_pos, *_rows(x, block.attn_q, block.attn_k, block.attn_v))[:, :T]
+      if source is not None: source = source.pad_to(x.shape)
+      return rows_attention(x, start_pos, *_rows(x, block.attn_q, block.attn_k, block.attn_v, norm=norm, source=source))[:, :T]
     if B != 1 or isinstance(T, UOp) or T != 1: return upstream_attention(x, start_pos)
     return rows_attention(x, start_pos, *_one_row(x, block.attn_q, block.attn_k, block.attn_v, norm=_norm_of(block, 'attn_norm')))
   def rows_attention(x: Tensor, start_pos, q: Tensor, k: Tensor, v: Tensor) -> Tensor:

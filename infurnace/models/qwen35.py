@@ -6,7 +6,7 @@ import functools
 import os
 from tinygrad import Context, Tensor, UOp
 from tinygrad.llm.model import GatedDeltaNetBlock
-from infurnace.engine import PREFILL_ROWS, _norm_of, _norm_q8, _one_row, _rows
+from infurnace.engine import PREFILL_ROWS, _norm_of, _norm_q8, _norm_rows_q8, _one_row, _rows
 from infurnace.kernels.gdn import gdn_gates, gdn_decode, gdn_prefill
 from infurnace.models import Family
 from infurnace.tokenizer import BPETokenizer
@@ -26,8 +26,15 @@ def _fused_gdn(block: GatedDeltaNetBlock):
     B, T, _ = x.shape
     T_pad = x.max_shape[1]
     initial = Tensor(start_pos).eq(0)
-    x = x.half()
-    qkv, out_gate = _rows(x, block.attn_qkv, block.attn_gate)
+    norm = _norm_of(block, 'attn_norm')
+    source, rotation = norm.take(x) if norm is not None else None, block.attn_qkv.rotation
+    if source is not None and block.attn_qkv.rows_quantized and block.attn_gate.rotation is rotation:
+      # the norm, rotation and quantization in one kernel, which also hands back the FP16 normed rows the pass reads
+      q8, x = _norm_rows_q8(block.attn_qkv, norm, source, half=True, normed=True)
+      qkv, out_gate = block.attn_qkv(x, q8), block.attn_gate(x, q8)
+    else:
+      x = x.half()
+      qkv, out_gate = _rows(x, block.attn_qkv, block.attn_gate)
     out_gate = out_gate.reshape(B, T, H, V)
     if isinstance(T, int):
       projected = gdn_gates(x.reshape(B * T, -1), gates).reshape(B, T, 2 * H)

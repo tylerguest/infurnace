@@ -78,3 +78,20 @@ def test_q2_0_row_gather_matches_decoding_the_rows():
     for j, r in enumerate(row): assert got[i][j] == pytest.approx(values[r * width:(r + 1) * width], abs=1e-6)
   with pytest.raises(ValueError, match="row count"): packed_gather(ids, packed, width=width, ggml_type=Q2_0)
   with pytest.raises(ValueError, match="cannot decode"): packed_gather(ids, packed, width=width, ggml_type=8)
+
+@pytest.mark.parametrize("kc", [2, 4])
+def test_q2_0_int8_cta_k_split_matches_unsplit(kc):
+  # kc warps sharing an output's K in a CTA add their sums through shared memory: the same sums as one warp
+  import functools
+  from infurnace.kernels.quant_gemm import _prefill_q2_imma
+  from infurnace.kernels.quant_gemv import q8_quantize64
+  rows, width, tokens = 256, 2560, 16
+  raw, _ = q2_blocks(rows * width // 64, seed=kc)
+  packed = prepare_q2(Tensor(raw, dtype=dtypes.uint8, device="NV"), in_features=width)
+  xq, xd = q8_quantize64(Tensor.randn(tokens, width, device="NV").realize(), tokens, width)
+  def run(kc):
+    out = Tensor.empty(1, tokens, rows, dtype=dtypes.float32, device="NV")
+    fxn = functools.partial(_prefill_q2_imma, tokens=tokens, width=width, rows=rows, tiles=4, mtiles=1, unroll=5, kc=kc)
+    return Tensor.custom_kernel(out, packed, xq, xd, fxn=fxn)[0]
+  reference = run(1)
+  assert ((run(kc) - reference).abs().max() / reference.abs().max()).item() < 1e-6
