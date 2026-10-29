@@ -23,6 +23,7 @@ from tinygrad.llm.model import Transformer, TransformerBlock, apply_rope
 from tinygrad.nn.state import get_state_dict
 from infurnace.gguf import Q2_0, decode as decode_packed, parse_gguf, read_gguf_metadata
 from infurnace.hadamard import rotations
+from infurnace.kernels.hadamard import norm_fwht_q8
 from infurnace.kernels.attention import attention
 from infurnace.kernels.quant_gemm import nv_prefill_supported
 from infurnace.kernels.quant_gemv import q8_quantize
@@ -131,16 +132,50 @@ PREFILL_CAPTURE_TOKENS = 2048
 
 _SHARED_Q8 = os.environ.get('INFURNACE_SHARED_Q8', '1') != '0'
 
-def _one_row(x: Tensor, *layers) -> tuple[Tensor, ...]:
+class _FusibleNorm:
+  """An RMSNorm that remembers the input of its last one-row call, so the consumer it feeds can take that input
+  (take) and norm, rotate and quantize it for Hadamard-folded projections in one kernel (_one_row's norm): the lazy
+  output, then never read, is never computed. Other callers (prompt chunks, DFlash's verifier) just get the output.
+  Tensors can't be weakly referenced, so the input is held only from the call to its consumer's take."""
+  def __init__(self, norm):
+    self.norm, self.weight, self.eps, self._last = norm, norm.weight, norm.eps, None
+
+  def __call__(self, x: Tensor) -> Tensor:
+    out = self.norm(x)
+    self._last = (out, x) if isinstance(x.numel(), int) and x.numel() == x.shape[-1] else None
+    return out
+
+  def take(self, h: Tensor) -> Tensor | None:
+    """The input that produced `h` (its last one-row output), else None; forgets it either way."""
+    last, self._last = self._last, None
+    return last[1] if last is not None and last[0] is h else None
+
+def _one_row(x: Tensor, *layers, norm: _FusibleNorm | None = None, half: bool = False) -> tuple[Tensor, ...]:
   """One-row outputs of projections that read the same input, quantizing it to Q8 once: each packed
-  GEMV would otherwise quantize it again. Other inputs or layers go through their own call."""
+  GEMV would otherwise quantize it again. Other inputs or layers go through their own call. With `norm`, `x` may be
+  that norm's output: Hadamard-folded projections then take its input and norm, rotate and quantize it in one kernel
+  (`half`: x is the norm's output rounded to FP16, as the GDN pass feeds it)."""
   width = getattr(layers[0], 'in_features', None)
+  source = norm.take(x) if norm is not None else None
   if _SHARED_Q8 and all(isinstance(layer, _NVLinear) and layer.rotation is layers[0].rotation for layer in layers) and \
      isinstance(x.numel(), int) and x.numel() == width:
+    rotation = layers[0].rotation
+    if rotation is not None and source is not None: q8 = _norm_q8(norm, source, rotation, half=half)
     # Hadamard-folded weights: one rotation for all of them, in the same kernel as the quantization
-    q8 = layers[0].rotation.quantized(x, 32) if layers[0].rotation is not None else q8_quantize(x, 1, width)
+    else: q8 = rotation.quantized(x, 32) if rotation is not None else q8_quantize(x, 1, width)
     return tuple(layer.decode(x, q8) for layer in layers)
   return tuple(layer(x) for layer in layers)
+
+def _norm_q8(norm: _FusibleNorm, source: Tensor, rotation, *, half: bool = False, normed: bool = False):
+  """norm(source), rotated and quantized in one kernel (norm_fwht_q8): the Q8 tuple for the projections, and with
+  `normed` also the normalized row in FP16."""
+  signs = rotation.signs if rotation.signs is not None else Tensor.ones(source.shape[-1], device=source.device)
+  out = norm_fwht_q8(source, norm.weight, norm.eps, signs, block=rotation.block, group=32, normed=normed, half=half)
+  return (out[:3], out[3]) if normed else out
+
+def _norm_of(block, name: str) -> _FusibleNorm | None:
+  """The block's norm `name` when it is fusible (Model._fuse_norms), else None."""
+  return norm if isinstance(norm := getattr(block, name, None), _FusibleNorm) else None
 
 def _rows(x: Tensor, *layers) -> tuple[Tensor, ...]:
   """Multirow outputs of projections that read the same input: Hadamard-folded Q2_0 weights share one rotated
@@ -158,8 +193,9 @@ def _fused_feed_forward(block):
     if not isinstance(x.numel(), int) or x.numel() != getattr(block.ffn_gate, 'in_features', None):
       gate, up = _rows(x, block.ffn_gate, block.ffn_up)
       return block.ffn_down(gate.silu().contiguous() * up)
-    gate, up = _one_row(x, block.ffn_gate, block.ffn_up)
+    gate, up = _one_row(x, block.ffn_gate, block.ffn_up, norm=_norm_of(block, 'ffn_norm'))
     return block.ffn_down(gate.silu().contiguous() * up)
+  feed_forward.takes_norm = True  # its one-row path takes a _FusibleNorm's input (_one_row)
   return feed_forward
 
 def _fused_attention(block: TransformerBlock):
@@ -179,7 +215,7 @@ def _fused_attention(block: TransformerBlock):
       x = x.pad_to((B, x.max_shape[1], x.shape[2]))
       return rows_attention(x, start_pos, *_rows(x, block.attn_q, block.attn_k, block.attn_v))[:, :T]
     if B != 1 or isinstance(T, UOp) or T != 1: return upstream_attention(x, start_pos)
-    return rows_attention(x, start_pos, *_one_row(x, block.attn_q, block.attn_k, block.attn_v))
+    return rows_attention(x, start_pos, *_one_row(x, block.attn_q, block.attn_k, block.attn_v, norm=_norm_of(block, 'attn_norm')))
   def rows_attention(x: Tensor, start_pos, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
     B, T, _ = x.shape
     if c.qk_norm and c.qk_norm != c.head_dim: q, k = block.attn_q_norm(q), block.attn_k_norm(k)
@@ -196,6 +232,7 @@ def _fused_attention(block: TransformerBlock):
     attn = attention(q, Tensor(block.cache_kv.uop.after(store)), start_pos)
     attn = attn.cast(q.dtype).transpose(1, 2).reshape(B, T, -1)
     return block.attn_output(attn * gate.sigmoid() if c.attn_output_gate else attn)
+  attention_step.takes_norm = True  # its one-row path takes a _FusibleNorm's input (_one_row)
   return attention_step
 
 @contextlib.contextmanager
@@ -564,6 +601,15 @@ class Model:
     if self._embedding is None: raise ValueError('lookup needs a packed output head tied to the token embedding')
     return self._embedding.rows(ids)
 
+  def _fuse_norms(self):
+    """Hadamard-folded models: each block's norms become _FusibleNorm where their consumer is infurnace's pass (which
+    takes the norm's input for one row), so one-row decoding norms, rotates and quantizes in one kernel: ~65 fewer
+    kernels a Bonsai-4B token, and the norm's own reduction and scaling kernels."""
+    for block in self.transformer.blk:
+      if getattr(getattr(block, 'attn_qkv', getattr(block, 'attn_q', None)), 'rotation', None) is None: continue
+      if getattr(block._attention, 'takes_norm', False): block.attn_norm = _FusibleNorm(block.attn_norm)
+      if getattr(block._feed_forward, 'takes_norm', False): block.ffn_norm = _FusibleNorm(block.ffn_norm)
+
   def _sample_on_device(self):
     """Upstream's forward with its sample from kernels/sampling.py (the same Gumbel-max, noise made in the kernel)
     instead of tensor ops: upstream's random noise, two logs and two argmax passes over the 248,320 logits took
@@ -611,6 +657,7 @@ class Model:
     # The family's own passes; it says whether prompts can then be read in chunks.
     chunks = family.accelerate(result)
     if transformer.config.hc is None: result._sample_on_device()
+    result._fuse_norms()
     result._multirow_prefill = chunks and result.nv_prefill and os.environ.get('INFURNACE_MULTIROW_PREFILL', '1') != '0'
     # Placeholder initialization leaves an unrealized host RNG update chain that
     # every later realize would walk. Swap in a fresh counter rather than realize

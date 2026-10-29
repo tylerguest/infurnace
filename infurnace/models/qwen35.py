@@ -6,7 +6,7 @@ import functools
 import os
 from tinygrad import Context, Tensor, UOp
 from tinygrad.llm.model import GatedDeltaNetBlock
-from infurnace.engine import PREFILL_ROWS, _one_row, _rows
+from infurnace.engine import PREFILL_ROWS, _norm_of, _norm_q8, _one_row, _rows
 from infurnace.kernels.gdn import gdn_gates, gdn_decode, gdn_prefill
 from infurnace.models import Family
 from infurnace.tokenizer import BPETokenizer
@@ -80,8 +80,15 @@ def _fused_gdn(block: GatedDeltaNetBlock):
     if B == 1 and multirow and x.max_shape[1] % PREFILL_ROWS == 0: return prefill(x, start_pos)
     if B != 1 or multirow: return upstream_attention(x, start_pos)
     initial = Tensor(start_pos).eq(0)
-    x = x.half()
-    qkv, out_gate = _one_row(x, block.attn_qkv, block.attn_gate)
+    norm = _norm_of(block, 'attn_norm')
+    source, rotation = norm.take(x) if norm is not None else None, block.attn_qkv.rotation
+    if source is not None and rotation is not None and block.attn_gate.rotation is rotation:
+      # the norm, rotation and quantization in one kernel, which also hands back the FP16 normed row the pass reads
+      q8, x = _norm_q8(norm, source, rotation, half=True, normed=True)
+      qkv, out_gate = block.attn_qkv.decode(x, q8), block.attn_gate.decode(x, q8)
+    else:
+      x = x.half()
+      qkv, out_gate = _one_row(x, block.attn_qkv, block.attn_gate)
     out_gate = out_gate.reshape(H, V)
     # beta/decay projections, conv, q/k norms, recurrence, RMSNorm and gate in one kernel; then the conv shift
     qkv = qkv.cast(block.conv_state.dtype).reshape(-1)
@@ -91,6 +98,7 @@ def _fused_gdn(block: GatedDeltaNetBlock):
                    block.ssm_dt['bias'], block.ssm_a, state, out_gate, block.ssm_norm.weight, (1 - initial.float()).reshape(1),
                    block.ssm_norm.eps, kheads=block.num_k_heads)
     return block.ssm_out(z.reshape(1, 1, H * V))
+  attention.takes_norm = True  # its one-row path takes a _FusibleNorm's input
   return attention
 
 def accelerate(model) -> bool:
