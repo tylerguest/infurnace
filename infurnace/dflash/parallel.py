@@ -26,7 +26,7 @@ from infurnace.dflash.jit import captured
 from infurnace.dflash.target import TargetObserver, detach_rng
 from infurnace.engine import _norm_of, _norm_rows_q8, _rows
 from infurnace.kernels.attention import attention
-from infurnace.kernels.gdn import gdn_chunk, gdn_gates
+from infurnace.kernels.gdn import gdn_chunk, gdn_gates, gdn_commit
 from infurnace.kernels.sampling import Sampler
 from infurnace.device import nvidia
 
@@ -248,6 +248,15 @@ class ParallelVerifier:
 
   def _commit(self, count: UOp, start_pos: UOp):
     # S_m = γ_m S0 + Σ_{j<m} (γ_m/γ_j) u_j k_jᵀ for the m accepted rows.
+    if nvidia(self.device):  # a kernel per layer (kernels/gdn.py) instead of ~5 tensor-op kernels
+      params = Tensor(count).cast(dtypes.int32).reshape(1).cat(Tensor(start_pos).eq(0).cast(dtypes.int32).reshape(1)).contiguous()
+      outputs = []
+      for i, ops in self._operands.items():
+        block = self.observer.model.transformer.blk[i]
+        outputs += gdn_commit(_raw(block.recurrent_state), _raw(block.conv_state), _raw(ops.g), _raw(ops.k), _raw(ops.u),
+                              _raw(ops.window), params)
+      Tensor.realize(*outputs)
+      return tuple(outputs)
     rows, initial, outputs = Tensor(count), Tensor(start_pos).eq(0), []
     index = Tensor.arange(self.rows)
     for i, ops in self._operands.items():

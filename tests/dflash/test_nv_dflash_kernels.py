@@ -5,10 +5,30 @@ from tinygrad import Context, Tensor, dtypes
 from infurnace.dflash.parallel import _decays, _unit_lower_inverse
 from tinygrad.llm.gguf import ggml_data_to_tensor as _dequant
 from infurnace.kernels.embedding import packed_gather
-from infurnace.kernels.gdn import gdn_chunk
+from infurnace.kernels.gdn import gdn_chunk, gdn_commit
 from infurnace.kernels.quant_gemv import prepare_q4, prepare_q6
 
 pytestmark = pytest.mark.nv
+
+@pytest.mark.parametrize("count,initial", [(16, False), (5, False), (1, True)])
+def test_gdn_commit_matches_the_tensor_ops(count, initial):
+  # the verifier's commit (dflash/parallel.py): S = exp(g_last) S0 + sum_{j<count} exp(g_last - g_j) u_j k_j^T, conv window shift
+  H, T, D, C, conv_rows = 32, 16, 128, 8192, 3
+  with Context(DEV='NV'):
+    Tensor.manual_seed(count)
+    g = (-Tensor.rand(1, H, T) * 0.3).cumsum(-1).realize()
+    k, u = Tensor.randn(1, H, T, D).realize(), Tensor.randn(1, H, T, D).realize()
+    window = Tensor.randn(1, conv_rows + T, C).realize()
+    S0 = (Tensor.randn(1, H, D, D) * 0.1).realize()
+    index = Tensor.arange(T)
+    last = g[..., count - 1:count]
+    weight = (index < count).where(last - g, float('-inf')).exp()
+    expected = (0 if initial else last.exp().unsqueeze(-1) * S0) + (u * weight.unsqueeze(-1)).transpose(-1, -2) @ k
+    params = Tensor([count, int(initial)], dtype=dtypes.int32).realize()
+    state, conv = S0.clone().realize(), Tensor.zeros(1, conv_rows, C).contiguous().realize()
+    state, conv = gdn_commit(state, conv, g, k, u, window, params)
+    assert ((state - expected).abs().max() / expected.abs().max()).item() < 1e-5
+    assert (conv - window[:, count:count + conv_rows]).abs().max().item() == 0
 
 def test_gdn_chunk_matches_tensor_closed_form():
   H, T, D, eps = 32, 16, 128, 1e-6
