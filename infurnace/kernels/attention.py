@@ -6,9 +6,12 @@ so each key and value is read once per KV head; each row has its own causal limi
 split into fixed segments processed in parallel and merged afterwards, as llama.cpp's
 flash_attn_combine_results does (ggml/src/ggml-cuda/fattn-common.cuh, MIT). Written in tinygrad UOps.
 
-Three partial kernels share that merge: one-row decode (flash-decoding: a lane owns dim/32 dimensions, softmax
-in registers), multirow on FP16 tensor cores (FlashAttention-2's fragment layout on mma.sync m16n8k16, FP32
-accumulation; INFURNACE_MMA_ATTENTION=0 turns it off), and the FP32 FMA kernel for everything else.
+Four partial kernels share that merge: one-row decode (flash-decoding: a lane owns dim/32 dimensions, softmax
+in registers); multirow over the whole context (target verification, prompt chunks) on FP16 tensor cores with
+each key tile staged in shared memory for a block of warps and the next one loaded meanwhile (_flash_kernel, a
+fixed number of key slices; INFURNACE_FLASH_ATTENTION=0 turns it off); multirow with a window, ring or floor (the
+DFlash draft) on tensor cores reading fragments from the cache (FlashAttention-2's fragment layout on mma.sync
+m16n8k16, FP32 accumulation; INFURNACE_MMA_ATTENTION=0 turns both off); and the FP32 FMA kernel for everything else.
 
 Only segments that hold active keys launch (with a window, only those inside it), so the cost
 follows the visible length, not the allocated cache, with one captured graph for every length.
@@ -186,6 +189,8 @@ def _partial_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, *extra: UOp, start: 
   return UOp.group(*stores).end(block, warp, lane).sink(arg=KernelInfo(name=f"attention_partial_d{dim}", opts_to_apply=()))
 
 _MMA = os.environ.get('INFURNACE_MMA_ATTENTION', '1') != '0'
+_FLASH = os.environ.get('INFURNACE_FLASH_ATTENTION', '1') != '0'
+FLASH_BLOCKS = 120  # _flash_kernel blocks to aim for
 
 def _tensor_cores(device: str) -> bool:
   from infurnace.kernels.quant_gemm import nv_prefill_supported  # FP16 m16n8k16 MMA through the CUDA C renderer
@@ -338,6 +343,173 @@ def _mma_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, *extra: UOp, start: int 
   return UOp.group(*stores).end(block, warp, lane).sink(arg=KernelInfo(name=f"attention_mma_d{dim}", opts_to_apply=()))
 
 @functools.cache
+def _flash_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, *extra: UOp, start: int | UOp, kv_heads: int, groups: int, rows: int,
+                  dim: int, causal: bool, capacity: int, parts: int, warps_m: int, int8: bool = False) -> UOp:
+  """Multirow attention without a window, ring or floor (target verification, prompt chunks), FlashAttention-2 style:
+  a block of warps_m x 2 warps takes up to 16 * warps_m packed queries of one KV head and one of `parts` slices of
+  the active keys. Each 32-key tile is staged in shared memory once (keys row-major, values transposed; an int8
+  cache dequantized there) from registers loaded during the previous tile, so global loads overlap the MMAs. Warp
+  (wm, wn) scores its 16 queries against keys wn * 16.. of the tile; the pair shares its row maxima and
+  probabilities through shared memory, and each accumulates output dims wn * dim / 2.. against all 32 keys, so no
+  score is computed twice and a lane holds half a head's output. Same partial/stats outputs as _mma_kernel, one
+  per slice. RTX 5060, Bonsai-4B's heads at 64k keys, int8 cache: 16 rows 717 us against _mma_kernel's 1656, 64
+  rows 3402 against 5480, and the merge reads a few dozen partials instead of one a 256-key segment (16 us, from
+  up to 660)."""
+  scales, _ = _extras(extra, int8)
+  queries, steps, tiles_n = groups * rows, dim // 16, dim // 8
+  half_tiles = tiles_n // 2
+  warps, threads = warps_m * 2, warps_m * 64
+  qblocks = -(-queries // (16 * warps_m))
+  active = start + rows
+  per = ((active + 31) // 32 + parts - 1) // parts  # tiles a slice
+  block = UOp.range(kv_heads * parts * qblocks, 0, axis_type=AxisType.GLOBAL)
+  warp = UOp.range(warps, 1, axis_type=AxisType.LOCAL)
+  lane = UOp.range(32, -1, axis_type=AxisType.WARP)
+  kv_head, rest = block // (parts * qblocks), block % (parts * qblocks)
+  part_index, qblock = rest // qblocks, rest % qblocks
+  wm, wn, tid = warp // 2, warp % 2, warp * 32 + lane
+  group, thread = lane // 4, lane % 4
+  F32, F16, U32 = dtypes.float32, dtypes.float16, dtypes.uint32
+  zero, neg = UOp.const(0.0, F32), UOp.const(_NEG, F32)
+  ms = [(qblock * warps_m + wm) * 16 + group + 8 * r for r in (0, 1)]
+  valid_m = [m < queries for m in ms]
+  heads, row_of = [kv_head * groups + m // rows for m in ms], [m % rows for m in ms]
+  qa = UOp.placeholder((steps * 8,), F16, slot=0, addrspace=AddrSpace.REG)
+  slots = [(0, 0), (0, 1), (1, 0), (1, 1), (0, 8), (0, 9), (1, 8), (1, 9)]
+  qa = qa.after(UOp.group(*(qa[ks * 8 + i].store(
+    q[0, heads[r], row_of[r], (ks * 16 + thread * 2 + c).valid(valid_m[r])].load().cast(F16))
+    for ks in range(steps) for i, (r, c) in enumerate(slots))))
+  # max and this warp's half of the sum for rows g, g + 8; output fragments in their own 4-slot accumulators
+  state = UOp.placeholder((4,), F32, slot=1, addrspace=AddrSpace.REG)
+  state = state.after(UOp.group(state[0].store(neg), state[1].store(neg), state[2].store(zero), state[3].store(zero)))
+  outs = []
+  for c in range(half_tiles):
+    o = UOp.placeholder((4,), F32, slot=2 + c, addrspace=AddrSpace.REG)
+    outs.append(o.after(o.store(o.const_like(0))))
+  slot = 2 + half_tiles
+  scores = [UOp.placeholder((4,), F32, slot=slot + nt, addrspace=AddrSpace.REG) for nt in range(2)]
+  # This thread's 16-byte chunks of a tile: keys row-major (K) and key-minor (V, staged transposed: neighbouring
+  # lanes take neighbouring keys, no bank conflicts), held in registers from one tile to the next.
+  width = 16 if int8 else 8  # values a 16-byte load
+  chunks = 32 * dim // width
+  count = -(-chunks // threads)
+  lanes = 4 if int8 else 8
+  held = UOp.placeholder((2 * count * lanes,), U32 if int8 else F16, slot=slot + 2, addrspace=AddrSpace.REG)
+  held_scales = UOp.placeholder((2 * count,), F32, slot=slot + 3, addrspace=AddrSpace.REG) if int8 else None
+  def place(c: int, i: int) -> tuple[UOp, UOp, UOp]:
+    chunk = i * threads + tid
+    key, col = (chunk // (dim // width), (chunk % (dim // width)) * width) if c == 0 else (chunk % 32, (chunk // 32) * width)
+    return chunk < chunks, key, col
+  def fetch(t: UOp) -> list[UOp]:
+    """Stores of tile t's chunks into the held registers."""
+    stores = []
+    for c in range(2):
+      for i in range(count):
+        inside, key, col = place(c, i)
+        index = ((part_index * per + t) * 32 + key).minimum(capacity - 1).valid(inside)
+        n = c * count + i
+        if int8:
+          words = _load_lanes(kv[c, 0, kv_head, index, col // 4], 4)
+          stores += [held[n * 4 + w].store(words[w]) for w in range(4)]
+          stores.append(held_scales[n].store(scales[c, 0, kv_head, index].load().float()))
+        else:
+          values = _load_lanes(kv[c, 0, kv_head, index, col], 8)
+          stores += [held[n * 8 + w].store(values[w]) for w in range(8)]
+    return stores
+  held = held.after(UOp.group(*fetch(lane.const_like(0))))
+  if int8: held_scales = held_scales.after(held)
+  # Padded rows: a row of keys is 4 banks off the next (K), a dim of values 20 words off the next (V transposed),
+  # a row of probabilities 20 words off the next, so the lanes of a fragment load hit 32 different banks.
+  k_lds = UOp.placeholder((32, dim + 8), F16, slot=slot + 4, addrspace=AddrSpace.LOCAL)
+  v_lds = UOp.placeholder((dim, 32 + 8), F16, slot=slot + 5, addrspace=AddrSpace.LOCAL)
+  p_lds = UOp.placeholder((warps_m, 16, 32 + 8), F16, slot=slot + 6, addrspace=AddrSpace.LOCAL)
+  m_lds = UOp.placeholder((warps_m, 2, 16), F32, slot=slot + 7, addrspace=AddrSpace.LOCAL)
+  tile = UOp.range(per, 2, axis_type=AxisType.LOOP)
+  base = (part_index * per + tile) * 32
+  cur_held = held.after(tile)
+  cur_scales = held_scales.after(tile) if int8 else None
+  stage = []
+  for c in range(2):
+    for i in range(count):
+      inside, key, col = place(c, i)
+      n = c * count + i
+      if int8:
+        scale = cur_scales[n].load()
+        values = [(_byte(cur_held[n * 4 + w // 4].load(), w % 4).float() * scale).cast(F16) for w in range(16)]
+      else: values = [cur_held[n * 8 + w].load() for w in range(8)]
+      live = base + key < active  # unwritten rows may hold any bits: zero keys and values past the active length
+      values = [live.where(v, UOp.const(0.0, F16)) for v in values]
+      stage += [(k_lds[key.valid(inside), col + w] if c == 0 else v_lds[(col + w).valid(inside), key]).store(v) for w, v in enumerate(values)]
+  staged = UOp.group(*stage).barrier()
+  k_lds, v_lds = k_lds.after(staged), v_lds.after(staged)
+  # The next tile's loads, issued now: they land while this one's MMAs run
+  prefetch = UOp.group(*fetch(tile + 1))
+  qv = [qa.after(tile)[i].load() for i in range(steps * 8)]
+  computed = []
+  for nt in range(2):
+    acc = UOp.stack(zero, zero, zero, zero)
+    for ks in range(steps):
+      pairs = [_load_lanes(k_lds[wn * 16 + nt * 8 + group, ks * 16 + thread * 2 + c], 2) for c in (0, 8)]
+      acc = UOp.wmma(UOp.stack(*qv[ks * 8:ks * 8 + 8]), UOp.stack(pairs[0][0], pairs[0][1], pairs[1][0], pairs[1][1]), acc, (8, 16, 16), 32)
+    computed.append(scores[nt].after(scores[nt].store(acc)))
+  scale = 1 / math.sqrt(dim)
+  cur = state.after(tile)
+  values = [[None] * 4 for _ in range(2)]  # per row: 2 n-tiles x 2 columns
+  for nt in range(2):
+    for i in range(4):
+      r, col = i // 2, i % 2
+      key = base + wn * 16 + nt * 8 + thread * 2 + col
+      visible = valid_m[r] & (key < active) & _visible(key, start, row_of[r], rows, causal, 0)
+      values[r][nt * 2 + col] = visible.where(computed[nt][i].load() * scale, neg)
+  # The pair's row maxima through shared memory
+  mine = []
+  for r in range(2):
+    top = values[r][0]
+    for v in values[r][1:]: top = top.maximum(v)
+    mine.append(_shuffle_rows(top, True))
+  shared = UOp.group(*(m_lds[wm, wn, (group + 8 * r).valid(thread.eq(0))].store(mine[r]) for r in range(2))).barrier()
+  m_lds_now = m_lds.after(shared)
+  updates, alphas, probs = [], [], []
+  for r in range(2):
+    old = cur[r].load()
+    new_max = old.maximum(mine[r].maximum(m_lds_now[wm, 1 - wn, group + 8 * r].load()))
+    safe = new_max.ne(neg).where(new_max, zero)        # all masked so far: keep exp() finite
+    alpha = (old - safe).exp()
+    probs.append([(v - safe).exp() for v in values[r]])
+    total = probs[r][0]
+    for p in probs[r][1:]: total = total + p
+    updates += [cur[r].store(new_max), cur[2 + r].store(cur[2 + r].load() * alpha + _shuffle_rows(total, False))]
+    alphas.append(alpha)
+  # This warp's probabilities into the pair's shared rows; both read all 32 keys' as A fragments
+  written = UOp.group(*(p_lds[wm, group + 8 * r, wn * 16 + nt * 8 + thread * 2 + col].store(probs[r][nt * 2 + col].cast(F16))
+                        for r in range(2) for nt in range(2) for col in range(2))).barrier()
+  p_now = p_lds.after(written)
+  pa = []
+  for kk in range(2):
+    pairs = [_load_lanes(p_now[wm, group + 8 * r, kk * 16 + thread * 2 + c], 2) for c in (0, 8) for r in (0, 1)]
+    pa.append(UOp.stack(*(pairs[h * 2 + r][col] for h in (0, 1) for r in (0, 1) for col in (0, 1))))
+  for c in range(half_tiles):
+    o = outs[c].after(tile)
+    acc = UOp.stack(*(o[i].load() * alphas[i // 2] for i in range(4)))
+    d = (wn * half_tiles + c) * 8 + group
+    for kk in range(2):
+      pairs = [_load_lanes(v_lds[d, kk * 16 + thread * 2 + j], 2) for j in (0, 8)]
+      acc = UOp.wmma(pa[kk], UOp.stack(pairs[0][0], pairs[0][1], pairs[1][0], pairs[1][1]), acc, (8, 16, 16), 32)
+    updates.append(o.store(acc))
+  # Every warp must finish with the tile before the next one is staged over it.
+  done = UOp.group(*updates, prefetch).barrier().end(tile)
+  state, outs = state.after(done), [o.after(done) for o in outs]
+  # The pair's halves of each row's sum
+  sums = UOp.group(*(m_lds.after(done)[wm, wn, (group + 8 * r).valid(thread.eq(0))].store(state[2 + r].load()) for r in range(2))).barrier()
+  m_lds = m_lds.after(sums)
+  totals = [m_lds[wm, 0, group + 8 * r].load() + m_lds[wm, 1, group + 8 * r].load() for r in range(2)]
+  stores = [part[kv_head, part_index, ms[i // 2].valid(valid_m[i // 2]), (wn * half_tiles + c) * 8 + thread * 2 + i % 2].store(outs[c][i].load())
+            for c in range(half_tiles) for i in range(4)]
+  stores += [stats[kv_head, part_index, ms[r].valid(valid_m[r] & thread.eq(0) & wn.eq(0)), s].store(state[r].load() if s == 0 else totals[r])
+             for r in range(2) for s in range(2)]
+  return UOp.group(*stores).end(block, warp, lane).sink(arg=KernelInfo(name=f"attention_flash_d{dim}", opts_to_apply=()))
+
+@functools.cache
 def _decode_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, *extra: UOp, start: int | UOp, kv_heads: int, groups: int, dim: int,
                    capacity: int, segment: int, tile: int, warps: int, int8: bool = False) -> UOp:
   """One query row (every grouped head of a KV head) after flash-decoding: lane owns dim/32 consecutive
@@ -410,9 +582,10 @@ def _decode_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, *extra: UOp, start: i
 
 @functools.cache
 def _merge_kernel(out: UOp, part: UOp, stats: UOp, *, start: int | UOp, kv_heads: int, groups: int, rows: int, dim: int,
-                  window: int, segment: int) -> UOp:
+                  window: int, segment: int, parts: int = 0) -> UOp:
+  """Adds the partials of each query; `parts`: a fixed count of them (_flash_kernel's slices) instead of one a segment."""
   queries, lanes_dim = groups * rows, dim // 32
-  live = _live(start, rows, segment) - _first(start, window, segment)
+  live = parts or _live(start, rows, segment) - _first(start, window, segment)
   block = UOp.range(kv_heads * queries, 0, axis_type=AxisType.GLOBAL)
   lane = UOp.range(32, -1, axis_type=AxisType.WARP)
   kv_head, m = block // queries, block % queries
@@ -478,6 +651,20 @@ def attention(q: Tensor, kv: Tensor, start: int | UOp, *, causal: bool = True, w
     out = Tensor.empty(1, heads, 1, dim, dtype=dtypes.float32, device=q.device)
     return _launch((out,), (part, stats), start, functools.partial(
       _merge_kernel, start=scalar, kv_heads=kv_heads, groups=groups, rows=1, dim=dim, window=0, segment=seg))[0]
+  if rows > 1 and not window and not ring and floor is None and dim % 32 == 0 and _FLASH and _MMA and _tensor_cores(q.device):
+    queries = groups * rows
+    warps_m = min(-(-queries // 16), 4)
+    qblocks = -(-queries // (16 * warps_m))
+    # About four blocks an SM (an RTX 5060 has 30) between the KV heads, query blocks and key slices
+    parts = max(1, round(FLASH_BLOCKS / (kv_heads * qblocks)))
+    part = Tensor.empty(kv_heads, parts, queries, dim, dtype=dtypes.float32, device=q.device)
+    stats = Tensor.empty(kv_heads, parts, queries, 2, dtype=dtypes.float32, device=q.device)
+    part, stats = _launch((part, stats), (q.contiguous(), kv, *extra), start, functools.partial(
+      _flash_kernel, start=scalar, kv_heads=kv_heads, groups=groups, rows=rows, dim=dim, causal=causal, capacity=capacity,
+      parts=parts, warps_m=warps_m, int8=int8))
+    out = Tensor.empty(1, heads, rows, dim, dtype=dtypes.float32, device=q.device)
+    return _launch((out,), (part, stats), start, functools.partial(
+      _merge_kernel, start=scalar, kv_heads=kv_heads, groups=groups, rows=rows, dim=dim, window=0, segment=segment, parts=parts))[0]
   # A ring's window can straddle one more segment boundary than its length spans.
   if rows > 16 and not (dim % 16 == 0 and segment % 32 == 0 and _MMA and _tensor_cores(q.device)):
     # The FP32 kernel stages a probability row per query: past 16 rows its shared memory runs out. Slices of
