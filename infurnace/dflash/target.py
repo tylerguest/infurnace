@@ -75,9 +75,10 @@ class TargetObserver:
       if index in self.layers: features.append(x)
       x, mask = block(x, position, mask)  # blocks return (output, the indexer's token mask)
     logits = target.output(target.output_norm(x[:, -1:]))[:, -1, :]
-    # Identical to ordinary tinygrad target sampling, including greedy RNG
-    # consumption and its tie behavior. Draft argmax never consumes this RNG.
-    decision = (logits / temperature.maximum(1e-12)
+    # Identical to plain decoding's sample, including its RNG consumption and tie behavior: the model's device
+    # sampler (Model._sample_on_device), else upstream's. Draft argmax never consumes this RNG.
+    if (sampler := getattr(self.model, 'sampler', None)) is not None: decision = sampler(logits, temperature).reshape(1, 1)
+    else: decision = (logits / temperature.maximum(1e-12)
       - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
     return decision, features[0].cat(*features[1:], dim=-1).contiguous()
 

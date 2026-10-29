@@ -564,6 +564,22 @@ class Model:
     if self._embedding is None: raise ValueError('lookup needs a packed output head tied to the token embedding')
     return self._embedding.rows(ids)
 
+  def _sample_on_device(self):
+    """Upstream's forward with its sample from kernels/sampling.py (the same Gumbel-max, noise made in the kernel)
+    instead of tensor ops: upstream's random noise, two logs and two argmax passes over the 248,320 logits took
+    ~0.53 ms of a ~6.6 ms Bonsai-4B decode step (RTX 5060). DFlash's target step samples from the same sampler, so
+    its decisions keep matching plain decoding's."""
+    from infurnace.kernels.sampling import Sampler
+    t = self.transformer
+    # Seeded from tinygrad's seed, so Tensor.manual_seed before loading makes sampled requests reproducible.
+    self.sampler = Sampler(self.device, (Tensor._seed * 0xD1B54A32D192ED03 + 0x51A7E) & (2 ** 64 - 1))
+    def forward(tokens: Tensor, start_pos, temperature: Tensor) -> Tensor:
+      x, mask = t.token_embd(tokens.to(t.token_embd.weight.device)).float(), None
+      for block in t.blk: x, mask = block(x, start_pos, mask)
+      logits = t.output(t.output_norm(x[:, -1:]))[:, -1, :]
+      return self.sampler(logits, temperature).reshape(1, 1).to(tokens.device)
+    t.forward, t.prefill_jit, t.rollout_jit = forward, TinyJit(forward), TinyJit(forward)
+
   @classmethod
   def from_gguf(cls, path: str | Path, max_context: int | None = None, device: str = 'CPU', *,
                 nv_quant: bool = False, nv_prefill: bool | None = None, family: 'Family | None' = None) -> 'Model':
@@ -594,6 +610,7 @@ class Model:
       if isinstance(getattr(block, 'ffn_gate', None), _NVLinear): block._feed_forward = _fused_feed_forward(block)
     # The family's own passes; it says whether prompts can then be read in chunks.
     chunks = family.accelerate(result)
+    if transformer.config.hc is None: result._sample_on_device()
     result._multirow_prefill = chunks and result.nv_prefill and os.environ.get('INFURNACE_MULTIROW_PREFILL', '1') != '0'
     # Placeholder initialization leaves an unrealized host RNG update chain that
     # every later realize would walk. Swap in a fresh counter rather than realize
