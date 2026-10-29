@@ -1,6 +1,6 @@
 import pytest
 from tinygrad import Context, Tensor, TinyJit, UOp, dtypes
-from infurnace.kernels.attention import attention, store_rows
+from infurnace.kernels.attention import attention, dequantize_kv, quantize_kv, store_kv, store_rows
 
 pytestmark = pytest.mark.nv
 
@@ -116,3 +116,38 @@ def test_ring_store_wraps():
       expected = values.tolist()
       for r in range(rows):
         assert out[1][0][1][(start + r) % length] == expected[1][0][1][r]
+
+@pytest.mark.parametrize('heads,kv_heads,rows,dim,causal', [
+  (16, 4, 1, 256, True),     # Bonsai-4B decode: two words a lane
+  (32, 8, 1, 128, True),     # one word a lane
+  (16, 4, 16, 256, True),    # verify: tensor cores, values read from global
+  (16, 4, 64, 256, True),    # a prompt chunk
+  (32, 8, 5, 128, False),    # values staged in shared memory
+])
+def test_int8_cache_matches_attention_over_its_values(heads, kv_heads, rows, dim, causal):
+  # Each kernel scales scores and probabilities by the vectors' scales: the same attention as over the dequantized cache.
+  capacity = 1300
+  with Context(DEV='NV'):
+    Tensor.manual_seed(8)
+    words, scales = (t.contiguous().realize() for t in quantize_kv(Tensor.randn(2, 1, kv_heads, capacity, dim) * 0.5))
+    kv = dequantize_kv(words, scales).contiguous().realize()
+    q = Tensor.randn(1, heads, rows, dim).realize()
+    variable = UOp.variable('start_pos', 0, capacity - rows)
+    step = TinyJit(lambda q, start: attention(q, words, start, causal=causal, scales=scales).realize())
+    for start in (0, 127, 700, capacity - rows, 3):
+      out = step(q, variable.bind(start))
+      assert (out - reference(q, kv, start, causal)).abs().max().item() < 2e-3, start
+
+def test_int8_store_keeps_each_vector_within_half_a_step():
+  with Context(DEV='NV'):
+    Tensor.manual_seed(9)
+    cache = Tensor.zeros(2, 1, 4, 64, 64, dtype=dtypes.uint32).contiguous().realize()
+    scales = Tensor.zeros(2, 1, 4, 64, dtype=dtypes.float16).contiguous().realize()
+    k, v = Tensor.randn(1, 4, 16, 256).realize(), (Tensor.randn(1, 4, 16, 256) * 3).realize()
+    cache, scales = store_kv(cache, scales, k, v, 20)
+    Tensor.realize(cache, scales)
+    stored = dequantize_kv(cache, scales)[:, :, :, 20:36].float()
+    values = Tensor.stack(k, v)
+    step = values.abs().max(-1, keepdim=True) / 127
+    assert ((stored - values).abs() <= step * 0.5 + values.abs() * 2 ** -10).all().item()  # and FP16 rounding
+    assert dequantize_kv(cache, scales)[:, :, :, :20].abs().max().item() == 0  # rows outside untouched

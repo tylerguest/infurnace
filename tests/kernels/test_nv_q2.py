@@ -52,7 +52,7 @@ def test_fwht_q8_matches_the_transform_then_quantizing(rows, width, perm):
     if group == 32: assert (got[2] - reference[2]).abs().max().item() <= 1
 
 @pytest.mark.parametrize("int8", [True, False])
-@pytest.mark.parametrize("out_features,in_features,tokens", [(64, 2560, 64), (96, 9216, 17)])
+@pytest.mark.parametrize("out_features,in_features,tokens", [(64, 2560, 64), (96, 9216, 17), (256, 2560, 16), (96, 9216, 13)])
 def test_q2_0_prefill_gemm_matches_dense(out_features, in_features, tokens, int8, monkeypatch):
   from infurnace.kernels.quant_gemm import quant_gemm
   monkeypatch.setenv("INFURNACE_Q2_INT8", "1" if int8 else "0")

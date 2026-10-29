@@ -19,12 +19,12 @@ from typing import Iterator
 from tinygrad import Context, Tensor, TinyJit, UOp, dtypes
 from tinygrad.device import Buffer
 import tinygrad.llm.model as upstream_model
-from tinygrad.llm.model import Transformer, TransformerBlock, apply_rope
+from tinygrad.llm.model import Transformer, TransformerBlock, apply_rope, precompute_freqs_cis
 from tinygrad.nn.state import get_state_dict
 from infurnace.gguf import Q2_0, decode as decode_packed, parse_gguf, read_gguf_metadata
 from infurnace.hadamard import rotations
 from infurnace.kernels.hadamard import norm_fwht_q8
-from infurnace.kernels.attention import attention
+from infurnace.kernels.attention import attention, store_kv
 from infurnace.kernels.quant_gemm import nv_prefill_supported
 from infurnace.kernels.quant_gemv import q8_quantize
 from infurnace.kernels.embedding import packed_gather
@@ -217,6 +217,29 @@ def _fused_feed_forward(block):
   feed_forward.takes_norm = True  # its one-row path takes a _FusibleNorm's input (_one_row)
   return feed_forward
 
+def cached_attention(block: TransformerBlock, q: Tensor, k: Tensor, v: Tensor, start_pos) -> Tensor:
+  """Write k, v (1, kv_heads, rows, dim) as cache rows start_pos.. of the block's KV cache, then attend over it
+  (kernels/attention.py): an int8 cache (_int8_kv_cache) when the block has one."""
+  if (scales := getattr(block, 'cache_scale', None)) is not None:
+    cache, scales = store_kv(block.cache_kv, scales, k, v, start_pos)
+    return attention(q, cache, start_pos, scales=scales)
+  store = block.cache_kv[:, :, :, start_pos:start_pos + k.shape[2], :].uop.store(Tensor.stack(k, v).cast(block.cache_kv.dtype).uop)
+  return attention(q, Tensor(block.cache_kv.uop.after(store)), start_pos)
+
+def _int8_kv_cache(block: TransformerBlock):
+  """Create the block's KV cache as int8 with one scale a vector (kernels/attention.store_kv) in place of upstream's
+  FP16 one: half the bytes a decoding step reads, which at long contexts is most of a step (Bonsai-4B at 64k keys:
+  ~6 of ~12 ms). Only cached_attention reads it."""
+  init, c = block._init_state, block.config
+  def init_state(x: Tensor):
+    if not hasattr(block, 'cache_kv'):  # upstream creates the RoPE table with its cache: so does this
+      batch, device = x.shape[0], x.device
+      block.cache_kv = Tensor.zeros(2, batch, c.n_kv_heads, c.max_context, c.head_dim // 4, dtype=dtypes.uint32, device=device).contiguous()
+      block.cache_scale = Tensor.zeros(2, batch, c.n_kv_heads, c.max_context, dtype=dtypes.float16, device=device).contiguous()
+      block.freqs_cis = precompute_freqs_cis(c.rope_dim, c.max_context, c.rope_theta, device=device, yarn=c.yarn)
+    init(x)
+  block._init_state = init_state
+
 def _fused_attention(block: TransformerBlock):
   """Upstream TransformerBlock._attention for one-row decoding and multirow prompt chunks, with the
   attention itself in kernels/attention.py: upstream's attention over a runtime length slows as the
@@ -236,7 +259,9 @@ def _fused_attention(block: TransformerBlock):
       x = x.pad_to((B, x.max_shape[1], x.shape[2]))
       if source is not None: source = source.pad_to(x.shape)
       return rows_attention(x, start_pos, *_rows(x, block.attn_q, block.attn_k, block.attn_v, norm=norm, source=source))[:, :T]
-    if B != 1 or isinstance(T, UOp) or T != 1: return upstream_attention(x, start_pos)
+    if B != 1 or isinstance(T, UOp) or T != 1:
+      if hasattr(block, 'cache_scale'): raise NotImplementedError("upstream attention can't read an int8 KV cache")
+      return upstream_attention(x, start_pos)
     return rows_attention(x, start_pos, *_one_row(x, block.attn_q, block.attn_k, block.attn_v, norm=_norm_of(block, 'attn_norm')))
   def rows_attention(x: Tensor, start_pos, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
     B, T, _ = x.shape
@@ -250,9 +275,7 @@ def _fused_attention(block: TransformerBlock):
     if c.qk_norm == c.head_dim: q, k = block.attn_q_norm(q), block.attn_k_norm(k)
     q = apply_rope(q[..., :c.rope_dim], block.freqs_cis[start_pos:start_pos + T]).cat(q[..., c.rope_dim:], dim=-1)
     k = apply_rope(k[..., :c.rope_dim], block.freqs_cis[start_pos:start_pos + T]).cat(k[..., c.rope_dim:], dim=-1)
-    store = block.cache_kv[:, :, :, start_pos:start_pos + T, :].uop.store(Tensor.stack(k, v).cast(block.cache_kv.dtype).uop)
-    attn = attention(q, Tensor(block.cache_kv.uop.after(store)), start_pos)
-    attn = attn.cast(q.dtype).transpose(1, 2).reshape(B, T, -1)
+    attn = cached_attention(block, q, k, v, start_pos).cast(q.dtype).transpose(1, 2).reshape(B, T, -1)
     return block.attn_output(attn * gate.sigmoid() if c.attn_output_gate else attn)
   attention_step.takes_norm = True  # its one-row path takes a _FusibleNorm's input (_one_row)
   return attention_step
@@ -388,7 +411,8 @@ class Model:
       x, states = Tensor.empty(1, 1, self.config.embedding_length), []
       for block in self.transformer.blk:
         block._init_state(x)
-        states += [getattr(block, name) for name in ('cache_kv', 'freqs_cis', 'conv_state', 'recurrent_state') if hasattr(block, name)]
+        states += [getattr(block, name) for name in ('cache_kv', 'cache_scale', 'freqs_cis', 'conv_state', 'recurrent_state')
+                   if hasattr(block, name)]
       if self.device not in Tensor._device_seeds: Tensor._next_counter(self.device, 0)
       states += [Tensor._device_seeds[self.device], Tensor._device_rng_counters[self.device]]
       if pending := [t for t in states if not t.uop.is_realized]: Tensor.realize(*pending)
@@ -674,6 +698,8 @@ class Model:
         if (type(block) is TransformerBlock and not block.config.sliding_window and not hasattr(block, 'attn_sinks')
             and block.config.head_dim % 32 == 0):
           block._attention = _fused_attention(block)
+          if nvidia(device) and block.config.head_dim % 128 == 0 and os.environ.get('INFURNACE_KV_INT8', '1') != '0':
+            _int8_kv_cache(block)
     for block in transformer.blk:
       if isinstance(getattr(block, 'ffn_gate', None), _NVLinear): block._feed_forward = _fused_feed_forward(block)
     # The family's own passes; it says whether prompts can then be read in chunks.

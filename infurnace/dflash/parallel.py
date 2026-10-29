@@ -24,8 +24,7 @@ from tinygrad import Context, Tensor, UOp, dtypes
 from tinygrad.llm.model import GatedDeltaNetBlock, apply_rope
 from infurnace.dflash.jit import captured
 from infurnace.dflash.target import TargetObserver, detach_rng
-from infurnace.engine import _norm_of, _norm_rows_q8, _rows
-from infurnace.kernels.attention import attention
+from infurnace.engine import _norm_of, _norm_rows_q8, _rows, cached_attention
 from infurnace.kernels.gdn import gdn_chunk, gdn_gates, gdn_commit
 from infurnace.kernels.sampling import Sampler
 from infurnace.device import nvidia
@@ -97,8 +96,8 @@ class ParallelVerifier:
     H, K, V = block.num_v_heads, block.head_k_dim, block.head_v_dim
     initial = Tensor(start_pos).eq(0)
     norm = _norm_of(block, 'attn_norm')
-    source, rotation = norm.take(x) if norm is not None else None, block.attn_qkv.rotation
-    if source is not None and block.attn_qkv.rows_quantized and block.attn_gate.rotation is rotation:
+    source = norm.take(x) if norm is not None else None  # a fusible norm feeds rotated packed projections
+    if source is not None and block.attn_qkv.rows_quantized and block.attn_gate.rotation is block.attn_qkv.rotation:
       # the norm, rotation and quantization in one kernel, which also hands back the FP16 normed rows the pass reads
       q8, x = _norm_rows_q8(block.attn_qkv, norm, source, half=True, normed=True)
       qkv, out_gate = block.attn_qkv(x, q8), block.attn_gate(x, q8)
@@ -159,9 +158,7 @@ class ParallelVerifier:
     freqs = block.freqs_cis[start_pos:start_pos + T]
     q = apply_rope(q[..., :c.rope_dim], freqs).cat(q[..., c.rope_dim:], dim=-1)
     k = apply_rope(k[..., :c.rope_dim], freqs).cat(k[..., c.rope_dim:], dim=-1)
-    store = block.cache_kv[:, :, :, start_pos:start_pos + T, :].uop.store(Tensor.stack(k, v).cast(block.cache_kv.dtype).uop)
-    cache = Tensor(block.cache_kv.uop.after(store))
-    attn = attention(q, cache, start_pos).cast(q.dtype).transpose(1, 2).reshape(B, T, -1)
+    attn = cached_attention(block, q, k, v, start_pos).cast(q.dtype).transpose(1, 2).reshape(B, T, -1)
     return block.attn_output(attn * gate.sigmoid() if c.attn_output_gate else attn)
 
   def logits(self, x: Tensor, start_pos: UOp) -> tuple[Tensor, list[Tensor]]:

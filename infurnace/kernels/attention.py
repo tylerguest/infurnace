@@ -18,6 +18,11 @@ Row t (absolute position start+t) sees keys lo <= key < hi:
   floor:       lo >= floor[0] (a one-element buffer, so captured graphs read its current value)
 A ring cache (`ring=True`, sliding windows only) holds position x at slot x % its length, which
 must be at least window + rows: it only keeps what a window can see. `store_rows` writes it.
+
+An int8 cache (`store_kv`) holds each key and value vector as int8 with one FP16 scale, four values a uint32
+word: a key's scale multiplies its scores and a value's its probabilities, so the kernels convert the integers
+and apply one multiply a key. Bonsai-4B perplexity (eval.txt, 16-row path): 18.7368 -> 18.7586 at 2048 tokens,
+6.5237 -> 6.5251 at 8192.
 """
 from __future__ import annotations
 import functools
@@ -71,9 +76,20 @@ def _visible(key: UOp, start: int | UOp, row: UOp, rows: int, causal: bool, wind
   if window: visible = visible & (key >= position - window + 1)
   return visible
 
+def _byte(word: UOp, index: int | UOp) -> UOp:
+  """Signed byte `index` (0-3) of a uint32 word, as an int32."""
+  shift = (3 - index) * 8
+  if isinstance(shift, UOp): shift = shift.cast(dtypes.int32)
+  return (word.bitcast(dtypes.int32) << shift) >> 24
+
+def _extras(extra: tuple[UOp, ...], int8: bool) -> tuple[UOp | None, UOp | None]:
+  """A kernel's optional sources after kv: the int8 cache's scales, then the floor."""
+  return (extra[0] if int8 else None), (extra[int(int8)] if len(extra) > int(int8) else None)
+
 @functools.cache
-def _partial_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, floor: UOp | None = None, *, start: int | UOp, kv_heads: int,
-                    groups: int, rows: int, dim: int, causal: bool, window: int, segment: int, ring: int) -> UOp:
+def _partial_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, *extra: UOp, start: int | UOp, kv_heads: int, groups: int, rows: int,
+                    dim: int, causal: bool, window: int, segment: int, ring: int, int8: bool = False) -> UOp:
+  scales, floor = _extras(extra, int8)
   queries, lanes_dim = groups * rows, dim // 32
   per = min(QUERIES, queries)  # one-row decode packs only the grouped heads
   warps = -(-queries // per)
@@ -110,8 +126,12 @@ def _partial_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, floor: UOp | None = 
   key, column = element // dim, element % dim
   live_key = in_tile & (base + key < active)
   kv_index = ((base + key) % ring if ring else base + key).valid(live_key)
-  stage = UOp.group(k_tile[column.valid(in_tile), key].store(kv[0, 0, kv_head, kv_index, column].load()),
-                    v_tile[key.valid(in_tile), column].store(kv[1, 0, kv_head, kv_index, column].load())).end(loader).barrier()
+  def element_of(c: int) -> UOp:
+    if scales is None: return kv[c, 0, kv_head, kv_index, column].load()
+    value = _byte(kv[c, 0, kv_head, kv_index, column // 4].load(), column % 4).float() * scales[c, 0, kv_head, kv_index].load().float()
+    return value.cast(dtypes.float16)
+  stage = UOp.group(k_tile[column.valid(in_tile), key].store(element_of(0)),
+                    v_tile[key.valid(in_tile), column].store(element_of(1))).end(loader).barrier()
   k_tile, v_tile = k_tile.after(stage), v_tile.after(stage)
 
   # Scores: lane = key, accumulated over the head dimension; queries broadcast from global.
@@ -179,12 +199,14 @@ def _shuffle_rows(value: UOp, maximum: bool) -> UOp:
   return value
 
 @functools.cache
-def _mma_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, floor: UOp | None = None, *, start: int | UOp, kv_heads: int,
-                groups: int, rows: int, dim: int, causal: bool, window: int, segment: int, ring: int, capacity: int) -> UOp:
+def _mma_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, *extra: UOp, start: int | UOp, kv_heads: int, groups: int, rows: int,
+                dim: int, causal: bool, window: int, segment: int, ring: int, capacity: int, int8: bool = False) -> UOp:
   """Multirow attention on FP16 tensor cores (FlashAttention-2's layout, mma.sync m16n8k16): one warp per 16
   packed queries, S = Q·Kᵀ per 32-key tile, online softmax on the accumulator fragments (a row's values sit
   in four neighbouring lanes), then P·V with P taken straight from the score fragments, which are already
-  in the A-operand layout. Same partial/stats outputs as _partial_kernel."""
+  in the A-operand layout. Same partial/stats outputs as _partial_kernel. An int8 cache's integers are exact in
+  FP16: the MMAs take them as they are, and the scales multiply the scores (keys) and probabilities (values)."""
+  scales, floor = _extras(extra, int8)
   queries, steps, tiles_n = groups * rows, dim // 16, dim // 8
   # Up to 4 warps (64 queries) a block: at dim 256 a lane takes ~254 registers, so a block can't be larger.
   # More queries (a 64-row prompt chunk) go to more blocks, each reading the same keys.
@@ -236,7 +258,10 @@ def _mma_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, floor: UOp | None = None
     in_tile = chunk < chunks
     v_key, v_col = chunk % 32, (chunk // 32) * 8  # neighbouring lanes take neighbouring keys: no bank conflicts
     v_live, v_index = slot_of(base + v_key)
-    row = _load_lanes(kv[1, 0, kv_head, v_index, v_col], 8)
+    if scales is None: row = _load_lanes(kv[1, 0, kv_head, v_index, v_col], 8)
+    else:
+      words = _load_lanes(kv[1, 0, kv_head, v_index, v_col // 4], 2)
+      row = [_byte(words[i // 4], i % 4).cast(F16) for i in range(8)]
     stage = UOp.group(*(vt[(v_col + i).valid(in_tile), v_key].store(v_live.where(row[i], UOp.const(0.0, F16))) for i in range(8)))
     vt = vt.after(stage.end(loader).barrier())
   qv = [qa.after(tile)[i].load() for i in range(steps * 8)]
@@ -245,12 +270,24 @@ def _mma_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, floor: UOp | None = None
     _, index = slot_of(base + nt * 8 + group)  # past the active length: masked after the MMA
     acc = UOp.stack(zero, zero, zero, zero)
     for ks in range(steps):
-      pairs = [_load_lanes(kv[0, 0, kv_head, index, ks * 16 + thread * 2 + c], 2) for c in (0, 8)]  # 4-byte loads
-      b = UOp.stack(pairs[0][0], pairs[0][1], pairs[1][0], pairs[1][1])
+      if scales is None:
+        pairs = [_load_lanes(kv[0, 0, kv_head, index, ks * 16 + thread * 2 + c], 2) for c in (0, 8)]  # 4-byte loads
+        b = UOp.stack(pairs[0][0], pairs[0][1], pairs[1][0], pairs[1][1])
+      else:  # dims thread*2, +1 (and +8, +9) of the step: two bytes of one word each
+        words = [kv[0, 0, kv_head, index, ks * 4 + c // 4 + thread // 2].load() for c in (0, 8)]
+        b = UOp.stack(*(_byte(w, (thread % 2) * 2 + j).cast(F16) for w in words for j in (0, 1)))
       acc = UOp.wmma(UOp.stack(*qv[ks * 8:ks * 8 + 8]), b, acc, (8, 16, 16), 32)
     computed.append(scores[nt].after(scores[nt].store(acc)))
   scale = 1 / math.sqrt(dim)
   cur = state.after(tile)
+  # An int8 cache: this lane's eight score columns' key and value scales (n-tile nt, column col at nt * 2 + col)
+  key_scales, value_scales = [], []
+  if scales is not None:
+    for nt in range(4):
+      for col in range(2):
+        live, index = slot_of(base + nt * 8 + thread * 2 + col)
+        key_scales.append(scales[0, 0, kv_head, index].load().float())
+        value_scales.append(live.where(scales[1, 0, kv_head, index].load().float(), zero))
   values = [[None] * 8 for _ in range(2)]  # per row: 4 n-tiles x 2 columns
   for nt in range(4):
     for i in range(4):
@@ -259,7 +296,8 @@ def _mma_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, floor: UOp | None = None
       seen = key < active
       if floor is not None: seen = seen & (key >= floor[0].load().cast(key.dtype))
       visible = valid_m[r] & seen & _visible(key, start, row_of[r], rows, causal, window)
-      values[r][nt * 2 + col] = visible.where(computed[nt][i].load() * scale, neg)
+      score = computed[nt][i].load() * (scale * key_scales[nt * 2 + col] if key_scales else scale)
+      values[r][nt * 2 + col] = visible.where(score, neg)
   updates, alphas, probs = [], [], [None, None]
   for r in range(2):
     top = values[r][0]
@@ -274,7 +312,8 @@ def _mma_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, floor: UOp | None = None
     updates += [cur[r].store(new_max), cur[2 + r].store(cur[2 + r].load() * alpha + _shuffle_rows(total, False))]
     alphas.append(alpha)
   # P as A fragments: k-chunk kk covers n-tiles 2kk (columns c0,c1) and 2kk+1 (c8,c9).
-  pa = [UOp.stack(*(probs[r][(2 * kk + h) * 2 + col].cast(F16) for h in (0, 1) for r in (0, 1) for col in (0, 1))) for kk in range(2)]
+  weights = [[p * value_scales[n] for n, p in enumerate(probs[r])] if value_scales else probs[r] for r in range(2)]
+  pa = [UOp.stack(*(weights[r][(2 * kk + h) * 2 + col].cast(F16) for h in (0, 1) for r in (0, 1) for col in (0, 1))) for kk in range(2)]
   for c in range(tiles_n):
     o = outs[c].after(tile)
     acc = UOp.stack(*(o[i].load() * alphas[i // 2] for i in range(4)))
@@ -284,7 +323,9 @@ def _mma_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, floor: UOp | None = None
         parts = []
         for j in (0, 1, 8, 9):
           live, index = slot_of(base + kk * 16 + thread * 2 + j)
-          parts.append(live.where(kv[1, 0, kv_head, index, c * 8 + group].load(), UOp.const(0.0, F16)))
+          value = (kv[1, 0, kv_head, index, c * 8 + group].load() if scales is None else
+                   _byte(kv[1, 0, kv_head, index, c * 2 + group // 4].load(), group % 4).cast(F16))
+          parts.append(live.where(value, UOp.const(0.0, F16)))
       acc = UOp.wmma(pa[kk], UOp.stack(*parts), acc, (8, 16, 16), 32)
     updates.append(o.store(acc))
   # Every warp must finish with the tile before the next one is staged over it.
@@ -297,11 +338,13 @@ def _mma_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, floor: UOp | None = None
   return UOp.group(*stores).end(block, warp, lane).sink(arg=KernelInfo(name=f"attention_mma_d{dim}", opts_to_apply=()))
 
 @functools.cache
-def _decode_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, *, start: int | UOp, kv_heads: int, groups: int, dim: int,
-                   capacity: int, segment: int, tile: int, warps: int) -> UOp:
+def _decode_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, *extra: UOp, start: int | UOp, kv_heads: int, groups: int, dim: int,
+                   capacity: int, segment: int, tile: int, warps: int, int8: bool = False) -> UOp:
   """One query row (every grouped head of a KV head) after flash-decoding: lane owns dim/32 consecutive
   dimensions and reads them with one vector load per key, scores are summed across the warp by shuffles, and
-  the online softmax lives in registers (no shared memory or barriers). Each warp writes one partial."""
+  the online softmax lives in registers (no shared memory or barriers). Each warp writes one partial. An int8
+  cache (dim a multiple of 128: whole words a lane) scales each key's score and each value's probability."""
+  scales, _ = _extras(extra, int8)
   lanes_dim, F32 = dim // 32, dtypes.float32
   zero, neg = UOp.const(0.0, F32), UOp.const(_NEG, F32)
   active = start + 1
@@ -320,19 +363,27 @@ def _decode_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, *, start: int | UOp, 
                                 *(state[groups + j].store(zero) for j in range(groups + groups * lanes_dim))))
   t = UOp.range(segment // tile, 2, axis_type=AxisType.LOOP)
   cur, qv = state.after(t), [qs[i].load() for i in range(groups * lanes_dim)]
-  scores, values = [[] for _ in range(groups)], []
+  scores, values, value_scales = [[] for _ in range(groups)], [], []
   for u in range(tile):
     key = entry * segment + t * tile + u
     live = key < active
     row = key.minimum(capacity - 1)  # past the active length: in bounds, masked below
-    k = _load_lanes(kv[0, 0, kv_head, row, lane * lanes_dim], lanes_dim)
-    v = _load_lanes(kv[1, 0, kv_head, row, lane * lanes_dim], lanes_dim)
+    if scales is None:
+      k, v = (_load_lanes(kv[c, 0, kv_head, row, lane * lanes_dim], lanes_dim) for c in (0, 1))
+      k, v = [x.float() for x in k], [x.float() for x in v]
+    else:
+      words = [_load_lanes(kv[c, 0, kv_head, row, lane * lanes_dim // 4], lanes_dim // 4) if lanes_dim > 4 else
+               [kv[c, 0, kv_head, row, lane].load()] for c in (0, 1)]
+      k, v = ([_byte(w[i // 4], i % 4).float() for i in range(lanes_dim)] for w in words)
+      value_scales.append(live.where(scales[1, 0, kv_head, row].load().float(), zero))
     # Unwritten cache rows may hold any bits: zero their values so a 0 weight can't meet a NaN.
-    values.append([live.where(v[i].float(), zero) for i in range(lanes_dim)])
+    values.append([live.where(v[i], zero) for i in range(lanes_dim)])
     for j in range(groups):
-      dot = qv[j * lanes_dim] * k[0].float()
-      for i in range(1, lanes_dim): dot = dot + qv[j * lanes_dim + i] * k[i].float()
-      scores[j].append(live.where(warp_reduce(dot, full_wave=True), neg))
+      dot = qv[j * lanes_dim] * k[0]
+      for i in range(1, lanes_dim): dot = dot + qv[j * lanes_dim + i] * k[i]
+      score = warp_reduce(dot, full_wave=True)
+      if scales is not None: score = score * scales[0, 0, kv_head, row].load().float()
+      scores[j].append(live.where(score, neg))
   updates = []
   for j in range(groups):
     top = scores[j][0]
@@ -344,10 +395,11 @@ def _decode_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, *, start: int | UOp, 
     total = cur[groups + j].load() * alpha
     for p in ps: total = total + p
     updates += [cur[j].store(new_max), cur[groups + j].store(total)]
+    weights = [p * m for p, m in zip(ps, value_scales)] if value_scales else ps
     for i in range(lanes_dim):
       slot = 2 * groups + j * lanes_dim + i
       acc = cur[slot].load() * alpha
-      for p, v in zip(ps, values): acc = acc + p * v[i]
+      for p, v in zip(weights, values): acc = acc + p * v[i]
       updates.append(cur[slot].store(acc))
   state = state.after(UOp.group(*updates).end(t))
   stores = [part[kv_head, entry, j, lane * lanes_dim + i].store(state[2 * groups + j * lanes_dim + i].load())
@@ -397,27 +449,32 @@ def _masked(q: Tensor, kv: Tensor, start: int | UOp, causal: bool, window: int, 
   return q.float().scaled_dot_product_attention(kv[0].float(), kv[1].float(), attn_mask=mask, enable_gqa=True)
 
 def attention(q: Tensor, kv: Tensor, start: int | UOp, *, causal: bool = True, window: int = 0, segment: int = SEGMENT,
-              ring: bool = False, floor: Tensor | None = None) -> Tensor:
+              ring: bool = False, floor: Tensor | None = None, scales: Tensor | None = None) -> Tensor:
   """q: (1, heads, rows, dim) at positions start..start+rows-1; kv: (2, 1, kv_heads, capacity, dim) FP16
-  cache already holding those rows (a ring of length capacity with `ring`). floor: optional (1,) int32
-  buffer, the lowest visible key. Returns (1, heads, rows, dim) FP32. dim must be a multiple of 32.
+  cache already holding those rows (a ring of length capacity with `ring`), or with `scales` an int8 cache
+  (store_kv: (2, 1, kv_heads, capacity, dim / 4) words and (2, 1, kv_heads, capacity) scales). floor: optional
+  (1,) int32 buffer, the lowest visible key. Returns (1, heads, rows, dim) FP32. dim must be a multiple of 32.
   The fused kernels need NV (CUDA warp shuffles); other devices use plain tensor ops over the whole cache.
   One row without a window, ring or floor (decoding) uses the flash-decoding kernel, which splits the keys
   itself (DECODE_SEGMENT per warp); `segment` applies to the other shapes."""
   _, heads, rows, dim = q.shape
   _, _, kv_heads, capacity, kv_dim = kv.shape
-  if dim != kv_dim or heads % kv_heads: raise ValueError("attention needs matching head sizes and grouped heads")
+  int8 = scales is not None
+  if int8 and (kv.dtype != dtypes.uint32 or scales.shape != kv.shape[:4]): raise ValueError("an int8 cache is store_kv's words and scales")
+  if dim != kv_dim * (4 if int8 else 1) or heads % kv_heads: raise ValueError("attention needs matching head sizes and grouped heads")
   if ring and not 0 < window <= capacity - rows: raise ValueError("a ring cache needs a window and room for it plus the rows")
-  if not nvidia(q.device) or dim % 32 or kv.dtype != dtypes.float16: return _masked(q, kv, start, causal, window, ring, floor)
+  if not nvidia(q.device) or dim % 32 or not (int8 or kv.dtype == dtypes.float16):
+    return _masked(q, dequantize_kv(kv, scales) if int8 else kv, start, causal, window, ring, floor)
   groups, scalar = heads // kv_heads, _kernel_scalar(start)
-  if rows == 1 and not window and not ring and floor is None and dim // 32 in (2, 4, 8):
+  extra = ((scales,) if int8 else ()) + ((floor,) if floor is not None else ())
+  if rows == 1 and not window and not ring and floor is None and dim // 32 in ((4, 8) if int8 else (2, 4, 8)):
     seg = DECODE_SEGMENT
     entries = -(-capacity // (seg * DECODE_WARPS)) * DECODE_WARPS
     part = Tensor.empty(kv_heads, entries, groups, dim, dtype=dtypes.float32, device=q.device)
     stats = Tensor.empty(kv_heads, entries, groups, 2, dtype=dtypes.float32, device=q.device)
-    part, stats = _launch((part, stats), (q.contiguous(), kv), start, functools.partial(
+    part, stats = _launch((part, stats), (q.contiguous(), kv, *extra), start, functools.partial(
       _decode_kernel, start=scalar, kv_heads=kv_heads, groups=groups, dim=dim, capacity=capacity, segment=seg,
-      tile=DECODE_TILE, warps=DECODE_WARPS))
+      tile=DECODE_TILE, warps=DECODE_WARPS, int8=int8))
     out = Tensor.empty(1, heads, 1, dim, dtype=dtypes.float32, device=q.device)
     return _launch((out,), (part, stats), start, functools.partial(
       _merge_kernel, start=scalar, kv_heads=kv_heads, groups=groups, rows=1, dim=dim, window=0, segment=seg))[0]
@@ -426,20 +483,20 @@ def attention(q: Tensor, kv: Tensor, start: int | UOp, *, causal: bool = True, w
     # The FP32 kernel stages a probability row per query: past 16 rows its shared memory runs out. Slices of
     # up to 16 rows are the same attention at later starting positions.
     return Tensor.cat(*(attention(q[:, :, i:i + 16], kv, start + i, causal=causal, window=window, segment=segment, ring=ring,
-                                  floor=floor) for i in range(0, rows, 16)), dim=2)
+                                  floor=floor, scales=scales) for i in range(0, rows, 16)), dim=2)
   segments = -(-capacity // segment) + int(ring)
   part = Tensor.empty(kv_heads, segments, groups * rows, dim, dtype=dtypes.float32, device=q.device)
   stats = Tensor.empty(kv_heads, segments, groups * rows, 2, dtype=dtypes.float32, device=q.device)
   if rows > 1 and dim % 16 == 0 and segment % 32 == 0 and _MMA and _tensor_cores(q.device):
-    part, stats = _launch((part, stats), (q.contiguous(), kv) + ((floor,) if floor is not None else ()), start, functools.partial(
+    part, stats = _launch((part, stats), (q.contiguous(), kv, *extra), start, functools.partial(
       _mma_kernel, start=scalar, kv_heads=kv_heads, groups=groups, rows=rows, dim=dim, causal=causal, window=window,
-      segment=segment, ring=capacity if ring else 0, capacity=capacity))
+      segment=segment, ring=capacity if ring else 0, capacity=capacity, int8=int8))
     out = Tensor.empty(1, heads, rows, dim, dtype=dtypes.float32, device=q.device)
     return _launch((out,), (part, stats), start, functools.partial(
       _merge_kernel, start=scalar, kv_heads=kv_heads, groups=groups, rows=rows, dim=dim, window=window, segment=segment))[0]
-  part, stats = _launch((part, stats), (q.contiguous(), kv) + ((floor,) if floor is not None else ()), start, functools.partial(
+  part, stats = _launch((part, stats), (q.contiguous(), kv, *extra), start, functools.partial(
     _partial_kernel, start=scalar, kv_heads=kv_heads, groups=groups, rows=rows, dim=dim, causal=causal, window=window, segment=segment,
-    ring=capacity if ring else 0))
+    ring=capacity if ring else 0, int8=int8))
   out = Tensor.empty(1, heads, rows, dim, dtype=dtypes.float32, device=q.device)
   return _launch((out,), (part, stats), start, functools.partial(
     _merge_kernel, start=scalar, kv_heads=kv_heads, groups=groups, rows=rows, dim=dim, window=window, segment=segment))[0]
@@ -463,3 +520,22 @@ def store_rows(cache: Tensor, values: Tensor, start: int | UOp, *, ring: bool = 
   offset = (Tensor.arange(length) - Tensor(start) % length + length) % length    # each slot's row, if < rows
   new = (offset < rows).reshape(1, 1, 1, length, 1).where(values[:, :, :, offset.clip(0, rows - 1)], cache).contiguous()
   return Tensor(cache.uop.after(cache.uop.store(new.uop)))
+
+def quantize_kv(values: Tensor) -> tuple[Tensor, Tensor]:
+  """(..., dim) keys or values as int8, one FP16 scale (max |x| / 127) a vector: (words (..., dim / 4) uint32, scales (...))."""
+  x = values.float()
+  scale = (x.abs().max(-1) / 127).cast(dtypes.float16)
+  codes = (x / scale.float().maximum(1e-30).unsqueeze(-1)).round().clip(-127, 127).cast(dtypes.int8)
+  return codes.bitcast(dtypes.uint32), scale
+
+def dequantize_kv(kv: Tensor, scales: Tensor) -> Tensor:
+  """An int8 cache (store_kv's words and scales) as FP16."""
+  return (kv.bitcast(dtypes.int8).float() * scales.float().unsqueeze(-1)).cast(dtypes.float16)
+
+def store_kv(cache: Tensor, scales: Tensor, k: Tensor, v: Tensor, start: int | UOp) -> tuple[Tensor, Tensor]:
+  """Write keys and values (1, kv_heads, rows, dim) as positions start..start+rows-1 of an int8 cache: words
+  (2, 1, kv_heads, capacity, dim / 4) uint32 and scales (2, 1, kv_heads, capacity) FP16. Returns both after the write."""
+  words, scale = quantize_kv(Tensor.stack(k, v))
+  rows = k.shape[2]
+  return (Tensor(cache.uop.after(cache[:, :, :, start:start + rows].uop.store(words.uop))),
+          Tensor(scales.uop.after(scales[:, :, :, start:start + rows].uop.store(scale.uop))))
