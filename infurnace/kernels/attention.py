@@ -845,3 +845,56 @@ def store_kv(cache: Tensor, scales: Tensor, k: Tensor, v: Tensor, start: int | U
   rows = k.shape[2]
   return (Tensor(cache.uop.after(cache[:, :, :, start:start + rows].uop.store(words.uop))),
           Tensor(scales.uop.after(scales[:, :, :, start:start + rows].uop.store(scale.uop))))
+
+@functools.cache
+def _prologue_kernel(q_out: UOp, cache: UOp, scales: UOp, joined: UOp, q_w: UOp, k_w: UOp, freqs: UOp, *, start: int | UOp,
+                     heads: int, kv_heads: int, dim: int, rope_dim: int, eps: float) -> UOp:
+  """A decoding step's attention inputs in one kernel (TensorRT-LLM's fused QK-norm/RoPE/KV-insert): a block per
+  head of the merged q (+ output gate) / k / v projection's row, `dim` threads. Q and K heads RMS-normalize (their
+  own weights) and rotate their first rope_dim dims (rotate-half, freqs[start]); Q heads write FP32 q, K and V heads
+  quantize as store_kv (int8, one FP16 scale a vector) into the cache at `start`. In place of ~8 small kernels."""
+  warps, half = dim // 32, rope_dim // 2
+  block = UOp.range(heads + 2 * kv_heads, 0, axis_type=AxisType.GLOBAL)
+  warp = UOp.range(warps, 1, axis_type=AxisType.LOCAL)
+  lane = UOp.range(32, -1, axis_type=AxisType.WARP)
+  t = warp * 32 + lane
+  F32 = dtypes.float32
+  is_q, is_v = block < heads, block >= heads + kv_heads
+  k_head, v_head = block - heads, block - heads - kv_heads
+  base = heads * 2 * dim
+  source = is_q.where(block * 2 * dim, is_v.where(base + kv_heads * dim + v_head * dim, base + k_head * dim)) + t
+  x = joined[source].load().float()
+  def block_sum(value: UOp, slot: int, maximum: bool = False) -> UOp:
+    partial = warp_reduce(value, maximum=maximum, full_wave=True)
+    buf = UOp.placeholder((warps,), F32, slot=slot, addrspace=AddrSpace.LOCAL)
+    buf = buf.after(buf[warp.valid(lane.eq(0))].store(partial).barrier())
+    return functools.reduce(lambda a, b: a.maximum(b) if maximum else a + b, (buf[i].load() for i in range(warps)))
+  inverse = (block_sum(x * x, 0) * (1 / dim) + eps).rsqrt()
+  y = is_v.where(x, x * inverse * is_q.where(q_w[t].load().float(), k_w[t].load().float()))
+  shared = UOp.placeholder((dim,), F32, slot=1, addrspace=AddrSpace.LOCAL)
+  shared = shared.after(shared[t].store(y).barrier())
+  low = t < half
+  partner = shared[low.where(t + half, t - half).minimum(dim - 1)].load()
+  cos, sin = freqs[start, t % half].load(), freqs[start, half + t % half].load()
+  z = (~is_v & (t < rope_dim)).where(low.where(y * cos - partner * sin, y * cos + partner * sin), y)
+  stores = [q_out[block.valid(is_q), t].store(z)]
+  # K and V: int8 with one FP16 scale, rounded as store_kv rounds
+  scale = (block_sum(z.abs(), 2, maximum=True) / 127).cast(dtypes.float16)
+  code = (z / scale.float().maximum(1e-30)).round().clip(-127, 127).cast(dtypes.int32)
+  def down(value: UOp, n: int) -> UOp: return UOp(Ops.CUSTOM, src=(value,), arg=(f"__shfl_down_sync(0xffffffff, {{0}}, {n})", dtypes.int32))
+  word = functools.reduce(lambda a, b: a | b, [((down(code, n) if n else code).cast(dtypes.uint32) & 255) << (8 * n) for n in range(4)])
+  which, head = is_v.cast(dtypes.int32), is_v.where(v_head, k_head)
+  stores.append(cache[which, 0, head.valid(~is_q & (lane % 4).eq(0)), start, t // 4].store(word))
+  stores.append(scales[which, 0, head.valid(~is_q & t.eq(0)), start].store(scale))
+  return UOp.group(*stores).end(block, warp, lane).sink(arg=KernelInfo(name=f"attention_prologue_d{dim}", opts_to_apply=()))
+
+def attention_prologue(joined: Tensor, q_weight: Tensor, k_weight: Tensor, freqs: Tensor, cache: Tensor, scales: Tensor, start: int | UOp, *,
+                       heads: int, kv_heads: int, dim: int, rope_dim: int, eps: float) -> tuple[Tensor, Tensor, Tensor]:
+  """One decoding row's q (heads, dim) FP32, normalized and rotated, and its K/V written into the int8 cache at
+  `start`, from the merged projection's output `joined` (heads x [q, gate], then K, then V; _prologue_kernel).
+  Returns (q, cache, scales) after the write."""
+  if dim % 32 or rope_dim % 2 or rope_dim > dim or joined.numel() != (heads * 2 + kv_heads * 2) * dim:
+    raise ValueError("attention_prologue needs gated q, 32-aligned heads and an even rotary width")
+  q = Tensor.empty(heads, dim, dtype=dtypes.float32, device=joined.device)
+  return _launch((q, cache, scales), (joined.reshape(-1).contiguous(), q_weight, k_weight, freqs), start, functools.partial(
+    _prologue_kernel, start=_kernel_scalar(start), heads=heads, kv_heads=kv_heads, dim=dim, rope_dim=rope_dim, eps=float(eps)))

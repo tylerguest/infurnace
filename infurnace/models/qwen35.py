@@ -6,7 +6,7 @@ import functools
 import os
 from tinygrad import Context, Tensor, UOp
 from tinygrad.llm.model import GatedDeltaNetBlock
-from infurnace.engine import PREFILL_ROWS, _norm_of, _norm_q8, _norm_rows_q8, _one_row, _rows
+from infurnace.engine import PREFILL_ROWS, _norm_of, _norm_q8, _norm_rows_q8, _one_row, _project, _rows
 from infurnace.kernels.gdn import gdn_gates, gdn_decode, gdn_prefill
 from infurnace.models import Family
 from infurnace.tokenizer import BPETokenizer
@@ -33,7 +33,7 @@ def _fused_gdn(block: GatedDeltaNetBlock):
     if source is not None and block.attn_qkv.rows_quantized and block.attn_gate.rotation is rotation:
       # the norm, rotation and quantization in one kernel, which also hands back the FP16 normed rows the pass reads
       q8, x = _norm_rows_q8(block.attn_qkv, norm, source, half=True, normed=True)
-      qkv, out_gate = block.attn_qkv(x, q8), block.attn_gate(x, q8)
+      qkv, out_gate = _project((block.attn_qkv, block.attn_gate), x, q8, one_row=False)
     else:
       x = x.half()
       qkv, out_gate = _rows(x, block.attn_qkv, block.attn_gate)
@@ -86,11 +86,13 @@ def _fused_gdn(block: GatedDeltaNetBlock):
     if source is not None and rotation is not None and block.attn_gate.rotation is rotation:
       # the norm, rotation and quantization in one kernel, which also hands back the FP16 normed row the pass reads
       q8, x = _norm_q8(norm, source, rotation, half=True, normed=True)
-      qkv, out_gate = block.attn_qkv.decode(x, q8), block.attn_gate.decode(x, q8)
+      # merged: the kernel reads the qkv channels and the gate from the one output (no copies of its halves)
+      outs = _project((block.attn_qkv, block.attn_gate), x, q8, one_row=True, joined=True)
+      qkv, out_gate = (outs[0], None) if len(outs) == 1 else outs
     else:
       x = x.half()
       qkv, out_gate = _one_row(x, block.attn_qkv, block.attn_gate)
-    out_gate = out_gate.reshape(H, V)
+    if out_gate is not None: out_gate = out_gate.reshape(H, V)
     # beta/decay projections, conv, q/k norms, recurrence, RMSNorm and gate in one kernel; then the conv shift
     qkv = qkv.cast(block.conv_state.dtype).reshape(-1)
     conv_state = Tensor(block.conv_state.uop.buf_uop).reshape(block.ssm_conv_kernel - 1, block.conv_channels)

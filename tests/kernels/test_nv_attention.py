@@ -160,3 +160,32 @@ def test_int8_store_keeps_each_vector_within_half_a_step():
     step = values.abs().max(-1, keepdim=True) / 127
     assert ((stored - values).abs() <= step * 0.5 + values.abs() * 2 ** -10).all().item()  # and FP16 rounding
     assert dequantize_kv(cache, scales)[:, :, :, :20].abs().max().item() == 0  # rows outside untouched
+
+def test_prologue_matches_norm_rope_and_store():
+  # One decoding row: the fused kernel's q, and the K/V it writes, against upstream's ops and store_kv
+  from tinygrad.llm.model import apply_rope, precompute_freqs_cis
+  from infurnace.kernels.attention import attention_prologue
+  heads, kv_heads, dim, rope_dim, capacity, eps, start = 16, 4, 256, 64, 300, 1e-6, 123
+  with Context(DEV='NV'):
+    Tensor.manual_seed(10)
+    joined = (Tensor.randn((heads * 2 + kv_heads * 2) * dim) * 3).realize()
+    q_w, k_w = (Tensor.rand(dim) + 0.5).realize(), (Tensor.rand(dim) + 0.5).realize()
+    freqs = precompute_freqs_cis(rope_dim, capacity, 1e6).realize()
+    cache = Tensor.zeros(2, 1, kv_heads, capacity, dim // 4, dtype=dtypes.uint32).contiguous().realize()
+    scales = Tensor.zeros(2, 1, kv_heads, capacity, dtype=dtypes.float16).contiguous().realize()
+    ref_cache, ref_scales = cache.clone().realize(), scales.clone().realize()
+    q, cache, scales = attention_prologue(joined, q_w, k_w, freqs, cache, scales, start, heads=heads, kv_heads=kv_heads, dim=dim,
+                                          rope_dim=rope_dim, eps=eps)
+    Tensor.realize(q, cache, scales)
+    def norm(x, w): return x * (x.square().mean(-1, keepdim=True) + eps).rsqrt() * w
+    def rope(x): return apply_rope(x[..., :rope_dim], freqs[start:start + 1]).cat(x[..., rope_dim:], dim=-1)
+    qg = joined[:heads * 2 * dim].reshape(1, heads, 1, 2, dim)[:, :, :, 0]
+    k = joined[heads * 2 * dim:heads * 2 * dim + kv_heads * dim].reshape(1, kv_heads, 1, dim)
+    v = joined[heads * 2 * dim + kv_heads * dim:].reshape(1, kv_heads, 1, dim)
+    q_ref, k_ref = rope(norm(qg, q_w)), rope(norm(k, k_w))
+    assert (q.reshape(1, heads, 1, dim) - q_ref).abs().max().item() < 1e-4
+    ref_cache, ref_scales = store_kv(ref_cache, ref_scales, k_ref, v, start)
+    got, want = dequantize_kv(cache, scales).float(), dequantize_kv(ref_cache, ref_scales).float()
+    # the same codes up to a rounding tie: one step of a vector's scale at most
+    assert ((got - want).abs() <= dequantize_kv(ref_cache, ref_scales).float().abs().max(-1, keepdim=True) / 127 + 1e-6).all().item()
+    assert got[:, :, :, :start].abs().max().item() == 0 and got[:, :, :, start + 1:].abs().max().item() == 0  # one row written

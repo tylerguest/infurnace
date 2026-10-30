@@ -222,7 +222,8 @@ def gdn_prefill(q: Tensor, k: Tensor, v: Tensor, beta: Tensor, log_decay: Tensor
 
 @functools.cache
 def _gdn_decode_kernel(z: UOp, state: UOp, qkv: UOp, conv: UOp, conv_w: UOp, x: UOp, w_beta: UOp, w_alpha: UOp, dt_bias: UOp,
-                       a: UOp, gate: UOp, weight: UOp, keep: UOp, *, heads: int, kheads: int, width: int, eps: float) -> UOp:
+                       a: UOp, gate: UOp, weight: UOp, keep: UOp, *, heads: int, kheads: int, width: int, eps: float,
+                       gate_offset: int = 0) -> UOp:
   D = 128
   head = UOp.range(heads, 0, axis_type=AxisType.GLOBAL)
   warp = UOp.range(4, 1, axis_type=AxisType.LOCAL)
@@ -285,7 +286,7 @@ def _gdn_decode_kernel(z: UOp, state: UOp, qkv: UOp, conv: UOp, conv_w: UOp, x: 
   partial = partial.after(partial[warp].store(warp_reduce(out*out, full_wave=True)).barrier())
   mean = sum((partial[w].load() for w in range(1, 4)), partial[0].load())/D
   scale = (mean+eps).sqrt().reciprocal()*weight[col].load()
-  store = z[head, col].store((out*scale*_silu(gate[head, col].load().float())).cast(dtypes.float16))
+  store = z[head, col].store((out*scale*_silu(gate[gate_offset + head*128 + col].load().float())).cast(dtypes.float16))
   return store.end(head, warp, lane).sink(arg=KernelInfo(name="gdn_decode", opts_to_apply=()))
 
 @functools.cache
@@ -305,15 +306,18 @@ def _conv_shift_kernel(out: UOp, conv: UOp, qkv: UOp, keep: UOp, z: UOp, *, chan
   return UOp.group(*stores).end(block, lane).sink(arg=KernelInfo(name="gdn_conv_shift", opts_to_apply=()))
 
 def gdn_decode(qkv: Tensor, conv_state: Tensor, conv_w: Tensor, x: Tensor, w_beta: Tensor, w_alpha: Tensor, dt_bias: Tensor,
-               a: Tensor, state: Tensor, gate: Tensor, weight: Tensor, keep: Tensor, eps: float, kheads: int) -> Tensor:
+               a: Tensor, state: Tensor, gate: Tensor | None, weight: Tensor, keep: Tensor, eps: float, kheads: int) -> Tensor:
   """One gated delta-net decode row from the raw qkv projection, in two kernels.
 
   qkv: (C,) projection output; conv_state: (3, C) FP32 realized; conv_w: (C, 4); x: (width,) layer
   input; w_beta, w_alpha: (H, width) projection weights (beta = sigmoid(x·w_beta), log decay =
   softplus(x·w_alpha + dt_bias)*a); state: (H, 128, 128) FP32 as (V, K), realized; gate: (H, 128);
-  weight: (128,); keep: (1,) 0/1 multiplier on the old conv and recurrent state.
+  weight: (128,); keep: (1,) 0/1 multiplier on the old conv and recurrent state. With gate None, qkv is the merged
+  projection's output (C + H x 128,): the qkv channels, then the gate, read from the one buffer.
   The recurrent and conv states are updated in place; returns z (H, 128) FP16."""
-  heads, channels, width = w_beta.shape[0], qkv.shape[0], x.shape[0]
+  heads, width = w_beta.shape[0], x.shape[0]
+  channels = qkv.shape[0] - (heads*128 if gate is None else 0)
+  gate_offset, gate = (channels, qkv) if gate is None else (0, gate.reshape(-1))
   if (state.shape != (heads, 128, 128) or conv_state.shape != (3, channels) or channels != 2*kheads*128 + heads*128
       or channels % (heads*128) or width % 128 or w_beta.shape != (heads, width) or w_alpha.shape != (heads, width)):
     raise ValueError("fused GDN decode requires 128-dimensional heads and a 4-tap conv")
@@ -322,7 +326,8 @@ def gdn_decode(qkv: Tensor, conv_state: Tensor, conv_w: Tensor, x: Tensor, w_bet
   z = Tensor.custom_kernel(z, state, qkv, conv_state, conv_w.float().contiguous(), x.contiguous(), w_beta.contiguous(),
                            w_alpha.contiguous(), dt_bias.contiguous(), a.contiguous(), gate.contiguous(),
                            weight.float().contiguous(), keep,
-                           fxn=functools.partial(_gdn_decode_kernel, heads=heads, kheads=kheads, width=width, eps=eps))[0]
+                           fxn=functools.partial(_gdn_decode_kernel, heads=heads, kheads=kheads, width=width, eps=eps,
+                                                 gate_offset=gate_offset))[0]
   out = Tensor.empty(heads, 128, dtype=dtypes.float16, device=qkv.device)
   return Tensor.custom_kernel(out, conv_state, qkv, keep, z, fxn=functools.partial(
     _conv_shift_kernel, channels=channels, size=heads*128))[0]

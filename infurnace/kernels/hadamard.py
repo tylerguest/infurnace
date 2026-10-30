@@ -74,7 +74,7 @@ def _fwht_q8_kernel(q: UOp, scale: UOp, *sources: UOp, rows: int, width: int, bl
   xsum = sources.pop(0) if group == 32 else None
   normed_out = sources.pop(0) if normed else None
   summed_out = sources.pop(0) if other == 'add' else None
-  y = sources.pop() if other else None
+  y = sources.pop() if other in ('add', 'swiglu') else None
   x, signs = sources[0], sources[1]
   weight = sources[2] if eps is not None else None
   span = max(block, SPAN)
@@ -91,6 +91,7 @@ def _fwht_q8_kernel(q: UOp, scale: UOp, *sources: UOp, rows: int, width: int, bl
     values = _vector(x[row, index], x.dtype)
     if other == 'add': return [a + b for a, b in zip(values, _vector(y[row, index], y.dtype))]
     if other == 'swiglu': return [a / (1 + (-a).exp()) * b for a, b in zip(values, _vector(y[row, index], y.dtype))]
+    if other == 'pair': return [a / (1 + (-a).exp()) * b for a, b in zip(values, _vector(x[row, width + index], x.dtype))]
     return values
   source = source_of(first)
   values = inputs(source)
@@ -219,22 +220,27 @@ def _fwht_q8_staged_kernel(q: UOp, scale: UOp, *sources: UOp, rows: int, width: 
     arg=KernelInfo(name=f"{'norm_' if eps is not None else ''}fwht_q8_{block}_{group}", opts_to_apply=()))
 
 def fwht_q8(x: Tensor, signs: Tensor, *, block: int, perm: tuple[int, int, int] | None = None, group: int = 32,
-            up: Tensor | None = None) -> tuple[Tensor, ...]:
+            up: Tensor | None = None, pair: bool = False) -> tuple[Tensor, ...]:
   """fwht(x, signs, ...) quantized to int8 in one kernel, without the FP32 result: (words, scales, half sums) as
   quant_gemv.q8_quantize returns for group 32, (words, scales) as q8_quantize64 for group 64. With `up`, of
-  silu(x) * up instead (a feed-forward's down projection input, made in the same kernel)."""
-  width = x.shape[-1]
+  silu(x) * up instead (a feed-forward's down projection input, made in the same kernel); with `pair`, x's rows are
+  gate then up (a merged gate-up projection's output) and the transform is of silu(gate) * up."""
+  width = x.shape[-1] // (2 if pair else 1)
   if block > 1024 or block & (block - 1) or width % block or block < 64:
     raise ValueError("fwht_q8 needs a power-of-two block of 64-1024 dividing the width")
   if group not in (32, 64): raise ValueError("fwht_q8 quantizes 32- or 64-value groups")
-  rows, groups = x.numel() // width, width // group
+  rows, groups = x.numel() // x.shape[-1], width // group
   outputs = [Tensor.empty(rows, width // 4, dtype=dtypes.uint32, device=x.device), Tensor.empty(rows, groups, dtype=dtypes.float32, device=x.device)]
   if group == 32: outputs.append(Tensor.empty(rows, groups * 2, dtype=dtypes.int32, device=x.device))
-  if up is not None and not _fits(width, block, perm): x, up = x.silu() * up, None
-  kernel = functools.partial(_fwht_q8_kernel if _fits(width, block, perm) else _fwht_q8_staged_kernel, rows=rows, width=width,
-                             block=block, perm=perm, group=group, **({'other': 'swiglu'} if up is not None else {}))
+  fits = _fits(width, block, perm)
+  if pair and not fits: x, up, pair = x[..., :width], x[..., width:], False  # the staged kernel takes neither: tensor ops
+  if up is not None and not fits: x, up = x.silu() * up, None
+  other = {'other': 'pair'} if pair else {'other': 'swiglu'} if up is not None else {}
+  kernel = functools.partial(_fwht_q8_kernel if fits else _fwht_q8_staged_kernel, rows=rows, width=width, block=block, perm=perm,
+                             group=group, **other)
   extra = (up.reshape(rows, width).contiguous(),) if up is not None else ()
-  results = Tensor.custom_kernel(*outputs, x.reshape(rows, width).contiguous(), signs.float().contiguous(), *extra, fxn=kernel)[:len(outputs)]
+  results = Tensor.custom_kernel(*outputs, x.reshape(rows, x.shape[-1]).contiguous(), signs.float().contiguous(), *extra,
+                                 fxn=kernel)[:len(outputs)]
   shapes = ((rows, groups, group // 4), (rows, groups), (rows, groups, 2))
   return tuple(r.reshape(s) for r, s in zip(results, shapes))
 

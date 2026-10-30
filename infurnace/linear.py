@@ -60,14 +60,14 @@ class _NVLinear:
     """Whether multirow inputs are rotated and quantized in one kernel (rows_q8), Hadamard-folded Q2_0 on int8 tensor cores."""
     return self.prefill and self.rotation is not None and q2_int8(self.ggml_type)
 
-  def rows_q8(self, x: Tensor, up: Tensor | None = None) -> tuple[Tensor, Tensor]:
+  def rows_q8(self, x: Tensor, up: Tensor | None = None, pair: bool = False) -> tuple[Tensor, Tensor]:
     """The int8 multirow input quant_gemm takes as `q8`: rows padded to a multiple of 16, rotated and quantized
-    (with `up`, of silu(x) * up)."""
+    (with `up`, of silu(x) * up; with `pair`, x is gate then up along its rows)."""
     def padded(t: Tensor) -> Tensor:
       activation = t.pad_to(t.max_shape) if not isinstance(t.numel(), int) else t
-      tokens = activation.numel() // self.in_features
-      return activation.reshape(tokens, self.in_features).pad(((0, -tokens % 16), (0, 0)))
-    return self.rotation.quantized(padded(x), 64, up=padded(up) if up is not None else None)
+      tokens = activation.numel() // t.shape[-1]
+      return activation.reshape(tokens, t.shape[-1]).pad(((0, -tokens % 16), (0, 0)))
+    return self.rotation.quantized(padded(x), 64, up=padded(up) if up is not None else None, pair=pair)
 
   def __call__(self, x: Tensor, q8: tuple[Tensor, Tensor] | None = None) -> Tensor:
     """`q8`: rows_q8(x), shared by projections of one input."""
@@ -86,3 +86,23 @@ class _NVLinear:
       if symbolic: result = result.shrink(tuple((0, size) for size in (*x.shape[:-1], self.out_features)))
       return result if self.bias is None else result + self.bias
     return self.original(x)
+
+  @classmethod
+  def merged(cls, layers: tuple['_NVLinear', ...]) -> '_NVLinear':
+    """One Q2_0 linear of the rows of `layers` (projections of one input, rotation and flags): prepare_q2's 8-row tiles
+    are contiguous, so their words concatenate, and the projections take one launch instead of one each. Each layer
+    keeps a view of its rows of the merged words, so no weight is stored twice, and a dense decode graph only if it
+    kept one (a live lazy graph is walked on every realize: tens of ms each for the model's)."""
+    merged = object.__new__(cls)
+    merged.__dict__.update(layers[0].__dict__)
+    merged.packed = Tensor.cat(*(layer.packed for layer in layers)).contiguous().realize()
+    merged.out_features = sum(layer.out_features for layer in layers)
+    merged.original = merged.weight = merged.bias = None
+    offset = 0
+    for layer in layers:
+      layer.packed = merged.packed[offset:offset + layer.packed.numel()]
+      offset += layer.packed.numel()
+      if layer.weight is None: continue
+      decoded = dequant_prepared_q2(layer.packed, in_features=layer.in_features)
+      layer.original.weight = layer.weight = decoded.reshape(layer.out_features, layer.in_features).cast(dtypes.float16)
+    return merged

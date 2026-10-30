@@ -25,7 +25,7 @@ from tinygrad.uop.ops import Ops
 from infurnace.gguf import Q2_0, decode as decode_packed, parse_gguf, read_gguf_metadata
 from infurnace.hadamard import rotations
 from infurnace.kernels.hadamard import norm_fwht_q8
-from infurnace.kernels.attention import attention, store_kv
+from infurnace.kernels.attention import attention, attention_prologue, store_kv
 from infurnace.kernels.quant_gemm import nv_prefill_supported
 from infurnace.kernels.quant_gemv import q8_quantize
 from infurnace.kernels.embedding import packed_gather
@@ -157,7 +157,7 @@ class _FusibleNorm:
     last, self._last = self._last, None
     return last[1] if last is not None and last[0] is h else None
 
-def _one_row(x: Tensor, *layers, norm: _FusibleNorm | None = None, half: bool = False) -> tuple[Tensor, ...]:
+def _one_row(x: Tensor, *layers, norm: _FusibleNorm | None = None, half: bool = False, joined: bool = False) -> tuple[Tensor, ...]:
   """One-row outputs of projections that read the same input, quantizing it to Q8 once: each packed
   GEMV would otherwise quantize it again. Other inputs or layers go through their own call. With `norm`, `x` may be
   that norm's output: Hadamard-folded projections then take its input and norm, rotate and quantize it in one kernel
@@ -170,8 +170,18 @@ def _one_row(x: Tensor, *layers, norm: _FusibleNorm | None = None, half: bool = 
     if rotation is not None and source is not None: q8 = _norm_q8(norm, source, rotation, half=half)
     # Hadamard-folded weights: one rotation for all of them, in the same kernel as the quantization
     else: q8 = rotation.quantized(x, 32) if rotation is not None else q8_quantize(x, 1, width)
-    return tuple(layer.decode(x, q8) for layer in layers)
+    return _project(layers, x, q8, one_row=True, joined=joined)
   return tuple(layer(x) for layer in layers)
+
+def _project(layers: tuple, x: Tensor, q8, *, one_row: bool, joined: bool = False) -> tuple[Tensor, ...]:
+  """Projections of one quantized input: one launch of their merged linear (Model._merge_projections) when they
+  were merged in this order, its output split (or with `joined` returned whole, a 1-tuple, for a consumer that reads
+  its parts itself: a custom kernel's slice of it would be copied first), else one launch each."""
+  group = getattr(layers[0], 'merged_group', None)
+  if group is not None and group[1] == tuple(layers):
+    out = group[0].decode(x, q8) if one_row else group[0](x, q8)
+    return (out,) if joined else tuple(out.split([layer.out_features for layer in layers], dim=-1))
+  return tuple(layer.decode(x, q8) if one_row else layer(x, q8) for layer in layers)
 
 def _materialized(*tensors: Tensor) -> bool:
   """Whether each tensor is a view of a kernel's output (so a custom kernel can read it without another kernel)."""
@@ -222,7 +232,7 @@ def _norm_rows_q8(layer: _NVLinear, norm: _FusibleNorm, source: Tensor, *, half:
   if symbolic: rows_normed = rows_normed.shrink(tuple((0, size) for size in source.shape))
   return out[:2], rows_normed
 
-def _rows(x: Tensor, *layers, norm: _FusibleNorm | None = None, source: Tensor | None = None) -> tuple[Tensor, ...]:
+def _rows(x: Tensor, *layers, norm: _FusibleNorm | None = None, source: Tensor | None = None, joined: bool = False) -> tuple[Tensor, ...]:
   """Multirow outputs of projections that read the same input: Hadamard-folded Q2_0 weights share one rotated
   int8 input (_NVLinear.rows_q8) instead of each rotating and quantizing it. Other layers go through their own call.
   With `norm`, `x` may be that norm's output (or `source` its input): the shared input is then normalized, rotated
@@ -230,7 +240,7 @@ def _rows(x: Tensor, *layers, norm: _FusibleNorm | None = None, source: Tensor |
   if source is None and norm is not None: source = norm.take(x)
   if all(isinstance(layer, _NVLinear) and layer.rows_quantized and layer.rotation is layers[0].rotation for layer in layers):
     q8 = _norm_rows_q8(layers[0], norm, source) if source is not None else layers[0].rows_q8(x)
-    return tuple(layer(x, q8) for layer in layers)
+    return _project(layers, x, q8, one_row=False, joined=joined)
   return tuple(layer(x) for layer in layers)
 
 def _fused_feed_forward(block):
@@ -239,13 +249,20 @@ def _fused_feed_forward(block):
   down = block.ffn_down
   def feed_forward(x: Tensor) -> Tensor:
     if hasattr(block, 'ffn_gate_exps'): return upstream_feed_forward(x)
+    width = getattr(down, 'in_features', None)
     if not isinstance(x.numel(), int) or x.numel() != getattr(block.ffn_gate, 'in_features', None):
-      gate, up = _rows(x, block.ffn_gate, block.ffn_up, norm=_norm_of(block, 'ffn_norm'))
-      # silu(gate) * up made by the down projection's rotate-and-quantize kernel, when both are kernel outputs
-      # already (a 16-row verification's are lazy sums of split partials, which the multiply's kernel adds)
+      outs = _rows(x, block.ffn_gate, block.ffn_up, norm=_norm_of(block, 'ffn_norm'), joined=True)
+      # merged gate and up: the down projection's rotate-and-quantize kernel reads both halves of the one output
+      if len(outs) == 1 and down.rows_quantized: return down(outs[0][..., :width], down.rows_q8(outs[0], pair=True))
+      gate, up = outs if len(outs) == 2 else outs[0].split(width, dim=-1)
+      # silu(gate) * up made by the same kernel, when both are kernel outputs already (a 16-row verification's are
+      # lazy sums of split partials, which the multiply's kernel adds)
       if isinstance(down, _NVLinear) and down.rows_quantized and _materialized(gate, up): return down(gate, down.rows_q8(gate, up=up))
       return down(gate.silu().contiguous() * up)
-    gate, up = _one_row(x, block.ffn_gate, block.ffn_up, norm=_norm_of(block, 'ffn_norm'))
+    outs = _one_row(x, block.ffn_gate, block.ffn_up, norm=_norm_of(block, 'ffn_norm'), joined=True)
+    if len(outs) == 1 and _SHARED_Q8 and down.rotation is not None:
+      return down.decode(outs[0][..., :width], down.rotation.quantized(outs[0], 32, pair=True))
+    gate, up = outs if len(outs) == 2 else outs[0].split(width, dim=-1)
     if _SHARED_Q8 and isinstance(down, _NVLinear) and down.rotation is not None and _materialized(gate, up):
       return down.decode(gate, down.rotation.quantized(gate, 32, up=up))
     return down(gate.silu().contiguous() * up)
@@ -297,7 +314,21 @@ def _fused_attention(block: TransformerBlock):
     if B != 1 or isinstance(T, UOp) or T != 1:
       if hasattr(block, 'cache_scale'): raise NotImplementedError("upstream attention can't read an int8 KV cache")
       return upstream_attention(x, start_pos)
-    return rows_attention(x, start_pos, *_one_row(x, block.attn_q, block.attn_k, block.attn_v, norm=_norm_of(block, 'attn_norm')))
+    outs = _one_row(x, block.attn_q, block.attn_k, block.attn_v, norm=_norm_of(block, 'attn_norm'), joined=True)
+    if len(outs) == 1:  # merged: the fused prologue reads the one output, or it is split as three
+      if (weights := getattr(block, 'qk_norm_f32', None)) is not None and hasattr(block, 'cache_scale'):
+        return prologue_row(outs[0], start_pos, weights)
+      outs = outs[0].split([block.attn_q.out_features, block.attn_k.out_features, block.attn_v.out_features], dim=-1)
+    return rows_attention(x, start_pos, *outs)
+  def prologue_row(joined: Tensor, start_pos, weights: tuple[Tensor, Tensor]) -> Tensor:
+    # q/k norms, RoPE and the int8 K/V write in one kernel (kernels/attention.attention_prologue), then attention
+    H, D = c.n_heads, c.head_dim
+    joined = joined.reshape(-1)
+    q, cache, scales = attention_prologue(joined, *weights, block.freqs_cis, block.cache_kv, block.cache_scale, start_pos, heads=H,
+                                          kv_heads=c.n_kv_heads, dim=D, rope_dim=c.rope_dim, eps=block.attn_q_norm.eps)
+    attn = attention(q.reshape(1, H, 1, D), cache, start_pos, scales=scales).reshape(1, 1, H * D)
+    gate = joined[:H * 2 * D].reshape(H, 2, D)[:, 1].reshape(1, 1, H * D)
+    return block.attn_output(attn * gate.sigmoid())
   def rows_attention(x: Tensor, start_pos, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
     B, T, _ = x.shape
     if c.qk_norm and c.qk_norm != c.head_dim: q, k = block.attn_q_norm(q), block.attn_k_norm(k)
@@ -723,6 +754,27 @@ class Model:
       if getattr(block._attention, 'takes_norm', False): block.attn_norm = _FusibleNorm(block.attn_norm)
       if getattr(block._feed_forward, 'takes_norm', False): block.ffn_norm = _FusibleNorm(block.ffn_norm)
 
+  def _merge_projections(self):
+    """Q2_0 projections of one input (attn_qkv and attn_gate, attn_q/k/v, ffn_gate and ffn_up) become one linear of
+    their rows (_NVLinear.merged), run by _project: one launch instead of two or three. A small GEMV is short of
+    the bandwidth a large one reaches (RTX 5060: ~280-330 GB/s at 6 MB, 400 at 179 MB), so fewer, larger ones help."""
+    for block in self.transformer.blk:
+      for names in (('attn_qkv', 'attn_gate'), ('attn_q', 'attn_k', 'attn_v'), ('ffn_gate', 'ffn_up')):
+        layers = tuple(getattr(block, name, None) for name in names)
+        if not all(isinstance(layer, _NVLinear) and layer.ggml_type == Q2_0 and layer.bias is None for layer in layers): continue
+        if any(layer.in_features != layers[0].in_features or layer.rotation is not layers[0].rotation for layer in layers): continue
+        layers[0].merged_group = (_NVLinear.merged(layers), layers)
+
+  def _fuse_attention_prologue(self):
+    """Blocks whose one-row attention can take kernels/attention.attention_prologue (gated q, per-head q/k norms, an
+    int8 KV cache, merged q/k/v): their norm weights in FP32 once, which marks them."""
+    for block in self.transformer.blk:
+      c = block.config
+      group = getattr(getattr(block, 'attn_q', None), 'merged_group', None)
+      if group is None or not c.attn_output_gate or c.qk_norm != c.head_dim or c.rope_interleave or not 0 < c.rope_dim <= c.head_dim: continue
+      if not nvidia(self.device) or c.head_dim % 32 or os.environ.get('INFURNACE_KV_INT8', '1') == '0': continue
+      block.qk_norm_f32 = tuple(n.weight.float().contiguous().realize() for n in (block.attn_q_norm, block.attn_k_norm))
+
   def _sample_on_device(self):
     """Upstream's forward with its sample from kernels/sampling.py (the same Gumbel-max, noise made in the kernel)
     instead of tensor ops: upstream's random noise, two logs and two argmax passes over the 248,320 logits took
@@ -773,6 +825,8 @@ class Model:
     chunks = family.accelerate(result)
     if transformer.config.hc is None: result._sample_on_device()
     result._fuse_norms()
+    result._merge_projections()
+    result._fuse_attention_prologue()
     result._multirow_prefill = chunks and result.nv_prefill and os.environ.get('INFURNACE_MULTIROW_PREFILL', '1') != '0'
     # Placeholder initialization leaves an unrealized host RNG update chain that
     # every later realize would walk. Swap in a fresh counter rather than realize
@@ -832,8 +886,10 @@ class Model:
         packed.add(name)
         if tied: self._embedding = _PackedEmbedding(adapter)
         if tied and entry.ggml_type == Q2_0:
-          # Upstream's embedding would decode the whole table: the packed lookup is the token embedding too.
+          # Upstream's embedding would decode the whole table: the packed lookup is the token embedding too, so no
+          # dense decode graph stays alive (each realize walks it: ~5 ms of host time for Bonsai-4B's 248k-row head)
           self.transformer.token_embd = self._embedding
+          adapter.weight = adapter.original.weight = None
         elif tied:
           # Embedding lookups read rows from the same packed allocation.
           self.transformer.token_embd.weight = adapter.weight

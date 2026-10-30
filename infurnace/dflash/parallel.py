@@ -24,7 +24,7 @@ from tinygrad import Context, Tensor, UOp, dtypes
 from tinygrad.llm.model import GatedDeltaNetBlock, apply_rope
 from infurnace.dflash.jit import captured
 from infurnace.dflash.target import TargetObserver, detach_rng
-from infurnace.engine import _norm_of, _norm_rows_q8, _rows, cached_attention
+from infurnace.engine import _norm_of, _norm_rows_q8, _project, _rows, cached_attention
 from infurnace.kernels.gdn import gdn_chunk, gdn_gates, gdn_commit
 from infurnace.kernels.sampling import Sampler
 from infurnace.device import nvidia
@@ -100,7 +100,7 @@ class ParallelVerifier:
     if source is not None and block.attn_qkv.rows_quantized and block.attn_gate.rotation is block.attn_qkv.rotation:
       # the norm, rotation and quantization in one kernel, which also hands back the FP16 normed rows the pass reads
       q8, x = _norm_rows_q8(block.attn_qkv, norm, source, half=True, normed=True)
-      qkv, out_gate = block.attn_qkv(x, q8), block.attn_gate(x, q8)
+      qkv, out_gate = _project((block.attn_qkv, block.attn_gate), x, q8, one_row=False)
     else:
       x = x.half()
       qkv, out_gate = _rows(x, block.attn_qkv, block.attn_gate)
