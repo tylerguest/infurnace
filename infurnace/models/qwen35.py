@@ -21,6 +21,8 @@ def _fused_gdn(block: GatedDeltaNetBlock):
   H, K, V = block.num_v_heads, block.head_k_dim, block.head_v_dim
   # β and α projections stacked for one gdn_gates launch (prompt chunks, and DFlash's verifier reads it from the block)
   gates = block.gdn_gates = block.ssm_beta.weight.cat(block.ssm_alpha.weight).contiguous().realize()
+  # the decode kernel's FP32 conv and norm weights, made once (cast in each captured step, they were a kernel each)
+  conv_w, norm_w = (w.float().contiguous().realize() for w in (block.ssm_conv1d['weight'], block.ssm_norm.weight))
   def prefill(x: Tensor, start_pos: UOp) -> Tensor:
     # Upstream's input processing, verbatim for the non-KDA case; only the scan below differs.
     B, T, _ = x.shape
@@ -93,8 +95,8 @@ def _fused_gdn(block: GatedDeltaNetBlock):
     qkv = qkv.cast(block.conv_state.dtype).reshape(-1)
     conv_state = Tensor(block.conv_state.uop.buf_uop).reshape(block.ssm_conv_kernel - 1, block.conv_channels)
     state = Tensor(block.recurrent_state.uop.buf_uop).reshape(H, V, K)
-    z = gdn_decode(qkv, conv_state, block.ssm_conv1d['weight'], x.reshape(-1), block.ssm_beta.weight, block.ssm_alpha.weight,
-                   block.ssm_dt['bias'], block.ssm_a, state, out_gate, block.ssm_norm.weight, (1 - initial.float()).reshape(1),
+    z = gdn_decode(qkv, conv_state, conv_w, x.reshape(-1), block.ssm_beta.weight, block.ssm_alpha.weight,
+                   block.ssm_dt['bias'], block.ssm_a, state, out_gate, norm_w, (1 - initial.float()).reshape(1),
                    block.ssm_norm.eps, kheads=block.num_k_heads)
     return block.ssm_out(z.reshape(1, 1, H * V))
   attention.takes_norm = True  # its one-row path takes a _FusibleNorm's input

@@ -21,6 +21,7 @@ from tinygrad.device import Buffer
 import tinygrad.llm.model as upstream_model
 from tinygrad.llm.model import Transformer, TransformerBlock, apply_rope, precompute_freqs_cis
 from tinygrad.nn.state import get_state_dict
+from tinygrad.uop.ops import Ops
 from infurnace.gguf import Q2_0, decode as decode_packed, parse_gguf, read_gguf_metadata
 from infurnace.hadamard import rotations
 from infurnace.kernels.hadamard import norm_fwht_q8
@@ -143,7 +144,8 @@ class _FusibleNorm:
   lazy output, then never read, is never computed. Every consumer of a fusible norm takes, so no input outlives its
   call (tensors can't be weakly referenced, and live lazy graphs are walked on every realize)."""
   def __init__(self, norm):
-    self.norm, self.weight, self.eps, self._last = norm, norm.weight, norm.eps, None
+    # the fused kernels' weight in FP32 once (casting the FP16 weight in each captured step is a kernel a norm)
+    self.norm, self.weight, self.eps, self._last = norm, norm.weight.float().contiguous().realize(), norm.eps, None
 
   def __call__(self, x: Tensor) -> Tensor:
     out = self.norm(x)
@@ -171,11 +173,28 @@ def _one_row(x: Tensor, *layers, norm: _FusibleNorm | None = None, half: bool = 
     return tuple(layer.decode(x, q8) for layer in layers)
   return tuple(layer(x) for layer in layers)
 
+def _materialized(*tensors: Tensor) -> bool:
+  """Whether each tensor is a view of a kernel's output (so a custom kernel can read it without another kernel)."""
+  return all(t.uop.base.op in (Ops.AFTER, Ops.BUFFER) for t in tensors)
+
+def _addends(source: Tensor) -> tuple[Tensor, Tensor] | None:
+  """The two FP32 operands of a lazy residual sum (a block's x + attention, h + feed-forward), else None."""
+  u = source.uop
+  if u.op is not Ops.ADD or len(u.src) != 2 or source.dtype != dtypes.float32 or not isinstance(source.numel(), int): return None
+  return (Tensor(u.src[0]), Tensor(u.src[1])) if all(s.shape == u.shape for s in u.src) else None
+
 def _norm_q8(norm: _FusibleNorm, source: Tensor, rotation, *, half: bool = False, normed: bool = False):
   """norm(source), rotated and quantized in one kernel (norm_fwht_q8): the Q8 tuple for the projections, and with
-  `normed` also the normalized row in FP16."""
+  `normed` also the normalized row in FP16. A residual sum's two operands go in separately: the kernel adds them,
+  stores the sum, and `source` becomes that output, so the block's later residual add reads it instead of adding
+  them again (one kernel fewer each residual add)."""
   signs = rotation.signs if rotation.signs is not None else Tensor.ones(source.shape[-1], device=source.device)
-  out = norm_fwht_q8(source, norm.weight, norm.eps, signs, block=rotation.block, group=32, normed=normed, half=half)
+  parts = _addends(source)
+  out = norm_fwht_q8(parts[0] if parts else source, norm.weight, norm.eps, signs, block=rotation.block, group=32, normed=normed,
+                     half=half, addend=parts[1] if parts else None)
+  if parts:
+    source.replace(out[-1].reshape(source.shape))
+    out = out[:-1]
   return (out[:3], out[3]) if normed else out
 
 def _norm_of(block, name: str) -> _FusibleNorm | None:
@@ -189,10 +208,15 @@ def _norm_rows_q8(layer: _NVLinear, norm: _FusibleNorm, source: Tensor, *, half:
   symbolic = not isinstance(source.numel(), int)
   activation = source.pad_to(source.max_shape) if symbolic else source
   tokens = activation.numel() // layer.in_features
-  rows = activation.reshape(tokens, layer.in_features).pad(((0, -tokens % 16), (0, 0)))
+  def padded(t: Tensor) -> Tensor: return t.reshape(tokens, layer.in_features).pad(((0, -tokens % 16), (0, 0)))
+  parts = _addends(source)  # a residual sum: added in the kernel, as _norm_q8 does
   rotation = layer.rotation
   signs = rotation.signs if rotation.signs is not None else Tensor.ones(layer.in_features, device=source.device)
-  out = norm_fwht_q8(rows, norm.weight, norm.eps, signs, block=rotation.block, group=64, normed=normed, half=half)
+  out = norm_fwht_q8(padded(parts[0] if parts else activation), norm.weight, norm.eps, signs, block=rotation.block, group=64,
+                     normed=normed, half=half, addend=padded(parts[1]) if parts else None)
+  if parts:
+    source.replace(out[-1][:tokens].reshape(source.shape))
+    out = out[:-1]
   if not normed: return out
   rows_normed = out[2][:tokens].reshape(activation.shape)
   if symbolic: rows_normed = rows_normed.shrink(tuple((0, size) for size in source.shape))
@@ -212,13 +236,19 @@ def _rows(x: Tensor, *layers, norm: _FusibleNorm | None = None, source: Tensor |
 def _fused_feed_forward(block):
   """Upstream's dense feed-forward, with gate and up sharing one Q8 activation for one row."""
   upstream_feed_forward = block._feed_forward
+  down = block.ffn_down
   def feed_forward(x: Tensor) -> Tensor:
     if hasattr(block, 'ffn_gate_exps'): return upstream_feed_forward(x)
     if not isinstance(x.numel(), int) or x.numel() != getattr(block.ffn_gate, 'in_features', None):
       gate, up = _rows(x, block.ffn_gate, block.ffn_up, norm=_norm_of(block, 'ffn_norm'))
-      return block.ffn_down(gate.silu().contiguous() * up)
+      # silu(gate) * up made by the down projection's rotate-and-quantize kernel, when both are kernel outputs
+      # already (a 16-row verification's are lazy sums of split partials, which the multiply's kernel adds)
+      if isinstance(down, _NVLinear) and down.rows_quantized and _materialized(gate, up): return down(gate, down.rows_q8(gate, up=up))
+      return down(gate.silu().contiguous() * up)
     gate, up = _one_row(x, block.ffn_gate, block.ffn_up, norm=_norm_of(block, 'ffn_norm'))
-    return block.ffn_down(gate.silu().contiguous() * up)
+    if _SHARED_Q8 and isinstance(down, _NVLinear) and down.rotation is not None and _materialized(gate, up):
+      return down.decode(gate, down.rotation.quantized(gate, 32, up=up))
+    return down(gate.silu().contiguous() * up)
   feed_forward.takes_norm = True  # its one-row path takes a _FusibleNorm's input (_one_row)
   return feed_forward
 

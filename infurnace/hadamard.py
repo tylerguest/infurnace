@@ -50,10 +50,11 @@ class Rotation:
     if self.signs is not None: x = x * self.signs
     return self._blocks(x).cast(dtype)
 
-  def quantized(self, x: Tensor, group: int) -> tuple[Tensor, ...]:
-    """A folded weight's int8 input in one NV kernel: q8_quantize's tuple for group 32, q8_quantize64's for 64."""
+  def quantized(self, x: Tensor, group: int, up: Tensor | None = None) -> tuple[Tensor, ...]:
+    """A folded weight's int8 input in one NV kernel: q8_quantize's tuple for group 32, q8_quantize64's for 64.
+    With `up`, of silu(x) * up (a feed-forward's down projection)."""
     signs = self.signs if self.signs is not None else Tensor.ones(x.shape[-1], device=x.device)
-    return fwht_q8(x, signs, block=self.block, perm=self.perm, group=group)
+    return fwht_q8(x, signs, block=self.block, perm=self.perm, group=group, up=up)
 
   def inverse(self, z: Tensor) -> Tensor:
     """A latent table row in the model's basis."""
@@ -76,12 +77,13 @@ def rotations(metadata: dict, widths: dict[str, int], device: str, *, value_head
   if metadata.get("prism.hadamard.transform") != "normalized-sylvester-walsh-hadamard" or \
      metadata.get("prism.hadamard.axis") != "input-last-dimension" or block <= 0 or block & (block - 1):
     raise ValueError("unsupported prism.hadamard transform")
-  matrix = Tensor(hadamard_matrix(block), dtype=dtypes.float32, device=device).reshape(block, block).contiguous()
+  # realized here: left lazy, the constants are rebuilt and uploaded in every captured step that reads them
+  matrix = Tensor(hadamard_matrix(block), dtype=dtypes.float32, device=device).reshape(block, block).contiguous().realize()
   signs: dict[int, Tensor] = {}
   if metadata.get("prism.hadamard.sign_mode") == "explicit":
     values, offset = field("sign_values", list), 0
     for width in field("sign_widths", list):
-      signs[width] = Tensor([float(v) for v in values[offset:offset + width]], dtype=dtypes.float32, device=device).contiguous()
+      signs[width] = Tensor([float(v) for v in values[offset:offset + width]], dtype=dtypes.float32, device=device).contiguous().realize()
       offset += width
     if offset != len(values): raise ValueError("prism.hadamard.sign_values length mismatch")
   elif metadata.get("prism.hadamard.sign_mode") != "identity": raise ValueError("unsupported prism.hadamard.sign_mode")

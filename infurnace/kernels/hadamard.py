@@ -54,7 +54,7 @@ def _fwht_kernel(out: UOp, x: UOp, signs: UOp, *, rows: int, width: int, block: 
 
 @functools.cache
 def _fwht_q8_kernel(q: UOp, scale: UOp, *sources: UOp, rows: int, width: int, block: int, perm: tuple[int, int, int] | None,
-                    group: int, eps: float | None = None, normed: bool = False, half: bool = False) -> UOp:
+                    group: int, eps: float | None = None, normed: bool = False, half: bool = False, other: str = '') -> UOp:
   """The forward transform, quantized to int8 in the same pass: q8_quantize's layout (group 32, with the halves'
   sums) or q8_quantize64's (group 64). A thread holds VALUES consecutive values and a CTA max(block, SPAN): the
   butterflies within a thread's values run in registers, those across a warp's lanes by shuffles, and only those
@@ -65,10 +65,16 @@ def _fwht_q8_kernel(q: UOp, scale: UOp, *sources: UOp, rows: int, width: int, bl
   sums the whole row's squares itself (the row is a few KB), so the norm needs no other kernel. `normed` also
   stores the normalized row in FP16 (before the transform), `half` rounds it to FP16 before the transform too.
 
+  `other` names a second input y (the last source) folded into the first as it loads: 'add' transforms x + y and
+  stores the sum (FP32, an output after the others: the residual stream), 'swiglu' transforms silu(x) * y (a
+  feed-forward's gate and up), so neither needs a kernel of its own.
+
   RTX 5060, 64 rows of 9216: 53 us with the earlier kernel (one value a thread, every stage through shared memory)."""
   sources = list(sources)
   xsum = sources.pop(0) if group == 32 else None
   normed_out = sources.pop(0) if normed else None
+  summed_out = sources.pop(0) if other == 'add' else None
+  y = sources.pop() if other else None
   x, signs = sources[0], sources[1]
   weight = sources[2] if eps is not None else None
   span = max(block, SPAN)
@@ -81,13 +87,18 @@ def _fwht_q8_kernel(q: UOp, scale: UOp, *sources: UOp, rows: int, width: int, bl
     if perm is None: return position
     rep, nk, hd = perm  # grouped position (k, r, d) reads tiled (r, k, d); VALUES positions stay contiguous
     return ((position // hd) % rep) * (nk * hd) + (position // (rep * hd)) * hd + position % hd
+  def inputs(index: UOp) -> list[UOp]:
+    values = _vector(x[row, index], x.dtype)
+    if other == 'add': return [a + b for a, b in zip(values, _vector(y[row, index], y.dtype))]
+    if other == 'swiglu': return [a / (1 + (-a).exp()) * b for a, b in zip(values, _vector(y[row, index], y.dtype))]
+    return values
   source = source_of(first)
-  values = _vector(x[row, source], x.dtype)
-  extra = []
+  values = inputs(source)
+  extra = [summed_out[row, source + i].store(v) for i, v in enumerate(values)] if summed_out is not None else []
   if eps is not None:
     # this thread's share of the row's squares, the warp's, then the CTA's
     squares = functools.reduce(lambda a, b: a + b, (v * v for j in range(width // span) for v in
-                                                    _vector(x[row, j * span + (warp * 32 + lane) * VALUES], x.dtype)))
+                                                    inputs(j * span + (warp * 32 + lane) * VALUES)))
     total = warp_reduce(squares, full_wave=True)
     if warps > 1:
       sums = UOp.placeholder((warps,), dtypes.float32, slot=0, addrspace=AddrSpace.LOCAL)
@@ -207,9 +218,11 @@ def _fwht_q8_staged_kernel(q: UOp, scale: UOp, *sources: UOp, rows: int, width: 
   return UOp.group(*stores, *extra).end(item, warp, thread).sink(
     arg=KernelInfo(name=f"{'norm_' if eps is not None else ''}fwht_q8_{block}_{group}", opts_to_apply=()))
 
-def fwht_q8(x: Tensor, signs: Tensor, *, block: int, perm: tuple[int, int, int] | None = None, group: int = 32) -> tuple[Tensor, ...]:
+def fwht_q8(x: Tensor, signs: Tensor, *, block: int, perm: tuple[int, int, int] | None = None, group: int = 32,
+            up: Tensor | None = None) -> tuple[Tensor, ...]:
   """fwht(x, signs, ...) quantized to int8 in one kernel, without the FP32 result: (words, scales, half sums) as
-  quant_gemv.q8_quantize returns for group 32, (words, scales) as q8_quantize64 for group 64."""
+  quant_gemv.q8_quantize returns for group 32, (words, scales) as q8_quantize64 for group 64. With `up`, of
+  silu(x) * up instead (a feed-forward's down projection input, made in the same kernel)."""
   width = x.shape[-1]
   if block > 1024 or block & (block - 1) or width % block or block < 64:
     raise ValueError("fwht_q8 needs a power-of-two block of 64-1024 dividing the width")
@@ -217,16 +230,19 @@ def fwht_q8(x: Tensor, signs: Tensor, *, block: int, perm: tuple[int, int, int] 
   rows, groups = x.numel() // width, width // group
   outputs = [Tensor.empty(rows, width // 4, dtype=dtypes.uint32, device=x.device), Tensor.empty(rows, groups, dtype=dtypes.float32, device=x.device)]
   if group == 32: outputs.append(Tensor.empty(rows, groups * 2, dtype=dtypes.int32, device=x.device))
+  if up is not None and not _fits(width, block, perm): x, up = x.silu() * up, None
   kernel = functools.partial(_fwht_q8_kernel if _fits(width, block, perm) else _fwht_q8_staged_kernel, rows=rows, width=width,
-                             block=block, perm=perm, group=group)
-  results = Tensor.custom_kernel(*outputs, x.reshape(rows, width).contiguous(), signs.float().contiguous(), fxn=kernel)[:len(outputs)]
+                             block=block, perm=perm, group=group, **({'other': 'swiglu'} if up is not None else {}))
+  extra = (up.reshape(rows, width).contiguous(),) if up is not None else ()
+  results = Tensor.custom_kernel(*outputs, x.reshape(rows, width).contiguous(), signs.float().contiguous(), *extra, fxn=kernel)[:len(outputs)]
   shapes = ((rows, groups, group // 4), (rows, groups), (rows, groups, 2))
   return tuple(r.reshape(s) for r, s in zip(results, shapes))
 
 def norm_fwht_q8(x: Tensor, weight: Tensor, eps: float, signs: Tensor, *, block: int, group: int = 32, normed: bool = False,
-                 half: bool = False) -> tuple[Tensor, ...]:
+                 half: bool = False, addend: Tensor | None = None) -> tuple[Tensor, ...]:
   """fwht_q8 of RMSNorm(x) (x / sqrt(mean(x^2) + eps) * weight, rounded to FP16 first with `half`) in one kernel;
-  with `normed`, the FP16 normalized rows (as x's shape) follow the quantized tuple."""
+  with `normed`, the FP16 normalized rows (as x's shape) follow the quantized tuple. With `addend`, of x + addend,
+  whose FP32 rows (as x's shape) come last."""
   width = x.shape[-1]
   if block > 1024 or block & (block - 1) or width % block or block < 64:
     raise ValueError("norm_fwht_q8 needs a power-of-two block of 64-1024 dividing the width")
@@ -235,13 +251,18 @@ def norm_fwht_q8(x: Tensor, weight: Tensor, eps: float, signs: Tensor, *, block:
   outputs = [Tensor.empty(rows, width // 4, dtype=dtypes.uint32, device=x.device), Tensor.empty(rows, groups, dtype=dtypes.float32, device=x.device)]
   if group == 32: outputs.append(Tensor.empty(rows, groups * 2, dtype=dtypes.int32, device=x.device))
   if normed: outputs.append(Tensor.empty(rows, width, dtype=dtypes.float16, device=x.device))
+  folded = None
+  if addend is not None and not _fits(width, block, None): x, folded, addend = x + addend, x + addend, None
+  if addend is not None: outputs.append(Tensor.empty(rows, width, dtype=dtypes.float32, device=x.device))
   kernel = functools.partial(_fwht_q8_kernel if _fits(width, block, None) else _fwht_q8_staged_kernel, rows=rows, width=width,
-                             block=block, perm=None, group=group, eps=float(eps), normed=normed, half=half)
+                             block=block, perm=None, group=group, eps=float(eps), normed=normed, half=half,
+                             **({'other': 'add'} if addend is not None else {}))
+  extra = (addend.reshape(rows, width).contiguous(),) if addend is not None else ()
   results = Tensor.custom_kernel(*outputs, x.reshape(rows, width).contiguous(), signs.float().contiguous(), weight.float().contiguous(),
-                                 fxn=kernel)[:len(outputs)]
+                                 *extra, fxn=kernel)[:len(outputs)]
   shapes = ((rows, groups, group // 4), (rows, groups), (rows, groups, 2))[:3 if group == 32 else 2]
   quantized = tuple(r.reshape(shape) for r, shape in zip(results, shapes))
-  return quantized + ((results[-1].reshape(x.shape),) if normed else ())
+  return quantized + tuple(r.reshape(x.shape) for r in results[len(quantized):]) + ((folded,) if folded is not None else ())
 
 def fwht(x: Tensor, signs: Tensor, *, block: int, perm: tuple[int, int, int] | None = None, signs_after: bool = False) -> Tensor:
   """x (..., width) -> FP32 (..., width): optional reorder, * signs, then the normalized transform per block (or,
