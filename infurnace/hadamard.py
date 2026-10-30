@@ -50,11 +50,11 @@ class Rotation:
     if self.signs is not None: x = x * self.signs
     return self._blocks(x).cast(dtype)
 
-  def quantized(self, x: Tensor, group: int, up: Tensor | None = None, pair: bool = False) -> tuple[Tensor, ...]:
+  def quantized(self, x: Tensor, group: int, up: Tensor | None = None, pair: bool = False, gated=None) -> tuple[Tensor, ...]:
     """A folded weight's int8 input in one NV kernel: q8_quantize's tuple for group 32, q8_quantize64's for 64.
     With `up`, of silu(x) * up (a feed-forward's down projection); with `pair`, x is gate then up along its rows."""
     signs = self.signs if self.signs is not None else Tensor.ones(x.shape[-1] // (2 if pair else 1), device=x.device)
-    return fwht_q8(x, signs, block=self.block, perm=self.perm, group=group, up=up, pair=pair)
+    return fwht_q8(x, signs, block=self.block, perm=self.perm, group=group, up=up, pair=pair, gated=gated)
 
   def inverse(self, z: Tensor) -> Tensor:
     """A latent table row in the model's basis."""

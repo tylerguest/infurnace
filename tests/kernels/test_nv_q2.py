@@ -112,3 +112,21 @@ def test_norm_fwht_q8_matches_normalizing_first(rows, group, half):
   assert ((got[1] - reference[1]).abs() / reference[1]).max().item() < 1e-4
   if group == 32: assert (got[2] - reference[2]).abs().max().item() <= 1
   assert (got[-1].float() - normed).abs().max().item() < 1e-2  # the FP16 normalized rows
+
+@pytest.mark.parametrize("perm", [None, (2, 16, 128)])
+def test_fwht_q8_gated_matches_norming_first(perm):
+  # A gated delta-net output's RMSNorm(o) * w * silu(gate) per 128-value head, the gate read at an offset of a wider buffer
+  from infurnace.kernels.hadamard import fwht_q8
+  rows, width, offset, eps = 64, 4096, 8192, 1e-6
+  signs = (Tensor.rand(width, device="NV") < 0.5).where(-1.0, 1.0).realize()
+  o = Tensor.randn(rows, width, device="NV").realize()
+  joined = Tensor.randn(rows, offset + width, device="NV").realize()
+  w = (Tensor.rand(128, device="NV") + 0.5).realize()
+  heads = o.reshape(rows, width // 128, 128)
+  gate = joined[:, offset:].reshape(rows, width // 128, 128)
+  normed = (heads * (heads.square().mean(-1, keepdim=True) + eps).rsqrt() * w * gate.silu()).reshape(rows, width)
+  reference = fwht_q8(normed, signs, block=512, perm=perm, group=64)
+  got = fwht_q8(o, signs, block=512, perm=perm, group=64, gated=(joined, offset, w, eps))
+  def codes(words): return words.flatten().bitcast(dtypes.int8).float()
+  assert (codes(got[0]) - codes(reference[0])).abs().max().item() <= 1
+  assert ((got[1] - reference[1]).abs() / reference[1]).max().item() < 1e-4

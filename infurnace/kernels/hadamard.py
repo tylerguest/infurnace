@@ -54,7 +54,8 @@ def _fwht_kernel(out: UOp, x: UOp, signs: UOp, *, rows: int, width: int, block: 
 
 @functools.cache
 def _fwht_q8_kernel(q: UOp, scale: UOp, *sources: UOp, rows: int, width: int, block: int, perm: tuple[int, int, int] | None,
-                    group: int, eps: float | None = None, normed: bool = False, half: bool = False, other: str = '') -> UOp:
+                    group: int, eps: float | None = None, normed: bool = False, half: bool = False, other: str = '',
+                    gate_offset: int = 0, gate_eps: float = 0.0) -> UOp:
   """The forward transform, quantized to int8 in the same pass: q8_quantize's layout (group 32, with the halves'
   sums) or q8_quantize64's (group 64). A thread holds VALUES consecutive values and a CTA max(block, SPAN): the
   butterflies within a thread's values run in registers, those across a warp's lanes by shuffles, and only those
@@ -67,7 +68,9 @@ def _fwht_q8_kernel(q: UOp, scale: UOp, *sources: UOp, rows: int, width: int, bl
 
   `other` names a second input y (the last source) folded into the first as it loads: 'add' transforms x + y and
   stores the sum (FP32, an output after the others: the residual stream), 'swiglu' transforms silu(x) * y (a
-  feed-forward's gate and up), so neither needs a kernel of its own.
+  feed-forward's gate and up), 'gated' transforms RMSNorm(x) * weight * silu(gate) over each 128-value head (a
+  gated delta-net's output for its out projection: the sources end with the gate's rows, read at `gate_offset`, then
+  the norm weight), so neither needs a kernel of its own.
 
   RTX 5060, 64 rows of 9216: 53 us with the earlier kernel (one value a thread, every stage through shared memory)."""
   sources = list(sources)
@@ -75,6 +78,8 @@ def _fwht_q8_kernel(q: UOp, scale: UOp, *sources: UOp, rows: int, width: int, bl
   normed_out = sources.pop(0) if normed else None
   summed_out = sources.pop(0) if other == 'add' else None
   y = sources.pop() if other in ('add', 'swiglu') else None
+  gate_weight = sources.pop() if other == 'gated' else None
+  gate = sources.pop() if other == 'gated' else None
   x, signs = sources[0], sources[1]
   weight = sources[2] if eps is not None else None
   span = max(block, SPAN)
@@ -92,6 +97,12 @@ def _fwht_q8_kernel(q: UOp, scale: UOp, *sources: UOp, rows: int, width: int, bl
     if other == 'add': return [a + b for a, b in zip(values, _vector(y[row, index], y.dtype))]
     if other == 'swiglu': return [a / (1 + (-a).exp()) * b for a, b in zip(values, _vector(y[row, index], y.dtype))]
     if other == 'pair': return [a / (1 + (-a).exp()) * b for a, b in zip(values, _vector(x[row, width + index], x.dtype))]
+    if other == 'gated':  # a head's 128 values are 16 neighbouring lanes' (positions and sources alike)
+      squares = functools.reduce(lambda a, b: a + b, (v * v for v in values))
+      for mask in (1, 2, 4, 8): squares = squares + _shuffle(squares, mask)
+      inverse = (squares * (1 / 128) + gate_eps).rsqrt()
+      gates, weights = _vector(gate[row, gate_offset + index], gate.dtype), _vector(gate_weight[index % 128], gate_weight.dtype)
+      return [v * inverse * w * (g / (1 + (-g).exp())) for v, w, g in zip(values, weights, gates)]
     return values
   source = source_of(first)
   values = inputs(source)
@@ -220,11 +231,12 @@ def _fwht_q8_staged_kernel(q: UOp, scale: UOp, *sources: UOp, rows: int, width: 
     arg=KernelInfo(name=f"{'norm_' if eps is not None else ''}fwht_q8_{block}_{group}", opts_to_apply=()))
 
 def fwht_q8(x: Tensor, signs: Tensor, *, block: int, perm: tuple[int, int, int] | None = None, group: int = 32,
-            up: Tensor | None = None, pair: bool = False) -> tuple[Tensor, ...]:
+            up: Tensor | None = None, pair: bool = False, gated: tuple[Tensor, int, Tensor, float] | None = None) -> tuple[Tensor, ...]:
   """fwht(x, signs, ...) quantized to int8 in one kernel, without the FP32 result: (words, scales, half sums) as
   quant_gemv.q8_quantize returns for group 32, (words, scales) as q8_quantize64 for group 64. With `up`, of
   silu(x) * up instead (a feed-forward's down projection input, made in the same kernel); with `pair`, x's rows are
-  gate then up (a merged gate-up projection's output) and the transform is of silu(gate) * up."""
+  gate then up (a merged gate-up projection's output) and the transform is of silu(gate) * up; with `gated`
+  (gate rows, offset, weight, eps), of each 128-value head's RMSNorm(x) * weight * silu(gate[:, offset + i])."""
   width = x.shape[-1] // (2 if pair else 1)
   if block > 1024 or block & (block - 1) or width % block or block < 64:
     raise ValueError("fwht_q8 needs a power-of-two block of 64-1024 dividing the width")
@@ -233,12 +245,18 @@ def fwht_q8(x: Tensor, signs: Tensor, *, block: int, perm: tuple[int, int, int] 
   outputs = [Tensor.empty(rows, width // 4, dtype=dtypes.uint32, device=x.device), Tensor.empty(rows, groups, dtype=dtypes.float32, device=x.device)]
   if group == 32: outputs.append(Tensor.empty(rows, groups * 2, dtype=dtypes.int32, device=x.device))
   fits = _fits(width, block, perm)
+  if gated is not None and not fits:  # the staged kernel takes none of these: tensor ops
+    gate, offset, weight, geps = gated
+    o, g = x.reshape(rows, width // 128, 128), gate.reshape(rows, -1)[:, offset:offset + width].reshape(rows, width // 128, 128)
+    x, gated = (o * (o.square().mean(-1, keepdim=True) + geps).rsqrt() * weight.float() * g.float().silu()).reshape(rows, width), None
   if pair and not fits: x, up, pair = x[..., :width], x[..., width:], False  # the staged kernel takes neither: tensor ops
   if up is not None and not fits: x, up = x.silu() * up, None
   other = {'other': 'pair'} if pair else {'other': 'swiglu'} if up is not None else {}
+  if gated is not None: other = {'other': 'gated', 'gate_offset': gated[1], 'gate_eps': float(gated[3])}
   kernel = functools.partial(_fwht_q8_kernel if fits else _fwht_q8_staged_kernel, rows=rows, width=width, block=block, perm=perm,
                              group=group, **other)
   extra = (up.reshape(rows, width).contiguous(),) if up is not None else ()
+  if gated is not None: extra = (gated[0].reshape(rows, -1).contiguous(), gated[2].float().contiguous())
   results = Tensor.custom_kernel(*outputs, x.reshape(rows, x.shape[-1]).contiguous(), signs.float().contiguous(), *extra,
                                  fxn=kernel)[:len(outputs)]
   shapes = ((rows, groups, group // 4), (rows, groups), (rows, groups, 2))

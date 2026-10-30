@@ -35,9 +35,8 @@ def test_diverging_prompt_drops_the_snapshot(tmp_path):
     model, resumed = model_with_spy(tmp_path)
     list(model.generate(list(FIRST), 2))
     assert [s.prefix for s in model._snapshots] == [FIRST[:4]]
-    assert all(state.device == 'CPU' for state in model._snapshots[0].states)  # kept in host memory
     live = {state.uop.buffer for state in model._recurrent_states()}
-    assert not live & {state.uop.buffer for state in model._snapshots[0].states}  # a copy, even on the CPU
+    assert model._snapshots[0].states.uop.buffer not in live  # a copy (flat), even on the CPU
     list(model.generate(list(OTHER), 2))
     assert resumed[-1] == 0 and [s.prefix for s in model._snapshots] == [OTHER[:4]]  # read from scratch, then a new snapshot
 

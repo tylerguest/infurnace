@@ -60,14 +60,16 @@ class _NVLinear:
     """Whether multirow inputs are rotated and quantized in one kernel (rows_q8), Hadamard-folded Q2_0 on int8 tensor cores."""
     return self.prefill and self.rotation is not None and q2_int8(self.ggml_type)
 
-  def rows_q8(self, x: Tensor, up: Tensor | None = None, pair: bool = False) -> tuple[Tensor, Tensor]:
+  def rows_q8(self, x: Tensor, up: Tensor | None = None, pair: bool = False, gated=None) -> tuple[Tensor, Tensor]:
     """The int8 multirow input quant_gemm takes as `q8`: rows padded to a multiple of 16, rotated and quantized
-    (with `up`, of silu(x) * up; with `pair`, x is gate then up along its rows)."""
+    (with `up`, of silu(x) * up; with `pair`, x is gate then up along its rows; with `gated` (gate rows, offset,
+    weight, eps), of the gated RMSNorm of x, kernels/hadamard.fwht_q8)."""
     def padded(t: Tensor) -> Tensor:
       activation = t.pad_to(t.max_shape) if not isinstance(t.numel(), int) else t
       tokens = activation.numel() // t.shape[-1]
       return activation.reshape(tokens, t.shape[-1]).pad(((0, -tokens % 16), (0, 0)))
-    return self.rotation.quantized(padded(x), 64, up=padded(up) if up is not None else None, pair=pair)
+    if gated is not None: gated = (padded(gated[0]), *gated[1:])
+    return self.rotation.quantized(padded(x), 64, up=padded(up) if up is not None else None, pair=pair, gated=gated)
 
   def __call__(self, x: Tensor, q8: tuple[Tensor, Tensor] | None = None) -> Tensor:
     """`q8`: rows_q8(x), shared by projections of one input."""

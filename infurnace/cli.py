@@ -95,7 +95,7 @@ def benchmark(model, tokenizer, prompt_tokens: int, count: int, warmup: bool = T
   finally: stream.close()
   return 0
 
-def _dflash_draft(args: argparse.Namespace) -> tuple[Path | None, bool]:
+def _dflash_draft(args: argparse.Namespace) -> tuple[Path | str | None, bool]:
   """The DFlash draft to use and whether it was picked automatically. Chat and --prompt on a
   Qwen3.5 model use an installed draft unless told otherwise."""
   if args.dflash is not None: return args.dflash, False

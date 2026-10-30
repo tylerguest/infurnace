@@ -33,8 +33,11 @@ def _fused_gdn(block: GatedDeltaNetBlock):
     if source is not None and block.attn_qkv.rows_quantized and block.attn_gate.rotation is rotation:
       # the norm, rotation and quantization in one kernel, which also hands back the FP16 normed rows the pass reads
       q8, x = _norm_rows_q8(block.attn_qkv, norm, source, half=True, normed=True)
-      qkv, out_gate = _project((block.attn_qkv, block.attn_gate), x, q8, one_row=False)
+      outs = _project((block.attn_qkv, block.attn_gate), x, q8, one_row=False, joined=True)
+      joined = outs[0] if len(outs) == 1 and isinstance(T, int) else None  # the gate stays in it for ssm_out's kernel
+      qkv, out_gate = outs[0].split([block.attn_qkv.out_features, block.attn_gate.out_features], dim=-1) if len(outs) == 1 else outs
     else:
+      joined = None
       x = x.half()
       qkv, out_gate = _rows(x, block.attn_qkv, block.attn_gate)
     out_gate = out_gate.reshape(B, T, H, V)
@@ -69,8 +72,13 @@ def _fused_gdn(block: GatedDeltaNetBlock):
     # ordered after the conv state write like upstream's AMD kernel.
     log_decay = log_alpha.transpose(1, 2)[0, ..., 0]                                   # (H, T_pad)
     state = Tensor(block.recurrent_state.uop.after(conv_state_store)).reshape(H, V, K)
-    z = gdn_prefill(q[0], k[0], v[0], beta[0], log_decay, state, out_gate[0], block.ssm_norm.weight,
-                    (1 - initial.float()).reshape(1), block.ssm_norm.eps)
+    keep = (1 - initial.float()).reshape(1)
+    if joined is not None and block.ssm_out.rows_quantized and T == T_pad:
+      # the gated RMSNorm in ssm_out's rotate-and-quantize kernel, the gate read from the merged projection's output
+      o = gdn_prefill(q[0], k[0], v[0], beta[0], log_decay, state, None, None, keep, 0.0).reshape(1, T_pad, H * V)
+      gated = (joined, block.attn_qkv.out_features, block.ssm_norm.weight, block.ssm_norm.eps)
+      return block.ssm_out(o, block.ssm_out.rows_q8(o, gated=gated))
+    z = gdn_prefill(q[0], k[0], v[0], beta[0], log_decay, state, out_gate[0], block.ssm_norm.weight, keep, block.ssm_norm.eps)
     return block.ssm_out(z.reshape(1, T_pad, H * V)[:, :T])
   def attention(x: Tensor, start_pos, idx_mask=None):
     # idx_mask: an indexer's token selection (DeepSeek-style sparse attention), which these models don't have

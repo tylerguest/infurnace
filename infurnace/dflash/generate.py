@@ -145,6 +145,7 @@ class DFlashGenerator:
             if token in eos_token_ids or emitted == limit: return
       finally:
         self.draft.reset()
+        self.model.offload_snapshots()
 
   def _step(self, token: int) -> int:
     # Every committed target row's features go to the draft as they are

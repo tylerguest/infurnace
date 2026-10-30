@@ -6,6 +6,7 @@ attention and the dense feed-forward for fused ones, and reads prompts in fixed-
 between model families (tokenizer, extra passes such as Qwen3.5's fused GDN, prompt snapshots) comes from
 their Family in infurnace/models.
 """
+import array
 import contextlib
 from dataclasses import dataclass
 import functools
@@ -396,7 +397,7 @@ class _Snapshot:
   prefix: list[int]
   owner: object                 # the DFlash draft whose state was saved too, or None
   draft_state: object
-  states: list[Tensor]          # recurrent and conv states, on the CPU
+  states: Tensor                # recurrent and conv states, flat: on the device when saved, the CPU after offload_snapshots
   user: bool                    # saved at the end of a user message
 
 class Model:
@@ -419,6 +420,8 @@ class Model:
     self._warming = False
     # Prompt chunks: a captured step that slices the prompt from a persistent device buffer (see _prompt_chunk)
     self._prompt_jit = TinyJit(self._prompt_chunk)
+    # A prompt snapshot's copy of the recurrent states into its own buffer: one captured step (see save_snapshot)
+    self._snapshot_jit = TinyJit(self._snapshot_copy)
     self._prompt_ids: Tensor | None = None
     # Decoding steps that read their token from that buffer and write their sample after it (see _decode)
     self._decode_jit = TinyJit(self._decode_step)
@@ -515,12 +518,19 @@ class Model:
       self._prompt_jit.reset()  # a graph captured for other taps
 
   def upload_prompt(self, tokens: list[int]):
-    """Put the whole prompt on the device once; each chunk's graph slices its rows from it."""
+    """Put the whole prompt on the device once; each chunk's graph slices its rows from it. The buffer starts as
+    zeros and only ever holds token ids after (prompts, decoding steps' samples), so a chunk's padding rows read
+    valid ids: an upload writes the prompt's positions only, and none when they hold it already."""
     t = self.transformer
     with Context(DEV=self.device):
-      if self._prompt_ids is None: self._prompt_ids = Tensor.empty(1, t.max_context, dtype=dtypes.int32, device=self.device).realize()
-      padded = Tensor(tokens + [0] * (t.max_context - len(tokens)), dtype=dtypes.int32).reshape(1, t.max_context)
-      Tensor(self._prompt_ids.uop.after(self._prompt_ids.uop.store(padded.to(self.device).uop))).realize()
+      if self._prompt_ids is None:
+        self._prompt_ids = Tensor.zeros(1, t.max_context, dtype=dtypes.int32, device=self.device).contiguous().realize()
+        self._uploaded: list[int] = []
+      if self._uploaded == tokens: return
+      # a plain copy into the buffer's first positions: a store kernel would compile anew for each prompt length
+      host = memoryview(array.array('i', tokens)).cast('B')
+      self._prompt_ids.uop.buffer.view(host.nbytes, 0).ensure_allocated().copy_from(Buffer('NPY', host.nbytes, opaque=host))
+      self._uploaded = list(tokens)
 
   def read_prompt(self, first: int, last: int, consume=None) -> int:
     """Read uploaded prompt rows from `first` toward `last` in PROMPT_ROWS chunks; returns where it stopped
@@ -576,12 +586,30 @@ class Model:
   def save_snapshot(self, prefix: list[int], draft=None) -> None:
     """Save the current state as the state after `prefix` (and the draft's, if it read the same rows)."""
     if any(snap.prefix == prefix and snap.owner is draft for snap in self._snapshots): return
-    with Context(DEV=self.device): states = [state.clone(device='CPU').realize() for state in self._recurrent_states()]
+    # One captured copy on the device into the snapshot's own buffer (a copy to the CPU per state cost ~3.5 ms of
+    # host time each, and the transfer ~1 GB/s: ~170 ms of a Bonsai-4B prompt's first token; scheduling the 48
+    # device copies ~40); offload_snapshots moves it to the CPU after the reply
+    sizes = [state.numel() for state in self._recurrent_states()]
+    with Context(DEV=self.device): states = self._snapshot_jit(Tensor.empty(sum(sizes), dtype=dtypes.float32).realize())
     snap = _Snapshot(list(prefix), draft, None if draft is None else draft.save_state(), states, self._ends_user_message(prefix))
     self._snapshots = sorted([s for s in self._snapshots if s.prefix != prefix] + [snap], key=lambda s: len(s.prefix))
     while len(self._snapshots) > SNAPSHOTS:  # the oldest goes, except the last user message's
       users = [s for s in self._snapshots if s.user]
       self._snapshots.remove(next(s for s in self._snapshots if not users or s is not users[-1]))
+
+  def _snapshot_copy(self, dest: Tensor) -> Tensor:
+    flat = Tensor.cat(*(state.float().flatten() for state in self._recurrent_states()))
+    return Tensor(dest.uop.after(dest.uop.store(flat.uop))).realize()
+
+  def offload_snapshots(self) -> None:
+    """Move snapshots other than the newest to CPU memory (one schedule): run after a reply, off the time to the
+    first token, so the device keeps one (~50 MB for Qwen3.5-4B)."""
+    moving = [snap for snap in self._snapshots[:-1] if snap.states.device != 'CPU']
+    if not moving: return
+    with Context(DEV=self.device):
+      copies = [snap.states.clone(device='CPU') for snap in moving]
+      Tensor.realize(*copies)
+    for snap, states in zip(moving, copies): snap.states = states
 
   def snapshot_length(self, tokens: list[int], draft=None) -> int:
     """How much of `tokens` the newest usable snapshot covers (0 without one)."""
@@ -597,8 +625,12 @@ class Model:
     if length > start:
       snap = next(s for s in reversed(self._snapshots) if len(s.prefix) == length and (draft is None or s.owner is draft))
       with Context(DEV=self.device):
-        Tensor.realize(*(Tensor(state.uop.after(state.uop.store(copy.to(self.device).uop)))
-                         for state, copy in zip(self._recurrent_states(), snap.states)))
+        flat, offset, writes = snap.states.to(self.device), 0, []
+        for state in self._recurrent_states():
+          part = flat[offset:offset + state.numel()].reshape(state.shape).cast(state.dtype)
+          writes.append(Tensor(state.uop.after(state.uop.store(part.uop))))
+          offset += state.numel()
+        Tensor.realize(*writes)
       if draft is not None: draft.load_state(snap.draft_state)
       start = length
     self._snapshots = [s for s in self._snapshots if len(s.prefix) <= start or tokens[:len(s.prefix)] == s.prefix]
@@ -636,6 +668,7 @@ class Model:
     finally:
       if stream is not None: stream.close()
       self._generating = False
+      self.offload_snapshots()
 
   def _decode_step(self, ids: Tensor, start_pos: UOp, temperature: Tensor) -> Tensor:
     """One decoding step: the token at start_pos of the device token buffer in, its sample stored at start_pos + 1."""

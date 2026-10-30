@@ -206,11 +206,12 @@ def gdn_gates(x: Tensor, weight: Tensor) -> Tensor:
   return Tensor.custom_kernel(out, x.half().contiguous(), weight.half().contiguous(),
                               fxn=functools.partial(_gates_kernel, rows=rows, outs=outs, width=width))[0]
 
-def gdn_prefill(q: Tensor, k: Tensor, v: Tensor, beta: Tensor, log_decay: Tensor, state: Tensor, gate: Tensor,
-                weight: Tensor, keep: Tensor, eps: float) -> Tensor:
+def gdn_prefill(q: Tensor, k: Tensor, v: Tensor, beta: Tensor, log_decay: Tensor, state: Tensor, gate: Tensor | None,
+                weight: Tensor | None, keep: Tensor, eps: float) -> Tensor:
   """The closed form for prompt prefill, any multiple of 16 rows in one launch: every row is kept, so `state`
   (H, 128, 128) FP32 is advanced past them all in place. log_decay (H, T) is per row (summed in the kernel within
-  each 16 rows). Padding rows (β = 0, log-decay 0) leave the state unchanged. Returns z (T, H, 128) FP16."""
+  each 16 rows). Padding rows (β = 0, log-decay 0) leave the state unchanged. Returns z (T, H, 128) FP16, or with
+  gate None the FP32 outputs before the gated RMSNorm (for a kernel that applies it, kernels/hadamard.fwht_q8)."""
   heads, rows, dim = q.shape
   if dim != 128 or rows % 16: raise ValueError("fused GDN prefill requires a multiple of 16 rows of 128-dimensional heads")
   o = Tensor.empty(rows, heads, dim, dtype=dtypes.float32, device=q.device)
@@ -218,7 +219,7 @@ def gdn_prefill(q: Tensor, k: Tensor, v: Tensor, beta: Tensor, log_decay: Tensor
   inputs = [t.float().contiguous() for t in (q, k, v, beta, log_decay)] + [state, keep.float().contiguous()]
   o = Tensor.custom_kernel(o, u, *inputs, fxn=functools.partial(_gdn_chunk_kernel, heads=heads, rows=rows, advance=True,
                                                                cumulative=False))[0]
-  return _gated_norm(o, gate, weight, eps)
+  return o if gate is None else _gated_norm(o, gate, weight, eps)
 
 @functools.cache
 def _gdn_decode_kernel(z: UOp, state: UOp, qkv: UOp, conv: UOp, conv_w: UOp, x: UOp, w_beta: UOp, w_alpha: UOp, dt_bias: UOp,
