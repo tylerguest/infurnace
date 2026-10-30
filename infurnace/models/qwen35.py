@@ -63,20 +63,12 @@ def _fused_gdn(block: GatedDeltaNetBlock):
     v = v.reshape(B, T_pad, H, V)
     q, k, v, beta = (z.transpose(1, 2).float() for z in (q, k, v, beta))
     q = q * K**-0.5
-    # The scan, RMSNorm and gate in one kernel that also advances the recurrent state in place,
+    # The scan, RMSNorm and gate in one launch that also advances the recurrent state in place (16 rows a step),
     # ordered after the conv state write like upstream's AMD kernel.
-    # A longer chunk is scanned 16 rows at a time, each scan continuing the state the previous one left.
     log_decay = log_alpha.transpose(1, 2)[0, ..., 0]                                   # (H, T_pad)
     state = Tensor(block.recurrent_state.uop.after(conv_state_store)).reshape(H, V, K)
-    zs = []
-    for first in range(0, T_pad, PREFILL_ROWS):
-      rows = slice(first, first + PREFILL_ROWS)
-      keep = (1 - initial.float()).reshape(1) if first == 0 else Tensor.ones(1)
-      z = gdn_prefill(q[0, :, rows], k[0, :, rows], v[0, :, rows], beta[0, :, rows], log_decay[:, rows].cumsum(-1), state,
-                      out_gate[0, rows], block.ssm_norm.weight, keep, block.ssm_norm.eps)
-      zs.append(z)
-      state = Tensor(state.uop.after(z.uop))
-    z = zs[0].cat(*zs[1:]) if len(zs) > 1 else zs[0]
+    z = gdn_prefill(q[0], k[0], v[0], beta[0], log_decay, state, out_gate[0], block.ssm_norm.weight,
+                    (1 - initial.float()).reshape(1), block.ssm_norm.eps)
     return block.ssm_out(z.reshape(1, T_pad, H * V)[:, :T])
   def attention(x: Tensor, start_pos, idx_mask=None):
     # idx_mask: an indexer's token selection (DeepSeek-style sparse attention), which these models don't have

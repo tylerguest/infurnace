@@ -1,17 +1,17 @@
-"""Fused gated delta-net chunk for multirow verification and prompt prefill (NV, one block per head).
+"""Fused gated delta-net chunk for multirow verification and prompt prefill (NV).
 
-Computes, for T rows of one GatedDeltaNet layer and initial state S0 (V x K):
+Computes, for T rows of one GatedDeltaNet layer and initial state S0 (V x K), 16 rows at a time:
   u_t   = β_t (v_t - γ_t S0 k_t - Σ_{s<t} (γ_t/γ_s)(k_t·k_s) u_s)     (forward substitution)
   o_t   = γ_t S0 q_t + Σ_{s<=t} (γ_t/γ_s)(q_t·k_s) u_s
   z_t   = RMSNorm_V(o_t) * silu(gate_t)
-with γ_t = exp(g_t) from cumulative log-decays g. Each of the 128 threads owns one
-value row v: it streams S0[v, :] once and keeps its column of U in registers, so
-the triangular solve needs no synchronization. Only K/Q tiles, the T x T Gram
-matrices and the norm partials live in shared memory. U is written for `commit`.
+with γ_t = exp(g_t) from cumulative log-decays g. The substitution is (I + A) u = rhs with A strictly lower and
+the same for every value row, so a block inverts it once (T = (I + A)^-1) and every row's u = T rhs and o are
+independent sums. A head is split over 4 blocks of 32 value rows; the projections of S0 on K and Q and the
+state update are register-tiled. U is written for `commit`.
 
-Prefill keeps every row, so `gdn_prefill` also advances the state in place:
+Prefill keeps every row, so `gdn_prefill` also advances the state in place, all rows in one launch:
   S_T   = γ_T S0 + Σ_t (γ_T/γ_t) u_t k_tᵀ
-each thread writing its own value row from the U column it already holds.
+the block's state rows staying in shared memory between the 16-row steps.
 """
 import functools
 
@@ -26,88 +26,136 @@ def _silu(x: UOp) -> UOp:
 
 @functools.cache
 def _gdn_chunk_kernel(o: UOp, u: UOp, q: UOp, k: UOp, v: UOp, beta: UOp, g: UOp, state: UOp, keep: UOp, *,
-                      heads: int, rows: int, advance: bool = False) -> UOp:
-  """The closed-form chunk for one 16-row block. A head is split over 4 blocks of 32 value rows (S0's rows) and,
-  inside a block, over 4 warps of 32 key columns: with one 128-thread block a head, each thread ran thousands of
-  dependent steps with one warp per scheduler to hide them (~68 us a call; RTX 5060)."""
-  T, D, R, W = rows, 128, 32, 4  # rows, head dim, value rows a block, warps (key-column quarters)
-  assert T == 16, "fused GDN chunk is specialized to 16 rows"
+                      heads: int, rows: int, advance: bool = False, cumulative: bool = True) -> UOp:
+  """The closed form over `rows` rows (a multiple of 16), 16 at a time, one launch. A head is split over 4 blocks
+  of 32 value rows (S0's rows), 128 threads each. The block's 32 state rows stay in shared memory from one 16-row
+  step to the next, so the state is read and (with `advance`) written once a call.
+
+  The products are register-tiled from 16-byte shared loads: the projections S0 Kᵀ and S0 Qᵀ as 2 value rows x 4
+  key rows a thread, the state update S += Wᵀ K as 4 x 8 a thread; the decayed Gram matrices and the
+  substitution's inverse, which don't depend on the value row, once a block. A lane a value row then takes its u
+  and outputs as independent sums (each thread solving the substitution itself, a 16-row step took ~41 us; RTX
+  5060: now ~26, a 64-row prompt chunk 105 us against four launches of 43). g is the cumulative log-decay within
+  each 16 rows, or with `cumulative=False` the per-row log-decay, summed here."""
+  T, D, R = 16, 128, 32  # rows a step, head dim, value rows a block
+  assert rows % T == 0, "fused GDN chunk takes a multiple of 16 rows"
   F32, zero = dtypes.float32, UOp.const(0.0, dtypes.float32)
   item = UOp.range(heads*(D//R), 0, axis_type=AxisType.GLOBAL)
-  warp = UOp.range(W, 1, axis_type=AxisType.LOCAL)
+  warp = UOp.range(4, 1, axis_type=AxisType.LOCAL)
   lane = UOp.range(32, -1, axis_type=AxisType.WARP)
+  tid = warp*32+lane
   head, row0 = item // (D//R), (item % (D//R))*R
-  col = warp*32+lane
-  row, column0 = row0+lane, warp*32  # this lane's value row (row phases), this warp's key columns
+  row = row0+lane  # the substitution's value row
+  def load4(ptr: UOp) -> list[UOp]: return list(_load_lanes(ptr, 4))
+  # The block's 32 rows of S0, carried across the steps (rows padded by 4: 16-byte loads of eight rows at one
+  # column hit different banks)
+  ssh = UOp.placeholder((R, D+4), F32, slot=8, addrspace=AddrSpace.LOCAL)
+  init = []
+  for n in range(R*D//4//128):
+    r, c = n*4+warp, lane*4
+    init += [ssh[r, c+i].store(x*keep[0].load()) for i, x in enumerate(load4(state[head, row0+r, c]))]
+  ssh = ssh.after(UOp.group(*init).barrier())
+  step = UOp.range(rows//T, 5, axis_type=AxisType.LOOP)
+  base = step*T
+  current = ssh.after(step)
 
-  # Stage this head's K and Q rows (coalesced over the 128 columns). Rows padded by one: the Gram loop below reads
-  # 16 rows at one column, which unpadded all fall in one bank (a 16-way conflict, ~16 of 48 us).
-  ksh = UOp.placeholder((T, D+1), F32, slot=0, addrspace=AddrSpace.LOCAL)
-  qsh = UOp.placeholder((T, D+1), F32, slot=1, addrspace=AddrSpace.LOCAL)
-  staged = UOp.group(*(ksh[t, col].store(k[head, t, col].load()) for t in range(T)),
-                     *(qsh[t, col].store(q[head, t, col].load()) for t in range(T))).barrier()
-  ksh, qsh = ksh.after(staged), qsh.after(staged)
+  # This step's K rows (0-15) and Q rows (16-31) in shared memory
+  kq = UOp.placeholder((2*T, D+4), F32, slot=0, addrspace=AddrSpace.LOCAL)
+  staged = []
+  for n in range(2*T*D//4//128):
+    t, c = n*4+warp, lane*4
+    source = k[head, base+t, c] if t.vmax < T else q[head, base+t-T, c]
+    staged += [kq[t, c+i].store(x) for i, x in enumerate(load4(source))]
+  kq = kq.after(UOp.group(*staged).barrier())
 
-  # Gram matrices K Kᵀ and Q Kᵀ (T x T): each thread computes two entries of each.
-  pairs = [(col//T, col%T), ((col+128)//T, (col+128)%T)]
-  gram = UOp.placeholder((4,), F32, slot=2, addrspace=AddrSpace.REG)
-  gram = gram.after(UOp.group(*(gram[i].store(zero) for i in range(4))))
-  d = UOp.range(D, 2, axis_type=AxisType.LOOP)
-  acc = gram.after(d)
-  terms = [ksh[pairs[0][0], d].load()*ksh[pairs[0][1], d].load(), ksh[pairs[1][0], d].load()*ksh[pairs[1][1], d].load(),
-           qsh[pairs[0][0], d].load()*ksh[pairs[0][1], d].load(), qsh[pairs[1][0], d].load()*ksh[pairs[1][1], d].load()]
-  gram = gram.after(UOp.group(*(acc[i].store(acc[i].load()+term) for i, term in enumerate(terms))).end(d))
-  kk = UOp.placeholder((T, T), F32, slot=3, addrspace=AddrSpace.LOCAL)
-  qk = UOp.placeholder((T, T), F32, slot=4, addrspace=AddrSpace.LOCAL)
-  grams = UOp.group(kk[pairs[0]].store(gram[0].load()), kk[pairs[1]].store(gram[1].load()),
-                    qk[pairs[0]].store(gram[2].load()), qk[pairs[1]].store(gram[3].load())).barrier()
-  kk, qk = kk.after(grams), qk.after(grams)
+  # This step's cumulative log-decays and betas (every thread holds all 16)
+  gs = [g[head, base+t].load() for t in range(T)]
+  if not cumulative:
+    for t in range(1, T): gs[t] = gs[t-1]+gs[t]
+  bs = [beta[head, base+t].load() for t in range(T)]
+  def pick(values: list[UOp], t: UOp) -> UOp: return sum((t.eq(i).where(x, zero) for i, x in enumerate(values)), zero)
 
-  # S0 rows against every K and Q row, each warp over its 32 key columns. The warp stages its 32 x 32 piece of S0
-  # coalesced (lanes along the columns), then lane r reads row r of it (+1 padding: no bank conflicts).
-  tile = UOp.placeholder((W, 2*T, R+1), F32, slot=5, addrspace=AddrSpace.LOCAL)  # S0 piece, then partial sums
-  piece = tile.after(UOp.group(*(tile[warp, r, lane].store(state[head, row0+r, column0+lane].load()*keep[0].load())
-                                 for r in range(R))).barrier())
-  proj = UOp.placeholder((2*T,), F32, slot=6, addrspace=AddrSpace.REG)
-  proj = proj.after(UOp.group(*(proj[i].store(zero) for i in range(2*T))))
-  j = UOp.range(R, 3, axis_type=AxisType.LOOP)
-  s0, acc = piece[warp, lane, j].load(), proj.after(j)
-  proj = proj.after(UOp.group(*(acc[t].store(acc[t].load()+ksh[t, column0+j].load()*s0) for t in range(T)),
-                              *(acc[T+t].store(acc[T+t].load()+qsh[t, column0+j].load()*s0) for t in range(T))).end(j).barrier())
-  # Sum the four warps' partial sums: the tile now holds them, partial[warp, t, row].
-  partial = tile.after(UOp.group(*(tile.after(proj)[warp, t, lane].store(proj[t].load()) for t in range(2*T))).barrier())
-  sums = [sum((partial[w, t, lane].load() for w in range(1, W)), partial[0, t, lane].load()) for t in range(2*T)]
-  ks, qs = sums[:T], sums[T:]
+  # Decayed Gram matrices, a block's once: kk[t, s] = β_t (γ_t/γ_s) k_t·k_s for s < t, qk[t, s] = (γ_t/γ_s) q_t·k_s for s <= t
+  pairs = [((tid+128*m) // T, (tid+128*m) % T) for m in range(2)]
+  dots = UOp.placeholder((4,), F32, slot=2, addrspace=AddrSpace.REG)
+  dots = dots.after(kq).after(UOp.group(*(dots.after(kq)[i].store(zero) for i in range(4))))
+  c = UOp.range(D//4, 3, axis_type=AxisType.LOOP)
+  acc = dots.after(c)
+  terms = []
+  for m in range(4):
+    (t, s), x = pairs[m % 2], m // 2
+    a, b = load4(kq[t+T*x, c*4]), load4(kq[s, c*4])
+    terms.append(acc[m].store(acc[m].load()+sum((a[i]*b[i] for i in range(1, 4)), a[0]*b[0])))
+  dots = dots.after(UOp.group(*terms).end(c))
+  grams = UOp.placeholder((2, T, T), F32, slot=3, addrspace=AddrSpace.LOCAL)
+  entries = []
+  for m in range(4):
+    (t, s), x = pairs[m % 2], m // 2
+    factor = (pick(gs, t)-pick(gs, s)).exp()
+    if x == 0: entries.append(grams[0, t, s].store((s < t).where(pick(bs, t)*factor*dots[m].load(), zero)))
+    else: entries.append(grams[1, t, s].store((s <= t).where(factor*dots[m].load(), zero)))
+  grams = grams.after(UOp.group(*entries).barrier())
 
-  # Forward substitution and outputs for value row `row`, in registers (every warp computes them; warp 0 stores).
-  gs = [g[head, t].load() for t in range(T)]
-  bs = [beta[head, t].load() for t in range(T)]
-  us, outs = [], []
+  # Projections of S0's rows on this step's K and Q rows: thread (rp, tq) takes value rows 2rp, 2rp+1 x kq rows
+  # 4tq..4tq+3, 32 FMAs per six 16-byte loads
+  rp, tq = tid % 16, tid // 16
+  proj = UOp.placeholder((8,), F32, slot=6, addrspace=AddrSpace.REG)
+  proj = proj.after(grams).after(UOp.group(*(proj.after(grams)[i].store(zero) for i in range(8))))
+  c4 = UOp.range(D//4, 2, axis_type=AxisType.LOOP)
+  srows = [load4(current.after(grams)[2*rp+r, c4*4]) for r in range(2)]
+  krows = [load4(kq[4*tq+i, c4*4]) for i in range(4)]
+  acc = proj.after(c4)
+  proj = proj.after(UOp.group(*(acc[r*4+i].store(acc[r*4+i].load()+sum((srows[r][j]*krows[i][j] for j in range(1, 4)), srows[r][0]*krows[i][0]))
+                                for r in range(2) for i in range(4))).end(c4))
+  pk = UOp.placeholder((R, 2*T+1), F32, slot=5, addrspace=AddrSpace.LOCAL)  # value row x (K's 16, Q's 16), +1: no conflicts
+  pk = pk.after(UOp.group(*(pk[2*rp+r, 4*tq+i].store(proj[r*4+i].load()) for r in range(2) for i in range(4))).barrier())
+  ks, qs = [pk[lane, t].load() for t in range(T)], [pk[lane, T+t].load() for t in range(T)]
+
+  # The substitution (I + A) u = rhs (A = kk, strictly lower) for every value row at once: T = (I + A)^-1, a column a
+  # lane of warp 0, then M = qk T, so a row's u = T rhs and outputs γ qs + M rhs are independent sums, not a chain.
+  inverse = UOp.placeholder((2, T, T), F32, slot=9, addrspace=AddrSpace.LOCAL)  # T, then M
+  column = []  # T[t, j] for j = lane: 1 on the diagonal, 0 above it, -Σ_s A[t, s] T[s, j] below
   for t in range(T):
-    value = bs[t]*(v[head, t, row].load()-gs[t].exp()*ks[t])
-    for s in range(t): value = value-bs[t]*(gs[t]-gs[s]).exp()*kk[t, s].load()*us[s]
-    us.append(value)
-  for t in range(T):
-    value = gs[t].exp()*qs[t]
-    for s in range(t+1): value = value+(gs[t]-gs[s]).exp()*qk[t, s].load()*us[s]
-    outs.append(value)
+    total = lane.eq(t).where(UOp.const(1.0, F32), zero)
+    for s in range(t): total = total-grams[0, t, s].load()*column[s]
+    column.append(total)
+  inv_stores = [inverse[0, t, lane.valid(warp.eq(0) & (lane < T))].store(column[t]) for t in range(T)]
+  inverse = inverse.after(UOp.group(*inv_stores).barrier())
+  mixed = []
+  for m in range(2):
+    n = tid+128*m
+    t, j = n // T, n % T
+    total = sum((grams[1, t, s].load()*inverse[0, s, j].load() for s in range(1, T)), grams[1, t, 0].load()*inverse[0, 0, j].load())
+    mixed.append(inverse[1, t, j].store(total))
+  inverse = inverse.after(UOp.group(*mixed).barrier())
+  rhs = [bs[t]*(v[head, base+t, row].load()-gs[t].exp()*ks[t]) for t in range(T)]
+  us = [sum((inverse[0, t, s].load()*rhs[s] for s in range(t)), rhs[t]) for t in range(T)]
+  outs = [sum((inverse[1, t, s].load()*rhs[s] for s in range(t+1)), gs[t].exp()*qs[t]) for t in range(T)]
   first = warp.eq(0)
-  stores = [o[t, head, row.valid(first)].store(outs[t]) for t in range(T)]
-  stores += [u[head, t, row.valid(first)].store(us[t]) for t in range(T)]
-  if advance:
-    # S_T[v, :] = γ_T S0[v, :] + Σ_t (γ_T/γ_t) u_t[v] k_t, with lanes along the key columns (coalesced): the block's
-    # rows' weights go through shared memory, each lane keeps its column of K in registers.
+  stores = [o[base+t, head, row.valid(first)].store(outs[t]) for t in range(T)]
+  if not advance: stores += [u[head, base+t, row.valid(first)].store(us[t]) for t in range(T)]
+  else:
+    # S_T = γ_T S0 + Σ_t (γ_T/γ_t) u_t k_tᵀ: the rows' weights through shared memory, then thread (rq, cq) updates
+    # value rows 4rq..4rq+3 x key columns 8cq..8cq+7, a rank-1 update per K row from three 16-byte loads
     wsh = UOp.placeholder((T, R), F32, slot=7, addrspace=AddrSpace.LOCAL)
     wsh = wsh.after(UOp.group(*(wsh[t, lane.valid(first)].store((gs[T-1]-gs[t]).exp()*us[t]) for t in range(T))).barrier())
-    kcol = [ksh[t, col].load() for t in range(T)]
-    decay = gs[T-1].exp()*keep[0].load()
-    # Eight rows an iteration: their loads are in flight together; all 32 unrolled would spill registers.
-    r8 = UOp.range(R//8, 4, axis_type=AxisType.LOOP)
-    rows8 = [r8*8+i for i in range(8)]
-    totals = [sum((wsh[t, r].load()*kcol[t] for t in range(T)), decay*state[head, row0+r, col].load()) for r in rows8]
-    stores.append(UOp.group(*(state[head, row0+r, col].store(total) for r, total in zip(rows8, totals))).end(r8))
+    rq, cq = tid // 16, tid % 16
+    now = current.after(wsh)
+    decay = gs[T-1].exp()
+    tile = [[x*decay for half in range(2) for x in load4(now[4*rq+r, 8*cq+4*half])] for r in range(4)]
+    for t in range(T):
+      w, kr = load4(wsh[t, 4*rq]), load4(kq[t, 8*cq])+load4(kq[t, 8*cq+4])
+      tile = [[tile[r][c]+w[r]*kr[c] for c in range(8)] for r in range(4)]
+    stores += [now[4*rq+r, 8*cq+c].store(tile[r][c]) for r in range(4) for c in range(8)]
+  # Every thread must be done with this step's shared memory before the next one is staged over it.
+  done = UOp.group(*stores).barrier().end(step)
+  final = [done]
+  if advance:
+    for n in range(R*D//4//128):
+      r, c = n*4+warp, lane*4
+      final += [state[head, row0+r, c+i].store(ssh.after(done)[r, c+i].load()) for i in range(4)]
   name = "gdn_prefill" if advance else "gdn_chunk"
-  return UOp.group(*stores).end(item, warp, lane).sink(arg=KernelInfo(name=name, opts_to_apply=()))
+  return UOp.group(*final).end(item, warp, lane).sink(arg=KernelInfo(name=name, opts_to_apply=()))
 
 def _gated_norm(o: Tensor, gate: Tensor, weight: Tensor, eps: float) -> Tensor:
   """RMSNorm over each head's 128 values, times the SiLU gate: z (T, H, 128) FP16. A separate step since a head's
@@ -158,16 +206,18 @@ def gdn_gates(x: Tensor, weight: Tensor) -> Tensor:
   return Tensor.custom_kernel(out, x.half().contiguous(), weight.half().contiguous(),
                               fxn=functools.partial(_gates_kernel, rows=rows, outs=outs, width=width))[0]
 
-def gdn_prefill(q: Tensor, k: Tensor, v: Tensor, beta: Tensor, g: Tensor, state: Tensor, gate: Tensor,
+def gdn_prefill(q: Tensor, k: Tensor, v: Tensor, beta: Tensor, log_decay: Tensor, state: Tensor, gate: Tensor,
                 weight: Tensor, keep: Tensor, eps: float) -> Tensor:
-  """`gdn_chunk` for prompt prefill: every row is kept, so `state` (H, 128, 128) FP32 is advanced
-  past all 16 rows in place. Padding rows (β = 0, log-decay 0) leave it unchanged. Returns z (T, H, 128) FP16."""
+  """The closed form for prompt prefill, any multiple of 16 rows in one launch: every row is kept, so `state`
+  (H, 128, 128) FP32 is advanced past them all in place. log_decay (H, T) is per row (summed in the kernel within
+  each 16 rows). Padding rows (β = 0, log-decay 0) leave the state unchanged. Returns z (T, H, 128) FP16."""
   heads, rows, dim = q.shape
-  if dim != 128 or rows != 16: raise ValueError("fused GDN prefill requires 16 rows of 128-dimensional heads")
+  if dim != 128 or rows % 16: raise ValueError("fused GDN prefill requires a multiple of 16 rows of 128-dimensional heads")
   o = Tensor.empty(rows, heads, dim, dtype=dtypes.float32, device=q.device)
-  u = Tensor.empty(heads, rows, dim, dtype=dtypes.float32, device=q.device)
-  inputs = [t.float().contiguous() for t in (q, k, v, beta, g)] + [state, keep.float().contiguous()]
-  o = Tensor.custom_kernel(o, u, *inputs, fxn=functools.partial(_gdn_chunk_kernel, heads=heads, rows=rows, advance=True))[0]
+  u = Tensor.empty(1, dtype=dtypes.float32, device=q.device)  # not written: prefill keeps every row
+  inputs = [t.float().contiguous() for t in (q, k, v, beta, log_decay)] + [state, keep.float().contiguous()]
+  o = Tensor.custom_kernel(o, u, *inputs, fxn=functools.partial(_gdn_chunk_kernel, heads=heads, rows=rows, advance=True,
+                                                               cumulative=False))[0]
   return _gated_norm(o, gate, weight, eps)
 
 @functools.cache

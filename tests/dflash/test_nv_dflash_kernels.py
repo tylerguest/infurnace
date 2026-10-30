@@ -116,10 +116,11 @@ def test_gdn_decode_matches_upstream_math_and_updates_states_in_place():
       assert ((S0 - S_ref).abs().max() / S_ref.abs().max()).item() < 1e-4   # updated in place
       assert conv0.tolist() == window[1:].tolist()                          # conv window shifted in place
 
-@pytest.mark.parametrize('rows', [16, 5])
-def test_gdn_prefill_matches_sequential_scan_and_advances_state(rows):
+@pytest.mark.parametrize('T,rows', [(16, 16), (16, 5), (64, 64), (64, 40)])
+def test_gdn_prefill_matches_sequential_scan_and_advances_state(T, rows):
+  # One launch over T rows, 16 at a time, the state carried between them in registers
   from infurnace.kernels.gdn import gdn_prefill
-  H, T, D, eps = 32, 16, 128, 1e-6
+  H, D, eps = 32, 128, 1e-6
   with Context(DEV='NV'):
     Tensor.manual_seed(7)
     k, q = Tensor.randn(H, T, D).normalize(dim=-1).realize(), (Tensor.randn(H, T, D).normalize(dim=-1) * D**-0.5).realize()
@@ -141,7 +142,7 @@ def test_gdn_prefill_matches_sequential_scan_and_advances_state(rows):
       core = Tensor.stack(*outs)
       z_ref = core * (core.square().mean(-1, keepdim=True) + eps).rsqrt() * weight * gate[:rows].float().silu()
       z_ref, S_ref = z_ref.realize(), S.realize()  # before the kernel overwrites S0
-      z = gdn_prefill(q, k, v, beta, log_alpha.cumsum(-1), S0, gate, weight, Tensor([keep]), eps).realize()
+      z = gdn_prefill(q, k, v, beta, log_alpha, S0, gate, weight, Tensor([keep]), eps).realize()
       assert ((z[:rows].float() - z_ref).abs().max() / z_ref.abs().max()).item() < 2e-3
       assert ((S0 - S_ref).abs().max() / S_ref.abs().max()).item() < 1e-4   # advanced in place, padding ignored
 
