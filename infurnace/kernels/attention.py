@@ -88,6 +88,11 @@ def _byte(word: UOp, index: int | UOp) -> UOp:
 _LDMATRIX = ('[&]() {{ unsigned a, b; asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {{%0,%1}}, [%2];" : "=r"(a), "=r"(b) '
              ': "r"((unsigned)__cvta_generic_to_shared({0}))); return ((unsigned long long)b << 32) | a; }}()')
 
+def _ldmatrix_words(ptr: UOp) -> list[UOp]:
+  """ldmatrix.x2 as its two 32-bit registers (as _ldmatrix): on int8 rows of 16 bytes, an m16n8k32 B fragment."""
+  pair = UOp(Ops.CUSTOM, src=(ptr,), arg=(_LDMATRIX, dtypes.uint64))
+  return [pair.cast(dtypes.uint32), (pair >> 32).cast(dtypes.uint32)]
+
 def _ldmatrix(ptr: UOp) -> list[UOp]:
   """ldmatrix.x2: two 8x8 FP16 tiles of shared memory, lanes 0-7 giving the rows of the first and 8-15 of the
   second; each lane gets row lane / 4, columns 2 (lane % 4) and the next of both, as four halves. Emitted once
@@ -374,10 +379,11 @@ def _flash_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, *extra: UOp, start: in
   (wm, wn) scores its 16 queries against keys wn * 16.. of the tile; the pair shares its row maxima and
   probabilities through shared memory, and each accumulates output dims wn * dim / 2.. against all 32 keys, so no
   score is computed twice and a lane holds half a head's output. Fragments come from shared memory by ldmatrix
-  (one instruction a B fragment), and an int8 tile converts two values an instruction (_int8_halves). Same
-  partial/stats outputs as _mma_kernel, one per slice. RTX 5060, Bonsai-4B's heads at 64k keys, int8 cache: 16
-  rows 616 us against _mma_kernel's 1656, 64 rows 2743 against 5480, and the merge reads a few dozen partials
-  instead of one a 256-key segment (16 us, from up to 660)."""
+  (one instruction a B fragment). With an int8 cache the scores run on int8 tensor cores (keys as stored, Q
+  quantized a row) and the values convert two an instruction (_int8_halves). Same partial/stats outputs as
+  _mma_kernel, one per slice. RTX 5060, Bonsai-4B's heads at 64k keys, int8 cache: 16 rows 492 us against
+  _mma_kernel's 1656 (616 with FP16 scores), 64 rows 2157 against 5480 (2743), and the merge reads a few dozen
+  partials instead of one a 256-key segment (16 us, from up to 660)."""
   scales, _ = _extras(extra, int8)
   queries, steps, tiles_n = groups * rows, dim // 16, dim // 8
   half_tiles = tiles_n // 2
@@ -397,11 +403,32 @@ def _flash_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, *extra: UOp, start: in
   ms = [(qblock * warps_m + wm) * 16 + group + 8 * r for r in (0, 1)]
   valid_m = [m < queries for m in ms]
   heads, row_of = [kv_head * groups + m // rows for m in ms], [m % rows for m in ms]
-  qa = UOp.placeholder((steps * 8,), F16, slot=0, addrspace=AddrSpace.REG)
-  slots = [(0, 0), (0, 1), (1, 0), (1, 1), (0, 8), (0, 9), (1, 8), (1, 9)]
-  qa = qa.after(UOp.group(*(qa[ks * 8 + i].store(
-    q[0, heads[r], row_of[r], (ks * 16 + thread * 2 + c).valid(valid_m[r])].load().cast(F16))
-    for ks in range(steps) for i, (r, c) in enumerate(slots))))
+  if int8:
+    # SageAttention's INT8 Q/K (TensorRT-LLM's Blackwell recipe, one scale a token): the int8 cache's keys go to
+    # int8 tensor cores as they are (4x the FP16-in, FP32-accumulate rate on an RTX 5060), against Q quantized here
+    # with one scale a query row, kept as the m16n8k32 A fragments: (row g, k 4t..), (g+8, 4t..), (g, 16+4t..), (g+8, 16+4t..)
+    words4 = [(r, off) for off in (0, 16) for r in (0, 1)]
+    def q_value(r: int, d) -> UOp: return q[0, heads[r], row_of[r], d.valid(valid_m[r])].load().float()
+    rowvals = [[q_value(r, s32 * 32 + off + thread * 4 + j) for s32 in range(dim // 32) for off in (0, 16) for j in range(4)] for r in (0, 1)]
+    q_scale = []
+    for r in range(2):
+      top = rowvals[r][0].abs()
+      for v in rowvals[r][1:]: top = top.maximum(v.abs())
+      q_scale.append((_shuffle_rows(top, True) / 127).maximum(1e-30))
+    qw = UOp.placeholder((dim // 32 * 4,), U32, slot=0, addrspace=AddrSpace.REG)
+    def word(r: int, s32: int, off: int) -> UOp:
+      codes = [(q_value(r, s32 * 32 + off + thread * 4 + j) / q_scale[r]).round().clip(-127, 127) for j in range(4)]
+      return sum((c.cast(dtypes.int8).cast(dtypes.uint8).cast(U32) << (8 * j) for j, c in enumerate(codes)), UOp.const(0, U32))
+    qs = UOp.placeholder((2,), F32, slot=9 + half_tiles, addrspace=AddrSpace.REG)
+    qw = qw.after(UOp.group(*(qw[s32 * 4 + n].store(word(r, s32, off)) for s32 in range(dim // 32) for n, (r, off) in enumerate(words4)),
+                            *(qs[r].store(q_scale[r]) for r in range(2))))
+    qs = qs.after(qw)
+  else:
+    qa = UOp.placeholder((steps * 8,), F16, slot=0, addrspace=AddrSpace.REG)
+    slots = [(0, 0), (0, 1), (1, 0), (1, 1), (0, 8), (0, 9), (1, 8), (1, 9)]
+    qa = qa.after(UOp.group(*(qa[ks * 8 + i].store(
+      q[0, heads[r], row_of[r], (ks * 16 + thread * 2 + c).valid(valid_m[r])].load().cast(F16))
+      for ks in range(steps) for i, (r, c) in enumerate(slots))))
   # max and this warp's half of the sum for rows g, g + 8; output fragments in their own 4-slot accumulators
   state = UOp.placeholder((4,), F32, slot=1, addrspace=AddrSpace.REG)
   state = state.after(UOp.group(state[0].store(neg), state[1].store(neg), state[2].store(zero), state[3].store(zero)))
@@ -443,7 +470,10 @@ def _flash_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, *extra: UOp, start: in
   if int8: held_scales = held_scales.after(held)
   # Padded rows: a row of keys is 4 banks off the next (K), a dim of values 20 words off the next (V transposed),
   # a row of probabilities 20 words off the next, so the lanes of a fragment load hit 32 different banks.
-  k_lds = UOp.placeholder((32, dim + 8), F16, slot=slot + 4, addrspace=AddrSpace.LOCAL)
+  # an int8 tile's keys stay int8 (rows of dim + 16 bytes, as words), with their scales
+  k_lds = (UOp.placeholder((32, (dim + 16) // 4), U32, slot=slot + 4, addrspace=AddrSpace.LOCAL) if int8 else
+           UOp.placeholder((32, dim + 8), F16, slot=slot + 4, addrspace=AddrSpace.LOCAL))
+  k_scales = UOp.placeholder((32,), F32, slot=slot + 8, addrspace=AddrSpace.LOCAL) if int8 else None
   v_lds = UOp.placeholder((dim, 32 + 8), F16, slot=slot + 5, addrspace=AddrSpace.LOCAL)
   p_lds = UOp.placeholder((warps_m, 16, 32 + 8), F16, slot=slot + 6, addrspace=AddrSpace.LOCAL)
   m_lds = UOp.placeholder((warps_m, 2, 16), F32, slot=slot + 7, addrspace=AddrSpace.LOCAL)
@@ -456,6 +486,10 @@ def _flash_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, *extra: UOp, start: in
     for i in range(count):
       inside, key, col = place(c, i)
       n = c * count + i
+      if int8 and c == 0:  # keys as they are: past the active length they're masked out of the scores
+        stage += [k_lds[key.valid(inside), col // 4 + w].store(cur_held[n * 4 + w].load()) for w in range(4)]
+        stage.append(k_scales[key.valid(inside & col.eq(0))].store(cur_scales[n].load()))
+        continue
       if int8: values = [v for w in range(4) for v in _int8_halves(cur_held[n * 4 + w].load(), cur_scales[n].load())]
       else: values = [cur_held[n * 8 + w].load() for w in range(8)]
       live = base + key < active  # unwritten rows may hold any bits: zero keys and values past the active length
@@ -463,16 +497,29 @@ def _flash_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, *extra: UOp, start: in
       stage += [(k_lds[key.valid(inside), col + w] if c == 0 else v_lds[(col + w).valid(inside), key]).store(v) for w, v in enumerate(values)]
   staged = UOp.group(*stage).barrier()
   k_lds, v_lds = k_lds.after(staged), v_lds.after(staged)
+  if int8: k_scales = k_scales.after(staged)
   # The next tile's loads, issued now: they land while this one's MMAs run
   prefetch = UOp.group(*fetch(tile + 1))
-  qv = [qa.after(tile)[i].load() for i in range(steps * 8)]
   computed = []
-  for nt in range(2):
-    acc = UOp.stack(zero, zero, zero, zero)
-    for ks in range(steps):
-      b = _ldmatrix(k_lds[wn * 16 + nt * 8 + lane % 8, ks * 16 + (lane // 8) % 2 * 8])
-      acc = UOp.wmma(UOp.stack(*qv[ks * 8:ks * 8 + 8]), UOp.stack(*b), acc, (8, 16, 16), 32)
-    computed.append(scores[nt].after(scores[nt].store(acc)))
+  if int8:
+    from infurnace.kernels.quant_gemm import _imma
+    qv, izero = [qw.after(tile)[i].load() for i in range(dim // 32 * 4)], UOp.const(0, dtypes.int32)
+    for nt in range(2):
+      acc = None
+      for s32 in range(dim // 32):  # 32 dims a step: 16 bytes of the 8 keys' rows (+16 for the second tile)
+        # each step's MMA from zero, its sums added after: chained through the accumulator, every inline MMA
+        # expression would repeat the previous four (8 steps: a source of gigabytes)
+        d = _imma(qv[s32 * 4:s32 * 4 + 4], _ldmatrix_words(k_lds[wn * 16 + nt * 8 + lane % 8, s32 * 8 + (lane // 8) % 2 * 4]), [izero] * 4)
+        acc = d if acc is None else [a + b for a, b in zip(acc, d)]
+      computed.append(scores[nt].after(scores[nt].store(UOp.stack(*(a.float() for a in acc)))))
+  else:
+    qv = [qa.after(tile)[i].load() for i in range(steps * 8)]
+    for nt in range(2):
+      acc = UOp.stack(zero, zero, zero, zero)
+      for ks in range(steps):
+        b = _ldmatrix(k_lds[wn * 16 + nt * 8 + lane % 8, ks * 16 + (lane // 8) % 2 * 8])
+        acc = UOp.wmma(UOp.stack(*qv[ks * 8:ks * 8 + 8]), UOp.stack(*b), acc, (8, 16, 16), 32)
+      computed.append(scores[nt].after(scores[nt].store(acc)))
   scale = 1 / math.sqrt(dim)
   cur = state.after(tile)
   values = [[None] * 4 for _ in range(2)]  # per row: 2 n-tiles x 2 columns
@@ -481,7 +528,8 @@ def _flash_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, *extra: UOp, start: in
       r, col = i // 2, i % 2
       key = base + wn * 16 + nt * 8 + thread * 2 + col
       visible = valid_m[r] & (key < active) & _visible(key, start, row_of[r], rows, causal, 0)
-      values[r][nt * 2 + col] = visible.where(computed[nt][i].load() * scale, neg)
+      factor = qs[r].load() * k_scales[wn * 16 + nt * 8 + thread * 2 + col].load() * scale if int8 else scale
+      values[r][nt * 2 + col] = visible.where(computed[nt][i].load() * factor, neg)
   # The pair's row maxima through shared memory
   mine = []
   for r in range(2):

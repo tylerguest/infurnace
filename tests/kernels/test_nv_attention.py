@@ -125,18 +125,22 @@ def test_ring_store_wraps():
   (32, 8, 5, 128, False),    # values staged in shared memory
 ])
 def test_int8_cache_matches_attention_over_its_values(heads, kv_heads, rows, dim, causal):
-  # Each kernel scales scores and probabilities by the vectors' scales: the same attention as over the dequantized cache.
+  # Each kernel scales scores and probabilities by the vectors' scales: the same attention as over the dequantized
+  # cache. Multirow scores run on int8 tensor cores against Q quantized per row (max / 127, as the cache's vectors),
+  # so their reference takes that Q; one-row decoding keeps Q exact.
   capacity = 1300
   with Context(DEV='NV'):
     Tensor.manual_seed(8)
     words, scales = (t.contiguous().realize() for t in quantize_kv(Tensor.randn(2, 1, kv_heads, capacity, dim) * 0.5))
     kv = dequantize_kv(words, scales).contiguous().realize()
     q = Tensor.randn(1, heads, rows, dim).realize()
+    step = q.abs().max(-1, keepdim=True) / 127
+    q_ref = ((q / step).round().clip(-127, 127) * step).realize() if rows > 1 else q
     variable = UOp.variable('start_pos', 0, capacity - rows)
-    step = TinyJit(lambda q, start: attention(q, words, start, causal=causal, scales=scales).realize())
+    run = TinyJit(lambda q, start: attention(q, words, start, causal=causal, scales=scales).realize())
     for start in (0, 127, 700, capacity - rows, 3):
-      out = step(q, variable.bind(start))
-      assert (out - reference(q, kv, start, causal)).abs().max().item() < 2e-3, start
+      out = run(q, variable.bind(start))
+      assert (out - reference(q_ref, kv, start, causal)).abs().max().item() < 2e-3, start
 
 def test_int8_store_keeps_each_vector_within_half_a_step():
   with Context(DEV='NV'):
