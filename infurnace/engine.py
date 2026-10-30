@@ -129,6 +129,11 @@ PROMPT_ROWS = 64
 # Capturing the prompt graph costs ~20-30 s and a one-row step ~9 ms (RTX 5060), so outside warmup it is
 # captured only for a prompt long enough to pay for it.
 PREFILL_CAPTURE_TOKENS = 2048
+# Decoding queues this many steps before reading their tokens back (after bursts of 1, 2 and 4): each step reads
+# its input from the device and writes its sample there, so the GPU doesn't wait on the host between them. Bonsai-4B
+# plain decoding, RTX 5060 (2k / 16k context): 167 / 145 tok/s reading every token, 174 / 154 with bursts of 4,
+# 183 / 158 with 8. A stop wastes up to 7 steps (~40 ms).
+DECODE_BURST = 8
 
 _SHARED_Q8 = os.environ.get('INFURNACE_SHARED_Q8', '1') != '0'
 
@@ -354,6 +359,8 @@ class Model:
     # Prompt chunks: a captured step that slices the prompt from a persistent device buffer (see _prompt_chunk)
     self._prompt_jit = TinyJit(self._prompt_chunk)
     self._prompt_ids: Tensor | None = None
+    # Decoding steps that read their token from that buffer and write their sample after it (see _decode)
+    self._decode_jit = TinyJit(self._decode_step)
     # Target layers whose inputs a prompt chunk also returns (DFlash's feature taps; set by its generator)
     self.feature_layers: tuple[int, ...] = ()
     # Saved prompt states for later turns (see save_snapshot). turn_token marks where turns start;
@@ -558,7 +565,9 @@ class Model:
     stream = None
     try:
       with Context(DEV=self.device): self._prefill(tokens, float(temperature))
-      stream = self.transformer.generate(list(tokens), chunk_size=chunk_size, temperature=float(temperature))
+      t = self.transformer
+      if hasattr(self, 'sampler') and t.get_start_pos(tokens) == len(tokens) - 1: stream = self._decode(tokens, count, float(temperature))
+      else: stream = t.generate(list(tokens), chunk_size=chunk_size, temperature=float(temperature))
       for _ in range(count):
         # Do not leave a device context active while yielding control to a caller.
         with Context(DEV=self.device): token = next(stream)
@@ -566,6 +575,34 @@ class Model:
     finally:
       if stream is not None: stream.close()
       self._generating = False
+
+  def _decode_step(self, ids: Tensor, start_pos: UOp, temperature: Tensor) -> Tensor:
+    """One decoding step: the token at start_pos of the device token buffer in, its sample stored at start_pos + 1."""
+    out = self.transformer.forward(ids[:, start_pos:start_pos + 1], start_pos, temperature)
+    return Tensor(ids.uop.after(ids[:, start_pos + 1:start_pos + 2].uop.store(out.cast(ids.dtype).uop)))
+
+  def _decode(self, tokens: list[int], count: int, temperature: float) -> Iterator[int]:
+    """Upstream's generate after _prefill (the last prompt token is the first step's input), but in bursts of
+    steps queued back to back, each taking its input from the device token buffer, then one read of their tokens:
+    the GPU no longer idles while the host reads each token and launches the next step (~0.7 ms a Bonsai-4B token,
+    RTX 5060). A stop inside a burst leaves its later steps done: the cached prefix counts them, so the next prompt
+    reuses the cache only if it extends them (a chat's next turn resumes from its prompt snapshot either way)."""
+    t = self.transformer
+    v_start = UOp.variable('start_pos', 0, t.max_context - 1)
+    with Context(DEV=self.device):
+      self.upload_prompt(tokens)
+      temp = Tensor([temperature]).contiguous().realize()
+    sequence, position, burst = list(tokens), len(tokens) - 1, 1
+    while count > 0:
+      steps = min(burst, count, t.max_context - 1 - position)
+      if steps <= 0: return
+      with Context(DEV=self.device):
+        for i in range(steps): self._decode_jit(self._prompt_ids, v_start.bind(position + i), temp)
+        new = self._prompt_ids[0, position + 1:position + 1 + steps].tolist()
+      sequence += new
+      position, count, burst = position + steps, count - steps, min(burst * 2, DECODE_BURST)
+      t._cached_tokens = sequence[:position]  # the steps ran on every position before this one
+      yield from new
 
   def _multirow_ready(self, rows: int) -> bool:
     """Whether to read `rows` prompt tokens in PROMPT_ROWS chunks (capturing that graph if needed)."""
