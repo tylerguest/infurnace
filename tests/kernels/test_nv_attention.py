@@ -127,7 +127,8 @@ def test_ring_store_wraps():
 def test_int8_cache_matches_attention_over_its_values(heads, kv_heads, rows, dim, causal):
   # Each kernel scales scores and probabilities by the vectors' scales: the same attention as over the dequantized
   # cache. Multirow scores run on int8 tensor cores against Q quantized per row (max / 127, as the cache's vectors),
-  # so their reference takes that Q; one-row decoding keeps Q exact.
+  # so their reference takes that Q, and P V on FP8 tensor cores (e4m3 values and probabilities: ~3% each, so the
+  # bound is relative); one-row decoding keeps everything exact.
   capacity = 1300
   with Context(DEV='NV'):
     Tensor.manual_seed(8)
@@ -140,7 +141,11 @@ def test_int8_cache_matches_attention_over_its_values(heads, kv_heads, rows, dim
     run = TinyJit(lambda q, start: attention(q, words, start, causal=causal, scales=scales).realize())
     for start in (0, 127, 700, capacity - rows, 3):
       out = run(q, variable.bind(start))
-      assert (out - reference(q_ref, kv, start, causal)).abs().max().item() < 2e-3, start
+      ref = reference(q_ref, kv, start, causal)
+      if rows == 1: assert (out - ref).abs().max().item() < 2e-3, start
+      else:
+        assert (out - ref).abs().mean().item() < 0.06 * ref.abs().mean().item(), start
+        assert (out - ref).abs().max().item() < 0.15 * ref.abs().max().item(), start
 
 def test_int8_store_keeps_each_vector_within_half_a_step():
   with Context(DEV='NV'):

@@ -112,6 +112,26 @@ def _int8_halves(word: UOp, scale: UOp) -> list[UOp]:
   pairs = [UOp(Ops.CUSTOM, src=(word, scale), arg=(_INT8_PAIR.replace('{2}', selector), dtypes.uint32)) for selector in ('0x4140u', '0x4342u')]
   return [(p >> s).cast(dtypes.uint16).bitcast(dtypes.float16) for p in pairs for s in (0, 16)]
 
+# FP8 e4m3: two FP16 (as a word) or two FP32 values to a byte pair (the first value the low byte), saturating
+_E4M3_F16X2 = '[&]() {{ unsigned short r; asm("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;" : "=h"(r) : "r"({0})); return (unsigned)r; }}()'
+_E4M3_F32X2 = '[&]() {{ unsigned short r; asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(r) : "f"({1}), "f"({0})); return (unsigned)r; }}()'
+_FMMA = ('[&]() {{ float d0, d1, d2, d3; asm("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {{%0,%1,%2,%3}}, {{%4,%5,%6,%7}}, '
+         '{{%8,%9}}, {{%10,%11,%12,%13}};" : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3) : "r"({0}), "r"({1}), "r"({2}), "r"({3}), '
+         '"r"({4}), "r"({5}), "f"({6}), "f"({7}), "f"({8}), "f"({9})); return d{index}; }}()')
+
+def _int8_e4m3(word: UOp) -> UOp:
+  """The four signed bytes of a uint32 word as FP8 e4m3 bytes (exact to 16, three mantissa bits above)."""
+  one = UOp.const(1.0, dtypes.float32)
+  pairs = [UOp(Ops.CUSTOM, src=(word, one), arg=(_INT8_PAIR.replace('{2}', selector), dtypes.uint32)) for selector in ('0x4140u', '0x4342u')]
+  low, high = (UOp(Ops.CUSTOMI, src=(p,), arg=(_E4M3_F16X2, dtypes.uint32)) for p in pairs)
+  return low | (high << 16)
+
+def _fmma(a: list[UOp], b: list[UOp]) -> list[UOp]:
+  """D = A x B on FP8 e4m3 tensor cores, FP32 out (m16n8k32; fragments as _imma's): 2x the FP16-in, FP32-accumulate
+  rate on an RTX 5060. Each starts from zero, so no inline MMA expression holds another."""
+  zero = UOp.const(0.0, dtypes.float32)
+  return [UOp(Ops.CUSTOMI, src=(*a, *b, zero, zero, zero, zero), arg=(_FMMA.replace('{index}', str(i)), dtypes.float32)) for i in range(4)]
+
 def _extras(extra: tuple[UOp, ...], int8: bool) -> tuple[UOp | None, UOp | None]:
   """A kernel's optional sources after kv: the int8 cache's scales, then the floor."""
   return (extra[0] if int8 else None), (extra[int(int8)] if len(extra) > int(int8) else None)
@@ -379,11 +399,13 @@ def _flash_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, *extra: UOp, start: in
   (wm, wn) scores its 16 queries against keys wn * 16.. of the tile; the pair shares its row maxima and
   probabilities through shared memory, and each accumulates output dims wn * dim / 2.. against all 32 keys, so no
   score is computed twice and a lane holds half a head's output. Fragments come from shared memory by ldmatrix
-  (one instruction a B fragment). With an int8 cache the scores run on int8 tensor cores (keys as stored, Q
-  quantized a row) and the values convert two an instruction (_int8_halves). Same partial/stats outputs as
-  _mma_kernel, one per slice. RTX 5060, Bonsai-4B's heads at 64k keys, int8 cache: 16 rows 492 us against
-  _mma_kernel's 1656 (616 with FP16 scores), 64 rows 2157 against 5480 (2743), and the merge reads a few dozen
-  partials instead of one a 256-key segment (16 us, from up to 660)."""
+  (one instruction a B fragment). With an int8 cache it follows SageAttention2: the scores run on int8 tensor
+  cores (keys as stored, Q quantized a row) and P V on FP8 ones, the values' integers as e4m3 against the
+  probabilities times their key's scale, scaled so the tile's largest fills e4m3's range (~3% rounding each;
+  Bonsai-4B perplexity +0.04% at 8192 tokens). Same partial/stats outputs as _mma_kernel, one per slice. RTX 5060,
+  Bonsai-4B's heads at 64k keys, int8 cache: 16 rows 445 us against _mma_kernel's 1656 (616 in FP16, 492 with
+  int8 scores), 64 rows 1897 against 5480 (2743, 2157), and the merge reads a few dozen partials instead of one a
+  256-key segment (16 us, from up to 660)."""
   scales, _ = _extras(extra, int8)
   queries, steps, tiles_n = groups * rows, dim // 16, dim // 8
   half_tiles = tiles_n // 2
@@ -474,8 +496,13 @@ def _flash_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, *extra: UOp, start: in
   k_lds = (UOp.placeholder((32, (dim + 16) // 4), U32, slot=slot + 4, addrspace=AddrSpace.LOCAL) if int8 else
            UOp.placeholder((32, dim + 8), F16, slot=slot + 4, addrspace=AddrSpace.LOCAL))
   k_scales = UOp.placeholder((32,), F32, slot=slot + 8, addrspace=AddrSpace.LOCAL) if int8 else None
-  v_lds = UOp.placeholder((dim, 32 + 8), F16, slot=slot + 5, addrspace=AddrSpace.LOCAL)
-  p_lds = UOp.placeholder((warps_m, 16, 32 + 8), F16, slot=slot + 6, addrspace=AddrSpace.LOCAL)
+  if int8:  # FP8 values (transposed, 48-byte rows: 16-byte aligned, ldmatrix rows 12 banks apart) and probabilities
+    v_lds = UOp.placeholder((dim, 48), dtypes.uint8, slot=slot + 5, addrspace=AddrSpace.LOCAL)
+    p_lds = UOp.placeholder((warps_m, 16, 48), dtypes.uint8, slot=slot + 6, addrspace=AddrSpace.LOCAL)
+    v_scales = UOp.placeholder((32,), F32, slot=slot + 9, addrspace=AddrSpace.LOCAL)
+  else:
+    v_lds = UOp.placeholder((dim, 32 + 8), F16, slot=slot + 5, addrspace=AddrSpace.LOCAL)
+    p_lds = UOp.placeholder((warps_m, 16, 32 + 8), F16, slot=slot + 6, addrspace=AddrSpace.LOCAL)
   m_lds = UOp.placeholder((warps_m, 2, 16), F32, slot=slot + 7, addrspace=AddrSpace.LOCAL)
   tile = UOp.range(per, 2, axis_type=AxisType.LOOP)
   base = (part_index * per + tile) * 32
@@ -490,14 +517,23 @@ def _flash_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, *extra: UOp, start: in
         stage += [k_lds[key.valid(inside), col // 4 + w].store(cur_held[n * 4 + w].load()) for w in range(4)]
         stage.append(k_scales[key.valid(inside & col.eq(0))].store(cur_scales[n].load()))
         continue
-      if int8: values = [v for w in range(4) for v in _int8_halves(cur_held[n * 4 + w].load(), cur_scales[n].load())]
-      else: values = [cur_held[n * 8 + w].load() for w in range(8)]
+      live = base + key < active
+      if int8:  # values as FP8 integers, their scales apart (folded into the probabilities)
+        for w in range(4):
+          fp8 = _int8_e4m3(cur_held[n * 4 + w].load())
+          stage += [v_lds[(col + 4 * w + j).valid(inside), key].store(((fp8 >> (8 * j)) & 255).cast(dtypes.uint8)) for j in range(4)]
+        stage.append(v_scales[key.valid(inside & col.eq(0))].store(live.where(cur_scales[n].load(), zero)))
+        continue
+      values = [cur_held[n * 8 + w].load() for w in range(8)]
       live = base + key < active  # unwritten rows may hold any bits: zero keys and values past the active length
       values = [live.where(v, UOp.const(0.0, F16)) for v in values]
       stage += [(k_lds[key.valid(inside), col + w] if c == 0 else v_lds[(col + w).valid(inside), key]).store(v) for w, v in enumerate(values)]
   staged = UOp.group(*stage).barrier()
   k_lds, v_lds = k_lds.after(staged), v_lds.after(staged)
-  if int8: k_scales = k_scales.after(staged)
+  if int8:
+    k_scales, v_scales = k_scales.after(staged), v_scales.after(staged)
+    # the tile's largest value scale: probabilities times their key's scale, over it, fill e4m3's range (448)
+    v_top = warp_reduce(v_scales[lane].load(), maximum=True, full_wave=True).maximum(1e-30)
   # The next tile's loads, issued now: they land while this one's MMAs run
   prefetch = UOp.group(*fetch(tile + 1))
   computed = []
@@ -550,18 +586,35 @@ def _flash_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, *extra: UOp, start: in
     updates += [cur[r].store(new_max), cur[2 + r].store(cur[2 + r].load() * alpha + _shuffle_rows(total, False))]
     alphas.append(alpha)
   # This warp's probabilities into the pair's shared rows; both read all 32 keys' as A fragments
-  written = UOp.group(*(p_lds[wm, group + 8 * r, wn * 16 + nt * 8 + thread * 2 + col].store(probs[r][nt * 2 + col].cast(F16))
-                        for r in range(2) for nt in range(2) for col in range(2))).barrier()
-  p_now = p_lds.after(written)
-  # A fragments: (rows 0-7, 8-15) at keys kk * 16 + 0-7, then at + 8-15
-  pa = [UOp.stack(*(v for c in (0, 8) for v in _ldmatrix(p_now[wm, lane % 8 + (lane // 8) % 2 * 8, kk * 16 + c]))) for kk in range(2)]
-  for c in range(half_tiles):
-    o = outs[c].after(tile)
-    acc = UOp.stack(*(o[i].load() * alphas[i // 2] for i in range(4)))
-    d = (wn * half_tiles + c) * 8 + lane % 8
-    for kk in range(2):
-      acc = UOp.wmma(pa[kk], UOp.stack(*_ldmatrix(v_lds[d, kk * 16 + (lane // 8) % 2 * 8])), acc, (8, 16, 16), 32)
-    updates.append(o.store(acc))
+  if int8:
+    written = []
+    for r in range(2):
+      for nt in range(2):
+        key = wn * 16 + nt * 8 + thread * 2
+        pair = UOp(Ops.CUSTOMI, src=tuple(probs[r][nt * 2 + col] * v_scales[key + col].load() * (448 / v_top) for col in range(2)),
+                   arg=(_E4M3_F32X2, U32))
+        written += [p_lds[wm, group + 8 * r, key + col].store(((pair >> (8 * col)) & 255).cast(dtypes.uint8)) for col in range(2)]
+    p_now = p_lds.after(UOp.group(*written).barrier())
+    # A fragment (k32): rows 0-7 and 8-15 at keys 0-15, then at 16-31
+    pa = [w for c in (0, 16) for w in _ldmatrix_words(p_now[wm, lane % 8 + (lane // 8) % 2 * 8, c])]
+    for c in range(half_tiles):
+      o = outs[c].after(tile)
+      d = (wn * half_tiles + c) * 8 + lane % 8
+      pv = _fmma(pa, _ldmatrix_words(v_lds[d, (lane // 8) % 2 * 16]))
+      updates.append(o.store(UOp.stack(*(o[i].load() * alphas[i // 2] + pv[i] * (v_top / 448) for i in range(4)))))
+  else:
+    written = UOp.group(*(p_lds[wm, group + 8 * r, wn * 16 + nt * 8 + thread * 2 + col].store(probs[r][nt * 2 + col].cast(F16))
+                          for r in range(2) for nt in range(2) for col in range(2))).barrier()
+    p_now = p_lds.after(written)
+    # A fragments: (rows 0-7, 8-15) at keys kk * 16 + 0-7, then at + 8-15
+    pa = [UOp.stack(*(v for c in (0, 8) for v in _ldmatrix(p_now[wm, lane % 8 + (lane // 8) % 2 * 8, kk * 16 + c]))) for kk in range(2)]
+    for c in range(half_tiles):
+      o = outs[c].after(tile)
+      acc = UOp.stack(*(o[i].load() * alphas[i // 2] for i in range(4)))
+      d = (wn * half_tiles + c) * 8 + lane % 8
+      for kk in range(2):
+        acc = UOp.wmma(pa[kk], UOp.stack(*_ldmatrix(v_lds[d, kk * 16 + (lane // 8) % 2 * 8])), acc, (8, 16, 16), 32)
+      updates.append(o.store(acc))
   # Every warp must finish with the tile before the next one is staged over it.
   done = UOp.group(*updates, prefetch).barrier().end(tile)
   state, outs = state.after(done), [o.after(done) for o in outs]
