@@ -25,8 +25,8 @@ def _silu(x: UOp) -> UOp:
   return x / (UOp.const(1.0, dtypes.float32) + (-x).exp())
 
 @functools.cache
-def _gdn_chunk_kernel(o: UOp, u: UOp, q: UOp, k: UOp, v: UOp, beta: UOp, g: UOp, state: UOp, keep: UOp, *,
-                      heads: int, rows: int, advance: bool = False, cumulative: bool = True) -> UOp:
+def _gdn_chunk_kernel(o: UOp, u: UOp, *srcs: UOp, heads: int, rows: int, advance: bool = False, cumulative: bool = True,
+                      kheads: int = 0) -> UOp:
   """The closed form over `rows` rows (a multiple of 16), 16 at a time, one launch. A head is split over 4 blocks
   of 32 value rows (S0's rows), 128 threads each. The block's 32 state rows stay in shared memory from one 16-row
   step to the next, so the state is read and (with `advance`) written once a call.
@@ -36,7 +36,10 @@ def _gdn_chunk_kernel(o: UOp, u: UOp, q: UOp, k: UOp, v: UOp, beta: UOp, g: UOp,
   substitution's inverse, which don't depend on the value row, once a block. A lane a value row then takes its u
   and outputs as independent sums (each thread solving the substitution itself, a 16-row step took ~41 us; RTX
   5060: now ~26, a 64-row prompt chunk 105 us against four launches of 43). g is the cumulative log-decay within
-  each 16 rows, or with `cumulative=False` the per-row log-decay, summed here."""
+  each 16 rows, or with `cumulative=False` the per-row log-decay, summed here.
+
+  srcs are q, k, v, beta, g, state, keep; or with `kheads`, gdn_prep's outputs (q, k and v heads x rows x 128, and
+  β and log-decay x heads x rows), state and keep, value head h reading key head h % kheads."""
   T, D, R = 16, 128, 32  # rows a step, head dim, value rows a block
   assert rows % T == 0, "fused GDN chunk takes a multiple of 16 rows"
   F32, zero = dtypes.float32, UOp.const(0.0, dtypes.float32)
@@ -45,6 +48,21 @@ def _gdn_chunk_kernel(o: UOp, u: UOp, q: UOp, k: UOp, v: UOp, beta: UOp, g: UOp,
   lane = UOp.range(32, -1, axis_type=AxisType.WARP)
   tid = warp*32+lane
   head, row0 = item // (D//R), (item % (D//R))*R
+  if kheads:
+    packed, bg, state, keep = srcs
+    kh = head % kheads
+    def q(t, c): return packed[kh, t, c]
+    def k(t, c): return packed[kheads+kh, t, c]
+    def v(t, c): return packed[2*kheads+head, t, c]
+    def beta(t): return bg[0, head, t]
+    def g(t): return bg[1, head, t]
+  else:
+    q_rows, k_rows, v_rows, betas, decays, state, keep = srcs
+    def q(t, c): return q_rows[head, t, c]
+    def k(t, c): return k_rows[head, t, c]
+    def v(t, c): return v_rows[head, t, c]
+    def beta(t): return betas[head, t]
+    def g(t): return decays[head, t]
   row = row0+lane  # the substitution's value row
   def load4(ptr: UOp) -> list[UOp]: return list(_load_lanes(ptr, 4))
   # The block's 32 rows of S0, carried across the steps (rows padded by 4: 16-byte loads of eight rows at one
@@ -64,15 +82,15 @@ def _gdn_chunk_kernel(o: UOp, u: UOp, q: UOp, k: UOp, v: UOp, beta: UOp, g: UOp,
   staged = []
   for n in range(2*T*D//4//128):
     t, c = n*4+warp, lane*4
-    source = k[head, base+t, c] if t.vmax < T else q[head, base+t-T, c]
+    source = k(base+t, c) if t.vmax < T else q(base+t-T, c)
     staged += [kq[t, c+i].store(x) for i, x in enumerate(load4(source))]
   kq = kq.after(UOp.group(*staged).barrier())
 
   # This step's cumulative log-decays and betas (every thread holds all 16)
-  gs = [g[head, base+t].load() for t in range(T)]
+  gs = [g(base+t).load() for t in range(T)]
   if not cumulative:
     for t in range(1, T): gs[t] = gs[t-1]+gs[t]
-  bs = [beta[head, base+t].load() for t in range(T)]
+  bs = [beta(base+t).load() for t in range(T)]
   def pick(values: list[UOp], t: UOp) -> UOp: return sum((t.eq(i).where(x, zero) for i, x in enumerate(values)), zero)
 
   # Decayed Gram matrices, a block's once: kk[t, s] = β_t (γ_t/γ_s) k_t·k_s for s < t, qk[t, s] = (γ_t/γ_s) q_t·k_s for s <= t
@@ -128,7 +146,7 @@ def _gdn_chunk_kernel(o: UOp, u: UOp, q: UOp, k: UOp, v: UOp, beta: UOp, g: UOp,
     total = sum((grams[1, t, s].load()*inverse[0, s, j].load() for s in range(1, T)), grams[1, t, 0].load()*inverse[0, 0, j].load())
     mixed.append(inverse[1, t, j].store(total))
   inverse = inverse.after(UOp.group(*mixed).barrier())
-  rhs = [bs[t]*(v[head, base+t, row].load()-gs[t].exp()*ks[t]) for t in range(T)]
+  rhs = [bs[t]*(v(base+t, row).load()-gs[t].exp()*ks[t]) for t in range(T)]
   us = [sum((inverse[0, t, s].load()*rhs[s] for s in range(t)), rhs[t]) for t in range(T)]
   outs = [sum((inverse[1, t, s].load()*rhs[s] for s in range(t+1)), gs[t].exp()*qs[t]) for t in range(T)]
   first = warp.eq(0)
@@ -220,6 +238,89 @@ def gdn_prefill(q: Tensor, k: Tensor, v: Tensor, beta: Tensor, log_decay: Tensor
   o = Tensor.custom_kernel(o, u, *inputs, fxn=functools.partial(_gdn_chunk_kernel, heads=heads, rows=rows, advance=True,
                                                                cumulative=False))[0]
   return o if gate is None else _gated_norm(o, gate, weight, eps)
+
+@functools.cache
+def _prep_kernel(out: UOp, bg: UOp, qkv: UOp, conv: UOp, conv_w: UOp, gates: UOp, dt_bias: UOp, a: UOp, live: UOp, keep: UOp,
+                 *, rows: int, heads: int, kheads: int, channels: int) -> UOp:
+  """gdn_prefill_raw's input processing: a block a row and 128 channels (a head), thread a channel. The causal conv over
+  [conv state | rows] and SiLU; q and k heads L2-normed (q also times 128^-0.5); and the first block of a row its
+  heads' β (sigmoid, FP16 like upstream) and log-decay (softplus(α + dt_bias) a), both 0 on rows past `live`."""
+  D = 128
+  groups = channels // D
+  F32, one, zero = dtypes.float32, UOp.const(1.0, dtypes.float32), UOp.const(0.0, dtypes.float32)
+  item = UOp.range(rows*groups, 0, axis_type=AxisType.GLOBAL)
+  warp = UOp.range(4, 1, axis_type=AxisType.LOCAL)
+  lane = UOp.range(32, -1, axis_type=AxisType.WARP)
+  col = warp*32+lane
+  t, group = item // groups, item % groups
+  channel = group*D+col
+  kept = keep[0].load()
+  taps = []
+  for i in range(4):
+    old = conv[(t+i).minimum(2), channel].load()*kept
+    new = qkv[(t+i-3).maximum(0), channel].load().float()
+    taps.append((t+i < 3).where(old, new)*conv_w[channel, i].load())
+  total = ((taps[0]+taps[1])+taps[2])+taps[3]
+  x = total*(one + (-total).exp()).reciprocal()
+  sums = UOp.placeholder((4,), F32, slot=0, addrspace=AddrSpace.LOCAL)
+  sums = sums.after(sums[warp].store(warp_reduce(x*x, full_wave=True)).barrier())
+  norm = sum((sums[w].load() for w in range(1, 4)), sums[0].load()).sqrt().maximum(UOp.const(1e-6, F32))
+  scale = (group < kheads).where(D**-0.5/norm, (group < 2*kheads).where(one/norm, one))
+  stores = [out[group, t, col].store(x*scale)]
+  def half(value: UOp) -> UOp: return value.cast(dtypes.float16).cast(F32)  # upstream rounds these to FP16
+  h = col.minimum(heads-1)
+  prompt = t.cast(dtypes.int32) < live[0].load()
+  beta = half((one + (-gates[t, h].load().float()).exp()).reciprocal())
+  pre = gates[t, heads+h].load().float() + dt_bias[h].load().float()
+  softplus = pre.maximum(zero) + (one + (-(pre.maximum(-pre))).exp()).log()  # log(1 + e^pre), stable
+  first = group.eq(0) & (col < heads)
+  stores += [bg[0, h, t.valid(first)].store(prompt.where(beta, zero)),
+             bg[1, h, t.valid(first)].store(prompt.where(softplus*a[h].load().float(), zero))]
+  return UOp.group(*stores).end(item, warp, lane).sink(arg=KernelInfo(name="gdn_prep", opts_to_apply=()))
+
+@functools.cache
+def _conv_store_kernel(conv: UOp, qkv: UOp, live: UOp, keep: UOp, prepped: UOp, *, rows: int, channels: int) -> UOp:
+  # Runs after gdn_prep (which reads the old conv state; prepped orders it): the conv state = the window's rows
+  # live .. live + 2, a thread a channel.
+  block = UOp.range(channels//128, 0, axis_type=AxisType.GLOBAL)
+  lane = UOp.range(128, 1, axis_type=AxisType.LOCAL)
+  channel, end, kept = block*128+lane, live[0].load(), keep[0].load()
+  values = []
+  for j in range(3):
+    index = end+j
+    old = conv[index.minimum(2), channel].load()*kept
+    new = qkv[(index-3).maximum(0).minimum(rows-1), channel].load().float()
+    values.append((index < 3).where(old, new))
+  after = conv.after(*values)
+  return UOp.group(*(after[j, channel].store(values[j]) for j in range(3))).end(block, lane).sink(
+    arg=KernelInfo(name="gdn_conv_store", opts_to_apply=()))
+
+def gdn_prefill_raw(qkv: Tensor, conv_state: Tensor, conv_w: Tensor, gates: Tensor, dt_bias: Tensor, a: Tensor, state: Tensor,
+                    live: Tensor, keep: Tensor, *, kheads: int) -> Tensor:
+  """gdn_prefill from the raw projections, in three kernels: gdn_prep (conv, SiLU, q/k norms, β and decay; upstream's
+  input processing was ~13 small kernels), the conv state's update, and the scan.
+
+  qkv: (T, ≥ C) the qkv projection's rows (a merged projection's output: the gate after the C channels is not read);
+  conv_state: (3, C) FP32 realized; conv_w: (C, 4) FP32; gates: (T, 2 x H) the β and α projections; dt_bias, a: (H,);
+  state: (H, 128, 128) FP32 realized; live: (1,) int32, the prompt rows (rows past it leave the state unchanged);
+  keep: (1,) 0/1 multiplier on the old conv and recurrent state. Both states advance in place; returns the FP32
+  outputs (T, H, 128) before the gated RMSNorm."""
+  rows, heads, channels = qkv.shape[0], state.shape[0], conv_state.shape[1]
+  if rows % 16 or channels != 2*kheads*128 + heads*128 or state.shape[1:] != (128, 128) or gates.shape != (rows, 2*heads):
+    raise ValueError("fused GDN prefill requires a multiple of 16 rows of 128-dimensional heads")
+  live, keep = live.cast(dtypes.int32).contiguous(), keep.float().contiguous()
+  packed = Tensor.empty(channels//128, rows, 128, dtype=dtypes.float32, device=qkv.device)
+  bg = Tensor.empty(2, heads, rows, dtype=dtypes.float32, device=qkv.device)
+  packed, bg = Tensor.custom_kernel(packed, bg, qkv, conv_state, conv_w, gates, dt_bias.float().contiguous(), a.float().contiguous(),
+                                    live, keep, fxn=functools.partial(_prep_kernel, rows=rows, heads=heads, kheads=kheads,
+                                                                      channels=channels))[:2]
+  conv = Tensor.custom_kernel(conv_state, qkv, live, keep, packed, fxn=functools.partial(_conv_store_kernel, rows=rows,
+                                                                                         channels=channels))[0]
+  o = Tensor.empty(rows, heads, 128, dtype=dtypes.float32, device=qkv.device)
+  u = Tensor.empty(1, dtype=dtypes.float32, device=qkv.device)  # not written: prefill keeps every row
+  state = Tensor(state.uop.after(conv.uop))
+  return Tensor.custom_kernel(o, u, packed, bg, state, keep, fxn=functools.partial(
+    _gdn_chunk_kernel, heads=heads, rows=rows, advance=True, cumulative=False, kheads=kheads))[0]
 
 @functools.cache
 def _gdn_decode_kernel(z: UOp, state: UOp, qkv: UOp, conv: UOp, conv_w: UOp, x: UOp, w_beta: UOp, w_alpha: UOp, dt_bias: UOp,

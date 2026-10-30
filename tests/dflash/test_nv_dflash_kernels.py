@@ -146,6 +146,35 @@ def test_gdn_prefill_matches_sequential_scan_and_advances_state(T, rows):
       assert ((z[:rows].float() - z_ref).abs().max() / z_ref.abs().max()).item() < 2e-3
       assert ((S0 - S_ref).abs().max() / S_ref.abs().max()).item() < 1e-4   # advanced in place, padding ignored
 
+@pytest.mark.parametrize('live,keep', [(64, 1.0), (40, 1.0), (2, 1.0), (64, 0.0)])
+def test_gdn_prefill_raw_matches_the_tensor_ops(live, keep):
+  # gdn_prep (conv, SiLU, q/k norms, β, decay) and the conv state's update against upstream's tensor ops + gdn_prefill
+  from infurnace.kernels.gdn import gdn_prefill, gdn_prefill_raw
+  T, H, KH, D = 64, 32, 16, 128
+  C = 2*KH*D + H*D
+  with Context(DEV='NV'):
+    Tensor.manual_seed(live)
+    joined = Tensor.randn(T, C + H*D).half().realize()   # qkv channels, then a gate the kernel doesn't read
+    gates = Tensor.randn(T, 2*H).half().realize()
+    conv_w, dt_bias, a = (Tensor.randn(C, 4) * 0.5).realize(), Tensor.randn(H).realize(), (-Tensor.rand(H)).realize()
+    conv0, S0 = Tensor.randn(3, C).realize(), (Tensor.randn(H, D, D) * 0.1).realize()
+    # Reference
+    window = (conv0 * keep).cat(joined[:, :C].float())
+    conv_out = sum(window[i:i + T] * conv_w[:, i] for i in range(4)).silu()
+    q, k, v = conv_out.split([KH*D, KH*D, H*D], dim=-1)
+    q, k = (z.reshape(T, KH, D).normalize(dim=-1, eps=1e-6).repeat(1, H // KH, 1).transpose(0, 1) for z in (q, k))
+    prompt = (Tensor.arange(T) < live).reshape(1, T)
+    beta = prompt.where(gates[:, :H].float().sigmoid().half().float().T, 0)   # FP32 sigmoid rounded to FP16
+    log_decay = prompt.where(((gates[:, H:].float() + dt_bias).softplus() * a).T, 0)
+    S_ref = (S0 * 1).contiguous().realize()
+    o_ref = gdn_prefill(q * D**-0.5, k, v.reshape(T, H, D).transpose(0, 1), beta, log_decay, S_ref, None, None, Tensor([keep]), 0.0)
+    o_ref, conv_ref = o_ref.realize(), window[live:live + 3].realize()
+    conv, S = conv0.clone().realize(), S0.clone().realize()
+    o = gdn_prefill_raw(joined, conv, conv_w, gates, dt_bias, a, S, Tensor([live]), Tensor([keep]), kheads=KH).realize()
+    assert ((o - o_ref).abs().max() / o_ref.abs().max()).item() < 1e-3
+    assert ((S - S_ref).abs().max() / S_ref.abs().max()).item() < 1e-4   # advanced in place
+    assert ((conv - conv_ref).abs().max()).item() < 1e-6                 # the conv window's rows live .. live + 2
+
 @pytest.mark.parametrize('rows', [16, 64])
 def test_gdn_gates_match_fp32_projection(rows):
   from infurnace.kernels.gdn import gdn_gates

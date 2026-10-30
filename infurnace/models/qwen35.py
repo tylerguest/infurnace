@@ -4,10 +4,10 @@ Its family adds the fused GDN pass on NV and prompt snapshots (GDN state can't b
 BPETokenizer. Everything else is the shared engine."""
 import functools
 import os
-from tinygrad import Context, Tensor, UOp
+from tinygrad import Context, Tensor, UOp, dtypes
 from tinygrad.llm.model import GatedDeltaNetBlock
 from infurnace.engine import PREFILL_ROWS, _norm_of, _norm_q8, _norm_rows_q8, _one_row, _project, _rows
-from infurnace.kernels.gdn import gdn_gates, gdn_decode, gdn_prefill
+from infurnace.kernels.gdn import _gated_norm, gdn_gates, gdn_decode, gdn_prefill, gdn_prefill_raw
 from infurnace.models import Family
 from infurnace.tokenizer import BPETokenizer
 
@@ -41,6 +41,23 @@ def _fused_gdn(block: GatedDeltaNetBlock):
       x = x.half()
       qkv, out_gate = _rows(x, block.attn_qkv, block.attn_gate)
     out_gate = out_gate.reshape(B, T, H, V)
+    # A prompt chunk always runs PROMPT_ROWS rows; only the first `live` are prompt (see Model._prompt_chunk).
+    live = getattr(block, '_prompt_rows', None)
+    keep = (1 - initial.float()).reshape(1)
+    if isinstance(T, int) and T == T_pad:
+      # the conv, q/k norms, β and decay in one kernel reading the projection's rows, then the scan
+      rows = (joined if joined is not None else qkv.contiguous()).reshape(T, -1)
+      conv_state = Tensor(block.conv_state.uop.buf_uop).reshape(block.ssm_conv_kernel - 1, block.conv_channels)
+      state = Tensor(block.recurrent_state.uop.buf_uop).reshape(H, V, K)
+      o = gdn_prefill_raw(rows, conv_state, conv_w, gdn_gates(x.reshape(T, -1), gates), block.ssm_dt['bias'], block.ssm_a,
+                          state, Tensor.full((1,), T if live is None else live, dtype=dtypes.int32), keep, kheads=block.num_k_heads)
+      o = o.reshape(1, T, H * V)
+      if joined is not None and block.ssm_out.rows_quantized:
+        # the gated RMSNorm in ssm_out's rotate-and-quantize kernel, the gate read from the merged projection's output
+        gated = (joined, block.attn_qkv.out_features, block.ssm_norm.weight, block.ssm_norm.eps)
+        return block.ssm_out(o, block.ssm_out.rows_q8(o, gated=gated))
+      z = _gated_norm(o.reshape(T, H, V), out_gate[0], block.ssm_norm.weight, block.ssm_norm.eps)
+      return block.ssm_out(z.reshape(1, T, H * V))
     if isinstance(T, int):
       projected = gdn_gates(x.reshape(B * T, -1), gates).reshape(B, T, 2 * H)
       beta_in, alpha_in = projected[..., :H], projected[..., H:]
@@ -50,8 +67,6 @@ def _fused_gdn(block: GatedDeltaNetBlock):
     conv_state = initial.where(0, block.conv_state)
     conv_window = conv_state.cat(qkv.cast(conv_state.dtype), dim=1)
     conv_window = conv_window.pad_to((B, block.ssm_conv_kernel - 1 + T_pad, block.conv_channels)).contiguous()
-    # A prompt chunk always runs PROMPT_ROWS rows; only the first `live` are prompt (see Model._prompt_chunk).
-    live = getattr(block, '_prompt_rows', None)
     end = T if live is None else live
     conv_state_store = block.conv_state.uop.store(conv_window[:, end:end + block.ssm_conv_kernel - 1].cast(block.conv_state.dtype).uop)
     conv_out = functools.reduce(lambda a, b: a + b,
@@ -72,12 +87,6 @@ def _fused_gdn(block: GatedDeltaNetBlock):
     # ordered after the conv state write like upstream's AMD kernel.
     log_decay = log_alpha.transpose(1, 2)[0, ..., 0]                                   # (H, T_pad)
     state = Tensor(block.recurrent_state.uop.after(conv_state_store)).reshape(H, V, K)
-    keep = (1 - initial.float()).reshape(1)
-    if joined is not None and block.ssm_out.rows_quantized and T == T_pad:
-      # the gated RMSNorm in ssm_out's rotate-and-quantize kernel, the gate read from the merged projection's output
-      o = gdn_prefill(q[0], k[0], v[0], beta[0], log_decay, state, None, None, keep, 0.0).reshape(1, T_pad, H * V)
-      gated = (joined, block.attn_qkv.out_features, block.ssm_norm.weight, block.ssm_norm.eps)
-      return block.ssm_out(o, block.ssm_out.rows_q8(o, gated=gated))
     z = gdn_prefill(q[0], k[0], v[0], beta[0], log_decay, state, out_gate[0], block.ssm_norm.weight, keep, block.ssm_norm.eps)
     return block.ssm_out(z.reshape(1, T_pad, H * V)[:, :T])
   def attention(x: Tensor, start_pos, idx_mask=None):
