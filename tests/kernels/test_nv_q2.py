@@ -95,3 +95,20 @@ def test_q2_0_int8_cta_k_split_matches_unsplit(kc):
     return Tensor.custom_kernel(out, packed, xq, xd, fxn=fxn)[0]
   reference = run(1)
   assert ((run(kc) - reference).abs().max() / reference.abs().max()).item() < 1e-6
+
+@pytest.mark.parametrize("rows,group,half", [(1, 32, True), (16, 64, False), (64, 64, True)])
+def test_norm_fwht_q8_matches_normalizing_first(rows, group, half):
+  from infurnace.kernels.hadamard import fwht_q8, norm_fwht_q8
+  width, eps = 2560, 1e-6
+  signs = (Tensor.rand(width, device="NV") < 0.5).where(-1.0, 1.0).realize()
+  weight = (Tensor.rand(width, device="NV") + 0.5).realize()
+  x = (Tensor.randn(rows, width, device="NV") * 3).realize()
+  normed = x * (x.square().mean(-1, keepdim=True) + eps).rsqrt() * weight
+  if half: normed = normed.half().float()
+  reference = fwht_q8(normed, signs, block=512, group=group)
+  got = norm_fwht_q8(x, weight, eps, signs, block=512, group=group, normed=True, half=half)
+  def codes(words): return words.flatten().bitcast(dtypes.int8).float()
+  assert (codes(got[0]) - codes(reference[0])).abs().max().item() <= 1
+  assert ((got[1] - reference[1]).abs() / reference[1]).max().item() < 1e-4
+  if group == 32: assert (got[2] - reference[2]).abs().max().item() <= 1
+  assert (got[-1].float() - normed).abs().max().item() < 1e-2  # the FP16 normalized rows
