@@ -1,5 +1,6 @@
 """infurnace command line: `serve` keeps a model warm on the GPU; `run`, `ps`, `stop` and `launch`
-talk to it (starting it when needed); `pull`, `list` and `rm` manage downloads.
+talk to it (starting it when needed); `pull`, `list` and `rm` manage downloads. Bare `infurnace` in a terminal
+opens a menu of the same (infurnace/menu.py); piped, it runs `run`.
 
 The original flags still work: `--prompt`, `--serve [PORT]`, `--benchmark` and in-process chat (`--chat`)."""
 from __future__ import annotations
@@ -235,6 +236,9 @@ def main(argv: list[str] | None = None) -> int:
   argv = sys.argv[1:] if argv is None else argv
   from infurnace.client import ServerError
   try:
+    if not argv and sys.stdin.isatty() and sys.stdout.isatty():
+      from infurnace import menu
+      return menu.main(command)  # a terminal: the menu
     if not argv or argv[0] in COMMANDS: return command(argv or ["run"])
     return run(parse_args(argv))
   except ServerError as exc:

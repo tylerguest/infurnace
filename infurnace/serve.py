@@ -38,6 +38,32 @@ def _now() -> str:
 
 class ClientDisconnected(Exception):
   """Abort a request without attempting to write a response to its closed socket."""
+class Speeds:
+  """Prompt reading (prefill) and decoding speeds over the requests a model has served, in tokens per second:
+  total tokens over total time, so a long prompt counts for more than a short one. Prefill is the time to the first
+  token, for the prompt tokens not reused from the cache; decode is the tokens after it, until the last. Peaks are the
+  fastest single request, of those long enough to time (a few tokens are mostly fixed overhead or noise)."""
+  PEAK_PREFILL, PEAK_DECODE = 64, 16  # tokens a request needs to count for a peak
+
+  def __init__(self):
+    self.requests, self.prefill_tokens, self.prefill_seconds, self.decode_tokens, self.decode_seconds = 0, 0, 0.0, 0, 0.0
+    self.peak_prefill = self.peak_decode = 0.0
+
+  def add(self, prompt_tokens: int, started: float, first: float | None, last: float | None, count: int):
+    if first is None: return  # nothing generated (cancelled during prefill): no time to the first token
+    self.requests += 1
+    self.prefill_tokens, self.prefill_seconds = self.prefill_tokens + prompt_tokens, self.prefill_seconds + first - started
+    if prompt_tokens >= self.PEAK_PREFILL and first > started: self.peak_prefill = max(self.peak_prefill, prompt_tokens / (first - started))
+    if count > 1: self.decode_tokens, self.decode_seconds = self.decode_tokens + count - 1, self.decode_seconds + last - first
+    if count - 1 >= self.PEAK_DECODE and last > first: self.peak_decode = max(self.peak_decode, (count - 1) / (last - first))
+
+  def report(self) -> dict:
+    return {'requests': self.requests,
+            **({'prefill_tokens_per_second': round(self.prefill_tokens / self.prefill_seconds)} if self.prefill_seconds > 0 else {}),
+            **({'decode_tokens_per_second': round(self.decode_tokens / self.decode_seconds)} if self.decode_seconds > 0 else {}),
+            **({'peak_prefill_tokens_per_second': round(self.peak_prefill)} if self.peak_prefill else {}),
+            **({'peak_decode_tokens_per_second': round(self.peak_decode)} if self.peak_decode else {})}
+
 class ServerModel:
   """What tinygrad's server generates with: DFlash when a draft is loaded (one generator serves every
   temperature), else plain decoding, bounded by the context and closed when a client goes away."""
@@ -45,6 +71,7 @@ class ServerModel:
     self.model, self.dflash, self.eos, self.block = model, dflash, eos_token_ids, block_size
     self.max_context = model.config.context_length
     self.cancelled: Callable[[], bool] | None = None
+    self.speeds = Speeds()
 
   def get_start_pos(self, ids):  # only for the server's log line: the reused prefix, counting the prompt snapshot
     snapshots = getattr(self.model, 'snapshot_length', None)
@@ -52,6 +79,9 @@ class ServerModel:
 
   def generate(self, ids, temperature=0.0):
     budget = self.max_context - len(ids)
+    started, prompt_tokens = time.perf_counter(), len(ids) - self.get_start_pos(ids)
+    first = last = None
+    count = 0
     if self.dflash is not None:
       stream = self.dflash.stream(list(ids), max_new_tokens=budget, block_size=self.block, eos_token_ids=self.eos, temperature=temperature)
     else: stream = self.model.generate(ids, budget, temperature=temperature)
@@ -61,10 +91,14 @@ class ServerModel:
         if self.cancelled is not None and self.cancelled(): raise ClientDisconnected()
         try: token = next(stream)
         except StopIteration: return
+        # timed before the yield: the client's handling of the token is not the model's
+        last, count = time.perf_counter(), count + 1
+        if first is None: first = last
         if self.cancelled is not None and self.cancelled(): raise ClientDisconnected()
         yield token
     finally:
       stream.close()
+      self.speeds.add(prompt_tokens, started, first, last, count)
 
 @dataclass
 class Loaded:
@@ -420,7 +454,8 @@ class Server(socketserver.ThreadingMixIn, LLMServer):
     state = ('failed' if self.failure else 'warming up' if not self.ready.is_set() else 'loading' if self.switching
              else 'unloaded' if self.model is None else 'ready')
     return {'status': state, 'model': self.switching or self.model_name, 'pid': os.getpid(), **({'error': self.failure} if self.failure else {}),
-            **({'warmup_seconds': round(self.warmup_seconds, 1)} if self.warmup_seconds is not None else {})}
+            **({'warmup_seconds': round(self.warmup_seconds, 1)} if self.warmup_seconds is not None else {}),
+            **({'speeds': self.model.speeds.report()} if self.model is not None and self.model.speeds.requests else {})}
 
   def loaded(self) -> dict:
     return {'name': self.model_name, 'model': self.model_name, 'size': self.info.get('size', 0), 'size_vram': self.info.get('size', 0),

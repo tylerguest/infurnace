@@ -4,7 +4,7 @@
 
 | Command | |
 |---|---|
-| `infurnace` | chat with the default model (same as `infurnace run`) |
+| `infurnace` | a menu of the commands below: start or stop the server (its OpenAI-compatible address, for coding agents and other apps, shows under the title), chat, the server's status (arrow keys, Enter, Esc). Closing it (Quit, Ctrl-C or the terminal window) stops a server it started; one already running when it opened keeps running. Piped, or outside a terminal, it chats like `infurnace run` |
 | `infurnace run [MODEL] [PROMPT]` | chat, or answer one prompt and exit; piped input works too (`cat notes.txt \| infurnace run "Summarize this"`). A running server switches to MODEL (downloaded first if needed) |
 | `infurnace serve` | start the server yourself; `run`, `ps`, `stop` and `launch` talk to it, and `run` starts one in the background when none answers (log: `~/.local/state/infurnace/serve.log`) |
 | `infurnace ps` | the running server: model, context, readiness, DFlash |

@@ -22,7 +22,8 @@ python3 -m pip install nvidia-cuda-nvrtc-cu12 nvidia-cuda-runtime-cu12
 ## Use
 
 ```sh
-infurnace                       # chat
+infurnace                       # menu: start the server for agents to connect to, chat
+infurnace run                   # chat
 infurnace run "your question"   # one answer
 infurnace launch pi             # use it in the pi coding agent
 infurnace stop                  # free the GPU

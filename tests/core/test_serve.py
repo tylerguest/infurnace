@@ -8,7 +8,7 @@ import time
 from types import SimpleNamespace
 
 from infurnace.chat import ChatTemplate
-from infurnace.serve import loaded, Server, ServerModel
+from infurnace.serve import loaded, Server, ServerModel, Speeds
 
 class Tokenizer:
   bos_id = None
@@ -50,6 +50,27 @@ def test_adapter_close_and_bound():
   stream.close()
   assert model.closed
   assert model.limit == 1022
+
+def test_adapter_measures_prefill_and_decode(monkeypatch):
+  clock = iter([0.0, 2.0, 3.0, 4.0, 5.0])  # start; then each token
+  monkeypatch.setattr(time, 'perf_counter', lambda: next(clock))
+  model = Model()
+  model.output = 'abcd'
+  adapter = ServerModel(model)
+  model.transformer = SimpleNamespace(get_start_pos=lambda ids: 100)  # 100 of the prompt's tokens cached
+  assert list(adapter.generate(list(range(500)))) == list(map(ord, 'abcd'))
+  # 400 prompt tokens in 2 s to the first token; 3 more tokens in 3 s
+  # too few tokens decoded (3) for a peak
+  assert adapter.speeds.report() == {'requests': 1, 'prefill_tokens_per_second': 200, 'decode_tokens_per_second': 1,
+                                     'peak_prefill_tokens_per_second': 200}
+
+def test_peaks_are_the_fastest_request_long_enough_to_time():
+  speeds = Speeds()
+  speeds.add(1000, 0.0, 1.0, 2.0, 101)  # prefill 1000 tok/s, decode 100 tok/s
+  speeds.add(2000, 0.0, 0.5, 0.6, 21)   # prefill 4000 tok/s, decode 200 tok/s
+  speeds.add(10, 0.0, 0.001, 0.002, 3)  # too short to count for a peak
+  report = speeds.report()
+  assert report['peak_prefill_tokens_per_second'] == 4000 and report['peak_decode_tokens_per_second'] == 200
 
 class DFlash:
   def stream(self, ids, **kwargs):
@@ -387,7 +408,9 @@ def test_requests_switch_between_models():
     assert chat(call, 'a:1b')[1]['message']['content'] == 'from a' and models.loads == []  # already loaded
     status, reply = chat(call, 'b:1b')
     assert status == 200 and reply['message']['content'] == 'from b' and reply['model'] == 'b:1b' and models.loads == ['b:1b']
-    assert call('GET', '/api/status')[1] == {'status': 'ready', 'model': 'b:1b', 'pid': os.getpid()}
+    current = call('GET', '/api/status')[1]
+    assert current.pop('speeds')['requests'] == 1  # b's own request: each model has its own speeds
+    assert current == {'status': 'ready', 'model': 'b:1b', 'pid': os.getpid()}
     assert call('GET', '/api/ps')[1]['models'][0]['name'] == 'b:1b'
     assert chat(call, None)[1]['message']['content'] == 'from b'  # no model named: the loaded one
     # An unknown model: 404 on the infurnace API, the loaded model on the OpenAI API (clients send fixed names)

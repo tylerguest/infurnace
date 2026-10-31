@@ -69,15 +69,23 @@ def status() -> dict | None:
 def log_path() -> Path:
   return Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))).expanduser() / "infurnace/serve.log"
 
-def start_server(serve_args: list[str]) -> None:
-  """Start `infurnace serve` detached, logging to log_path(), and wait until it answers."""
+def spawn_server(serve_args: list[str]) -> subprocess.Popen:
+  """`infurnace serve` started detached, logging to log_path(); it answers once it has its model (downloading it if
+  needed) and warms up after that."""
   log = log_path()
   log.parent.mkdir(parents=True, exist_ok=True)
   hostname, port = host().rsplit(":", 1)
-  command = [sys.executable, "-m", "infurnace.cli", "serve", "--host", hostname, "--port", port, *serve_args]
-  print(f"Starting the infurnace server in the background (log: {log})...", file=sys.stderr, flush=True)
+  # -P: not the current directory first on the import path. Started from the directory holding the checkout (~/repos,
+  # say), `-m` found the checkout itself as a namespace package `infurnace`, its models/ folder as infurnace.models
+  command = [sys.executable, "-P", "-m", "infurnace.cli", "serve", "--host", hostname, "--port", port, *serve_args]
   with open(log, "ab") as out:
-    process = subprocess.Popen(command, stdout=out, stderr=out, stdin=subprocess.DEVNULL, start_new_session=True)
+    return subprocess.Popen(command, stdout=out, stderr=out, stdin=subprocess.DEVNULL, start_new_session=True)
+
+def start_server(serve_args: list[str]) -> None:
+  """Start `infurnace serve` detached and wait until it answers."""
+  log = log_path()
+  print(f"Starting the infurnace server in the background (log: {log})...", file=sys.stderr, flush=True)
+  process = spawn_server(serve_args)
   deadline = time.monotonic() + 300
   while time.monotonic() < deadline:
     if status() is not None: return
@@ -291,10 +299,10 @@ def _write_with_backup(path: Path, value: dict) -> None:
   path.parent.mkdir(parents=True, exist_ok=True)
   path.write_text(json.dumps(value, indent=2) + "\n")
 
-def configure_pi(model: str, context: int, home: Path | None = None) -> Path:
+def configure_pi(model: str, context: int, home: Path | None = None, default: bool = True) -> Path:
   """Add (or refresh) this server's model in pi's models.json under the `infurnace` provider: entries this writes
-  are marked `_launch`; others (yours) are left as they are. Also makes it pi's default model. The files as they
-  were before the first launch are kept as *.infurnace.bak."""
+  are marked `_launch`; others (yours) are left as they are. With `default`, also makes it pi's default model. The
+  files as they were before the first launch are kept as *.infurnace.bak."""
   agent = (home or Path.home()) / ".pi" / "agent"
   models_path, settings_path = agent / "models.json", agent / "settings.json"
   config = json.loads(models_path.read_text()) if models_path.is_file() else {}
@@ -311,6 +319,7 @@ def configure_pi(model: str, context: int, home: Path | None = None) -> Path:
   kept = [m for m in provider.get("models", []) if not (isinstance(m, dict) and m.get("_launch") and m.get("id") == model)]
   provider["models"] = kept + [entry]
   _write_with_backup(models_path, config)
+  if not default: return models_path
   settings = json.loads(settings_path.read_text()) if settings_path.is_file() else {}
   settings.update(defaultProvider="infurnace", defaultModel=model)
   _write_with_backup(settings_path, settings)
