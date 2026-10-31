@@ -117,8 +117,8 @@ def test_chunked_prompt_matches_one_row_prompt(loaded):
   model, tokenizer, generator = loaded
   configure(generator)
   generator.warmup(16)
-  assert model._prompt_jit.captured is not None
-  notes = ' '.join(f'Step {i}: read the file, find the function, and check its callers.' for i in range(10))
+  assert all(jit.captured is not None for jit in model._prompt_jits.values())
+  notes = ' '.join(f'Step {i}: read the file, find the function, and check its callers.' for i in range(40))
   ids = prompt(tokenizer, notes + '\n\nWrite a Python function that returns the n-th Fibonacci number.')
   assert len(ids) > 2 * PROMPT_ROWS
   def states():

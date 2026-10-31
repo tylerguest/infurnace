@@ -125,9 +125,13 @@ class _PackedLinear(_NVLinear):
     return self.decode(x)
 
 PREFILL_ROWS = 16  # prompt chunks are padded to a multiple of this (the fused GDN kernel scans 16 rows at a time)
-# Prompt chunk: a fixed-size graph (see Model._prompt_chunk) reading 64 rows at once reads prompts ~2.5x
-# faster than 16 (RTX 5060: ~1,600 vs ~650 tok/s). GDN layers scan it 16 rows at a time.
-PROMPT_ROWS = 64
+# Prompt chunks: fixed-size graphs (see Model._prompt_chunk); GDN layers scan them 16 rows at a time. Bigger chunks
+# read each weight for more rows: Bonsai-4B (RTX 5060) reads prompts at 5055 tok/s in 64 rows, 5612 in 128, 5642 in
+# 256 (2k; 8k: 5290, 5578, 5714; 16k: 4959, 5306, 5468) and 4261 in 512 (16k). A chunk costs its full size however
+# few rows are prompt (a 256-row one 85 ms, a 64-row one 32), so the rest of a prompt goes SHORT_ROWS at a time once
+# a big chunk would cost more than the short ones it replaces.
+PROMPT_ROWS = 256
+SHORT_ROWS = 64
 # Capturing the prompt graph costs ~20-30 s and a one-row step ~9 ms (RTX 5060), so outside warmup it is
 # captured only for a prompt long enough to pay for it.
 PREFILL_CAPTURE_TOKENS = 2048
@@ -305,7 +309,7 @@ def _fused_attention(block: TransformerBlock):
     if idx_mask is not None: return upstream_attention(x, start_pos, idx_mask)
     B, T, _ = x.shape
     if B == 1 and (isinstance(T, UOp) or T > 1) and x.max_shape[1] % PREFILL_ROWS == 0:
-      # A prompt chunk (1..16 or 1..64 rows), padded to its maximum like the GDN prefill. The padding rows come
+      # A prompt chunk (1..16 rows, or up to a prompt chunk's size), padded to its maximum like the GDN prefill. The padding rows come
       # from zero inputs, so their cached keys and values are finite (the kernel reads every key below the
       # padded end), and the prompt's next rows overwrite them. The prompt reader keeps the padded end in the cache.
       norm = _norm_of(block, 'attn_norm')
@@ -417,10 +421,10 @@ class Model:
     self._path, self._host_embedding = None, None
     self._tied_head = False  # the packed output head is the token embedding table
     self._embedding: _PackedEmbedding | None = None  # its lookup, when it is (see lookup)
-    self._multirow_prefill = False  # prompts are read PROMPT_ROWS rows at a time (see _prefill)
+    self._multirow_prefill = False  # prompts are read in prompt chunks (see _prefill)
     self._warming = False
-    # Prompt chunks: a captured step that slices the prompt from a persistent device buffer (see _prompt_chunk)
-    self._prompt_jit = TinyJit(self._prompt_chunk)
+    # Prompt chunks: a captured step for each size that slices the prompt from a persistent device buffer (see _prompt_chunk)
+    self._prompt_jits = {size: TinyJit(functools.partial(self._prompt_chunk, size=size)) for size in (PROMPT_ROWS, SHORT_ROWS)}
     # A prompt snapshot's copy of the recurrent states into its own buffer: one captured step (see save_snapshot)
     self._snapshot_jit = TinyJit(self._snapshot_copy)
     self._prompt_ids: Tensor | None = None
@@ -439,8 +443,8 @@ class Model:
     """Prime upstream prefill/decode JIT using the same chunk size as normal generation. Without
     `prompt_graph`, the prompt-chunk graph is left for capture_prompt_graph (~11 s of the warmup)."""
     if self.config.context_length < 2: return
-    # Long enough to capture the multirow prompt graph too (one full chunk and a partial one).
-    prompt = [0] * min(PROMPT_ROWS + 2 if prompt_graph else 8, self.config.context_length - 1)
+    # Long enough to capture the prompt graphs too (a big chunk, a short one and a partial short one).
+    prompt = [0] * min(PROMPT_ROWS + SHORT_ROWS + 2 if prompt_graph else 8, self.config.context_length - 1)
     count = min(4, self.config.context_length - len(prompt))
     self._warming, multirow = True, self._multirow_prefill
     if not prompt_graph: self._multirow_prefill = False
@@ -456,19 +460,21 @@ class Model:
       self.reset()  # No dummy tokens become conversation history or reusable prefix.
 
   def capture_prompt_graph(self) -> bool:
-    """Capture the prompt-chunk graph outside a request (a server's idle time), leaving the conversation as
-    it was: the chunk is read at the end of the cache, past any prompt, and the recurrent states it advances
-    are put back. True when it captured the graph."""
+    """Capture the prompt-chunk graphs not captured yet outside a request (a server's idle time, after a warmup
+    whose prompt used only some), leaving the conversation as it was: each chunk is read at the end of the cache,
+    past any prompt, and the recurrent states it advances are put back. True when it captured any."""
     t = self.transformer
+    sizes = [size for size, jit in self._prompt_jits.items() if jit.captured is None]
     position = t.max_context - PROMPT_ROWS
-    if not self._multirow_prefill or self._prompt_jit.captured is not None or self._generating or position < 0: return False
+    if not self._multirow_prefill or not sizes or self._generating or position < 0: return False
     self.realize_state()
     with Context(DEV=self.device):
       states = self._recurrent_states()
       saved = [state.clone().realize() for state in states]
       self.upload_prompt([0])
-      self._prompt_jit.cnt = 1  # capture right away (see _multirow_ready)
-      self.read_prompt(position, position + 1)
+      for size in sizes:
+        self._prompt_jits[size].cnt = 1  # capture right away (see _multirow_ready)
+        self._read_chunk(size, position, 1)
       if states: Tensor.realize(*(Tensor(state.uop.after(state.uop.store(copy.uop))) for state, copy in zip(states, saved)))
     # Cache rows from `position` on now hold the capture's: forget a prefix or snapshot that reaches them.
     if len(t._cached_tokens) > position or any(len(s.prefix) > position for s in self._snapshots): self.reset()
@@ -489,10 +495,10 @@ class Model:
       states += [Tensor._device_seeds[self.device], Tensor._device_rng_counters[self.device]]
       if pending := [t for t in states if not t.uop.is_realized]: Tensor.realize(*pending)
 
-  def _prompt_chunk(self, ids: Tensor, start_pos: UOp, rows: UOp) -> Tensor:
-    """Read prompt rows start_pos..start_pos+rows-1 (1..PROMPT_ROWS) into the caches and states.
+  def _prompt_chunk(self, ids: Tensor, start_pos: UOp, rows: UOp, size: int) -> Tensor:
+    """Read prompt rows start_pos..start_pos+rows-1 (1..size) into the caches and states.
 
-    The graph always runs PROMPT_ROWS rows sliced from the whole prompt, already on the device; `rows` is only a
+    The graph always runs `size` rows sliced from the whole prompt, already on the device; `rows` is only a
     value: GDN layers treat later rows as no-ops (β 0, no decay) and keep their conv window at `rows`, and the
     keys and values attention writes for them lie past the prompt, overwritten before anything reads them. A
     symbolic row count would give hundreds of kernels runtime launch sizes, which the GPU patches on every
@@ -501,7 +507,7 @@ class Model:
     t, features = self.transformer, []
     for block in t.blk: block._prompt_rows = rows  # recurrent layers mask the rest (see models/qwen35.py)
     try:
-      x, mask = t.token_embd(ids[:, start_pos:start_pos + PROMPT_ROWS]).float(), None
+      x, mask = t.token_embd(ids[:, start_pos:start_pos + size]).float(), None
       for index, block in enumerate(t.blk):
         if index in self.feature_layers: features.append(x)  # tap N is the input of block N
         x, mask = block(x, start_pos, mask)  # blocks return (output, the indexer's token mask)
@@ -516,7 +522,7 @@ class Model:
     """Have prompt chunks return the inputs of these target layers (DFlash's feature taps)."""
     if tuple(layers) != self.feature_layers:
       self.feature_layers = tuple(layers)
-      self._prompt_jit.reset()  # a graph captured for other taps
+      for jit in self._prompt_jits.values(): jit.reset()  # graphs captured for other taps
 
   def upload_prompt(self, tokens: list[int]):
     """Put the whole prompt on the device once; each chunk's graph slices its rows from it. The buffer starts as
@@ -534,19 +540,24 @@ class Model:
       self._uploaded = list(tokens)
 
   def read_prompt(self, first: int, last: int, consume=None) -> int:
-    """Read uploaded prompt rows from `first` toward `last` in PROMPT_ROWS chunks; returns where it stopped
-    (short of `last` only near the end of the context: a chunk writes all its padded cache rows). With
-    feature layers set, `consume(features, rows)` gets each chunk's taps (1, PROMPT_ROWS, width) and its row
-    count before the next chunk overwrites them."""
+    """Read uploaded prompt rows from `first` toward `last` in prompt chunks (PROMPT_ROWS while more than three
+    short chunks remain, then SHORT_ROWS); returns where it stopped (short of `last` only near the end of the
+    context: a chunk writes all its padded cache rows). With feature layers set, `consume(features, rows)` gets
+    each chunk's taps (1, chunk size, width) and its row count before the next chunk overwrites them."""
     t, position = self.transformer, first
-    v_start, v_rows = UOp.variable('start_pos', 0, t.max_context - 1), UOp.variable('prompt_rows', 1, PROMPT_ROWS)
-    with Context(DEV=self.device):
-      while position < last and position + PROMPT_ROWS <= t.max_context:
-        rows = min(PROMPT_ROWS, last - position)
-        out = self._prompt_jit(self._prompt_ids, v_start.bind(position), v_rows.bind(rows))
-        if consume is not None: consume(out[0], rows)
-        position += rows
+    while position < last:
+      size = PROMPT_ROWS if last - position > 3 * SHORT_ROWS and position + PROMPT_ROWS <= t.max_context else SHORT_ROWS
+      if position + size > t.max_context: break
+      rows = min(size, last - position)
+      out = self._read_chunk(size, position, rows)
+      if consume is not None: consume(out[0], rows)
+      position += rows
     return position
+
+  def _read_chunk(self, size: int, position: int, rows: int):
+    t = self.transformer
+    v_start, v_rows = UOp.variable('start_pos', 0, t.max_context - 1), UOp.variable('prompt_rows', 1, size)
+    with Context(DEV=self.device): return self._prompt_jits[size](self._prompt_ids, v_start.bind(position), v_rows.bind(rows))
 
   def reset(self) -> None:
     """Invalidate prefix reuse without reallocating tinygrad's cache or JIT."""
@@ -700,16 +711,16 @@ class Model:
       yield from new
 
   def _multirow_ready(self, rows: int) -> bool:
-    """Whether to read `rows` prompt tokens in PROMPT_ROWS chunks (capturing that graph if needed)."""
+    """Whether to read `rows` prompt tokens in prompt chunks (capturing their graphs if needed)."""
     if not self._multirow_prefill or rows <= 0: return False
-    if self._prompt_jit.captured is None:
+    if pending := [jit for jit in self._prompt_jits.values() if jit.captured is None]:
       # Not captured yet: worth it during warmup or for a long prompt, otherwise upstream reads
       # this prompt one row at a time (a short cold `--prompt` would wait ~19 s to save ~0.2 s).
       if not (self._warming or rows >= PREFILL_CAPTURE_TOKENS): return False
       # Skip TinyJit's eager first call and capture right away: with every state buffer already
       # real, the eager call has nothing left to set up.
       self.realize_state()
-      self._prompt_jit.cnt = 1
+      for jit in pending: jit.cnt = 1
     return True
 
   def _prefill(self, tokens: list[int], temperature: float):
@@ -718,7 +729,7 @@ class Model:
 
     Resumes from the prompt snapshot when the prompt still matches it, and saves a new one on the way.
     Upstream prefills hybrid models one row per step except on AMD (its scan is a row-by-row loop
-    elsewhere); when the family supports it, rows go PROMPT_ROWS at a time through _prompt_chunk."""
+    elsewhere); when the family supports it, rows go through prompt chunks (_prompt_chunk)."""
     t = self.transformer
     end = len(tokens) - 1
     start = self.restore_snapshot(tokens, t.get_start_pos(tokens))

@@ -178,9 +178,9 @@ def test_tokenizer_reference(tmp_path):
 
 def test_cold_short_prompt_does_not_capture():
   # A short one-shot prompt on a fresh model reads its prompt one row at a time rather than
-  # spending ~19 s capturing the 16-row graph.
+  # spending ~19 s capturing the prompt graphs.
   from infurnace import engine
   model = engine.Model.__new__(engine.Model)
-  model._prompt_jit = type('J', (), {'captured': None, 'cnt': 0})()
+  model._prompt_jits = {size: type('J', (), {'captured': None, 'cnt': 0})() for size in (engine.PROMPT_ROWS, engine.SHORT_ROWS)}
   model._multirow_prefill, model._warming = True, False
-  assert not model._multirow_ready(39) and model._prompt_jit.cnt == 0
+  assert not model._multirow_ready(39) and all(jit.cnt == 0 for jit in model._prompt_jits.values())

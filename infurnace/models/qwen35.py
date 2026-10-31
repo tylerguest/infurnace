@@ -41,7 +41,7 @@ def _fused_gdn(block: GatedDeltaNetBlock):
       x = x.half()
       qkv, out_gate = _rows(x, block.attn_qkv, block.attn_gate)
     out_gate = out_gate.reshape(B, T, H, V)
-    # A prompt chunk always runs PROMPT_ROWS rows; only the first `live` are prompt (see Model._prompt_chunk).
+    # A prompt chunk always runs its full size; only the first `live` are prompt (see Model._prompt_chunk).
     live = getattr(block, '_prompt_rows', None)
     keep = (1 - initial.float()).reshape(1)
     if isinstance(T, int) and T == T_pad:

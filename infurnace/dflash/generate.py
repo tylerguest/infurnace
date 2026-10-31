@@ -173,7 +173,7 @@ class DFlashGenerator:
     """Prompt rows first..last-1; returns the decision after the last one."""
     anchor, done = None, first
     if self._chunks:
-      # The model's prompt chunks (64 rows, one captured graph) for all rows but the last, each chunk's feature
+      # The model's prompt chunks (captured graphs, see Model.read_prompt) for all rows but the last, each chunk's feature
       # taps going to the draft; the last row is an ordinary target step, which decides the next token.
       def observe(features, rows): self.draft.observe(features[:, :rows])
       done = self.model.read_prompt(first, last - 1, observe)
@@ -286,6 +286,7 @@ class DFlashGenerator:
         self.min_tau, self.plain_cost = min_tau, plain_cost
         self.model._warming = prompt_graph  # the prompt reads through (and captures) the model's prompt chunks
         for _ in range(2): list(self.stream(list(prompt), max_new_tokens=48, block_size=block_size))
+      if prompt_graph: self.model.capture_prompt_graph()  # the chunk sizes this short prompt didn't use
     finally:
       self.model._warming = False
       self.min_tau, self.plain_cost = saved

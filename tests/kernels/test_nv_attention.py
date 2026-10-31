@@ -162,7 +162,7 @@ def test_int8_store_keeps_each_vector_within_half_a_step(start, rows):
     cache, scales = store_kv(cache, scales, k, v, start)
     Tensor.realize(cache, scales)
     stored = dequantize_kv(cache, scales).float()
-    top = lambda x: x.abs().max(-1, keepdim=True)
+    def top(x): return x.abs().max(-1, keepdim=True)
     assert ((stored[0, :, :, start:start + rows] - k).abs() <= top(k) / 127 * 0.5 + k.abs() * 2 ** -10).all().item()  # and FP16 rounding
     assert ((stored[1, :, :, start:start + rows] - v).abs() <= v.abs() / 16 + top(v) / 448 * 2 ** -10 + v.abs() * 2 ** -10).all().item()
     assert (stored[:, :, :, :start] == old[:, :, :, :start]).all().item()  # rows outside untouched

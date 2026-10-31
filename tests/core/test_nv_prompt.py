@@ -7,7 +7,7 @@ import gc
 from pathlib import Path
 import pytest
 from infurnace.chat import user_prompt
-from infurnace.engine import PROMPT_ROWS
+from infurnace.engine import PROMPT_ROWS, SHORT_ROWS
 
 TARGETS = [Path('models/qwen35-validation/Qwen3.5-4B-Q4_K_M.gguf'), Path('models/Qwen3-4B-Q4_K_M.gguf'),
            Path.home() / '.local/share/infurnace/models/Ternary-Bonsai-2-4B-Q2_0.gguf']
@@ -22,7 +22,7 @@ def loaded(request):
   assert model._multirow_prefill
   # Outside warmup, short prompts never capture the prompt graph; warm up so these tests exercise it.
   model.warmup()
-  assert model._prompt_jit.captured is not None
+  assert all(jit.captured is not None for jit in model._prompt_jits.values())
   yield model, tokenizer
 
 def ids(loaded, text):
@@ -72,11 +72,11 @@ def test_multirow_logits_match_one_row(loaded):
 
 def test_multirow_prompt_matches_one_row_prompt(loaded):
   model, tokenizer = loaded
-  # Several full prompt chunks plus a partial one, through generate.
+  # Full big prompt chunks, then the rest in short ones (the last partial), through generate.
   question = 'Explain how a refrigerator keeps food cold, in simple terms suitable for a ten year old child, using an analogy.'
-  notes = ' '.join(f'Note {i}: the compressor, the coils and the refrigerant each play a part.' for i in range(9))
+  notes = ' '.join(f'Note {i}: the compressor, the coils and the refrigerant each play a part.' for i in range(30))
   tokens = ids(loaded, notes + '\n\n' + question)
-  assert len(tokens) > 2 * PROMPT_ROWS and (len(tokens) - 1) % PROMPT_ROWS  # full prompt chunks and a partial one
+  assert len(tokens) > 2 * PROMPT_ROWS and (len(tokens) - 1) % SHORT_ROWS
   multi, one = run(model, tokens), run(model, tokens, multirow=False)
   if multi != one:
     # The two paths' logits differ by up to 3% (see above), so they may flip a near-tie, but only that: the two
@@ -100,7 +100,7 @@ def test_capturing_the_prompt_graph_later_keeps_the_conversation(loaded):
   # A server captures the prompt graph in its first idle moment, maybe after a request: the cached prefix,
   # the conversation's cache rows and the recurrent states must come through unchanged.
   model, tokenizer = loaded
-  model._prompt_jit.reset()
+  for jit in model._prompt_jits.values(): jit.reset()
   tokens = ids(loaded, 'Name three rivers in Europe.')
   run(model, tokens, 4, reuse_cache=True)
   cached = list(model.transformer._cached_tokens)
@@ -109,7 +109,7 @@ def test_capturing_the_prompt_graph_later_keeps_the_conversation(loaded):
     return [block.cache_kv[:, :, :, :rows].tolist() if hasattr(block, 'cache_kv') else block.recurrent_state.tolist()
             for block in model.transformer.blk] + [s.tolist() for s in model._recurrent_states()]
   before = state()
-  assert model.capture_prompt_graph() and model._prompt_jit.captured is not None
+  assert model.capture_prompt_graph() and all(jit.captured is not None for jit in model._prompt_jits.values())
   assert model.transformer._cached_tokens == cached and state() == before
   assert not model.capture_prompt_graph()  # already captured
 
