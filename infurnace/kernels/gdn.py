@@ -127,7 +127,7 @@ def _gdn_chunk_kernel(o: UOp, u: UOp, *srcs: UOp, heads: int, rows: int, advance
                                 for r in range(2) for i in range(4))).end(c4))
   pk = UOp.placeholder((R, 2*T+1), F32, slot=5, addrspace=AddrSpace.LOCAL)  # value row x (K's 16, Q's 16), +1: no conflicts
   pk = pk.after(UOp.group(*(pk[2*rp+r, 4*tq+i].store(proj[r*4+i].load()) for r in range(2) for i in range(4))).barrier())
-  ks, qs = [pk[lane, t].load() for t in range(T)], [pk[lane, T+t].load() for t in range(T)]
+  ks = [pk[lane, t].load() for t in range(T)]
 
   # The substitution (I + A) u = rhs (A = kk, strictly lower) for every value row at once: T = (I + A)^-1, a column a
   # lane of warp 0, then M = qk T, so a row's u = T rhs and outputs γ qs + M rhs are independent sums, not a chain.
@@ -146,17 +146,19 @@ def _gdn_chunk_kernel(o: UOp, u: UOp, *srcs: UOp, heads: int, rows: int, advance
     total = sum((grams[1, t, s].load()*inverse[0, s, j].load() for s in range(1, T)), grams[1, t, 0].load()*inverse[0, 0, j].load())
     mixed.append(inverse[1, t, j].store(total))
   inverse = inverse.after(UOp.group(*mixed).barrier())
+  # Each warp takes 4 of the step's rows: T and M are stored whole (T 1 on its diagonal, 0 above; M 0 above), so a
+  # row's u and output are full 16-term sums (warp 0 doing all 16 rows' triangular sums: 32 heads, 256 rows, 381 us, now 325)
   rhs = [bs[t]*(v(base+t, row).load()-gs[t].exp()*ks[t]) for t in range(T)]
-  us = [sum((inverse[0, t, s].load()*rhs[s] for s in range(t)), rhs[t]) for t in range(T)]
-  outs = [sum((inverse[1, t, s].load()*rhs[s] for s in range(t+1)), gs[t].exp()*qs[t]) for t in range(T)]
-  first = warp.eq(0)
-  stores = [o[base+t, head, row.valid(first)].store(outs[t]) for t in range(T)]
-  if not advance: stores += [u[head, base+t, row.valid(first)].store(us[t]) for t in range(T)]
+  mine = [warp*(T//4)+j for j in range(T//4)]
+  us = [sum((inverse[0, t, s].load()*rhs[s] for s in range(1, T)), inverse[0, t, 0].load()*rhs[0]) for t in mine]
+  outs = [sum((inverse[1, t, s].load()*rhs[s] for s in range(T)), pick(gs, t).exp()*pk[lane, T+t].load()) for t in mine]
+  stores = [o[base+t, head, row].store(out) for t, out in zip(mine, outs)]
+  if not advance: stores += [u[head, base+t, row].store(x) for t, x in zip(mine, us)]
   else:
     # S_T = γ_T S0 + Σ_t (γ_T/γ_t) u_t k_tᵀ: the rows' weights through shared memory, then thread (rq, cq) updates
     # value rows 4rq..4rq+3 x key columns 8cq..8cq+7, a rank-1 update per K row from three 16-byte loads
     wsh = UOp.placeholder((T, R), F32, slot=7, addrspace=AddrSpace.LOCAL)
-    wsh = wsh.after(UOp.group(*(wsh[t, lane.valid(first)].store((gs[T-1]-gs[t]).exp()*us[t]) for t in range(T))).barrier())
+    wsh = wsh.after(UOp.group(*(wsh[t, lane].store((gs[T-1]-pick(gs, t)).exp()*x) for t, x in zip(mine, us))).barrier())
     rq, cq = tid // 16, tid % 16
     now = current.after(wsh)
     decay = gs[T-1].exp()
