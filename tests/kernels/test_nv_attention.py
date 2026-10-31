@@ -127,9 +127,9 @@ def test_ring_store_wraps():
 def test_int8_cache_matches_attention_over_its_values(heads, kv_heads, rows, dim, causal):
   # Each kernel scales scores and probabilities by the vectors' scales: the same attention as over the dequantized
   # cache. Multirow scores run on int8 tensor cores against Q quantized per row (max / 127, as the cache's vectors),
-  # so their reference takes that Q, and P V on FP8 tensor cores (e4m3 values and probabilities: ~3% each, so the
-  # bound is relative); one-row decoding keeps everything exact.
-  capacity = 1300
+  # so their reference takes that Q, and P V on FP8 tensor cores (e4m3 probabilities: ~3% each, so the bound is
+  # relative); one-row decoding keeps everything exact (the values are FP8 in the cache itself).
+  capacity = 1312
   with Context(DEV='NV'):
     Tensor.manual_seed(8)
     words, scales = (t.contiguous().realize() for t in quantize_kv(Tensor.randn(2, 1, kv_heads, capacity, dim) * 0.5))
@@ -147,25 +147,32 @@ def test_int8_cache_matches_attention_over_its_values(heads, kv_heads, rows, dim
         assert (out - ref).abs().mean().item() < 0.06 * ref.abs().mean().item(), start
         assert (out - ref).abs().max().item() < 0.15 * ref.abs().max().item(), start
 
-def test_int8_store_keeps_each_vector_within_half_a_step():
+@pytest.mark.parametrize('start,rows', [(20, 16), (21, 1), (8, 64)])
+def test_int8_store_keeps_each_vector_within_half_a_step(start, rows):
+  # keys: int8, half a step of max / 127; values: FP8 e4m3, half a step of its 3-bit mantissa (1/16 of the value)
+  # above its smallest subnormal (2^-9 of max / 448). Rows sharing a value word with the written ones keep theirs.
   with Context(DEV='NV'):
     Tensor.manual_seed(9)
-    cache = Tensor.zeros(2, 1, 4, 64, 64, dtype=dtypes.uint32).contiguous().realize()
-    scales = Tensor.zeros(2, 1, 4, 64, dtype=dtypes.float16).contiguous().realize()
-    k, v = Tensor.randn(1, 4, 16, 256).realize(), (Tensor.randn(1, 4, 16, 256) * 3).realize()
-    cache, scales = store_kv(cache, scales, k, v, 20)
+    cache = Tensor.zeros(2, 1, 4, 96, 64, dtype=dtypes.uint32).contiguous().realize()
+    scales = Tensor.zeros(2, 1, 4, 96, dtype=dtypes.float16).contiguous().realize()
+    before_k, before_v = Tensor.randn(1, 4, 96, 256).realize(), Tensor.randn(1, 4, 96, 256).realize()
+    cache, scales = (t.realize() for t in store_kv(cache, scales, before_k, before_v, 0))
+    old = dequantize_kv(cache, scales).float().realize()
+    k, v = Tensor.randn(1, 4, rows, 256).realize(), (Tensor.randn(1, 4, rows, 256) * 3).realize()
+    cache, scales = store_kv(cache, scales, k, v, start)
     Tensor.realize(cache, scales)
-    stored = dequantize_kv(cache, scales)[:, :, :, 20:36].float()
-    values = Tensor.stack(k, v)
-    step = values.abs().max(-1, keepdim=True) / 127
-    assert ((stored - values).abs() <= step * 0.5 + values.abs() * 2 ** -10).all().item()  # and FP16 rounding
-    assert dequantize_kv(cache, scales)[:, :, :, :20].abs().max().item() == 0  # rows outside untouched
+    stored = dequantize_kv(cache, scales).float()
+    top = lambda x: x.abs().max(-1, keepdim=True)
+    assert ((stored[0, :, :, start:start + rows] - k).abs() <= top(k) / 127 * 0.5 + k.abs() * 2 ** -10).all().item()  # and FP16 rounding
+    assert ((stored[1, :, :, start:start + rows] - v).abs() <= v.abs() / 16 + top(v) / 448 * 2 ** -10 + v.abs() * 2 ** -10).all().item()
+    assert (stored[:, :, :, :start] == old[:, :, :, :start]).all().item()  # rows outside untouched
+    assert (stored[:, :, :, start + rows:] == old[:, :, :, start + rows:]).all().item()
 
 def test_prologue_matches_norm_rope_and_store():
   # One decoding row: the fused kernel's q, and the K/V it writes, against upstream's ops and store_kv
   from tinygrad.llm.model import apply_rope, precompute_freqs_cis
   from infurnace.kernels.attention import attention_prologue
-  heads, kv_heads, dim, rope_dim, capacity, eps, start = 16, 4, 256, 64, 300, 1e-6, 123
+  heads, kv_heads, dim, rope_dim, capacity, eps, start = 16, 4, 256, 64, 320, 1e-6, 123
   with Context(DEV='NV'):
     Tensor.manual_seed(10)
     joined = (Tensor.randn((heads * 2 + kv_heads * 2) * dim) * 3).realize()
@@ -186,6 +193,7 @@ def test_prologue_matches_norm_rope_and_store():
     assert (q.reshape(1, heads, 1, dim) - q_ref).abs().max().item() < 1e-4
     ref_cache, ref_scales = store_kv(ref_cache, ref_scales, k_ref, v, start)
     got, want = dequantize_kv(cache, scales).float(), dequantize_kv(ref_cache, ref_scales).float()
-    # the same codes up to a rounding tie: one step of a vector's scale at most
-    assert ((got - want).abs() <= dequantize_kv(ref_cache, ref_scales).float().abs().max(-1, keepdim=True) / 127 + 1e-6).all().item()
+    # the same codes up to a rounding tie: one step of a key's scale, one FP8 step (1/8) of a value at most
+    assert ((got[0] - want[0]).abs() <= want[0].abs().max(-1, keepdim=True) / 127 + 1e-6).all().item()
+    assert ((got[1] - want[1]).abs() <= want[1].abs() / 8 + 1e-6).all().item()
     assert got[:, :, :, :start].abs().max().item() == 0 and got[:, :, :, start + 1:].abs().max().item() == 0  # one row written

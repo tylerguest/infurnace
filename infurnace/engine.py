@@ -280,15 +280,16 @@ def cached_attention(block: TransformerBlock, q: Tensor, k: Tensor, v: Tensor, s
   return attention(q, Tensor(block.cache_kv.uop.after(store)), start_pos)
 
 def _int8_kv_cache(block: TransformerBlock):
-  """Create the block's KV cache as int8 with one scale a vector (kernels/attention.store_kv) in place of upstream's
-  FP16 one: half the bytes a decoding step reads, which at long contexts is most of a step (Bonsai-4B at 64k keys:
-  ~6 of ~12 ms). Only cached_attention reads it."""
+  """Create the block's KV cache as int8 keys and FP8 values with one scale a vector (kernels/attention.store_kv) in
+  place of upstream's FP16 one: half the bytes a decoding step reads, which at long contexts is most of a step
+  (Bonsai-4B at 64k keys: ~6 of ~12 ms). Only cached_attention reads it. Its capacity is rounded up to whole
+  32-key tiles (the multirow kernel reads values a tile at a time)."""
   init, c = block._init_state, block.config
   def init_state(x: Tensor):
     if not hasattr(block, 'cache_kv'):  # upstream creates the RoPE table with its cache: so does this
-      batch, device = x.shape[0], x.device
-      block.cache_kv = Tensor.zeros(2, batch, c.n_kv_heads, c.max_context, c.head_dim // 4, dtype=dtypes.uint32, device=device).contiguous()
-      block.cache_scale = Tensor.zeros(2, batch, c.n_kv_heads, c.max_context, dtype=dtypes.float16, device=device).contiguous()
+      batch, device, capacity = x.shape[0], x.device, -(-c.max_context // 32) * 32
+      block.cache_kv = Tensor.zeros(2, batch, c.n_kv_heads, capacity, c.head_dim // 4, dtype=dtypes.uint32, device=device).contiguous()
+      block.cache_scale = Tensor.zeros(2, batch, c.n_kv_heads, capacity, dtype=dtypes.float16, device=device).contiguous()
       block.freqs_cis = precompute_freqs_cis(c.rope_dim, c.max_context, c.rope_theta, device=device, yarn=c.yarn)
     init(x)
   block._init_state = init_state

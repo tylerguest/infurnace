@@ -22,9 +22,12 @@ Row t (absolute position start+t) sees keys lo <= key < hi:
 A ring cache (`ring=True`, sliding windows only) holds position x at slot x % its length, which
 must be at least window + rows: it only keeps what a window can see. `store_rows` writes it.
 
-An int8 cache (`store_kv`) holds each key and value vector as int8 with one FP16 scale, four values a uint32
-word: a key's scale multiplies its scores and a value's its probabilities, so the kernels convert the integers
-and apply one multiply a key. Bonsai-4B perplexity (eval.txt, 16-row path): 18.7368 -> 18.7586 at 2048 tokens,
+An int8 cache (`store_kv`) holds each key vector as int8 and each value vector as FP8 e4m3, each with one FP16
+scale (max |x| / 127, max |x| / 448): a key's scale multiplies its scores and a value's its probabilities, so the
+kernels apply one multiply a key. Keys are rows of words (four values a uint32); values are stored dims-major in
+blocks of V_BLOCK keys, [capacity / 8][dim][8 keys] (_value_word), so a multirow tile's values arrive transposed,
+as the P V MMAs take them (and in FP8, as they take them), and a decoding lane's 8 dims of 8 keys are 64
+contiguous bytes. Bonsai-4B perplexity (eval.txt, 16-row path), int8 values: 18.7368 -> 18.7586 at 2048 tokens,
 6.5237 -> 6.5251 at 8192.
 """
 from __future__ import annotations
@@ -45,6 +48,7 @@ QUERIES = 8    # packed query vectors per warp, at most
 # One-row decode (no window, ring or floor): each warp walks DECODE_SEGMENT keys of one KV head, DECODE_TILE
 # keys per softmax update, DECODE_WARPS warps per block.
 DECODE_SEGMENT, DECODE_TILE, DECODE_WARPS = 128, 8, 4
+V_BLOCK = 8  # keys a block of an int8 cache's values (dims-major within it)
 _NEG = float('-inf')
 _VARIABLE_PARAM = {'param': True} if 'param' in inspect.signature(UOp.variable).parameters else {}
 
@@ -85,6 +89,26 @@ def _byte(word: UOp, index: int | UOp) -> UOp:
   if isinstance(shift, UOp): shift = shift.cast(dtypes.int32)
   return (word.bitcast(dtypes.int32) << shift) >> 24
 
+def _value_word(position: UOp, d: UOp | int, dim: int) -> tuple[UOp, UOp]:
+  """Where an int8 cache's value plane, (capacity, dim / 4) words, keeps the word holding value (position, d):
+  (row, column). Its byte in the word is position % 4."""
+  flat = (position // V_BLOCK * dim + d) * (V_BLOCK // 4) + position % V_BLOCK // 4
+  return flat // (dim // 4), flat % (dim // 4)
+
+# FP8 e4m3 byte pair (the low byte first) to two FP16 values as a word
+_E4M3X2_F16X2 = '[&]() {{ unsigned r; asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(r) : "h"((unsigned short)({0}))); return r; }}()'
+
+def _fp8_halves(word: UOp) -> list[UOp]:
+  """The four FP8 e4m3 bytes of a uint32 word (byte 0 first) as FP16."""
+  pairs = [UOp(Ops.CUSTOM, src=(word >> shift if shift else word,), arg=(_E4M3X2_F16X2, dtypes.uint32)) for shift in (0, 16)]
+  return [(p >> s).cast(dtypes.uint16).bitcast(dtypes.float16) for p in pairs for s in (0, 16)]
+
+def _value(kv: UOp, kv_head: UOp, position: UOp, d: UOp, valid: UOp | None = None) -> UOp:
+  """One value of an int8 cache, unscaled, as FP16 (0 where `valid` is false)."""
+  row, column = _value_word(position, d, kv.shape[-1] * 4)
+  byte = (kv[1, 0, kv_head, row if valid is None else row.valid(valid), column].load() >> ((position % 4) * 8).cast(dtypes.uint32)) & 255
+  return _fp8_halves(byte)[0]
+
 _LDMATRIX = ('[&]() {{ unsigned a, b; asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {{%0,%1}}, [%2];" : "=r"(a), "=r"(b) '
              ': "r"((unsigned)__cvta_generic_to_shared({0}))); return ((unsigned long long)b << 32) | a; }}()')
 
@@ -101,30 +125,11 @@ def _ldmatrix(ptr: UOp) -> list[UOp]:
   words = [pair.cast(dtypes.uint32), (pair >> 32).cast(dtypes.uint32)]
   return [(w >> s).cast(dtypes.uint16).bitcast(dtypes.float16) for w in words for s in (0, 16)]
 
-# Four int8 values of a word as two FP16 pairs times a scale: bytes made unsigned (+128) become the low mantissa
-# of 1024 + b (0x64XX), then 1152 comes off; two values an instruction (__hsub2, __hmul2) instead of shifts and
-# a conversion each.
-_INT8_PAIR = ('[&]() {{ unsigned u = __byte_perm({0} ^ 0x80808080u, 0x64646464u, {2}); __half2 h = __hmul2(__hsub2(*(__half2*)&u, '
-              '__float2half2_rn(1152.f)), __float2half2_rn({1})); return *(unsigned*)&h; }}()')
-
-def _int8_halves(word: UOp, scale: UOp) -> list[UOp]:
-  """The four signed bytes of a uint32 word, times `scale`, as FP16."""
-  pairs = [UOp(Ops.CUSTOM, src=(word, scale), arg=(_INT8_PAIR.replace('{2}', selector), dtypes.uint32)) for selector in ('0x4140u', '0x4342u')]
-  return [(p >> s).cast(dtypes.uint16).bitcast(dtypes.float16) for p in pairs for s in (0, 16)]
-
-# FP8 e4m3: two FP16 (as a word) or two FP32 values to a byte pair (the first value the low byte), saturating
-_E4M3_F16X2 = '[&]() {{ unsigned short r; asm("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;" : "=h"(r) : "r"({0})); return (unsigned)r; }}()'
+# FP8 e4m3: two FP32 values to a byte pair (the first value the low byte), saturating
 _E4M3_F32X2 = '[&]() {{ unsigned short r; asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(r) : "f"({1}), "f"({0})); return (unsigned)r; }}()'
 _FMMA = ('[&]() {{ float d0, d1, d2, d3; asm("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {{%0,%1,%2,%3}}, {{%4,%5,%6,%7}}, '
          '{{%8,%9}}, {{%10,%11,%12,%13}};" : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3) : "r"({0}), "r"({1}), "r"({2}), "r"({3}), '
          '"r"({4}), "r"({5}), "f"({6}), "f"({7}), "f"({8}), "f"({9})); return d{index}; }}()')
-
-def _int8_e4m3(word: UOp) -> UOp:
-  """The four signed bytes of a uint32 word as FP8 e4m3 bytes (exact to 16, three mantissa bits above)."""
-  one = UOp.const(1.0, dtypes.float32)
-  pairs = [UOp(Ops.CUSTOM, src=(word, one), arg=(_INT8_PAIR.replace('{2}', selector), dtypes.uint32)) for selector in ('0x4140u', '0x4342u')]
-  low, high = (UOp(Ops.CUSTOMI, src=(p,), arg=(_E4M3_F16X2, dtypes.uint32)) for p in pairs)
-  return low | (high << 16)
 
 def _fmma(a: list[UOp], b: list[UOp]) -> list[UOp]:
   """D = A x B on FP8 e4m3 tensor cores, FP32 out (m16n8k32; fragments as _imma's): 2x the FP16-in, FP32-accumulate
@@ -175,11 +180,13 @@ def _partial_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, *extra: UOp, start: 
   in_tile = element < elements
   key, column = element // dim, element % dim
   live_key = in_tile & (base + key < active)
-  kv_index = ((base + key) % ring if ring else base + key).valid(live_key)
+  position = (base + key) % ring if ring else base + key
+  kv_index = position.valid(live_key)
   def element_of(c: int) -> UOp:
     if scales is None: return kv[c, 0, kv_head, kv_index, column].load()
-    value = _byte(kv[c, 0, kv_head, kv_index, column // 4].load(), column % 4).float() * scales[c, 0, kv_head, kv_index].load().float()
-    return value.cast(dtypes.float16)
+    code = (_byte(kv[0, 0, kv_head, kv_index, column // 4].load(), column % 4) if c == 0 else
+            _value(kv, kv_head, position, column, live_key)).float()
+    return (code * scales[c, 0, kv_head, kv_index].load().float()).cast(dtypes.float16)
   stage = UOp.group(k_tile[column.valid(in_tile), key].store(element_of(0)),
                     v_tile[key.valid(in_tile), column].store(element_of(1))).end(loader).barrier()
   k_tile, v_tile = k_tile.after(stage), v_tile.after(stage)
@@ -256,8 +263,8 @@ def _mma_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, *extra: UOp, start: int 
   """Multirow attention on FP16 tensor cores (FlashAttention-2's layout, mma.sync m16n8k16): one warp per 16
   packed queries, S = Q·Kᵀ per 32-key tile, online softmax on the accumulator fragments (a row's values sit
   in four neighbouring lanes), then P·V with P taken straight from the score fragments, which are already
-  in the A-operand layout. Same partial/stats outputs as _partial_kernel. An int8 cache's integers are exact in
-  FP16: the MMAs take them as they are, and the scales multiply the scores (keys) and probabilities (values)."""
+  in the A-operand layout. Same partial/stats outputs as _partial_kernel. An int8 cache's keys (int8) and values
+  (FP8) are exact in FP16: the MMAs take them as they are, and the scales multiply the scores and probabilities."""
   scales, floor = _extras(extra, int8)
   queries, steps, tiles_n = groups * rows, dim // 16, dim // 8
   # Up to 4 warps (64 queries) a block: at dim 256 a lane takes ~254 registers, so a block can't be larger.
@@ -311,9 +318,7 @@ def _mma_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, *extra: UOp, start: int 
     v_key, v_col = chunk % 32, (chunk // 32) * 8  # neighbouring lanes take neighbouring keys: no bank conflicts
     v_live, v_index = slot_of(base + v_key)
     if scales is None: row = _load_lanes(kv[1, 0, kv_head, v_index, v_col], 8)
-    else:
-      words = _load_lanes(kv[1, 0, kv_head, v_index, v_col // 4], 2)
-      row = [_byte(words[i // 4], i % 4).cast(F16) for i in range(8)]
+    else: row = [_value(kv, kv_head, v_index, v_col + i) for i in range(8)]
     stage = UOp.group(*(vt[(v_col + i).valid(in_tile), v_key].store(v_live.where(row[i], UOp.const(0.0, F16))) for i in range(8)))
     vt = vt.after(stage.end(loader).barrier())
   qv = [qa.after(tile)[i].load() for i in range(steps * 8)]
@@ -375,8 +380,7 @@ def _mma_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, *extra: UOp, start: int 
         parts = []
         for j in (0, 1, 8, 9):
           live, index = slot_of(base + kk * 16 + thread * 2 + j)
-          value = (kv[1, 0, kv_head, index, c * 8 + group].load() if scales is None else
-                   _byte(kv[1, 0, kv_head, index, c * 2 + group // 4].load(), group % 4).cast(F16))
+          value = kv[1, 0, kv_head, index, c * 8 + group].load() if scales is None else _value(kv, kv_head, index, c * 8 + group)
           parts.append(live.where(value, UOp.const(0.0, F16)))
       acc = UOp.wmma(pa[kk], UOp.stack(*parts), acc, (8, 16, 16), 32)
     updates.append(o.store(acc))
@@ -395,17 +399,18 @@ def _flash_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, *extra: UOp, start: in
   """Multirow attention without a window, ring or floor (target verification, prompt chunks), FlashAttention-2 style:
   a block of warps_m x 2 warps takes up to 16 * warps_m packed queries of one KV head and one of `parts` slices of
   the active keys. Each 32-key tile is staged in shared memory once (keys row-major, values transposed; an int8
-  cache dequantized there) from registers loaded during the previous tile, so global loads overlap the MMAs. Warp
+  cache's as stored) from registers loaded during the previous tile, so global loads overlap the MMAs. Warp
   (wm, wn) scores its 16 queries against keys wn * 16.. of the tile; the pair shares its row maxima and
   probabilities through shared memory, and each accumulates output dims wn * dim / 2.. against all 32 keys, so no
   score is computed twice and a lane holds half a head's output. Fragments come from shared memory by ldmatrix
   (one instruction a B fragment). With an int8 cache it follows SageAttention2: the scores run on int8 tensor
-  cores (keys as stored, Q quantized a row) and P V on FP8 ones, the values' integers as e4m3 against the
-  probabilities times their key's scale, scaled so the tile's largest fills e4m3's range (~3% rounding each;
-  Bonsai-4B perplexity +0.04% at 8192 tokens). Same partial/stats outputs as _mma_kernel, one per slice. RTX 5060,
-  Bonsai-4B's heads at 64k keys, int8 cache: 16 rows 445 us against _mma_kernel's 1656 (616 in FP16, 492 with
-  int8 scores), 64 rows 1897 against 5480 (2743, 2157), and the merge reads a few dozen partials instead of one a
-  256-key segment (16 us, from up to 660)."""
+  cores (keys as stored, Q quantized a row) and P V on FP8 ones, the values as stored (FP8, already transposed in
+  blocks of 8 keys: a tile is 8 KB of contiguous words, staged as they are) against the probabilities times their
+  key's scale, scaled so the tile's largest fills e4m3's range. Same partial/stats outputs as _mma_kernel, one per
+  slice. RTX 5060, Bonsai-4B's heads at 64k keys, int8 cache: 16 rows 445 us against _mma_kernel's 1656 (616 in
+  FP16, 492 with int8 scores), 64 rows 1897 against 5480 (2743, 2157), and the merge reads a few dozen partials
+  instead of one a 256-key segment (16 us, from up to 660); FP8 values stored transposed: 64 rows with the merge,
+  4k keys 163 -> 153 us, 16k 519 -> 469, 32k 989 -> 897."""
   scales, _ = _extras(extra, int8)
   queries, steps, tiles_n = groups * rows, dim // 16, dim // 8
   half_tiles = tiles_n // 2
@@ -470,6 +475,8 @@ def _flash_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, *extra: UOp, start: in
   held_scales = UOp.placeholder((2 * count,), F32, slot=slot + 3, addrspace=AddrSpace.REG) if int8 else None
   def place(c: int, i: int) -> tuple[UOp, UOp, UOp]:
     chunk = i * threads + tid
+    if int8 and c == 1:  # the tile's 8 KB of values: chunk n is dims 2m, 2m + 1 of key block b (n = b dim / 2 + m)
+      return chunk < chunks, chunk // (dim // 2), chunk % (dim // 2) * 2
     key, col = (chunk // (dim // width), (chunk % (dim // width)) * width) if c == 0 else (chunk % 32, (chunk // 32) * width)
     return chunk < chunks, key, col
   def fetch(t: UOp) -> list[UOp]:
@@ -478,8 +485,18 @@ def _flash_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, *extra: UOp, start: in
     for c in range(2):
       for i in range(count):
         inside, key, col = place(c, i)
-        index = ((part_index * per + t) * 32 + key).minimum(capacity - 1).valid(inside)
         n = c * count + i
+        if int8 and c == 1:
+          # the tile's value blocks (clamped to the cache: keys past the active length have value scale 0); each
+          # chunk also brings the scale of key chunk % 32
+          first = ((part_index * per + t) * 32).minimum(capacity - 32)
+          row, word = _value_word(first + key * V_BLOCK, col, dim)
+          words = _load_lanes(kv[1, 0, kv_head, row, word], 4)
+          stores += [held[n * 4 + w].store(words[w]) for w in range(4)]
+          chunk = i * threads + tid
+          stores.append(held_scales[n].store(scales[1, 0, kv_head, ((part_index * per + t) * 32 + chunk % 32).minimum(capacity - 1)].load().float()))
+          continue
+        index = ((part_index * per + t) * 32 + key).minimum(capacity - 1).valid(inside)
         if int8:
           words = _load_lanes(kv[c, 0, kv_head, index, col // 4], 4)
           stores += [held[n * 4 + w].store(words[w]) for w in range(4)]
@@ -497,7 +514,7 @@ def _flash_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, *extra: UOp, start: in
            UOp.placeholder((32, dim + 8), F16, slot=slot + 4, addrspace=AddrSpace.LOCAL))
   k_scales = UOp.placeholder((32,), F32, slot=slot + 8, addrspace=AddrSpace.LOCAL) if int8 else None
   if int8:  # FP8 values (transposed, 48-byte rows: 16-byte aligned, ldmatrix rows 12 banks apart) and probabilities
-    v_lds = UOp.placeholder((dim, 48), dtypes.uint8, slot=slot + 5, addrspace=AddrSpace.LOCAL)
+    v_lds = UOp.placeholder((dim, 12), U32, slot=slot + 5, addrspace=AddrSpace.LOCAL)
     p_lds = UOp.placeholder((warps_m, 16, 48), dtypes.uint8, slot=slot + 6, addrspace=AddrSpace.LOCAL)
     v_scales = UOp.placeholder((32,), F32, slot=slot + 9, addrspace=AddrSpace.LOCAL)
   else:
@@ -518,11 +535,11 @@ def _flash_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, *extra: UOp, start: in
         stage.append(k_scales[key.valid(inside & col.eq(0))].store(cur_scales[n].load()))
         continue
       live = base + key < active
-      if int8:  # values as FP8 integers, their scales apart (folded into the probabilities)
-        for w in range(4):
-          fp8 = _int8_e4m3(cur_held[n * 4 + w].load())
-          stage += [v_lds[(col + 4 * w + j).valid(inside), key].store(((fp8 >> (8 * j)) & 255).cast(dtypes.uint8)) for j in range(4)]
-        stage.append(v_scales[key.valid(inside & col.eq(0))].store(live.where(cur_scales[n].load(), zero)))
+      if int8:  # values as stored: key block `key`'s 8 bytes of dims col and col + 1; their scales apart (folded into the probabilities)
+        stage += [v_lds[(col + w // 2).valid(inside), key * 2 + w % 2].store(cur_held[n * 4 + w].load()) for w in range(4)]
+        scale_key = (i * threads + tid) % 32
+        live = base + scale_key < active  # past the active length a value's scale is 0
+        stage.append(v_scales[scale_key.valid(i * threads + tid < 32)].store(live.where(cur_scales[n].load(), zero)))
         continue
       values = [cur_held[n * 8 + w].load() for w in range(8)]
       live = base + key < active  # unwritten rows may hold any bits: zero keys and values past the active length
@@ -600,7 +617,7 @@ def _flash_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, *extra: UOp, start: in
     for c in range(half_tiles):
       o = outs[c].after(tile)
       d = (wn * half_tiles + c) * 8 + lane % 8
-      pv = _fmma(pa, _ldmatrix_words(v_lds[d, (lane // 8) % 2 * 16]))
+      pv = _fmma(pa, _ldmatrix_words(v_lds[d, (lane // 8) % 2 * 4]))
       updates.append(o.store(UOp.stack(*(o[i].load() * alphas[i // 2] + pv[i] * (v_top / 448) for i in range(4)))))
   else:
     written = UOp.group(*(p_lds[wm, group + 8 * r, wn * 16 + nt * 8 + thread * 2 + col].store(probs[r][nt * 2 + col].cast(F16))
@@ -634,7 +651,8 @@ def _decode_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, *extra: UOp, start: i
   """One query row (every grouped head of a KV head) after flash-decoding: lane owns dim/32 consecutive
   dimensions and reads them with one vector load per key, scores are summed across the warp by shuffles, and
   the online softmax lives in registers (no shared memory or barriers). Each warp writes one partial. An int8
-  cache (dim a multiple of 128: whole words a lane) scales each key's score and each value's probability."""
+  cache (dim a multiple of 128: whole words a lane) scales each key's score and each value's probability; its
+  values come a block of 8 keys at a time (a tile), the lane's dims of all 8 one contiguous load."""
   scales, _ = _extras(extra, int8)
   lanes_dim, F32 = dim // 32, dtypes.float32
   zero, neg = UOp.const(0.0, F32), UOp.const(_NEG, F32)
@@ -655,6 +673,13 @@ def _decode_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, *extra: UOp, start: i
   t = UOp.range(segment // tile, 2, axis_type=AxisType.LOOP)
   cur, qv = state.after(t), [qs[i].load() for i in range(groups * lanes_dim)]
   scores, values, value_scales = [[] for _ in range(groups)], [], []
+  if scales is not None:
+    assert tile == V_BLOCK, "an int8 cache's decode tile is one value block"
+    first = (entry * segment + t * tile).minimum(capacity - V_BLOCK)  # past the active length: in bounds, masked below
+    value_row, value_word = _value_word(first, lane * lanes_dim, dim)
+    block_words = _load_lanes(kv[1, 0, kv_head, value_row, value_word], lanes_dim * V_BLOCK // 4)
+    # dim i's 8 keys are words 2 i, 2 i + 1
+    block_values = [[h for w in (2 * i, 2 * i + 1) for h in _fp8_halves(block_words[w])] for i in range(lanes_dim)]
   for u in range(tile):
     key = entry * segment + t * tile + u
     live = key < active
@@ -663,9 +688,9 @@ def _decode_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, *extra: UOp, start: i
       k, v = (_load_lanes(kv[c, 0, kv_head, row, lane * lanes_dim], lanes_dim) for c in (0, 1))
       k, v = [x.float() for x in k], [x.float() for x in v]
     else:
-      words = [_load_lanes(kv[c, 0, kv_head, row, lane * lanes_dim // 4], lanes_dim // 4) if lanes_dim > 4 else
-               [kv[c, 0, kv_head, row, lane].load()] for c in (0, 1)]
-      k, v = ([_byte(w[i // 4], i % 4).float() for i in range(lanes_dim)] for w in words)
+      words = (_load_lanes(kv[0, 0, kv_head, row, lane * lanes_dim // 4], lanes_dim // 4) if lanes_dim > 4 else
+               [kv[0, 0, kv_head, row, lane].load()])
+      k, v = [_byte(words[i // 4], i % 4).float() for i in range(lanes_dim)], [block_values[i][u].float() for i in range(lanes_dim)]
       value_scales.append(live.where(scales[1, 0, kv_head, row].load().float(), zero))
     # Unwritten cache rows may hold any bits: zero their values so a 0 weight can't meet a NaN.
     values.append([live.where(v[i], zero) for i in range(lanes_dim)])
@@ -752,7 +777,8 @@ def attention(q: Tensor, kv: Tensor, start: int | UOp, *, causal: bool = True, w
   _, heads, rows, dim = q.shape
   _, _, kv_heads, capacity, kv_dim = kv.shape
   int8 = scales is not None
-  if int8 and (kv.dtype != dtypes.uint32 or scales.shape != kv.shape[:4]): raise ValueError("an int8 cache is store_kv's words and scales")
+  if int8 and (kv.dtype != dtypes.uint32 or scales.shape != kv.shape[:4] or capacity % 32):
+    raise ValueError("an int8 cache is store_kv's words and scales, its capacity a multiple of 32")
   if dim != kv_dim * (4 if int8 else 1) or heads % kv_heads: raise ValueError("attention needs matching head sizes and grouped heads")
   if ring and not 0 < window <= capacity - rows: raise ValueError("a ring cache needs a window and room for it plus the rows")
   if not nvidia(q.device) or dim % 32 or not (int8 or kv.dtype == dtypes.float16):
@@ -827,24 +853,81 @@ def store_rows(cache: Tensor, values: Tensor, start: int | UOp, *, ring: bool = 
   new = (offset < rows).reshape(1, 1, 1, length, 1).where(values[:, :, :, offset.clip(0, rows - 1)], cache).contiguous()
   return Tensor(cache.uop.after(cache.uop.store(new.uop)))
 
-def quantize_kv(values: Tensor) -> tuple[Tensor, Tensor]:
-  """(..., dim) keys or values as int8, one FP16 scale (max |x| / 127) a vector: (words (..., dim / 4) uint32, scales (...))."""
-  x = values.float()
+def _quantize_keys(x: Tensor) -> tuple[Tensor, Tensor]:
+  """(..., dim) keys as int8, one FP16 scale (max |x| / 127) a vector: (words (..., dim / 4) uint32, scales (...))."""
+  x = x.float()
   scale = (x.abs().max(-1) / 127).cast(dtypes.float16)
   codes = (x / scale.float().maximum(1e-30).unsqueeze(-1)).round().clip(-127, 127).cast(dtypes.int8)
   return codes.bitcast(dtypes.uint32), scale
 
+def _value_scales(x: Tensor) -> Tensor: return (x.float().abs().max(-1) / 448).cast(dtypes.float16)
+
+def quantize_kv(values: Tensor) -> tuple[Tensor, Tensor]:
+  """(2, ..., capacity, dim) keys and values as a whole int8 cache: (words (2, ..., capacity, dim / 4) uint32,
+  scales (2, ..., capacity)); capacity a multiple of V_BLOCK."""
+  keys, key_scales = _quantize_keys(values[0])
+  v, value_scales = values[1].float(), _value_scales(values[1])
+  *lead, capacity, dim = v.shape
+  codes = (v / value_scales.float().maximum(1e-30).unsqueeze(-1)).cast(dtypes.fp8e4m3).bitcast(dtypes.uint8)
+  blocks = codes.reshape(*lead, capacity // V_BLOCK, V_BLOCK, dim).transpose(-1, -2).reshape(*lead, capacity, dim)
+  return Tensor.stack(keys, blocks.contiguous().bitcast(dtypes.uint32)), Tensor.stack(key_scales, value_scales)
+
 def dequantize_kv(kv: Tensor, scales: Tensor) -> Tensor:
-  """An int8 cache (store_kv's words and scales) as FP16."""
-  return (kv.bitcast(dtypes.int8).float() * scales.float().unsqueeze(-1)).cast(dtypes.float16)
+  """An int8 cache (store_kv's words and scales) as FP16, (2, ..., capacity, dim)."""
+  keys = kv[0].contiguous().bitcast(dtypes.int8).float() * scales[0].float().unsqueeze(-1)
+  blocks = kv[1].contiguous().bitcast(dtypes.uint8)
+  *lead, capacity, dim = blocks.shape
+  codes = blocks.reshape(*lead, capacity // V_BLOCK, dim, V_BLOCK).transpose(-1, -2).reshape(*lead, capacity, dim)
+  values = codes.contiguous().bitcast(dtypes.fp8e4m3).float() * scales[1].float().unsqueeze(-1)
+  return Tensor.stack(keys, values).cast(dtypes.float16)
+
+@functools.cache
+def _store_kernel(cache: UOp, scales: UOp, k: UOp, v: UOp, *, start: int | UOp, kv_heads: int, rows: int, dim: int) -> UOp:
+  # A block a head and four positions (one value word of each dim: the rows' bytes as FP8, the others kept), a
+  # thread a dim: each position's key and value maxima by block reductions, keys as int8 words (four lanes' codes),
+  # values' bytes merged into the thread's word.
+  groups, warps = (rows + 3) // 4 + 1, dim // 32
+  block = UOp.range(kv_heads * groups, 0, axis_type=AxisType.GLOBAL)
+  warp = UOp.range(warps, 1, axis_type=AxisType.LOCAL)
+  lane = UOp.range(32, -1, axis_type=AxisType.WARP)
+  head, d = block // groups, warp * 32 + lane
+  first = (start // 4 + block % groups) * 4
+  capacity, F32 = cache.shape[3], dtypes.float32
+  rows_of = [first + i - start for i in range(4)]
+  mine = [~(r < 0) & (r < rows) & (first + i < capacity) for i, r in enumerate(rows_of)]
+  ks = [k[0, head, r.maximum(0).minimum(rows - 1), d].load().float() for r in rows_of]
+  vs = [v[0, head, r.maximum(0).minimum(rows - 1), d].load().float() for r in rows_of]
+  tops = UOp.placeholder((8, warps), F32, slot=0, addrspace=AddrSpace.LOCAL)
+  tops = tops.after(UOp.group(*(tops[n, warp.valid(lane.eq(0))].store(warp_reduce(x.abs(), maximum=True, full_wave=True))
+                                for n, x in enumerate(ks + vs))).barrier())
+  def top(n: int) -> UOp: return functools.reduce(lambda a, b: a.maximum(b), (tops[n, w].load() for w in range(warps)))
+  key_scales = [(top(i) / 127).cast(dtypes.float16) for i in range(4)]
+  value_scales = [(top(4 + i) / 448).cast(dtypes.float16) for i in range(4)]
+  stores = []
+  def down(value: UOp, n: int) -> UOp: return UOp(Ops.CUSTOM, src=(value,), arg=(f"__shfl_down_sync(0xffffffff, {{0}}, {n})", dtypes.int32))
+  for i in range(4):
+    code = (ks[i] / key_scales[i].float().maximum(1e-30)).round().clip(-127, 127).cast(dtypes.int32)
+    word = functools.reduce(lambda a, b: a | b, [((down(code, n) if n else code).cast(dtypes.uint32) & 255) << (8 * n) for n in range(4)])
+    position = (first + i).minimum(capacity - 1)
+    stores.append(cache[0, 0, head, position.valid(mine[i] & (lane % 4).eq(0)), d // 4].store(word))
+    stores += [scales[c, 0, head, position.valid(mine[i] & d.eq(0))].store(x[i]) for c, x in enumerate((key_scales, value_scales))]
+  row, column = _value_word(first.minimum(capacity - 4), d, dim)
+  old = cache[1, 0, head, row, column].load()
+  codes = [vs[i] / value_scales[i].float().maximum(1e-30) for i in range(4)]
+  pairs = [UOp(Ops.CUSTOMI, src=(codes[2 * j], codes[2 * j + 1]), arg=(_E4M3_F32X2, dtypes.uint32)) for j in range(2)]
+  word = functools.reduce(lambda a, b: a | b, [mine[i].where((pairs[i // 2] >> (8 * (i % 2))) & 255, (old >> (8 * i)) & 255) << (8 * i)
+                                               for i in range(4)])
+  stores.append(cache.after(old)[1, 0, head, row.valid(first < capacity), column].store(word))
+  return UOp.group(*stores).end(block, warp, lane).sink(arg=KernelInfo(name=f"store_kv_d{dim}", opts_to_apply=()))
 
 def store_kv(cache: Tensor, scales: Tensor, k: Tensor, v: Tensor, start: int | UOp) -> tuple[Tensor, Tensor]:
   """Write keys and values (1, kv_heads, rows, dim) as positions start..start+rows-1 of an int8 cache: words
-  (2, 1, kv_heads, capacity, dim / 4) uint32 and scales (2, 1, kv_heads, capacity) FP16. Returns both after the write."""
-  words, scale = quantize_kv(Tensor.stack(k, v))
-  rows = k.shape[2]
-  return (Tensor(cache.uop.after(cache[:, :, :, start:start + rows].uop.store(words.uop))),
-          Tensor(scales.uop.after(scales[:, :, :, start:start + rows].uop.store(scale.uop))))
+  (2, 1, kv_heads, capacity, dim / 4) uint32 and scales (2, 1, kv_heads, capacity) FP16, in one kernel (_store_kernel).
+  Returns both after the write."""
+  _, kv_heads, rows, dim = k.shape
+  if dim % 32: raise ValueError("an int8 cache needs 32-aligned heads")
+  return _launch((cache, scales), (k.contiguous(), v.contiguous()), start, functools.partial(
+    _store_kernel, start=_kernel_scalar(start), kv_heads=kv_heads, rows=rows, dim=dim))
 
 @functools.cache
 def _prologue_kernel(q_out: UOp, cache: UOp, scales: UOp, joined: UOp, q_w: UOp, k_w: UOp, freqs: UOp, *, start: int | UOp,
@@ -852,7 +935,8 @@ def _prologue_kernel(q_out: UOp, cache: UOp, scales: UOp, joined: UOp, q_w: UOp,
   """A decoding step's attention inputs in one kernel (TensorRT-LLM's fused QK-norm/RoPE/KV-insert): a block per
   head of the merged q (+ output gate) / k / v projection's row, `dim` threads. Q and K heads RMS-normalize (their
   own weights) and rotate their first rope_dim dims (rotate-half, freqs[start]); Q heads write FP32 q, K and V heads
-  quantize as store_kv (int8, one FP16 scale a vector) into the cache at `start`. In place of ~8 small kernels."""
+  quantize as store_kv (int8 keys, FP8 values, one FP16 scale a vector) into the cache at `start`. In place of ~8
+  small kernels."""
   warps, half = dim // 32, rope_dim // 2
   block = UOp.range(heads + 2 * kv_heads, 0, axis_type=AxisType.GLOBAL)
   warp = UOp.range(warps, 1, axis_type=AxisType.LOCAL)
@@ -878,14 +962,20 @@ def _prologue_kernel(q_out: UOp, cache: UOp, scales: UOp, joined: UOp, q_w: UOp,
   cos, sin = freqs[start, t % half].load(), freqs[start, half + t % half].load()
   z = (~is_v & (t < rope_dim)).where(low.where(y * cos - partner * sin, y * cos + partner * sin), y)
   stores = [q_out[block.valid(is_q), t].store(z)]
-  # K and V: int8 with one FP16 scale, rounded as store_kv rounds
-  scale = (block_sum(z.abs(), 2, maximum=True) / 127).cast(dtypes.float16)
-  code = (z / scale.float().maximum(1e-30)).round().clip(-127, 127).cast(dtypes.int32)
+  # K as int8 and V as FP8, each with one FP16 scale, rounded as store_kv rounds
+  scale = (block_sum(z.abs(), 2, maximum=True) / is_v.where(UOp.const(448.0, F32), UOp.const(127.0, F32))).cast(dtypes.float16)
+  scaled = z / scale.float().maximum(1e-30)
+  code = scaled.round().clip(-127, 127).cast(dtypes.int32)
   def down(value: UOp, n: int) -> UOp: return UOp(Ops.CUSTOM, src=(value,), arg=(f"__shfl_down_sync(0xffffffff, {{0}}, {n})", dtypes.int32))
   word = functools.reduce(lambda a, b: a | b, [((down(code, n) if n else code).cast(dtypes.uint32) & 255) << (8 * n) for n in range(4)])
-  which, head = is_v.cast(dtypes.int32), is_v.where(v_head, k_head)
-  stores.append(cache[which, 0, head.valid(~is_q & (lane % 4).eq(0)), start, t // 4].store(word))
-  stores.append(scales[which, 0, head.valid(~is_q & t.eq(0)), start].store(scale))
+  stores.append(cache[0, 0, k_head.valid(~is_q & ~is_v & (lane % 4).eq(0)), start, t // 4].store(word))
+  # this value's byte into its word of the value blocks (each thread its own dim: its own word)
+  row, column = _value_word(start, t, dim)
+  old = cache[1, 0, v_head.valid(is_v), row, column].load()
+  fp8 = UOp(Ops.CUSTOMI, src=(scaled, UOp.const(0.0, F32)), arg=(_E4M3_F32X2, dtypes.uint32)) & 255
+  shift = ((start % 4) * 8).cast(dtypes.uint32) if isinstance(start, UOp) else start % 4 * 8
+  stores.append(cache.after(old)[1, 0, v_head.valid(is_v), row, column].store((old & ~(UOp.const(255, dtypes.uint32) << shift)) | (fp8 << shift)))
+  stores.append(scales[is_v.cast(dtypes.int32), 0, is_v.where(v_head, k_head).valid(~is_q & t.eq(0)), start].store(scale))
   return UOp.group(*stores).end(block, warp, lane).sink(arg=KernelInfo(name=f"attention_prologue_d{dim}", opts_to_apply=()))
 
 def attention_prologue(joined: Tensor, q_weight: Tensor, k_weight: Tensor, freqs: Tensor, cache: Tensor, scales: Tensor, start: int | UOp, *,
