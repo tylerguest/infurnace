@@ -131,11 +131,11 @@ _FMMA = ('[&]() {{ float d0, d1, d2, d3; asm("mma.sync.aligned.m16n8k32.row.col.
          '{{%8,%9}}, {{%10,%11,%12,%13}};" : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3) : "r"({0}), "r"({1}), "r"({2}), "r"({3}), '
          '"r"({4}), "r"({5}), "f"({6}), "f"({7}), "f"({8}), "f"({9})); return d{index}; }}()')
 
-def _fmma(a: list[UOp], b: list[UOp]) -> list[UOp]:
-  """D = A x B on FP8 e4m3 tensor cores, FP32 out (m16n8k32; fragments as _imma's): 2x the FP16-in, FP32-accumulate
-  rate on an RTX 5060. Each starts from zero, so no inline MMA expression holds another."""
-  zero = UOp.const(0.0, dtypes.float32)
-  return [UOp(Ops.CUSTOMI, src=(*a, *b, zero, zero, zero, zero), arg=(_FMMA.replace('{index}', str(i)), dtypes.float32)) for i in range(4)]
+def _fmma(a: list[UOp], b: list[UOp], c: list[UOp] | None = None) -> list[UOp]:
+  """D = A x B + C on FP8 e4m3 tensor cores, FP32 out (m16n8k32; fragments as _imma's): 2x the FP16-in, FP32-accumulate
+  rate on an RTX 5060. C (zero by default) must not hold another MMA: inline MMA expressions would repeat it."""
+  c = c or [UOp.const(0.0, dtypes.float32)] * 4
+  return [UOp(Ops.CUSTOMI, src=(*a, *b, *c), arg=(_FMMA.replace('{index}', str(i)), dtypes.float32)) for i in range(4)]
 
 def _extras(extra: tuple[UOp, ...], int8: bool) -> tuple[UOp | None, UOp | None]:
   """A kernel's optional sources after kv: the int8 cache's scales, then the floor."""
@@ -456,9 +456,11 @@ def _flash_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, *extra: UOp, start: in
     qa = qa.after(UOp.group(*(qa[ks * 8 + i].store(
       q[0, heads[r], row_of[r], (ks * 16 + thread * 2 + c).valid(valid_m[r])].load().cast(F16))
       for ks in range(steps) for i, (r, c) in enumerate(slots))))
-  # max and this warp's half of the sum for rows g, g + 8; output fragments in their own 4-slot accumulators
-  state = UOp.placeholder((4,), F32, slot=1, addrspace=AddrSpace.REG)
-  state = state.after(UOp.group(state[0].store(neg), state[1].store(neg), state[2].store(zero), state[3].store(zero)))
+  # max and this warp's half of the sum for rows g, g + 8, and (int8) the outputs' scale; output fragments in their
+  # own 4-slot accumulators
+  state = UOp.placeholder((5,), F32, slot=1, addrspace=AddrSpace.REG)
+  state = state.after(UOp.group(state[0].store(neg), state[1].store(neg), state[2].store(zero), state[3].store(zero),
+                                state[4].store(UOp.const(1e-30, F32))))
   outs = []
   for c in range(half_tiles):
     o = UOp.placeholder((4,), F32, slot=2 + c, addrspace=AddrSpace.REG)
@@ -604,21 +606,29 @@ def _flash_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, *extra: UOp, start: in
     alphas.append(alpha)
   # This warp's probabilities into the pair's shared rows; both read all 32 keys' as A fragments
   if int8:
+    # The outputs are kept in units of c, the largest tile's v_top / 448 so far, so P V accumulates in the MMA itself:
+    # rescaled by α c_prev / c (at most 1) instead of each tile's products scaled and added apart (256 rows with the
+    # merge: 4k keys 463 -> 441 us, 16k 1720 -> 1630)
+    c_prev = cur[4].load()
+    c_now = c_prev.maximum(v_top / 448)
+    ratio = c_prev / c_now
+    updates.append(cur[4].store(c_now))
     written = []
     for r in range(2):
       for nt in range(2):
         key = wn * 16 + nt * 8 + thread * 2
-        pair = UOp(Ops.CUSTOMI, src=tuple(probs[r][nt * 2 + col] * v_scales[key + col].load() * (448 / v_top) for col in range(2)),
+        pair = UOp(Ops.CUSTOMI, src=tuple(probs[r][nt * 2 + col] * v_scales[key + col].load() / c_now for col in range(2)),
                    arg=(_E4M3_F32X2, U32))
         written += [p_lds[wm, group + 8 * r, key + col].store(((pair >> (8 * col)) & 255).cast(dtypes.uint8)) for col in range(2)]
     p_now = p_lds.after(UOp.group(*written).barrier())
     # A fragment (k32): rows 0-7 and 8-15 at keys 0-15, then at 16-31
     pa = [w for c in (0, 16) for w in _ldmatrix_words(p_now[wm, lane % 8 + (lane // 8) % 2 * 8, c])]
+    factors = [alpha * ratio for alpha in alphas]
     for c in range(half_tiles):
       o = outs[c].after(tile)
       d = (wn * half_tiles + c) * 8 + lane % 8
-      pv = _fmma(pa, _ldmatrix_words(v_lds[d, (lane // 8) % 2 * 4]))
-      updates.append(o.store(UOp.stack(*(o[i].load() * alphas[i // 2] + pv[i] * (v_top / 448) for i in range(4)))))
+      pv = _fmma(pa, _ldmatrix_words(v_lds[d, (lane // 8) % 2 * 4]), [o[i].load() * factors[i // 2] for i in range(4)])
+      updates.append(o.store(UOp.stack(*pv)))
   else:
     written = UOp.group(*(p_lds[wm, group + 8 * r, wn * 16 + nt * 8 + thread * 2 + col].store(probs[r][nt * 2 + col].cast(F16))
                           for r in range(2) for nt in range(2) for col in range(2))).barrier()
@@ -639,8 +649,9 @@ def _flash_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, *extra: UOp, start: in
   sums = UOp.group(*(m_lds.after(done)[wm, wn, (group + 8 * r).valid(thread.eq(0))].store(state[2 + r].load()) for r in range(2))).barrier()
   m_lds = m_lds.after(sums)
   totals = [m_lds[wm, 0, group + 8 * r].load() + m_lds[wm, 1, group + 8 * r].load() for r in range(2)]
-  stores = [part[kv_head, part_index, ms[i // 2].valid(valid_m[i // 2]), (wn * half_tiles + c) * 8 + thread * 2 + i % 2].store(outs[c][i].load())
-            for c in range(half_tiles) for i in range(4)]
+  unit = state[4].load() if int8 else UOp.const(1.0, F32)
+  stores = [part[kv_head, part_index, ms[i // 2].valid(valid_m[i // 2]), (wn * half_tiles + c) * 8 + thread * 2 + i % 2].store(
+            outs[c][i].load() * unit) for c in range(half_tiles) for i in range(4)]
   stores += [stats[kv_head, part_index, ms[r].valid(valid_m[r] & thread.eq(0) & wn.eq(0)), s].store(state[r].load() if s == 0 else totals[r])
              for r in range(2) for s in range(2)]
   return UOp.group(*stores).end(block, warp, lane).sink(arg=KernelInfo(name=f"attention_flash_d{dim}", opts_to_apply=()))
