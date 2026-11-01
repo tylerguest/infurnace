@@ -102,7 +102,8 @@ def choose(title: str, options: list[str], *, notes: list[str] = (), start: int 
       if refresh is not None: notes, options, wait = refresh()
       current = min(current, len(options) - 1)
       lines = [*_beside(list(art), [f"{BOLD}{title}{RESET}", *(f"{DIM}{n}{RESET}" for n in notes)]), ""]
-      lines += [f"  {REVERSE} {o} {RESET}" if i == current else f"   {o}" for i, o in enumerate(options)]
+      # flush left, with the logo and the help line: the highlight's padding is the column every option's text starts at
+      lines += [f"{REVERSE} {o} {RESET}" if i == current else f" {o}" for i, o in enumerate(options)]
       lines += ["", f"{DIM}↑/↓ move · Enter select · Esc back{RESET}"]
       if lines != shown:  # redraw in place: back to the first line of the previous drawing, clear below it
         write((f"\x1b[{drawn}F" if drawn else "") + "\x1b[J" + "\n".join(lines) + "\n")
