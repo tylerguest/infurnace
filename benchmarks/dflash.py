@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 import time
 from tinygrad import Device, Tensor, dtypes
-from infurnace.chat import user_prompt
+from infurnace.server.chat import user_prompt
 from infurnace.loader import load_model as _build
 from infurnace.dflash import DFlashDraft, DFlashGenerator
 

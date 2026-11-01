@@ -5,7 +5,7 @@ import struct
 import pytest
 from tinygrad import Tensor, TinyJit, dtypes
 from tinygrad.llm.gguf import ggml_data_to_tensor
-from infurnace.gguf import Q5_K, Q8_0
+from infurnace.weights.gguf import Q5_K, Q8_0
 from tinygrad.llm.gguf import ggml_data_to_tensor as _dequant
 from infurnace.kernels.quant_gemv import q8_quantize, quant_gemv
 

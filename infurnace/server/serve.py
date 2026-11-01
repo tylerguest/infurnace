@@ -28,7 +28,7 @@ from typing import Any, Callable
 from tinygrad import Device
 from tinygrad.llm.serve import Handler, LLMServer, normalize_messages
 from tinygrad.viz.serve import TCPServerWithReuse
-from infurnace.chat import ChatTemplate
+from infurnace.server.chat import ChatTemplate
 
 try: VERSION = _metadata.version('infurnace')
 except _metadata.PackageNotFoundError: VERSION = '0.0.0'

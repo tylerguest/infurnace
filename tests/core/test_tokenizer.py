@@ -6,8 +6,8 @@ import unicodedata
 
 import pytest
 
-from infurnace.gguf import read_gguf_metadata
-from infurnace.tokenizer import PRESETS, BPETokenizer
+from infurnace.weights.gguf import read_gguf_metadata
+from infurnace.weights.tokenizer import PRESETS, BPETokenizer
 
 @pytest.fixture
 def metadata():

@@ -49,7 +49,7 @@ def _user_models() -> Path:
 
 def local(url: str) -> Path | None:
   """An existing copy of a download: user storage first, then an editable checkout's models/."""
-  name, checkout = _file_name(url), Path(__file__).resolve().parent.parent / "models"
+  name, checkout = _file_name(url), Path(__file__).resolve().parents[2] / "models"
   for path in (_user_models() / name, *(checkout / sub / name for sub in ("", "qwen35-validation", "dflash-qwen35"))):
     if path.is_file(): return path
   return None

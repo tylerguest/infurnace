@@ -12,8 +12,9 @@ import json
 import pathlib
 import time
 
-from infurnace import catalog, loader
-from infurnace.chat import user_prompt
+from infurnace import loader
+from infurnace.weights import catalog
+from infurnace.server.chat import user_prompt
 
 TEXT = pathlib.Path(__file__).parent / "quality" / "eval.txt"
 MARK = "\x00DOCUMENT\x00"

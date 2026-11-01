@@ -3,7 +3,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from infurnace import catalog, loader
+from infurnace import loader
+from infurnace.weights import catalog
 from infurnace.models import Family, family_for
 
 @pytest.fixture

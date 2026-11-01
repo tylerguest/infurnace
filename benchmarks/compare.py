@@ -63,7 +63,7 @@ def worker(args) -> dict:
   from tinygrad import Context, Device
   from tinygrad.helpers import GlobalCounters
   from infurnace.device import select_device
-  from infurnace.tokenizer import BPETokenizer
+  from infurnace.weights.tokenizer import BPETokenizer
   from tinygrad.llm.model import Transformer
   from infurnace.loader import load_model
   from decode import benchmark_prompt_ids, validate_benchmark_context

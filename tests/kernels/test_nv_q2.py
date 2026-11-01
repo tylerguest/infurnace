@@ -4,7 +4,7 @@ import os
 import pytest
 from tinygrad import Tensor, dtypes
 
-from infurnace.hadamard import Rotation, hadamard_matrix
+from infurnace.quant.hadamard import Rotation, hadamard_matrix
 from infurnace.kernels.hadamard import fwht
 from infurnace.kernels.quant_gemv import Q2_0, prepare_q2, q8_quantize, quant_gemv
 from test_hadamard import q2_blocks

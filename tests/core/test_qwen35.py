@@ -73,7 +73,7 @@ def test_packed_loader_preserves_embedding_aliases(monkeypatch, tied_head, head_
   """Exercise packed-load aliasing on CPU, replacing only the NV adapter."""
   from types import SimpleNamespace
   from tinygrad import nn, dtypes
-  from infurnace.gguf import PackedTensor
+  from infurnace.weights.gguf import PackedTensor
   from infurnace import engine
 
   embedding = Tensor.ones(16, 256, device='CPU').realize()
@@ -148,7 +148,7 @@ def test_cli_packed_projection_flags_require_nv_before_loading(tmp_path, monkeyp
 def test_tokenizer_reference(tmp_path):
   tokenizers = pytest.importorskip('tokenizers')
   from tokenizers import Regex, models, trainers, pre_tokenizers, decoders, normalizers
-  from infurnace.tokenizer import BPETokenizer
+  from infurnace.weights.tokenizer import BPETokenizer
   hf = tokenizers.Tokenizer(models.BPE())
   hf.normalizer = normalizers.NFC()
   pattern = (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}|"

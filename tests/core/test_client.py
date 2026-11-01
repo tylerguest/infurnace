@@ -4,9 +4,10 @@ import threading
 
 import pytest
 
-from infurnace import catalog, client
-from infurnace.chat import ChatTemplate
-from infurnace.serve import Server, ServerModel
+from infurnace.weights import catalog
+from infurnace.frontend import client
+from infurnace.server.chat import ChatTemplate
+from infurnace.server.serve import Server, ServerModel
 from test_serve import Model, Tokenizer
 
 @pytest.mark.parametrize('value,expected', [(None, '127.0.0.1:8000'), ('0.0.0.0:9000', '0.0.0.0:9000'),

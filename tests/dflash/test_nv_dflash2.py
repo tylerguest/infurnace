@@ -53,7 +53,7 @@ TARGET, DRAFT = MODELS / 'Ternary-Bonsai-2-4B-Q2_0.gguf', MODELS / 'Ternary-Bons
 @pytest.mark.skipif(not (TARGET.is_file() and DRAFT.is_file()), reason='needs Bonsai-4B and its DFlash2 draft (infurnace pull bonsai:4b)')
 def test_bonsai_dflash2_matches_plain_decoding():
   from infurnace import loader
-  from infurnace.chat import user_prompt
+  from infurnace.server.chat import user_prompt
   model, tokenizer = loader.load_model(str(TARGET), 1024, 'NV')
   dflash = loader.load_dflash(model, DRAFT)
   assert dflash.draft.config.selector_top_k == 16 and dflash.draft.config.conv_kernel == 2

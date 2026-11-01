@@ -5,9 +5,9 @@ Names and downloads are in catalog.py.
 from __future__ import annotations
 import sys
 from pathlib import Path
-from infurnace.catalog import details, draft_for
+from infurnace.weights.catalog import details, draft_for
 from infurnace.device import fast_path_problem, nvidia, select_device, supports_nv_quant
-from infurnace.gguf import Q2_0, parse_gguf, read_gguf_metadata
+from infurnace.weights.gguf import Q2_0, parse_gguf, read_gguf_metadata
 from infurnace.kernels.quant_gemm import nv_prefill_supported
 from infurnace.engine import Model
 from infurnace.models import family_for

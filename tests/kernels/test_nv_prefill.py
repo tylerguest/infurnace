@@ -6,9 +6,9 @@ import struct
 import pytest
 from tinygrad import Tensor, TinyJit, UOp, dtypes, function
 
-from infurnace.gguf import PackedTensor
+from infurnace.weights.gguf import PackedTensor
 from tinygrad.llm.gguf import ggml_data_to_tensor as _dequant
-from infurnace.linear import _NVLinear
+from infurnace.quant.linear import _NVLinear
 from infurnace.kernels.quant_gemm import quant_gemm, QuantGemmError, _prefill_kernel
 from tinygrad.dtype import AddrSpace
 from tinygrad.uop.ops import Ops

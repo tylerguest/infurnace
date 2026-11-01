@@ -95,7 +95,7 @@ def start_server(serve_args: list[str]) -> None:
 
 def _served_name(model: str) -> str:
   """The name a server gives a model (catalog.served_name): a catalog model's file is served as its catalog name."""
-  from infurnace import catalog
+  from infurnace.weights import catalog
   return catalog.served_name(model)
 
 def connect(model: str | None, serve_args: list[str]) -> dict:
@@ -106,7 +106,7 @@ def connect(model: str | None, serve_args: list[str]) -> dict:
     start_server((["--model", model] if model else []) + serve_args)
     current = status() or {}
   if model and (current.get("model") != _served_name(model) or current.get("status") == "unloaded"):
-    from infurnace import catalog
+    from infurnace.weights import catalog
     # A server on this machine reads this machine's downloads; a remote one has its own
     if _local_host() and model in catalog.CATALOG and not catalog.local(catalog.CATALOG[model].url): catalog.pull(model)
     wait_ready()

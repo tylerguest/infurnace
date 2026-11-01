@@ -1,8 +1,9 @@
 import io
 import pytest
 
-from infurnace import cli, menu
-from infurnace.menu import BACK, DOWN, ENTER, UP
+from infurnace import cli
+from infurnace.frontend import menu
+from infurnace.frontend.menu import BACK, DOWN, ENTER, UP
 
 @pytest.fixture(autouse=True)
 def home(tmp_path, monkeypatch):
@@ -33,9 +34,9 @@ def run_menu(monkeypatch, sequence, status=None, shutdowns=None):
   """The subcommands the menu ran; `status` is the server's (a function: called each time), `shutdowns` collects
   the shutdown requests the menu sends."""
   ran = []
-  monkeypatch.setattr('infurnace.catalog.listing', lambda: MODELS)
-  monkeypatch.setattr('infurnace.client.status', status if callable(status) else lambda: status)
-  monkeypatch.setattr('infurnace.client.request', lambda method, path, body=None, timeout=None:
+  monkeypatch.setattr('infurnace.weights.catalog.listing', lambda: MODELS)
+  monkeypatch.setattr('infurnace.frontend.client.status', status if callable(status) else lambda: status)
+  monkeypatch.setattr('infurnace.frontend.client.request', lambda method, path, body=None, timeout=None:
                       (shutdowns if shutdowns is not None else []).append(path) or {})
   monkeypatch.setattr('builtins.input', lambda prompt='': '')
   monkeypatch.setattr('sys.stdout', io.StringIO())
@@ -56,14 +57,14 @@ def test_menu_starts_the_server_in_its_header(monkeypatch):
   # Start the server (the second model); it warms up, then is ready, and the header says where to connect
   states = iter([None, None, None, {'status': 'warming up', 'model': 'bonsai:4b'}])
   spawned, drawn = [], io.StringIO()
-  monkeypatch.setattr('infurnace.client.spawn_server', lambda args: spawned.append(args) or Starting())
-  monkeypatch.setattr('infurnace.client.host', lambda: '127.0.0.1:8124')
+  monkeypatch.setattr('infurnace.frontend.client.spawn_server', lambda args: spawned.append(args) or Starting())
+  monkeypatch.setattr('infurnace.frontend.client.host', lambda: '127.0.0.1:8124')
   monkeypatch.setattr('time.monotonic', iter(range(10, 10_000)).__next__)  # every poll asks the server
   sequence = [ENTER, DOWN, ENTER, '', '', BACK]
   def key(timeout=None): return sequence.pop(0)
-  monkeypatch.setattr('infurnace.catalog.listing', lambda: MODELS)
-  monkeypatch.setattr('infurnace.client.status', lambda: next(states, {'status': 'ready', 'model': 'bonsai:4b'}))
-  monkeypatch.setattr('infurnace.client.request', lambda *a, **k: {})
+  monkeypatch.setattr('infurnace.weights.catalog.listing', lambda: MODELS)
+  monkeypatch.setattr('infurnace.frontend.client.status', lambda: next(states, {'status': 'ready', 'model': 'bonsai:4b'}))
+  monkeypatch.setattr('infurnace.frontend.client.request', lambda *a, **k: {})
   monkeypatch.setattr('sys.stdout', drawn)
   assert menu.Menu(lambda argv: 0, key).main() == 0
   assert spawned == [['--model', 'bonsai:4b']]
@@ -72,7 +73,7 @@ def test_menu_starts_the_server_in_its_header(monkeypatch):
 
 def test_stopping_a_server_still_loading_ends_its_process(monkeypatch):
   process = Starting()
-  monkeypatch.setattr('infurnace.client.spawn_server', lambda args: process)
+  monkeypatch.setattr('infurnace.frontend.client.spawn_server', lambda args: process)
   run_menu(monkeypatch, [ENTER, ENTER, ENTER, BACK])  # Start, the first model, Stop
   assert process.terminated
 
@@ -101,17 +102,17 @@ def test_a_server_stopped_and_started_again_from_the_menu_goes_with_it(monkeypat
 def test_ctrl_c_in_the_menu_still_stops_its_server(monkeypatch):
   calls, shutdowns = iter([None]), []
   def interrupt(timeout=None): raise KeyboardInterrupt
-  monkeypatch.setattr('infurnace.catalog.listing', lambda: MODELS)
-  monkeypatch.setattr('infurnace.client.status', lambda: next(calls, {'status': 'ready'}))
-  monkeypatch.setattr('infurnace.client.request', lambda method, path, body=None, timeout=None: shutdowns.append(path) or {})
+  monkeypatch.setattr('infurnace.weights.catalog.listing', lambda: MODELS)
+  monkeypatch.setattr('infurnace.frontend.client.status', lambda: next(calls, {'status': 'ready'}))
+  monkeypatch.setattr('infurnace.frontend.client.request', lambda method, path, body=None, timeout=None: shutdowns.append(path) or {})
   monkeypatch.setattr('sys.stdout', io.StringIO())
   with pytest.raises(KeyboardInterrupt): menu.Menu(lambda argv: 0, interrupt).main()
   assert shutdowns == ['/api/shutdown']
 
 def test_menu_keeps_going_after_a_failed_command(monkeypatch, capsys):
-  from infurnace.client import ServerError
+  from infurnace.frontend.client import ServerError
   def fail(argv): raise ServerError('the server went away')
-  monkeypatch.setattr('infurnace.client.status', lambda: None)
+  monkeypatch.setattr('infurnace.frontend.client.status', lambda: None)
   monkeypatch.setattr('builtins.input', lambda prompt='': '')
   assert menu.Menu(fail, keys('3', '4')).main() == 0
   assert 'the server went away' in capsys.readouterr().err
@@ -153,7 +154,7 @@ def test_logo_beside_the_title_only_when_it_fits(monkeypatch, columns, shown):
 def test_header_shows_the_servers_average_speeds(monkeypatch):
   status = {'status': 'ready', 'model': 'bonsai:4b', 'speeds': {'requests': 3, 'prefill_tokens_per_second': 6061, 'decode_tokens_per_second': 198,
                                                                   'peak_prefill_tokens_per_second': 6209, 'peak_decode_tokens_per_second': 213}}
-  monkeypatch.setattr('infurnace.client.status', lambda: status)
+  monkeypatch.setattr('infurnace.frontend.client.status', lambda: status)
   notes, _, wait = menu.Menu(lambda argv: 0, None).header()
   assert notes[1:] == ['Average: prefill 6,061 tok/s · decode 198 tok/s (3 requests)', 'Peak:    prefill 6,209 tok/s · decode 213 tok/s']
   assert wait == 1.0
@@ -163,8 +164,8 @@ def test_a_ready_server_is_listed_in_pi_without_changing_its_default(monkeypatch
   agent = home / '.pi' / 'agent'
   agent.mkdir(parents=True)
   (agent / 'settings.json').write_text('{"defaultProvider": "opencode-go", "defaultModel": "kimi"}')
-  monkeypatch.setattr('infurnace.client.status', lambda: {'status': 'ready', 'model': 'bonsai:4b'})
-  monkeypatch.setattr('infurnace.client.request', lambda method, path, body=None, timeout=None:
+  monkeypatch.setattr('infurnace.frontend.client.status', lambda: {'status': 'ready', 'model': 'bonsai:4b'})
+  monkeypatch.setattr('infurnace.frontend.client.request', lambda method, path, body=None, timeout=None:
                       {'models': [{'context_length': 32768}]} if path == '/api/ps' else {})
   m = menu.Menu(lambda argv: 0, None)
   m.header()
@@ -174,6 +175,6 @@ def test_a_ready_server_is_listed_in_pi_without_changing_its_default(monkeypatch
   assert json.loads((agent / 'settings.json').read_text())['defaultModel'] == 'kimi'
 
 def test_nothing_is_written_for_pi_when_pi_is_not_installed(monkeypatch, home):
-  monkeypatch.setattr('infurnace.client.status', lambda: {'status': 'ready', 'model': 'bonsai:4b'})
+  monkeypatch.setattr('infurnace.frontend.client.status', lambda: {'status': 'ready', 'model': 'bonsai:4b'})
   menu.Menu(lambda argv: 0, None).header()
   assert not (home / '.pi').exists()

@@ -20,7 +20,8 @@ import subprocess
 import time
 
 from tinygrad import Tensor, TinyJit, UOp, dtypes
-from infurnace import catalog, loader
+from infurnace import loader
+from infurnace.weights import catalog
 from infurnace.dflash.jit import captured
 from infurnace.dflash.parallel import ParallelVerifier
 from infurnace.dflash.target import TargetObserver

@@ -67,13 +67,13 @@ def test_loaded_config(runner):
 @pytest.mark.skipif(not (os.environ.get('INFURNACE_TEST_MODEL') and os.environ.get('INFURNACE_TEST_GENERATION')),
                     reason='set INFURNACE_TEST_MODEL and INFURNACE_TEST_GENERATION=1 for real-model generation')
 def test_local_generation():
-  from infurnace.tokenizer import BPETokenizer
+  from infurnace.weights.tokenizer import BPETokenizer
   model = Model.from_gguf(os.environ['INFURNACE_TEST_MODEL'], max_context=2048,
                               device=os.environ.get('INFURNACE_GENERATION_DEVICE', 'NV'),
                               nv_quant=bool(os.environ.get('INFURNACE_TEST_NV_QUANT')),
                               nv_prefill=bool(os.environ.get('INFURNACE_TEST_NV_PREFILL')))
   tokenizer = BPETokenizer.from_gguf(model.metadata)
-  from infurnace.chat import user_prompt
+  from infurnace.server.chat import user_prompt
   prompt = tokenizer.encode(user_prompt(model, tokenizer, 'Reply with just the word hello.'))
   ids = []
   stream = model.generate(prompt, 32)

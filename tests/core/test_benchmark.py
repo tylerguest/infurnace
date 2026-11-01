@@ -63,7 +63,7 @@ def test_prefill_selection_forwarded_to_children(monkeypatch, flags, expected):
 def test_comparison_worker_runs_qwen35_fixture(tmp_path, monkeypatch, worker):
   from types import SimpleNamespace
   from tinygrad import Context
-  from infurnace.tokenizer import BPETokenizer
+  from infurnace.weights.tokenizer import BPETokenizer
   from test_qwen35 import checkpoint
   monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / 'benchmarks'))
   with Context(DEV='CPU'):

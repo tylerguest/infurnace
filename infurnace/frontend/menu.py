@@ -141,11 +141,11 @@ class Menu:
     return choose(title, options, read_key=self.read_key, **kwargs)
 
   def server(self) -> dict | None:
-    from infurnace import client
+    from infurnace.frontend import client
     return client.status()
 
   def models(self) -> list[dict]:
-    from infurnace import catalog
+    from infurnace.weights import catalog
     return catalog.listing()
 
   def pick_model(self, title: str, current: str | None = None) -> str | None:
@@ -160,7 +160,7 @@ class Menu:
 
   def action(self, work: list[str] | Callable[[], object], pause: bool = True) -> None:
     """Run a subcommand (or a function), then come back to the menu, its errors and Ctrl-C included."""
-    from infurnace.client import ServerError
+    from infurnace.frontend.client import ServerError
     print()
     try: work() if callable(work) else self.run_command(work)
     except KeyboardInterrupt: print("\nInterrupted.", file=sys.stderr)
@@ -183,7 +183,7 @@ class Menu:
   def close(self) -> None:
     """Stop the server unless it was running before the menu opened: one the menu started, or a chat started from it,
     goes with the menu. The server finishes what it is doing (warming up, a reply) and exits on its own."""
-    from infurnace import client
+    from infurnace.frontend import client
     try:
       if client.status() is None:
         # still loading its model, not yet listening: only its process can be stopped
@@ -200,7 +200,7 @@ class Menu:
   def header(self) -> tuple[list[str], list[str], float | None]:
     """The main screen's notes and options, and how soon to draw it again: often, with a spinner, while the server
     starts or stops."""
-    from infurnace import client
+    from infurnace.frontend import client
     status = self.poll()
     if self.starting is not None:
       if status is None and self.starting.poll() is not None:
@@ -234,7 +234,7 @@ class Menu:
   def list_in_pi(self, model: str) -> None:
     """Add the served model to pi's model list (when pi is installed), so pi offers it in /model; pi's default model
     stays as it is."""
-    from infurnace import client
+    from infurnace.frontend import client
     self.listed = model
     if not (Path.home() / ".pi" / "agent").is_dir(): return
     try:
@@ -254,7 +254,7 @@ class Menu:
 
   def toggle_server(self, status: dict | None) -> None:
     """Start or stop the server without leaving the menu: the header follows it."""
-    from infurnace import client
+    from infurnace.frontend import client
     if self.stopping: return
     self.problem = None
     if status is None and self.starting is not None:  # not listening yet: stop its process

@@ -7,20 +7,19 @@ a general inference engine.
 
 ## Modules
 
+The top level holds the core: the commands, model loading and the engine. The rest is grouped by job.
+
 | Module | Responsibility |
 |---|---|
-| `cli.py` | Commands (`serve`, `run`, `ps`, `stop`, `pull`, `list`, `rm`, `launch`) and the original in-process flags |
-| `client.py` | Talking to the server: finding or starting it, chat and one-shot replies, `ps`/`stop`, `launch pi` |
-| `serve.py` | tinygrad's OpenAI-compatible server (`/v1`) plus infurnace's `/api`; DFlash, per-request thinking, warmup on a thread |
-| `catalog.py` | Named models (GGUF, architecture, optional DFlash draft) and their downloads (`pull`, `list`, `rm`) |
+| `cli.py` | Commands (`serve`, `run`, `ps`, `stop`, `pull`, `list`, `rm`, `launch`), the menu for bare `infurnace`, and the original in-process flags |
 | `loader.py` | The family for a GGUF's architecture, device dispatch, model and DFlash loading, context from free VRAM |
-| `device.py` | Device probing, the fast-path check, NVIDIA's pip-installed compiler, free VRAM |
-| `gguf.py` | GGUF parsing (tinygrad's parser) and metadata |
-| `chat.py` | Chat prompts from the GGUF's Jinja template (server and local chat) |
-| `tokenizer.py` | Byte-level BPE (pretokenizer per GGUF preset: Qwen3.5, Qwen2/3, Llama 3) and streaming decode |
 | `engine.py` | `Model`: upstream model loading, packed weights, fused attention and feed-forward, prompt chunks, generation, prompt snapshots |
+| `device.py` | Device probing, the fast-path check, NVIDIA's pip-installed compiler, free VRAM |
+| `server/` | `serve.py`: tinygrad's OpenAI-compatible server (`/v1`) plus infurnace's `/api`; DFlash, per-request thinking, warmup on a thread, speeds. `chat.py`: chat prompts from the GGUF's Jinja template (server and local chat) |
+| `frontend/` | `client.py`: talking to the server (finding or starting it, chat and one-shot replies, `ps`/`stop`, `launch pi`). `menu.py`: the arrow-key menu |
+| `weights/` | `gguf.py`: GGUF parsing (tinygrad's parser) and metadata. `tokenizer.py`: byte-level BPE (pretokenizer per GGUF preset) and streaming decode. `catalog.py`: named models (GGUF, architecture, optional DFlash draft) and their downloads |
+| `quant/` | `linear.py`: `_NVLinear`, the packed projection used by the models and the draft. `hadamard.py`: Hadamard-folded weights. `quantize.py`: requantization at load |
 | `models/` | Model families only (`Family`: tokenizer, extra passes, snapshots): `qwen35.py` adds the fused GDN layers; `qwen3.py` is attention-only |
-| `linear.py` | `_NVLinear`: packed projection used by the models and the draft |
 | `dflash/` | Draft model, target observation, parallel verification, adaptive drafting |
 | `kernels/` | Custom tinygrad UOp kernels (below) |
 

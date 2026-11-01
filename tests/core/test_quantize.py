@@ -1,8 +1,8 @@
 """Q4_K quantization at load time: the bytes decode (tinygrad's GGUF decoder) to within one quantization step."""
 from tinygrad import Tensor
 
-from infurnace import gguf
-from infurnace.quantize import Q4_K, Q4_K_BYTES, quantize_q4_k
+from infurnace.weights import gguf
+from infurnace.quant.quantize import Q4_K, Q4_K_BYTES, quantize_q4_k
 
 def test_q4_k_round_trip():
   Tensor.manual_seed(3)

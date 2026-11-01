@@ -7,7 +7,7 @@ import pytest
 from tinygrad import dtypes
 from tinygrad.uop.ops import Ops
 
-import infurnace.gguf as gguf
+import infurnace.weights.gguf as gguf
 
 BLOCK_BYTES = {gguf.Q4_K: 144, gguf.Q6_K: 210}
 

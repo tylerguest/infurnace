@@ -6,8 +6,8 @@ import functools
 from pathlib import Path
 import pytest
 from types import SimpleNamespace
-from infurnace.chat import user_prompt
-from infurnace.gguf import read_gguf_metadata
+from infurnace.server.chat import user_prompt
+from infurnace.weights.gguf import read_gguf_metadata
 
 TARGET = Path('models/qwen35-validation/Qwen3.5-4B-Q4_K_M.gguf')
 DRAFT = Path('models/dflash-qwen35/qwen35-4b-dflash-Q4_K_M.gguf')

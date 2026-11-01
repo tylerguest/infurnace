@@ -23,14 +23,14 @@ import tinygrad.llm.model as upstream_model
 from tinygrad.llm.model import Transformer, TransformerBlock, apply_rope, precompute_freqs_cis
 from tinygrad.nn.state import get_state_dict
 from tinygrad.uop.ops import Ops
-from infurnace.gguf import Q2_0, decode as decode_packed, parse_gguf, read_gguf_metadata
-from infurnace.hadamard import rotations
+from infurnace.weights.gguf import Q2_0, decode as decode_packed, parse_gguf, read_gguf_metadata
+from infurnace.quant.hadamard import rotations
 from infurnace.kernels.hadamard import norm_fwht_q8
 from infurnace.kernels.attention import attention, attention_prologue, store_kv
 from infurnace.kernels.quant_gemm import nv_prefill_supported
 from infurnace.kernels.quant_gemv import q8_quantize
 from infurnace.kernels.embedding import packed_gather
-from infurnace.linear import _NVLinear
+from infurnace.quant.linear import _NVLinear
 from infurnace.device import nvidia
 from infurnace.models import Family, family_for
 

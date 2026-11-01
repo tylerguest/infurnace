@@ -1,4 +1,4 @@
-"""Blockwise Walsh-Hadamard transform of activations (NV), for Hadamard-folded weights (infurnace/hadamard.py).
+"""Blockwise Walsh-Hadamard transform of activations (NV), for Hadamard-folded weights (infurnace/quant/hadamard.py).
 
 One CTA per block of `block` values, one thread per value: the reorder and signs are folded into the load, then
 log2(block) butterfly stages run in shared memory (a buffer per stage, 2 KB each for 512 values: tinygrad won't

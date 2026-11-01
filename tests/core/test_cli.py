@@ -37,14 +37,14 @@ def test_run_tells_models_from_prompts(value, model):
   assert cli._looks_like_model(value) is model
 
 def test_unknown_models_are_rejected_before_any_server(monkeypatch):
-  monkeypatch.setattr('infurnace.client.run', lambda *args: pytest.fail('must not contact a server'))
+  monkeypatch.setattr('infurnace.frontend.client.run', lambda *args: pytest.fail('must not contact a server'))
   with pytest.raises(ValueError, match="unknown model 'qwen9:4b'"): cli.command(['run', 'qwen9:4b', 'hi'])
   cli._check_model('qwen3.5:4b')
   cli._check_model('~/m/x.gguf')
 
 def test_list_shows_downloaded_and_available_models(monkeypatch, capsys):
   details = {'quantization_level': 'Q4_K_M'}
-  monkeypatch.setattr('infurnace.catalog.listing', lambda: [
+  monkeypatch.setattr('infurnace.weights.catalog.listing', lambda: [
     {'name': 'qwen3.5:4b', 'details': details, 'size': 3.4e9, 'downloaded': True, 'has_draft': True},
     {'name': 'other:3b', 'details': details, 'size': 0, 'downloaded': False, 'has_draft': False}])
   assert cli.command(['list']) == 0

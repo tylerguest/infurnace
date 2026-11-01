@@ -1,6 +1,6 @@
 """infurnace command line: `serve` keeps a model warm on the GPU; `run`, `ps`, `stop` and `launch`
 talk to it (starting it when needed); `pull`, `list` and `rm` manage downloads. Bare `infurnace` in a terminal
-opens a menu of the same (infurnace/menu.py); piped, it runs `run`.
+opens a menu of the same (infurnace/frontend/menu.py); piped, it runs `run`.
 
 The original flags still work: `--prompt`, `--serve [PORT]`, `--benchmark` and in-process chat (`--chat`)."""
 from __future__ import annotations
@@ -12,7 +12,8 @@ import time
 from pathlib import Path
 from typing import Callable, Iterator
 from tinygrad.helpers import GlobalCounters, Timing, profile_marker
-from infurnace import catalog, loader
+from infurnace import loader
+from infurnace.weights import catalog
 from infurnace.device import DeviceError, free_vram, nvidia, select_device
 
 PROMPT_MAX_TOKENS = 64
@@ -215,7 +216,7 @@ def run(args: argparse.Namespace) -> int:
     reply(generate, tokenizer, encode(tokenizer, args.prompt), args.max_tokens or PROMPT_MAX_TOKENS, context)
     return 0
   if args.serve is not None:
-    from infurnace.serve import serve
+    from infurnace.server.serve import serve
     # Warmup runs on a thread once the server listens (requests wait for it); the prompt graph follows in its first idle moment.
     block = _dflash_block(dflash) if dflash is not None else 16
     serve(model, tokenizer, args.serve, args.host, enable_thinking=not args.no_thinking, dflash=dflash, block_size=block,
@@ -224,7 +225,7 @@ def run(args: argparse.Namespace) -> int:
           info=loader.model_info(_model_name(args.model), catalog.fetch_model(args.model), dflash is not None), installed=catalog.installed)
     return 0
   window, thinking = min(args.max_context, context), not args.no_thinking
-  from infurnace.chat import ChatTemplate
+  from infurnace.server.chat import ChatTemplate
   template = ChatTemplate(model.metadata, tokenizer)
   if args.no_warmup: return chat(generate, tokenizer, template, window, args.max_tokens, thinking)
   print(f"Warming up {model.device} in the background; you can type your first message now.", file=sys.stderr, flush=True)
@@ -234,10 +235,10 @@ def run(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
   argv = sys.argv[1:] if argv is None else argv
-  from infurnace.client import ServerError
+  from infurnace.frontend.client import ServerError
   try:
     if not argv and sys.stdin.isatty() and sys.stdout.isatty():
-      from infurnace import menu
+      from infurnace.frontend import menu
       return menu.main(command)  # a terminal: the menu
     if not argv or argv[0] in COMMANDS: return command(argv or ["run"])
     return run(parse_args(argv))
@@ -346,7 +347,7 @@ class ServerModels:
     return [self.first, *(m['name'] for m in catalog.installed() if m['name'] != self.first)]
 
   def __call__(self, name: str):
-    from infurnace.serve import loaded
+    from infurnace.server.serve import loaded
     args, first = self.args, name == self.first
     source = args.model if first else name
     # --dflash names the first model's draft; --no-dflash applies to every model
@@ -368,8 +369,8 @@ class ServerModels:
 def serve_command(args: argparse.Namespace) -> int:
   """Load the model and serve it, and the other downloaded models on request; warmup runs on a thread after the
   server starts listening."""
-  from infurnace import client
-  from infurnace.serve import serve_models
+  from infurnace.frontend import client
+  from infurnace.server.serve import serve_models
   hostname, port = client.host().rsplit(":", 1)
   hostname, port = args.host or hostname, args.port or int(port)
   if not 1 <= port <= 65535: raise ValueError("port must be between 1 and 65535")
@@ -380,7 +381,7 @@ def serve_command(args: argparse.Namespace) -> int:
   return 0
 
 def command(argv: list[str]) -> int:
-  from infurnace import client
+  from infurnace.frontend import client
   args = command_parser().parse_args(argv)
   if args.command == "serve": return serve_command(args)
   if args.command == "run":

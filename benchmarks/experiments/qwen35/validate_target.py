@@ -14,7 +14,7 @@ import urllib.error
 import urllib.request
 
 from tinygrad import Device
-from infurnace.chat import user_prompt
+from infurnace.server.chat import user_prompt
 from infurnace.loader import load_model as _build
 
 

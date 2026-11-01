@@ -6,7 +6,7 @@ Marked nv (INFURNACE_TEST_NV=1); needs the model files below; loads each (~3 GB)
 import gc
 from pathlib import Path
 import pytest
-from infurnace.chat import user_prompt
+from infurnace.server.chat import user_prompt
 from infurnace.engine import PROMPT_ROWS, SHORT_ROWS
 
 TARGETS = [Path('models/qwen35-validation/Qwen3.5-4B-Q4_K_M.gguf'), Path('models/Qwen3-4B-Q4_K_M.gguf'),

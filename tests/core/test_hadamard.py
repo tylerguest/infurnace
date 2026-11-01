@@ -5,8 +5,8 @@ import struct
 import pytest
 from tinygrad import Tensor, dtypes
 
-from infurnace import gguf
-from infurnace.hadamard import hadamard_matrix, rotations
+from infurnace.weights import gguf
+from infurnace.quant.hadamard import hadamard_matrix, rotations
 from infurnace.kernels.quant_gemv import dequant_prepared_q2, prepare_q2
 
 def q2_blocks(count: int, seed: int = 0) -> tuple[bytes, list[float]]:

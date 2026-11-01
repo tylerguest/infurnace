@@ -2,7 +2,7 @@ import pytest
 from types import SimpleNamespace
 
 from infurnace import cli
-from infurnace.chat import ChatTemplate
+from infurnace.server.chat import ChatTemplate
 from jinja2.exceptions import SecurityError
 
 class Tokenizer:

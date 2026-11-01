@@ -7,8 +7,8 @@ import threading
 import time
 from types import SimpleNamespace
 
-from infurnace.chat import ChatTemplate
-from infurnace.serve import loaded, Server, ServerModel, Speeds
+from infurnace.server.chat import ChatTemplate
+from infurnace.server.serve import loaded, Server, ServerModel, Speeds
 
 class Tokenizer:
   bos_id = None

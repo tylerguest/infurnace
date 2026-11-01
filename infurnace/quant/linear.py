@@ -1,7 +1,7 @@
 """Packed NV projection adapter shared by the target models and the DFlash draft."""
 from tinygrad import Tensor, dtypes
 from tinygrad.llm.gguf import ggml_data_to_tensor
-from infurnace.gguf import PackedTensor
+from infurnace.weights.gguf import PackedTensor
 from infurnace.kernels.quant_gemv import (quant_gemv, prepare_q2, prepare_q6, prepare_q4, dequant_prepared_q2, dequant_prepared_q4,
                                           dequant_prepared_q6, untile)
 from infurnace.kernels.quant_gemm import quant_gemm, nv_prefill_supported, q2_int8

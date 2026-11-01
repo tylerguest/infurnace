@@ -82,7 +82,8 @@ def report(model, tokenizer, count: int, load_seconds: float, prompt_tokens: int
   }
 
 def main() -> int:
-  from infurnace import catalog, loader
+  from infurnace import loader
+  from infurnace.weights import catalog
   ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
   ap.add_argument("--model", default=catalog.DEFAULT, help="model name or GGUF path")
   ap.add_argument("--tokens", type=int, default=20, help="output tokens per run (default 20)")
