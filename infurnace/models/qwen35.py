@@ -6,7 +6,7 @@ import functools
 import os
 from tinygrad import Context, Tensor, UOp, dtypes
 from tinygrad.llm.model import GatedDeltaNetBlock
-from infurnace.engine import PREFILL_ROWS, _norm_of, _norm_q8, _norm_rows_q8, _one_row, _project, _rows
+from infurnace.layers.fused import PREFILL_ROWS, _norm_of, _norm_q8, _norm_rows_q8, _one_row, _project, _rows
 from infurnace.kernels.gdn import _gated_norm, gdn_gates, gdn_decode, gdn_prefill, gdn_prefill_raw
 from infurnace.models import Family
 from infurnace.weights.tokenizer import BPETokenizer

@@ -24,7 +24,7 @@ from tinygrad import Context, Tensor, UOp, dtypes
 from tinygrad.llm.model import GatedDeltaNetBlock, apply_rope
 from infurnace.dflash.jit import captured
 from infurnace.dflash.target import TargetObserver, detach_rng
-from infurnace.engine import _norm_of, _norm_rows_q8, _project, _rows, cached_attention
+from infurnace.layers.fused import _norm_of, _norm_rows_q8, _project, _rows, cached_attention
 from infurnace.kernels.gdn import gdn_chunk, gdn_gates, gdn_commit
 from infurnace.kernels.sampling import Sampler
 from infurnace.device import nvidia

@@ -1,5 +1,5 @@
 from tinygrad import Context, Tensor, dtypes
-from infurnace.engine import _load_tensors, _save_tensors
+from infurnace.weights.cache import load_tensors, save_tensors
 
 def test_tensors_round_trip_as_views_of_one_buffer(tmp_path):
   with Context(DEV='CPU'):
@@ -7,8 +7,8 @@ def test_tensors_round_trip_as_views_of_one_buffer(tmp_path):
                'b.weight': Tensor.arange(12).reshape(3, 4).cast(dtypes.int32).contiguous().realize(),
                'c': Tensor([7.0]).contiguous().realize()}
     path = tmp_path / 'params.bin'
-    _save_tensors(path, tensors)
-    loaded = _load_tensors(path, 'CPU')
+    save_tensors(path, tensors)
+    loaded = load_tensors(path, 'CPU')
     assert set(loaded) == set(tensors)
     for name, tensor in tensors.items():
       assert (loaded[name].shape, loaded[name].dtype) == (tensor.shape, tensor.dtype)
@@ -19,8 +19,8 @@ def test_tensors_round_trip_as_views_of_one_buffer(tmp_path):
 def test_damaged_tensor_file_is_a_miss(tmp_path):
   path = tmp_path / 'params.bin'
   path.write_bytes(b'nonsense')
-  assert _load_tensors(path, 'CPU') is None
-  assert _load_tensors(tmp_path / 'missing.bin', 'CPU') is None
-  with Context(DEV='CPU'): _save_tensors(path, {'a': Tensor([1.0, 2.0]).contiguous().realize()})
+  assert load_tensors(path, 'CPU') is None
+  assert load_tensors(tmp_path / 'missing.bin', 'CPU') is None
+  with Context(DEV='CPU'): save_tensors(path, {'a': Tensor([1.0, 2.0]).contiguous().realize()})
   path.write_bytes(path.read_bytes()[:-256])  # data block cut off
-  assert _load_tensors(path, 'CPU') is None
+  assert load_tensors(path, 'CPU') is None

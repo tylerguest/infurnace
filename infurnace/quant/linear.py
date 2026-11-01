@@ -5,6 +5,7 @@ from infurnace.weights.gguf import PackedTensor
 from infurnace.kernels.quant_gemv import (quant_gemv, prepare_q2, prepare_q6, prepare_q4, dequant_prepared_q2, dequant_prepared_q4,
                                           dequant_prepared_q6, untile)
 from infurnace.kernels.quant_gemm import quant_gemm, nv_prefill_supported, q2_int8
+from infurnace.kernels.embedding import packed_gather
 
 KERNEL_TYPES = (12, 13, 14, 42)  # Q4_K, Q5_K, Q6_K, Q2_0: the one-row GEMV, the tensor-core GEMM and the row gather
 
@@ -108,3 +109,40 @@ class _NVLinear:
       decoded = dequant_prepared_q2(layer.packed, in_features=layer.in_features)
       layer.original.weight = layer.weight = decoded.reshape(layer.out_features, layer.in_features).cast(dtypes.float16)
     return merged
+
+class PackedLinear(_NVLinear):
+  """Packed projection that keeps no dense decode graph alive.
+
+  Every live lazy graph is walked on each realize, so retained per-weight
+  dequantization graphs cost tens of milliseconds per call. Rows go through
+  the packed GEMM when available, otherwise the multirow packed GEMV.
+  """
+  def __init__(self, original, entry, *, prefill: bool, keep_weight: bool = False, realize: bool = True):
+    super().__init__(original, entry, prefill=prefill, q6_aligned=True, realize=realize)
+    if not keep_weight: self.weight = original.weight = None
+
+  def __call__(self, x, q8=None):
+    if self.prefill: return super().__call__(x, q8)
+    return self.decode(x)
+
+class PackedEmbedding:
+  """The token embedding of a tied packed table (the output head's storage), and the one place rows are looked up:
+  rows() decodes only the requested ones (kernels/embedding.py) and restores them from a Hadamard-latent basis when
+  the table is rotated. Model.lookup (Model.embed, DFlash's verifier) uses it for every tied table; Q2_0 tables also
+  take it as transformer.token_embd, called like upstream's embedding."""
+  def __init__(self, table: _NVLinear):
+    self.table, self.rotation = table, None  # the table's Hadamard rotation: rows are restored with its inverse
+
+  @property
+  def weight(self) -> Tensor:  # upstream's forward places the token ids on token_embd.weight's device
+    return self.table.packed
+
+  def rows(self, ids: Tensor) -> Tensor:
+    """FP32 rows for `ids` (int32, any shape)."""
+    t = self.table
+    x = packed_gather(ids, t.packed, width=t.in_features, ggml_type=t.ggml_type, q6_aligned=t.q6_aligned, q6_tiled=t.q6_tiled,
+                      q4_tiled=t.q4_tiled, rows=t.out_features)
+    return self.rotation.inverse(x) if self.rotation is not None else x
+
+  def __call__(self, ids: Tensor) -> Tensor:
+    return self.rows(ids).half()  # FP16, like upstream's token embedding

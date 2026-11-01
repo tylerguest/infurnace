@@ -96,7 +96,7 @@ def test_packed_loader_preserves_embedding_aliases(monkeypatch, tied_head, head_
       self.packed = Tensor.zeros(1, device='CPU').realize()
       adapters.append(self)
 
-  monkeypatch.setattr(engine, '_PackedLinear', Adapter)
+  monkeypatch.setattr(engine, 'PackedLinear', Adapter)
   model._enable_packed('unused.gguf', prefill=False)
   assert model._tied_head is tied_head
   assert transformer.token_embd.weight.tolist() == embedding.tolist()

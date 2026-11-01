@@ -7,30 +7,23 @@ between model families (tokenizer, extra passes such as Qwen3.5's fused GDN, pro
 their Family in infurnace/models.
 """
 import array
-import contextlib
 from dataclasses import dataclass
 import functools
 import hashlib
-import json
 import math
 import os
-import struct
 from pathlib import Path
 from typing import Iterator
 from tinygrad import Context, Tensor, TinyJit, UOp, dtypes
 from tinygrad.device import Buffer
-import tinygrad.llm.model as upstream_model
-from tinygrad.llm.model import Transformer, TransformerBlock, apply_rope, precompute_freqs_cis
+from tinygrad.llm.model import Transformer, TransformerBlock
 from tinygrad.nn.state import get_state_dict
-from tinygrad.uop.ops import Ops
-from infurnace.weights.gguf import Q2_0, decode as decode_packed, parse_gguf, read_gguf_metadata
+from infurnace.weights.gguf import Q2_0, lazy_upstream_weights, parse_gguf, read_gguf_metadata
+from infurnace.weights.cache import cache_root, file_identity, load_tensors, prune_cache, save_tensors, source_hash
 from infurnace.quant.hadamard import rotations
-from infurnace.kernels.hadamard import norm_fwht_q8
-from infurnace.kernels.attention import attention, attention_prologue, store_kv
+from infurnace.quant.linear import PackedEmbedding, PackedLinear, _NVLinear
+from infurnace.layers.fused import FusibleNorm, fused_attention, fused_feed_forward, int8_kv_cache
 from infurnace.kernels.quant_gemm import nv_prefill_supported
-from infurnace.kernels.quant_gemv import q8_quantize
-from infurnace.kernels.embedding import packed_gather
-from infurnace.quant.linear import _NVLinear
 from infurnace.device import nvidia
 from infurnace.models import Family, family_for
 
@@ -50,81 +43,6 @@ class ModelConfig:
   vocab_size: int
   context_length: int
 
-# The parameter cache lives under $XDG_CACHE_HOME/infurnace/params and is
-# keyed on everything that changes what it holds. A key mismatch, missing file or read error is a miss.
-def cache_root() -> Path:
-  return Path(os.environ.get('XDG_CACHE_HOME', str(Path.home() / '.cache'))).expanduser() / 'infurnace'
-
-@functools.cache
-def source_hash() -> str:
-  """Hash of the tinygrad and infurnace sources: any code change selects new entries."""
-  import tinygrad, infurnace
-  digest = hashlib.sha256()
-  for module in (tinygrad, infurnace):
-    package = Path(module.__file__).parent
-    for path in sorted(package.rglob('*.py')):
-      digest.update(str(path.relative_to(package)).encode())
-      digest.update(path.read_bytes())
-  return digest.hexdigest()
-
-def file_identity(path: str | Path) -> str:
-  stat = Path(path).stat()
-  return f'{Path(path).resolve()} {stat.st_size} {stat.st_mtime_ns}'
-
-def prune_cache(directory: Path, keep: int) -> None:
-  # Finished entries only: a .tmp may be another process's write in progress.
-  for old in sorted(directory.glob('*.bin'), key=lambda p: p.stat().st_mtime)[:-keep]: old.unlink(missing_ok=True)
-
-_ALIGN, _MAGIC = 256, b'INFTENS1'
-
-def _save_tensors(path: Path, tensors: dict[str, Tensor]) -> None:
-  """Realized tensors as one blob, each 256-byte aligned, plus a name/dtype/shape/offset index."""
-  index, chunks, offset = [], [], 0
-  for name, tensor in tensors.items():
-    data = bytes(tensor.data())
-    index.append({'name': name, 'dtype': tensor.dtype.name, 'shape': list(tensor.shape), 'offset': offset, 'nbytes': len(data)})
-    chunks.append(data + bytes(-len(data) % _ALIGN))
-    offset += len(chunks[-1])
-  header = json.dumps(index).encode()
-  path.parent.mkdir(parents=True, exist_ok=True)
-  partial = path.with_suffix('.tmp')
-  with partial.open('wb') as f:
-    f.write(_MAGIC + struct.pack('<Q', len(header)) + header)
-    f.write(bytes(-f.tell() % _ALIGN))
-    for chunk in chunks: f.write(chunk)
-  partial.replace(path)
-
-def _load_tensors(path: Path, device: str) -> dict[str, Tensor] | None:
-  """One host read and one copy to `device`; each tensor is a view into that buffer."""
-  try:
-    raw = path.read_bytes()
-    if raw[:8] != _MAGIC: return None
-    size = struct.unpack_from('<Q', raw, 8)[0]
-    index = json.loads(raw[16:16 + size])
-    blob = raw[16 + size + (-(16 + size) % _ALIGN):]
-    if any(entry['offset'] + entry['nbytes'] > len(blob) for entry in index): return None
-    base = Buffer(device, max(len(blob), 1), initial_value=blob)
-    return {entry['name']: Tensor(UOp.from_buffer(Buffer(device, entry['nbytes'], base=base, offset=entry['offset']).ensure_allocated(),
-                                                  getattr(dtypes, entry['dtype']))).reshape(entry['shape']) for entry in index}
-  except (OSError, ValueError, KeyError, TypeError, AttributeError, struct.error):
-    return None
-
-class _PackedLinear(_NVLinear):
-  """Packed projection that keeps no dense decode graph alive.
-
-  Every live lazy graph is walked on each realize, so retained per-weight
-  dequantization graphs cost tens of milliseconds per call. Rows go through
-  the packed GEMM when available, otherwise the multirow packed GEMV.
-  """
-  def __init__(self, original, entry, *, prefill: bool, keep_weight: bool = False, realize: bool = True):
-    super().__init__(original, entry, prefill=prefill, q6_aligned=True, realize=realize)
-    if not keep_weight: self.weight = original.weight = None
-
-  def __call__(self, x, q8=None):
-    if self.prefill: return super().__call__(x, q8)
-    return self.decode(x)
-
-PREFILL_ROWS = 16  # prompt chunks are padded to a multiple of this (the fused GDN kernel scans 16 rows at a time)
 # Prompt chunks: fixed-size graphs (see Model._prompt_chunk); GDN layers scan them 16 rows at a time. Bigger chunks
 # read each weight for more rows: Bonsai-4B (RTX 5060) reads prompts at 5055 tok/s in 64 rows, 5612 in 128, 5642 in
 # 256 (2k; 8k: 5290, 5578, 5714; 16k: 4959, 5306, 5468) and 4261 in 512 (16k). A chunk costs its full size however
@@ -140,260 +58,6 @@ PREFILL_CAPTURE_TOKENS = 2048
 # plain decoding, RTX 5060 (2k / 16k context): 167 / 145 tok/s reading every token, 174 / 154 with bursts of 4,
 # 183 / 158 with 8. A stop wastes up to 7 steps (~40 ms).
 DECODE_BURST = 8
-
-_SHARED_Q8 = os.environ.get('INFURNACE_SHARED_Q8', '1') != '0'
-
-class _FusibleNorm:
-  """An RMSNorm that remembers the input of its last call, so the consumer it feeds can take that input (take)
-  and norm, rotate and quantize it for Hadamard-folded projections in one kernel (_one_row's and _rows' norm): the
-  lazy output, then never read, is never computed. Every consumer of a fusible norm takes, so no input outlives its
-  call (tensors can't be weakly referenced, and live lazy graphs are walked on every realize)."""
-  def __init__(self, norm):
-    # the fused kernels' weight in FP32 once (casting the FP16 weight in each captured step is a kernel a norm)
-    self.norm, self.weight, self.eps, self._last = norm, norm.weight.float().contiguous().realize(), norm.eps, None
-
-  def __call__(self, x: Tensor) -> Tensor:
-    out = self.norm(x)
-    self._last = (out, x)
-    return out
-
-  def take(self, h: Tensor) -> Tensor | None:
-    """The input that produced `h` (its last output), else None; forgets it either way."""
-    last, self._last = self._last, None
-    return last[1] if last is not None and last[0] is h else None
-
-def _one_row(x: Tensor, *layers, norm: _FusibleNorm | None = None, half: bool = False, joined: bool = False) -> tuple[Tensor, ...]:
-  """One-row outputs of projections that read the same input, quantizing it to Q8 once: each packed
-  GEMV would otherwise quantize it again. Other inputs or layers go through their own call. With `norm`, `x` may be
-  that norm's output: Hadamard-folded projections then take its input and norm, rotate and quantize it in one kernel
-  (`half`: x is the norm's output rounded to FP16, as the GDN pass feeds it)."""
-  width = getattr(layers[0], 'in_features', None)
-  source = norm.take(x) if norm is not None else None
-  if _SHARED_Q8 and all(isinstance(layer, _NVLinear) and layer.rotation is layers[0].rotation for layer in layers) and \
-     isinstance(x.numel(), int) and x.numel() == width:
-    rotation = layers[0].rotation
-    if rotation is not None and source is not None: q8 = _norm_q8(norm, source, rotation, half=half)
-    # Hadamard-folded weights: one rotation for all of them, in the same kernel as the quantization
-    else: q8 = rotation.quantized(x, 32) if rotation is not None else q8_quantize(x, 1, width)
-    return _project(layers, x, q8, one_row=True, joined=joined)
-  return tuple(layer(x) for layer in layers)
-
-def _project(layers: tuple, x: Tensor, q8, *, one_row: bool, joined: bool = False) -> tuple[Tensor, ...]:
-  """Projections of one quantized input: one launch of their merged linear (Model._merge_projections) when they
-  were merged in this order, its output split (or with `joined` returned whole, a 1-tuple, for a consumer that reads
-  its parts itself: a custom kernel's slice of it would be copied first), else one launch each."""
-  group = getattr(layers[0], 'merged_group', None)
-  if group is not None and group[1] == tuple(layers):
-    out = group[0].decode(x, q8) if one_row else group[0](x, q8)
-    return (out,) if joined else tuple(out.split([layer.out_features for layer in layers], dim=-1))
-  return tuple(layer.decode(x, q8) if one_row else layer(x, q8) for layer in layers)
-
-def _materialized(*tensors: Tensor) -> bool:
-  """Whether each tensor is a view of a kernel's output (so a custom kernel can read it without another kernel)."""
-  return all(t.uop.base.op in (Ops.AFTER, Ops.BUFFER) for t in tensors)
-
-def _addends(source: Tensor) -> tuple[Tensor, Tensor] | None:
-  """The two FP32 operands of a lazy residual sum (a block's x + attention, h + feed-forward), else None."""
-  u = source.uop
-  if u.op is not Ops.ADD or len(u.src) != 2 or source.dtype != dtypes.float32 or not isinstance(source.numel(), int): return None
-  return (Tensor(u.src[0]), Tensor(u.src[1])) if all(s.shape == u.shape for s in u.src) else None
-
-def _norm_q8(norm: _FusibleNorm, source: Tensor, rotation, *, half: bool = False, normed: bool = False):
-  """norm(source), rotated and quantized in one kernel (norm_fwht_q8): the Q8 tuple for the projections, and with
-  `normed` also the normalized row in FP16. A residual sum's two operands go in separately: the kernel adds them,
-  stores the sum, and `source` becomes that output, so the block's later residual add reads it instead of adding
-  them again (one kernel fewer each residual add)."""
-  signs = rotation.signs if rotation.signs is not None else Tensor.ones(source.shape[-1], device=source.device)
-  parts = _addends(source)
-  out = norm_fwht_q8(parts[0] if parts else source, norm.weight, norm.eps, signs, block=rotation.block, group=32, normed=normed,
-                     half=half, addend=parts[1] if parts else None)
-  if parts:
-    source.replace(out[-1].reshape(source.shape))
-    out = out[:-1]
-  return (out[:3], out[3]) if normed else out
-
-def _norm_of(block, name: str) -> _FusibleNorm | None:
-  """The block's norm `name` when it is fusible (Model._fuse_norms), else None."""
-  return norm if isinstance(norm := getattr(block, name, None), _FusibleNorm) else None
-
-def _norm_rows_q8(layer: _NVLinear, norm: _FusibleNorm, source: Tensor, *, half: bool = False, normed: bool = False):
-  """layer.rows_q8 of norm(source) in one kernel (norm_fwht_q8): rows padded to a multiple of 16 (padding rows
-  normalize to zero), rotated and quantized in 64-value groups; with `normed`, also the FP16 normalized rows in
-  source's shape."""
-  symbolic = not isinstance(source.numel(), int)
-  activation = source.pad_to(source.max_shape) if symbolic else source
-  tokens = activation.numel() // layer.in_features
-  def padded(t: Tensor) -> Tensor: return t.reshape(tokens, layer.in_features).pad(((0, -tokens % 16), (0, 0)))
-  parts = _addends(source)  # a residual sum: added in the kernel, as _norm_q8 does
-  rotation = layer.rotation
-  signs = rotation.signs if rotation.signs is not None else Tensor.ones(layer.in_features, device=source.device)
-  out = norm_fwht_q8(padded(parts[0] if parts else activation), norm.weight, norm.eps, signs, block=rotation.block, group=64,
-                     normed=normed, half=half, addend=padded(parts[1]) if parts else None)
-  if parts:
-    source.replace(out[-1][:tokens].reshape(source.shape))
-    out = out[:-1]
-  if not normed: return out
-  rows_normed = out[2][:tokens].reshape(activation.shape)
-  if symbolic: rows_normed = rows_normed.shrink(tuple((0, size) for size in source.shape))
-  return out[:2], rows_normed
-
-def _rows(x: Tensor, *layers, norm: _FusibleNorm | None = None, source: Tensor | None = None, joined: bool = False) -> tuple[Tensor, ...]:
-  """Multirow outputs of projections that read the same input: Hadamard-folded Q2_0 weights share one rotated
-  int8 input (_NVLinear.rows_q8) instead of each rotating and quantizing it. Other layers go through their own call.
-  With `norm`, `x` may be that norm's output (or `source` its input): the shared input is then normalized, rotated
-  and quantized in one kernel."""
-  if source is None and norm is not None: source = norm.take(x)
-  if all(isinstance(layer, _NVLinear) and layer.rows_quantized and layer.rotation is layers[0].rotation for layer in layers):
-    q8 = _norm_rows_q8(layers[0], norm, source) if source is not None else layers[0].rows_q8(x)
-    return _project(layers, x, q8, one_row=False, joined=joined)
-  return tuple(layer(x) for layer in layers)
-
-def _fused_feed_forward(block):
-  """Upstream's dense feed-forward, with gate and up sharing one Q8 activation for one row."""
-  upstream_feed_forward = block._feed_forward
-  down = block.ffn_down
-  def feed_forward(x: Tensor) -> Tensor:
-    if hasattr(block, 'ffn_gate_exps'): return upstream_feed_forward(x)
-    width = getattr(down, 'in_features', None)
-    if not isinstance(x.numel(), int) or x.numel() != getattr(block.ffn_gate, 'in_features', None):
-      outs = _rows(x, block.ffn_gate, block.ffn_up, norm=_norm_of(block, 'ffn_norm'), joined=True)
-      # merged gate and up: the down projection's rotate-and-quantize kernel reads both halves of the one output
-      if len(outs) == 1 and down.rows_quantized: return down(outs[0][..., :width], down.rows_q8(outs[0], pair=True))
-      gate, up = outs if len(outs) == 2 else outs[0].split(width, dim=-1)
-      # silu(gate) * up made by the same kernel, when both are kernel outputs already (a 16-row verification's are
-      # lazy sums of split partials, which the multiply's kernel adds)
-      if isinstance(down, _NVLinear) and down.rows_quantized and _materialized(gate, up): return down(gate, down.rows_q8(gate, up=up))
-      return down(gate.silu().contiguous() * up)
-    outs = _one_row(x, block.ffn_gate, block.ffn_up, norm=_norm_of(block, 'ffn_norm'), joined=True)
-    if len(outs) == 1 and _SHARED_Q8 and down.rotation is not None:
-      return down.decode(outs[0][..., :width], down.rotation.quantized(outs[0], 32, pair=True))
-    gate, up = outs if len(outs) == 2 else outs[0].split(width, dim=-1)
-    if _SHARED_Q8 and isinstance(down, _NVLinear) and down.rotation is not None and _materialized(gate, up):
-      return down.decode(gate, down.rotation.quantized(gate, 32, up=up))
-    return down(gate.silu().contiguous() * up)
-  feed_forward.takes_norm = True  # its one-row path takes a _FusibleNorm's input (_one_row)
-  return feed_forward
-
-def cached_attention(block: TransformerBlock, q: Tensor, k: Tensor, v: Tensor, start_pos) -> Tensor:
-  """Write k, v (1, kv_heads, rows, dim) as cache rows start_pos.. of the block's KV cache, then attend over it
-  (kernels/attention.py): an int8 cache (_int8_kv_cache) when the block has one."""
-  if (scales := getattr(block, 'cache_scale', None)) is not None:
-    cache, scales = store_kv(block.cache_kv, scales, k, v, start_pos)
-    return attention(q, cache, start_pos, scales=scales)
-  store = block.cache_kv[:, :, :, start_pos:start_pos + k.shape[2], :].uop.store(Tensor.stack(k, v).cast(block.cache_kv.dtype).uop)
-  return attention(q, Tensor(block.cache_kv.uop.after(store)), start_pos)
-
-def _int8_kv_cache(block: TransformerBlock):
-  """Create the block's KV cache as int8 keys and FP8 values with one scale a vector (kernels/attention.store_kv) in
-  place of upstream's FP16 one: half the bytes a decoding step reads, which at long contexts is most of a step
-  (Bonsai-4B at 64k keys: ~6 of ~12 ms). Only cached_attention reads it. Its capacity is rounded up to whole
-  32-key tiles (the multirow kernel reads values a tile at a time)."""
-  init, c = block._init_state, block.config
-  def init_state(x: Tensor):
-    if not hasattr(block, 'cache_kv'):  # upstream creates the RoPE table with its cache: so does this
-      batch, device, capacity = x.shape[0], x.device, -(-c.max_context // 32) * 32
-      block.cache_kv = Tensor.zeros(2, batch, c.n_kv_heads, capacity, c.head_dim // 4, dtype=dtypes.uint32, device=device).contiguous()
-      block.cache_scale = Tensor.zeros(2, batch, c.n_kv_heads, capacity, dtype=dtypes.float16, device=device).contiguous()
-      block.freqs_cis = precompute_freqs_cis(c.rope_dim, c.max_context, c.rope_theta, device=device, yarn=c.yarn)
-    init(x)
-  block._init_state = init_state
-
-def _fused_attention(block: TransformerBlock):
-  """Upstream TransformerBlock._attention for one-row decoding and multirow prompt chunks, with the
-  attention itself in kernels/attention.py: upstream's attention over a runtime length slows as the
-  conversation grows (it swaps in its own kernel only on AMD, at this same spot). Other shapes use
-  upstream's path."""
-  upstream_attention, c = block._attention, block.config
-  def attention_step(x: Tensor, start_pos, idx_mask=None):
-    # idx_mask: an indexer's token selection (DeepSeek-style sparse attention), which these models don't have
-    if idx_mask is not None: return upstream_attention(x, start_pos, idx_mask)
-    B, T, _ = x.shape
-    if B == 1 and (isinstance(T, UOp) or T > 1) and x.max_shape[1] % PREFILL_ROWS == 0:
-      # A prompt chunk (1..16 rows, or up to a prompt chunk's size), padded to its maximum like the GDN prefill. The padding rows come
-      # from zero inputs, so their cached keys and values are finite (the kernel reads every key below the
-      # padded end), and the prompt's next rows overwrite them. The prompt reader keeps the padded end in the cache.
-      norm = _norm_of(block, 'attn_norm')
-      source = norm.take(x) if norm is not None else None
-      x = x.pad_to((B, x.max_shape[1], x.shape[2]))
-      if source is not None: source = source.pad_to(x.shape)
-      return rows_attention(x, start_pos, *_rows(x, block.attn_q, block.attn_k, block.attn_v, norm=norm, source=source))[:, :T]
-    if B != 1 or isinstance(T, UOp) or T != 1:
-      if hasattr(block, 'cache_scale'): raise NotImplementedError("upstream attention can't read an int8 KV cache")
-      return upstream_attention(x, start_pos)
-    outs = _one_row(x, block.attn_q, block.attn_k, block.attn_v, norm=_norm_of(block, 'attn_norm'), joined=True)
-    if len(outs) == 1:  # merged: the fused prologue reads the one output, or it is split as three
-      if (weights := getattr(block, 'qk_norm_f32', None)) is not None and hasattr(block, 'cache_scale'):
-        return prologue_row(outs[0], start_pos, weights)
-      outs = outs[0].split([block.attn_q.out_features, block.attn_k.out_features, block.attn_v.out_features], dim=-1)
-    return rows_attention(x, start_pos, *outs)
-  def prologue_row(joined: Tensor, start_pos, weights: tuple[Tensor, Tensor]) -> Tensor:
-    # q/k norms, RoPE and the int8 K/V write in one kernel (kernels/attention.attention_prologue), then attention
-    H, D = c.n_heads, c.head_dim
-    joined = joined.reshape(-1)
-    q, cache, scales = attention_prologue(joined, *weights, block.freqs_cis, block.cache_kv, block.cache_scale, start_pos, heads=H,
-                                          kv_heads=c.n_kv_heads, dim=D, rope_dim=c.rope_dim, eps=block.attn_q_norm.eps)
-    attn = attention(q.reshape(1, H, 1, D), cache, start_pos, scales=scales).reshape(1, 1, H * D)
-    gate = joined[:H * 2 * D].reshape(H, 2, D)[:, 1].reshape(1, 1, H * D)
-    return block.attn_output(attn * gate.sigmoid())
-  def rows_attention(x: Tensor, start_pos, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
-    B, T, _ = x.shape
-    if c.qk_norm and c.qk_norm != c.head_dim: q, k = block.attn_q_norm(q), block.attn_k_norm(k)
-    if c.attn_output_gate:
-      qg = q.reshape(B, T, c.n_heads, 2, c.head_dim)
-      q, gate = qg[:, :, :, 0, :], qg[:, :, :, 1, :].reshape(B, T, c.n_heads * c.head_dim)
-    q = q.reshape(B, T, c.n_heads, c.head_dim).transpose(1, 2)
-    k = k.reshape(B, T, c.n_kv_heads, c.head_dim).transpose(1, 2)
-    v = v.reshape(B, T, c.n_kv_heads, c.head_dim).transpose(1, 2)
-    if c.qk_norm == c.head_dim: q, k = block.attn_q_norm(q), block.attn_k_norm(k)
-    q = apply_rope(q[..., :c.rope_dim], block.freqs_cis[start_pos:start_pos + T]).cat(q[..., c.rope_dim:], dim=-1)
-    k = apply_rope(k[..., :c.rope_dim], block.freqs_cis[start_pos:start_pos + T]).cat(k[..., c.rope_dim:], dim=-1)
-    attn = cached_attention(block, q, k, v, start_pos).cast(q.dtype).transpose(1, 2).reshape(B, T, -1)
-    return block.attn_output(attn * gate.sigmoid() if c.attn_output_gate else attn)
-  attention_step.takes_norm = True  # its one-row path takes a _FusibleNorm's input (_one_row)
-  return attention_step
-
-@contextlib.contextmanager
-def _lazy_upstream_weights(path):
-  """Build upstream's Transformer without reading its weights into host memory.
-
-  Upstream's gguf_shard realizes every tensor of the file (2.7 GB copied to host
-  RAM, one realize each), but the packed load replaces nearly all of them with
-  packed NV copies read straight from disk. Inside this block the weights stay
-  lazy, so only the ones that are kept get read (when moved to the device), and
-  upstream reuses the header we already parsed (same metadata and entries)."""
-  parse, shard = upstream_model.gguf_parse, upstream_model.gguf_shard
-  def cached_parse(fn):
-    metadata, entries = parse_gguf(path)
-    return metadata, {name: (entry.data, entry.shape, entry.ggml_type) for name, entry in entries.items()}
-  def lazy_shard(entries, devices, shard_map=None):
-    if shard_map or len(devices) != 1: return shard(entries, devices, shard_map)
-    return {name: decode_packed(data.to(devices[0]).flatten(), math.prod(shape), typ).reshape(shape)
-            for name, (data, shape, typ) in entries.items()}
-  upstream_model.gguf_parse, upstream_model.gguf_shard = cached_parse, lazy_shard
-  try: yield
-  finally: upstream_model.gguf_parse, upstream_model.gguf_shard = parse, shard
-
-class _PackedEmbedding:
-  """The token embedding of a tied packed table (the output head's storage), and the one place rows are looked up:
-  rows() decodes only the requested ones (kernels/embedding.py) and restores them from a Hadamard-latent basis when
-  the table is rotated. Model.lookup (Model.embed, DFlash's verifier) uses it for every tied table; Q2_0 tables also
-  take it as transformer.token_embd, called like upstream's embedding."""
-  def __init__(self, table: _NVLinear):
-    self.table, self.rotation = table, None  # the table's Hadamard rotation: rows are restored with its inverse
-
-  @property
-  def weight(self) -> Tensor:  # upstream's forward places the token ids on token_embd.weight's device
-    return self.table.packed
-
-  def rows(self, ids: Tensor) -> Tensor:
-    """FP32 rows for `ids` (int32, any shape)."""
-    t = self.table
-    x = packed_gather(ids, t.packed, width=t.in_features, ggml_type=t.ggml_type, q6_aligned=t.q6_aligned, q6_tiled=t.q6_tiled,
-                      q4_tiled=t.q4_tiled, rows=t.out_features)
-    return self.rotation.inverse(x) if self.rotation is not None else x
-
-  def __call__(self, ids: Tensor) -> Tensor:
-    return self.rows(ids).half()  # FP16, like upstream's token embedding
 
 SNAPSHOTS = 8  # prompt snapshots kept (recurrent families), about 50 MB of host memory each for Qwen3.5-4B
 
@@ -420,7 +84,7 @@ class Model:
     self.nv_prefill = False
     self._path, self._host_embedding = None, None
     self._tied_head = False  # the packed output head is the token embedding table
-    self._embedding: _PackedEmbedding | None = None  # its lookup, when it is (see lookup)
+    self._embedding: PackedEmbedding | None = None  # its lookup, when it is (see lookup)
     self._multirow_prefill = False  # prompts are read in prompt chunks (see _prefill)
     self._warming = False
     # Prompt chunks: a captured step for each size that slices the prompt from a persistent device buffer (see _prompt_chunk)
@@ -791,13 +455,13 @@ class Model:
     return self._embedding.rows(ids)
 
   def _fuse_norms(self):
-    """Hadamard-folded models: each block's norms become _FusibleNorm where their consumer is infurnace's pass (which
+    """Hadamard-folded models: each block's norms become FusibleNorm where their consumer is infurnace's pass (which
     takes the norm's input for one row), so one-row decoding norms, rotates and quantizes in one kernel: ~65 fewer
     kernels a Bonsai-4B token, and the norm's own reduction and scaling kernels."""
     for block in self.transformer.blk:
       if getattr(getattr(block, 'attn_qkv', getattr(block, 'attn_q', None)), 'rotation', None) is None: continue
-      if getattr(block._attention, 'takes_norm', False): block.attn_norm = _FusibleNorm(block.attn_norm)
-      if getattr(block._feed_forward, 'takes_norm', False): block.ffn_norm = _FusibleNorm(block.ffn_norm)
+      if getattr(block._attention, 'takes_norm', False): block.attn_norm = FusibleNorm(block.attn_norm)
+      if getattr(block._feed_forward, 'takes_norm', False): block.ffn_norm = FusibleNorm(block.ffn_norm)
 
   def _merge_projections(self):
     """Q2_0 projections of one input (attn_qkv and attn_gate, attn_q/k/v, ffn_gate and ffn_up) become one linear of
@@ -852,7 +516,7 @@ class Model:
     # Stage upstream's raw file in host memory; only packed projections and the
     # small remaining parameters are copied to the GPU. Upstream otherwise
     # re-unpacks every quantized weight inside each step's kernels.
-    with Context(DEV='CPU'), _lazy_upstream_weights(path):
+    with Context(DEV='CPU'), lazy_upstream_weights(path):
       transformer, metadata = Transformer.from_gguf(Path(path), max_context=max_context, realize=False)
     result = cls(transformer, metadata, device, family)
     result._path = Path(path)
@@ -861,11 +525,11 @@ class Model:
       for block in transformer.blk:
         if (type(block) is TransformerBlock and not block.config.sliding_window and not hasattr(block, 'attn_sinks')
             and block.config.head_dim % 32 == 0):
-          block._attention = _fused_attention(block)
+          block._attention = fused_attention(block)
           if nvidia(device) and block.config.head_dim % 128 == 0 and os.environ.get('INFURNACE_KV_INT8', '1') != '0':
-            _int8_kv_cache(block)
+            int8_kv_cache(block)
     for block in transformer.blk:
-      if isinstance(getattr(block, 'ffn_gate', None), _NVLinear): block._feed_forward = _fused_feed_forward(block)
+      if isinstance(getattr(block, 'ffn_gate', None), _NVLinear): block._feed_forward = fused_feed_forward(block)
     # The family's own passes; it says whether prompts can then be read in chunks.
     chunks = family.accelerate(result)
     if transformer.config.hc is None: result._sample_on_device()
@@ -924,12 +588,12 @@ class Model:
         tied = name == 'output.weight' and self._tied_head
         # Lazy copy + repack; each layer is realized in one schedule below
         # (one realize per weight costs ~20 ms of graph bookkeeping each).
-        adapter = _PackedLinear(getattr(owner, attribute), entry.to(self.device, realize=False), prefill=prefill,
+        adapter = PackedLinear(getattr(owner, attribute), entry.to(self.device, realize=False), prefill=prefill,
                                 keep_weight=tied, realize=False)
         layers.setdefault(name.split('.')[1] if name.startswith('blk.') else name, []).append(adapter.packed)
         setattr(owner, attribute, adapter)
         packed.add(name)
-        if tied: self._embedding = _PackedEmbedding(adapter)
+        if tied: self._embedding = PackedEmbedding(adapter)
         if tied and entry.ggml_type == Q2_0:
           # Upstream's embedding would decode the whole table: the packed lookup is the token embedding too, so no
           # dense decode graph stays alive (each realize walks it: ~5 ms of host time for Bonsai-4B's 248k-row head)
@@ -955,7 +619,7 @@ class Model:
       # them schedules ~700 tiny kernels (~2 s) for ~10 MB, so the result is cached on disk.
       remaining = {name: tensor for name, tensor in get_state_dict(self.transformer).items() if tensor.device != self.device}
       cache = self._param_cache_path(path) if remaining else None
-      cached = _load_tensors(cache, self.device) if cache is not None and cache.is_file() else None
+      cached = load_tensors(cache, self.device) if cache is not None and cache.is_file() else None
       if cached is not None and set(cached) == set(remaining) and all(
           cached[name].shape == tensor.shape and cached[name].dtype == tensor.dtype for name, tensor in remaining.items()):
         for name, tensor in remaining.items(): tensor.replace(cached[name])
@@ -964,5 +628,5 @@ class Model:
         Tensor.realize(*[copy for _, copy in moved])
         for tensor, copy in moved: tensor.replace(copy)
         if cache is not None:
-          _save_tensors(cache, remaining)
+          save_tensors(cache, remaining)
           prune_cache(cache.parent, keep=4)

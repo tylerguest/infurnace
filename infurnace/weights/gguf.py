@@ -2,6 +2,7 @@
 
 The header is read here, with tinygrad's readers, so that types tinygrad doesn't know (Q2_0, Bonsai's ternary
 weights) still get their tensor views; decode() handles those and leaves the rest to tinygrad."""
+import contextlib
 import functools
 import io
 import math
@@ -11,6 +12,7 @@ from pathlib import Path
 from typing import Any
 from tinygrad import Tensor, dtypes
 from tinygrad.helpers import round_up
+import tinygrad.llm.model as upstream_model
 from tinygrad.llm.gguf import _GGML_NATIVE, _GGML_QUANT, TensorIO, ggml_data_to_tensor, read_int32, read_int64, read_str, read_uint32, \
   read_uint64, readers
 
@@ -94,3 +96,24 @@ def parse_gguf(path: str | Path) -> tuple[dict[str, Any], dict[str, PackedTensor
 
 def read_gguf_metadata(path: str | Path) -> dict[str, Any]:
   return parse_gguf(path)[0]
+
+@contextlib.contextmanager
+def lazy_upstream_weights(path):
+  """Build upstream's Transformer without reading its weights into host memory.
+
+  Upstream's gguf_shard realizes every tensor of the file (2.7 GB copied to host
+  RAM, one realize each), but the packed load replaces nearly all of them with
+  packed NV copies read straight from disk. Inside this block the weights stay
+  lazy, so only the ones that are kept get read (when moved to the device), and
+  upstream reuses the header we already parsed (same metadata and entries)."""
+  parse, shard = upstream_model.gguf_parse, upstream_model.gguf_shard
+  def cached_parse(fn):
+    metadata, entries = parse_gguf(path)
+    return metadata, {name: (entry.data, entry.shape, entry.ggml_type) for name, entry in entries.items()}
+  def lazy_shard(entries, devices, shard_map=None):
+    if shard_map or len(devices) != 1: return shard(entries, devices, shard_map)
+    return {name: decode(data.to(devices[0]).flatten(), math.prod(shape), typ).reshape(shape)
+            for name, (data, shape, typ) in entries.items()}
+  upstream_model.gguf_parse, upstream_model.gguf_shard = cached_parse, lazy_shard
+  try: yield
+  finally: upstream_model.gguf_parse, upstream_model.gguf_shard = parse, shard

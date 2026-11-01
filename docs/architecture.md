@@ -13,12 +13,13 @@ The top level holds the core: the commands, model loading and the engine. The re
 |---|---|
 | `cli.py` | Commands (`serve`, `run`, `ps`, `stop`, `pull`, `list`, `rm`, `launch`), the menu for bare `infurnace`, and the original in-process flags |
 | `loader.py` | The family for a GGUF's architecture, device dispatch, model and DFlash loading, context from free VRAM |
-| `engine.py` | `Model`: upstream model loading, packed weights, fused attention and feed-forward, prompt chunks, generation, prompt snapshots |
+| `engine.py` | `Model`: upstream model loading, packed weights, prompt chunks, generation, prompt snapshots |
 | `device.py` | Device probing, the fast-path check, NVIDIA's pip-installed compiler, free VRAM |
 | `server/` | `serve.py`: tinygrad's OpenAI-compatible server (`/v1`) plus infurnace's `/api`; DFlash, per-request thinking, warmup on a thread, speeds. `chat.py`: chat prompts from the GGUF's Jinja template (server and local chat) |
 | `frontend/` | `client.py`: talking to the server (finding or starting it, chat and one-shot replies, `ps`/`stop`, `launch pi`). `menu.py`: the arrow-key menu |
-| `weights/` | `gguf.py`: GGUF parsing (tinygrad's parser) and metadata. `tokenizer.py`: byte-level BPE (pretokenizer per GGUF preset) and streaming decode. `catalog.py`: named models (GGUF, architecture, optional DFlash draft) and their downloads |
-| `quant/` | `linear.py`: `_NVLinear`, the packed projection used by the models and the draft. `hadamard.py`: Hadamard-folded weights. `quantize.py`: requantization at load |
+| `weights/` | `gguf.py`: GGUF parsing (tinygrad's parser) and metadata. `tokenizer.py`: byte-level BPE (pretokenizer per GGUF preset) and streaming decode. `catalog.py`: named models (GGUF, architecture, optional DFlash draft) and their downloads. `cache.py`: the parameter cache of prepared weights |
+| `layers/` | `fused.py`: upstream's attention and feed-forward on infurnace's kernels (int8 KV cache, fused prologue), and the shared-input projections the families and the draft use |
+| `quant/` | `linear.py`: `_NVLinear`, the packed projection used by the models and the draft, and the packed embedding. `hadamard.py`: Hadamard-folded weights. `quantize.py`: requantization at load |
 | `models/` | Model families only (`Family`: tokenizer, extra passes, snapshots): `qwen35.py` adds the fused GDN layers; `qwen3.py` is attention-only |
 | `dflash/` | Draft model, target observation, parallel verification, adaptive drafting |
 | `kernels/` | Custom tinygrad UOp kernels (below) |
