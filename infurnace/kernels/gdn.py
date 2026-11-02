@@ -324,6 +324,21 @@ def gdn_prefill_raw(qkv: Tensor, conv_state: Tensor, conv_w: Tensor, gates: Tens
   return Tensor.custom_kernel(o, u, packed, bg, state, keep, fxn=functools.partial(
     _gdn_chunk_kernel, heads=heads, rows=rows, advance=True, cumulative=False, kheads=kheads))[0]
 
+def gdn_verify_raw(qkv: Tensor, conv_state: Tensor, conv_w: Tensor, gates: Tensor, dt_bias: Tensor, a: Tensor, state: Tensor,
+                   live: Tensor, keep: Tensor, packed: Tensor, bg: Tensor, u: Tensor, *, kheads: int) -> Tensor:
+  """A verification block's GDN from the raw projections (gdn_prefill_raw's arguments), leaving both states as they are:
+  gdn_prep into `packed` (C / 128, T, 128) and `bg` (2, H, T), then the closed form, its u into `u` (H, T, 128): the
+  three buffers gdn_commit reads (with `kheads`) once the accepted rows are known. Upstream's input processing was ~12
+  small kernels a layer here. Returns the FP32 outputs (T, H, 128) before the gated RMSNorm."""
+  rows, heads, channels = qkv.shape[0], state.shape[0], conv_state.shape[1]
+  if rows % 16 or channels != 2*kheads*128 + heads*128 or state.shape[1:] != (128, 128) or gates.shape != (rows, 2*heads):
+    raise ValueError("fused GDN verification requires a multiple of 16 rows of 128-dimensional heads")
+  packed, bg = Tensor.custom_kernel(packed, bg, qkv, conv_state, conv_w, gates, dt_bias, a, live, keep, fxn=functools.partial(
+    _prep_kernel, rows=rows, heads=heads, kheads=kheads, channels=channels))[:2]
+  o = Tensor.empty(rows, heads, 128, dtype=dtypes.float32, device=qkv.device)
+  return Tensor.custom_kernel(o, u, packed, bg, state, keep, fxn=functools.partial(
+    _gdn_chunk_kernel, heads=heads, rows=rows, cumulative=False, kheads=kheads))[0]
+
 @functools.cache
 def _gdn_decode_kernel(z: UOp, state: UOp, qkv: UOp, conv: UOp, conv_w: UOp, x: UOp, w_beta: UOp, w_alpha: UOp, dt_bias: UOp,
                        a: UOp, gate: UOp, weight: UOp, keep: UOp, *, heads: int, kheads: int, width: int, eps: float,
@@ -438,19 +453,29 @@ def gdn_decode(qkv: Tensor, conv_state: Tensor, conv_w: Tensor, x: Tensor, w_bet
 
 @functools.cache
 def _commit_kernel(state: UOp, conv: UOp, g: UOp, k: UOp, u: UOp, window: UOp, params: UOp, *, heads: int, kd: int, vd: int,
-                   rows: int, conv_rows: int, channels: int, tile: int) -> UOp:
+                   rows: int, conv_rows: int, channels: int, tile: int, kheads: int = 0) -> UOp:
   """A verified block's first `count` rows (params[0]) into one GDN layer's state, in place:
   S = exp(g_last) S + sum_{j<count} exp(g_last - g_j) u_j k_j^T (S zeroed first when params[1], the block at position 0),
   and the conv state = the window's rows count .. count + conv_rows - 1. A CTA per head and `tile` value rows, a
-  thread per key column: each thread weighs its 16 key values once and updates its column of the tile's rows."""
+  thread per key column: each thread weighs its 16 key values once and updates its column of the tile's rows.
+  g and k are the cumulative log-decays (1, heads, rows) and keys (1, heads, rows, kd); or with `kheads`, gdn_prep's
+  per-row β and log-decays (2, heads, rows) and packed heads (value head h reading key head h % kheads)."""
   tiles = vd // tile
   block = UOp.range(heads * tiles, 0, axis_type=AxisType.GLOBAL)
   lane = UOp.range(kd, 1, axis_type=AxisType.LOCAL)
   head, first_row = block // tiles, (block % tiles) * tile
   count, initial = params[0].load(), params[1].load().ne(0)
-  last = g[0, head, (count - 1).maximum(0)].load()
-  weighted = [(UOp.const(j, dtypes.int32) < count).where((last - g[0, head, j].load()).exp(), UOp.const(0.0, dtypes.float32))
-              * k[0, head, j, lane].load() for j in range(rows)]
+  F32, zero = dtypes.float32, UOp.const(0.0, dtypes.float32)
+  if kheads:
+    gs = [g[1, head, j].load() for j in range(rows)]
+    for j in range(1, rows): gs[j] = gs[j - 1] + gs[j]
+    keys = [k[kheads + head % kheads, j, lane].load() for j in range(rows)]
+    last = sum(((count - 1).maximum(0).eq(j).where(x, zero) for j, x in enumerate(gs)), zero)
+  else:
+    gs = [g[0, head, j].load() for j in range(rows)]
+    keys = [k[0, head, j, lane].load() for j in range(rows)]
+    last = g[0, head, (count - 1).maximum(0)].load()
+  weighted = [(UOp.const(j, dtypes.int32) < count).where((last - gs[j]).exp(), zero) * keys[j] for j in range(rows)]
   decay = last.exp()
   stores = []
   for r in range(tile):
@@ -466,7 +491,8 @@ def _commit_kernel(state: UOp, conv: UOp, g: UOp, k: UOp, u: UOp, window: UOp, p
   stores.append(conv[0, clamped // channels, (clamped % channels).valid(index < size)].store(shifted))
   return UOp.group(*stores).end(block, lane).sink(arg=KernelInfo(name="gdn_commit", opts_to_apply=()))
 
-def gdn_commit(state: Tensor, conv: Tensor, g: Tensor, k: Tensor, u: Tensor, window: Tensor, params: Tensor, *, tile: int = 4):
+def gdn_commit(state: Tensor, conv: Tensor, g: Tensor, k: Tensor, u: Tensor, window: Tensor, params: Tensor, *, tile: int = 4,
+               kheads: int = 0):
   """One GDN layer's commit of a verified block (see _commit_kernel), in place: returns (state, conv) after it. RTX 5060,
   Bonsai-4B's 32 x 128 x 128 FP32 state: 13.1 us with 4 value rows a CTA (16: 16.2, 1: 22.8); reading and writing
   the state takes ~9.4 us at the card's bandwidth."""
@@ -474,5 +500,6 @@ def gdn_commit(state: Tensor, conv: Tensor, g: Tensor, k: Tensor, u: Tensor, win
   rows, conv_rows, channels = g.shape[-1], conv.shape[1], conv.shape[2]
   if vd % tile or heads * (vd // tile) * kd < conv_rows * channels:
     raise ValueError("gdn_commit: tile must divide the value rows and its threads cover the conv state")
-  fxn = functools.partial(_commit_kernel, heads=heads, kd=kd, vd=vd, rows=rows, conv_rows=conv_rows, channels=channels, tile=tile)
+  fxn = functools.partial(_commit_kernel, heads=heads, kd=kd, vd=vd, rows=rows, conv_rows=conv_rows, channels=channels, tile=tile,
+                          kheads=kheads)
   return tuple(Tensor.custom_kernel(state, conv, g, k, u, window, params, fxn=fxn)[:2])

@@ -25,7 +25,7 @@ from tinygrad.llm.model import GatedDeltaNetBlock, apply_rope
 from infurnace.dflash.jit import captured
 from infurnace.dflash.target import TargetObserver, detach_rng
 from infurnace.layers.fused import _norm_of, _norm_rows_q8, _project, _rows, cached_attention
-from infurnace.kernels.gdn import gdn_chunk, gdn_gates, gdn_commit
+from infurnace.kernels.gdn import _gated_norm, gdn_chunk, gdn_gates, gdn_commit, gdn_verify_raw
 from infurnace.kernels.sampling import Sampler
 from infurnace.device import nvidia
 
@@ -64,6 +64,14 @@ class _Operands:
     self.k = Tensor.empty(1, heads, rows, kd, device=device).realize()
     self.u = Tensor.empty(1, heads, rows, vd, device=device).realize()
     self.g = Tensor.empty(1, heads, rows, device=device).realize()
+    # The NV path (gdn_verify_raw): gdn_prep's outputs, which gdn_commit reads in place of g and k, and its constants
+    self.packed = self.bg = None
+    if nvidia(device) and rows % 16 == 0 and kd == vd == 128 and getattr(block, 'gdn_gates', None) is not None:
+      self.packed = Tensor.empty(block.conv_channels // 128, rows, 128, device=device).realize()
+      self.bg = Tensor.empty(2, heads, rows, device=device).realize()
+      self.conv_w = block.ssm_conv1d['weight'].float().contiguous().realize()
+      self.dt_bias, self.a = (w.float().contiguous().realize() for w in (block.ssm_dt['bias'], block.ssm_a))
+      self.live = Tensor.full((1,), rows, dtype=dtypes.int32, device=device).contiguous().realize()
 
 class ParallelVerifier:
   def __init__(self, observer: TargetObserver, rows: int):
@@ -101,10 +109,31 @@ class ParallelVerifier:
     if source is not None and block.attn_qkv.rows_quantized and block.attn_gate.rotation is block.attn_qkv.rotation:
       # the norm, rotation and quantization in one kernel, which also hands back the FP16 normed rows the pass reads
       q8, x = _norm_rows_q8(block.attn_qkv, norm, source, half=True, normed=True)
-      qkv, out_gate = _project((block.attn_qkv, block.attn_gate), x, q8, one_row=False)
+      outs = _project((block.attn_qkv, block.attn_gate), x, q8, one_row=False, joined=True)
+      # the merged projection's output whole (its split sums added once), for the kernels below that read its parts
+      joined = outs[0].reshape(T, -1).contiguous() if len(outs) == 1 else None
+      qkv, out_gate = joined.reshape(B, T, -1).split([block.attn_qkv.out_features, block.attn_gate.out_features], dim=-1) \
+        if joined is not None else outs
     else:
-      x = x.half()
+      joined, x = None, x.half()
       qkv, out_gate = _rows(x, block.attn_qkv, block.attn_gate)
+    if self._fused and ops.packed is not None:
+      # As a prompt chunk (models/qwen35.py): the conv, q/k norms, β and decay in one kernel reading the projection's
+      # rows, then the closed form; ~12 small kernels a layer before
+      rows = joined if joined is not None else qkv.reshape(T, -1).contiguous()
+      conv_state = initial.where(0, _raw(block.conv_state)).reshape(block.ssm_conv_kernel - 1, block.conv_channels)
+      # the commit's conv window (zeroed state at position 0); gdn_prep reads the old state from it, which orders the store
+      window = _stored(ops.window, conv_state.float().cat(rows[:, :block.conv_channels].float()).reshape(1, -1, block.conv_channels))
+      keep = (1 - initial.float()).reshape(1)
+      o = gdn_verify_raw(rows, window[0, :block.ssm_conv_kernel - 1], ops.conv_w, gdn_gates(x.reshape(T, -1), block.gdn_gates),
+                         ops.dt_bias, ops.a, _raw(block.recurrent_state).reshape(H, V, K), ops.live, keep, _raw(ops.packed),
+                         _raw(ops.bg), _raw(ops.u).reshape(H, T, V), kheads=block.num_k_heads).reshape(B, T, H * V)
+      if joined is not None and block.ssm_out.rows_quantized:
+        # the gated RMSNorm in ssm_out's rotate-and-quantize kernel, the gate read from the merged projection's output
+        gated = (joined.reshape(B, T, -1), block.attn_qkv.out_features, block.ssm_norm.weight, block.ssm_norm.eps)
+        return block.ssm_out(o, block.ssm_out.rows_q8(o, gated=gated))
+      z = _gated_norm(o.reshape(T, H, V), out_gate.reshape(T, H, V), block.ssm_norm.weight, block.ssm_norm.eps)
+      return block.ssm_out(z.reshape(B, T, -1))
     out_gate = out_gate.reshape(B, T, H, V)
     if (gates := getattr(block, 'gdn_gates', None)) is not None:  # both projections in one launch (models/qwen35.py)
       projected = gdn_gates(x.reshape(B * T, -1), gates).reshape(B, T, 2 * H)
@@ -251,8 +280,10 @@ class ParallelVerifier:
       outputs = []
       for i, ops in self._operands.items():
         block = self.observer.model.transformer.blk[i]
-        outputs += gdn_commit(_raw(block.recurrent_state), _raw(block.conv_state), _raw(ops.g), _raw(ops.k), _raw(ops.u),
-                              _raw(ops.window), params)
+        packed = self._fused and ops.packed is not None  # gdn_verify_raw's outputs in place of g and k
+        outputs += gdn_commit(_raw(block.recurrent_state), _raw(block.conv_state), _raw(ops.bg if packed else ops.g),
+                              _raw(ops.packed if packed else ops.k), _raw(ops.u), _raw(ops.window), params,
+                              kheads=block.num_k_heads if packed else 0)
       Tensor.realize(*outputs)
       return tuple(outputs)
     rows, initial, outputs = Tensor(count), Tensor(start_pos).eq(0), []
