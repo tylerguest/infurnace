@@ -22,7 +22,7 @@ from infurnace.kernels.quant_gemv import QUANT_SIZES
 from infurnace.kernels.quant_gemm import nv_prefill_supported
 from infurnace.engine import Model
 from infurnace.dflash.jit import captured
-from infurnace.kernels.attention import attention, store_rows
+from infurnace.kernels.attention import attention, store_kv, store_rows
 from infurnace.kernels.embedding import dense_gather
 from infurnace.kernels.topk import topk
 from infurnace.device import nvidia
@@ -155,8 +155,17 @@ class DFlashDraft:
       # Two blocks of slack cover a padded context chunk plus the noise block written past the window.
       self.ring_length = config.window + 2 * config.block_size
       self.ring = [config.sliding[i] and config.window > 0 and self.ring_length < self.cache_length for i in range(config.layers)]
-      self.cache = [Tensor.zeros(2, 1, config.kv_heads, self.ring_length if ring else self.cache_length, config.head_dim,
-                                 dtype=dtypes.float16, device=self.device).contiguous().realize() for ring in self.ring]
+      # Full-attention layers on NV keep the target's int8 cache (int8 keys, FP8 values, a scale each: store_kv), read
+      # by its flash kernel: half the bytes of FP16, which the whole context costs every round (Bonsai-4B's DFlash2
+      # at 64k: 788 -> 510 us a round, acceptance unchanged). Sliding layers read only their window and stay FP16.
+      self.int8 = [not config.sliding[i] and config.head_dim % 32 == 0 and nvidia(self.device) for i in range(config.layers)]
+      if any(self.int8): self.cache_length = -(-self.cache_length // 32) * 32  # store_kv's 8-key value blocks, attention's tiles
+      self.cache = [Tensor.zeros(2, 1, config.kv_heads, self.cache_length, config.head_dim // 4, dtype=dtypes.uint32, device=self.device)
+                    .contiguous().realize() if int8 else
+                    Tensor.zeros(2, 1, config.kv_heads, self.ring_length if ring else self.cache_length, config.head_dim,
+                                 dtype=dtypes.float16, device=self.device).contiguous().realize() for ring, int8 in zip(self.ring, self.int8)]
+      self.scales = [Tensor.zeros(2, 1, config.kv_heads, self.cache_length, dtype=dtypes.float16, device=self.device).contiguous().realize()
+                     if int8 else None for int8 in self.int8]
       # Ring slots below the floor hold positions from a later pass (see load_state); attention skips them.
       self._floor = Tensor.zeros(1, dtype=dtypes.int32, device=self.device).contiguous().realize()
       self._floor_value, self._high = 0, 0  # the floor, and an upper bound on every position written
@@ -308,8 +317,14 @@ class DFlashDraft:
       k = block.attn_k_norm(projection(block.attn_k, context).reshape(1, width, c.kv_heads, c.head_dim)).transpose(1, 2)
       v = projection(block.attn_v, context).reshape(1, width, c.kv_heads, c.head_dim).transpose(1, 2)
       k = apply_rope(k, self.frequencies[start:start + width])
-      stored.append(store_rows(self.cache[i], Tensor.stack(k, v).half(), start, ring=self.ring[i]))
+      stored += self._store(i, k, v, start)
     Tensor.realize(*stored)
+
+  def _store(self, i: int, k: Tensor, v: Tensor, start) -> tuple[Tensor, ...]:
+    """Layer i's keys and values (1, kv_heads, rows, dim) at positions start.. : its cache after the write (and the
+    scales, int8 caches)."""
+    if self.int8[i]: return store_kv(self.cache[i], self.scales[i], k.half(), v.half(), start)
+    return (store_rows(self.cache[i], Tensor.stack(k, v).half(), start, ring=self.ring[i]),)
 
   def _conv(self, x: Tensor, coefficients: Tensor, base: Tensor, side: int) -> Tensor:
     """DFlash2's block convolution (llama.cpp's build_dflash2_conv): position p mixes rows p, p-1, ... of `x` (zero
@@ -338,11 +353,11 @@ class DFlashDraft:
       k = block.attn_k_norm(projection(block.attn_k, norm).reshape(1, rows, c.kv_heads, c.head_dim)).transpose(1, 2)
       v = projection(block.attn_v, norm).reshape(1, rows, c.kv_heads, c.head_dim).transpose(1, 2)
       q, k = apply_rope(q, self.frequencies[position:position + rows]), apply_rope(k, self.frequencies[position:position + rows])
-      cache = store_rows(self.cache[i], Tensor.stack(k, v).half(), position, ring=self.ring[i])
+      cache, *scales = self._store(i, k, v, position)
       # Over the active length only: rows see keys up to position+rows (causal: up to their own),
       # within the window on sliding layers.
       attended = attention(q, cache, position, causal=c.layer_causal(i), window=c.window if c.sliding[i] else 0,
-                           ring=self.ring[i], floor=self._floor if self.ring[i] else None).cast(q.dtype)
+                           ring=self.ring[i], floor=self._floor if self.ring[i] else None, scales=scales[0] if scales else None).cast(q.dtype)
       out = projection(block.attn_output, attended.transpose(1, 2).reshape(1, rows, -1))
       if c.conv_kernel: out = self._conv(out, attn_coeffs, block.attn_conv_base, 1)
       x = residual + out
