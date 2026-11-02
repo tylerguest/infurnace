@@ -81,6 +81,7 @@ class ParallelVerifier:
     self._count = UOp.variable('dflash_commit_rows', 1, rows)
     self._forward_jit, self._commit_jit = captured(self._forward_store), captured(self._commit)
     self._round_jit = None
+    self._embed_jit = None  # run's input embedding (captured on first use)
     self._draft_anchor = None  # the draft's anchor buffer, which the fused round's pick also writes (see _round_graphs)
     self._fused = rows == 16 and nvidia(self.device) and all(
       b.head_k_dim == 128 and b.head_v_dim == 128 for b in model.transformer.blk if isinstance(b, GatedDeltaNetBlock))
@@ -335,8 +336,13 @@ class ParallelVerifier:
     try:
       with Context(DEV=self.device):
         self._allocate()
-        # Always the same persistent input buffer for the captured forward.
-        _stored(self._embeddings, observer.model.embed(padded)).realize()
+        # Always the same persistent input buffer for the captured forward, embedded in a captured graph (an eager
+        # realize builds and links its schedule on the host: ~13 ms the request's first round)
+        model = observer.model
+        if model._embedding is None: _stored(self._embeddings, model.embed(padded)).realize()
+        else:
+          if self._embed_jit is None: self._embed_jit = captured(lambda ids: _stored(self._embeddings, model.embed_ids(ids)).realize())
+          self._embed_jit(Tensor(padded, dtype=dtypes.int32, device=self.device).realize())
         self._forward_jit(_raw(self._embeddings), self._position.bind(observer.position))
         detach_rng(self.device)  # only the tensor-op fallback (CPU) draws from tinygrad's RNG
         decisions = [int(v) for v in _raw(self._decisions).tolist()[0]]

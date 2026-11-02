@@ -8,6 +8,7 @@ the token chosen before it."""
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import functools
 import math
 from pathlib import Path
 
@@ -162,6 +163,8 @@ class DFlashDraft:
       self.frequencies = precompute_freqs_cis(config.head_dim, self.cache_length, config.theta, device=self.device).realize()
       self._start = UOp.variable('dflash_context_start', 0, self.capacity - 1)
       self._absorb_jit = captured(self._absorb)
+      self._chunk_jits: dict = {}  # whole prompt chunks, by their row count (observe_chunk)
+      self._input_jits: dict = {}  # propose's noise block and anchor, by row count (_inputs)
       self._noise_inputs: dict[int, Tensor] = {}
       # The block's anchor token id, read by DFlash2's selector inside the captured graphs (written by propose and
       # by the fused round's pick)
@@ -275,6 +278,24 @@ class DFlashDraft:
           self._absorb_jit(self._context, self._start.bind(self.observed - chunk))
           self._staged = 0
       self._wrote(self.observed + chunk)
+
+  def observe_chunk(self, features: Tensor, rows: int):
+    """Absorb a prompt chunk's taps (1, size, width), its first `rows` valid. A whole chunk on an empty staging
+    buffer is absorbed at once in a graph captured for its size; anything else goes through `observe`, 16 rows at
+    a time, each staging copy scheduled on the host (~6 ms a block: 8k-token prompts read at ~1.7k tok/s)."""
+    size = features.shape[1]
+    if self._staged or rows != size or size % self.config.block_size or self.observed + rows > self.capacity:
+      return self.observe(features[:, :rows])
+    if size not in self._chunk_jits: self._chunk_jits[size] = captured(lambda taps, start: self._absorb(taps.float(), start))
+    with Context(DEV=self.device): self._chunk_jits[size](features, self._start.bind(self.observed))
+    self.observed += rows
+    self._wrote(self.observed)
+
+  def _inputs(self, ids: Tensor, noise: Tensor):
+    """The noise block (anchor, then mask tokens) embedded into `noise`, and the anchor into `self.anchor`."""
+    embedded = self.target.embed_ids(ids) if self.target._embedding is not None else self.target.embed(ids.tolist())
+    Tensor.realize(Tensor(noise.uop.after(noise.uop.store(embedded.uop))),
+                   Tensor(self.anchor.uop.after(self.anchor.uop.store(ids[:1].uop))))
 
   def _absorb(self, features: Tensor, start: UOp):
     # Fixed-width context chunk: write draft K/V for observed target rows.
@@ -394,9 +415,13 @@ class DFlashDraft:
       # Only the last positions of the context need a smaller block.
       rows = c.block_size - 1 if position + c.block_size <= self.capacity else count
       graph, noise = self._denoise_graph(rows)
-      embedded = self.target.embed([anchor] + [c.mask_token] * rows)
-      Tensor(noise.uop.after(noise.uop.store(embedded.uop))).realize()
-      Tensor(self.anchor.uop.after(self.anchor.uop.store(Tensor([anchor], dtype=dtypes.int32, device=self.device).uop))).realize()
+      ids = Tensor([anchor] + [c.mask_token] * rows, dtype=dtypes.int32, device=self.device)
+      if self.target._embedding is not None:
+        # The noise block's embedding and the anchor in a graph captured per block: realized eagerly, the two
+        # stores' schedules were built and linked on the host every call (~18 ms the request's first round)
+        if rows not in self._input_jits: self._input_jits[rows] = captured(functools.partial(self._inputs, noise=noise))
+        self._input_jits[rows](ids.realize())
+      else: self._inputs(ids, noise)
       pos = UOp.variable('dflash_position', 1, self.capacity - rows - 1).bind(position)
       decisions = graph(noise, pos).realize()
       output = [int(v) for v in Tensor(decisions.uop.buf_uop).reshape(rows).tolist()][:count]

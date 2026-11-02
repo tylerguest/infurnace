@@ -435,9 +435,7 @@ class Model:
     from tinygrad import dtypes
     dim = self.config.embedding_length
     if self._embedding is not None:
-      with Context(DEV=self.device):
-        rows = self.lookup(Tensor(tokens, dtype=dtypes.int32, device=self.device))
-        return rows.half().float().reshape(1, len(tokens), dim)
+      with Context(DEV=self.device): return self.embed_ids(Tensor(tokens, dtype=dtypes.int32, device=self.device))
     if self._host_embedding is None:
       _, entries = parse_gguf(self._path)
       with Context(DEV='CPU'):
@@ -446,6 +444,11 @@ class Model:
     view, width = self._host_embedding[1], dim * 2
     rows = b''.join(view[t * width:(t + 1) * width] for t in tokens)
     return Tensor(rows, device=self.device).bitcast(dtypes.float16).reshape(1, len(tokens), dim).float()
+
+  def embed_ids(self, ids: Tensor) -> Tensor:
+    """`embed` of token ids already on the device (int32 (n,)), lazily, for captured graphs; needs the packed table
+    (`lookup`)."""
+    return self.lookup(ids).half().float().reshape(1, ids.shape[0], self.config.embedding_length)
 
   def lookup(self, ids: Tensor) -> Tensor:
     """FP32 token embedding rows for `ids` (int32 on the device, any shape), from the tied packed table: decoded and,

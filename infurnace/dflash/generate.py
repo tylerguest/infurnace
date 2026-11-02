@@ -175,7 +175,7 @@ class DFlashGenerator:
     if self._chunks:
       # The model's prompt chunks (captured graphs, see Model.read_prompt) for all rows but the last, each chunk's feature
       # taps going to the draft; the last row is an ordinary target step, which decides the next token.
-      def observe(features, rows): self.draft.observe(features[:, :rows])
+      def observe(features, rows): self.draft.observe_chunk(features, rows)
       done = self.model.read_prompt(first, last - 1, observe)
       self.observer.position = done
     elif self.verifier == 'parallel' and block > 1:
