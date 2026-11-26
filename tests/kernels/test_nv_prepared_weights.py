@@ -57,10 +57,9 @@ def test_q6_prepared_decode_and_prefill(width, tiled, warps, monkeypatch):
     x = Tensor.randn(2, width, device='NV').realize()
     reference = quant_gemv(x, native, out_features=rows, in_features=width, ggml_type=14).realize()
     assert (jit(x)-reference).abs().max().item() < 1e-5
+  if not tiled: return  # prompt rows read only the tiled layout
   x = Tensor.randn(3, width, device='NV').realize()
-  baseline = quant_gemm(x, native, out_features=rows, in_features=width, ggml_type=14)
-  actual = quant_gemm(x, prepared, out_features=rows, in_features=width, ggml_type=14,
-                      q6_aligned=True, q6_tiled=tiled)
-  # Prepared Q6 sums the same products in a permuted k order; the tiled kernel also rounds d*scale to FP16
-  # (as Marlin does): compare relative to the output scale, not bitwise.
-  assert ((baseline-actual).abs().max()/baseline.abs().max().maximum(1)).item() < (1e-3 if tiled else 1e-5)
+  baseline = x.half().float() @ ggml_data_to_tensor(raw, rows*width, 14).reshape(rows, width).half().float().T
+  actual = quant_gemm(x, prepared, out_features=rows, in_features=width, ggml_type=14, q6_aligned=True, q6_tiled=True)
+  # The tiled kernel rounds d*scale to FP16 before multiplying (as Marlin does): compare relative to the output scale.
+  assert ((baseline-actual).abs().max()/baseline.abs().max().maximum(1)).item() < 1e-3

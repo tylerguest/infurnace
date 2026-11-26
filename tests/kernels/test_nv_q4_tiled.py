@@ -32,6 +32,11 @@ def test_q4_tiled_bytes_and_generic_decode(width):
   decoded = dequant_prepared_q4(packed, in_features=width)
   assert (decoded-ggml_data_to_tensor(native, native.numel()//144*256, 12).flatten()).abs().max().item() == 0
 
+def dense(x, raw, rows, width, typ):
+  """x @ the decoded weight, both rounded to FP16 as the tensor-core kernels read them (FP32 products)."""
+  weight = ggml_data_to_tensor(raw, rows*width, typ).reshape(rows, width).half().float()
+  return x.half().float() @ weight.T
+
 def test_q4_tiled_needs_16_row_tiles():
   with pytest.raises(QuantGemvError, match='rows of 16'):
     prepare_q4(Tensor(data(8, 256), dtype=dtypes.uint8, device='CPU'), in_features=256)
@@ -51,9 +56,9 @@ def test_q4_tiled_decode_jit_and_prefill(width):
     expected = quant_gemv(x, native, out_features=rows, in_features=width, ggml_type=12)
     assert (jit(x)-expected).abs().max().item() < 1e-5
   x = Tensor.randn(3, width, device='NV').realize()
-  expected = quant_gemm(x, native, out_features=rows, in_features=width, ggml_type=12)
+  expected = dense(x, raw, rows, width, 12)
   actual = quant_gemm(x, packed, out_features=rows, in_features=width, ggml_type=12, q4_tiled=True)
-  # The tiled kernel rounds d*scale to FP16 before multiplying (as Marlin does); the native one rounds once in FP32.
+  # The tiled kernel rounds d*scale to FP16 before multiplying (as Marlin does).
   assert (actual-expected).abs().max().item() < 1e-3 * expected.abs().max().item()
 
 def q5_data(rows, width):
@@ -80,7 +85,7 @@ def test_q5_tiled_decode_and_prefill(width):
   expected = quant_gemv(x, native, out_features=rows, in_features=width, ggml_type=13)
   assert (quant_gemv(x, packed, out_features=rows, in_features=width, ggml_type=13, q4_tiled=True)-expected).abs().max().item() == 0
   x = Tensor.randn(16, width, device='NV').realize()
-  expected = quant_gemm(x, native, out_features=rows, in_features=width, ggml_type=13)
+  expected = dense(x, raw, rows, width, 13)
   actual = quant_gemm(x, packed, out_features=rows, in_features=width, ggml_type=13, q4_tiled=True)
   # The tiled kernel rounds d*scale to FP16 before multiplying (as Marlin does).
   assert (actual-expected).abs().max().item() < 1e-3 * expected.abs().max().item()
@@ -99,11 +104,10 @@ def test_tiled_prefill_with_several_chunks_per_warp(typ, tokens):
   from infurnace.kernels.quant_gemv import prepare_q6
   rows, width = 64, 2560
   raw = Tensor({12: data, 13: q5_data, 14: q6_data}[typ](rows, width), dtype=dtypes.uint8, device='NV').realize()
-  native = raw.bitcast(dtypes.uint16 if typ == 14 else dtypes.uint32).flatten().realize()
   if typ == 14: packed, options = prepare_q6(raw, in_features=width, tiled=True), dict(q6_aligned=True, q6_tiled=True)
   else: packed, options = prepare_q4(raw, in_features=width, ggml_type=typ), dict(q4_tiled=True)
   x = Tensor.randn(tokens, width, device='NV').realize()
-  expected = quant_gemm(x, native, out_features=rows, in_features=width, ggml_type=typ)
+  expected = dense(x, raw, rows, width, typ)
   actual = quant_gemm(x, packed, out_features=rows, in_features=width, ggml_type=typ, **options)
   assert actual.shape == (tokens, rows)
   # The tiled kernels round d*scale to FP16 before multiplying (as Marlin does).

@@ -145,7 +145,7 @@ A DFlash round was 23 ms: the 16-row target verify 15.8 ms (its matmuls 11 ms, n
 - [ ] **Draft vocabulary.** The draft scores all 248k tokens (1.9 ms of its 4.1 ms); scoring only the
   most frequent ~32k, as FR-Spec does, keeps output exact (the target still verifies). About +7%.
 - [ ] **Per-GPU tuning tables** (after ExLlamaV3's autotuner): replace hand-picked kernel constants
-  (`quant_gemm._schedule`, `quant_gemv._decode_warps`, `PREFILL_ROWS`) with values measured per GPU and
+  (`quant_gemm`'s split and unroll rules, `quant_gemv._decode_warps`, `PREFILL_ROWS`) with values measured per GPU and
   checked in, with launch sizes derived from the SM count as the default for unknown cards.
 - [ ] **Bundled projections:** one launch for MLP gate+up and for GDN qkv+gate. Shared Q8 quantization
   is already done; bundling must win end to end, not only in launch count.

@@ -51,11 +51,9 @@ def test_fwht_q8_matches_the_transform_then_quantizing(rows, width, perm):
     assert ((got[1] - reference[1]).abs() / reference[1]).max().item() < 1e-6
     if group == 32: assert (got[2] - reference[2]).abs().max().item() <= 1
 
-@pytest.mark.parametrize("int8", [True, False])
 @pytest.mark.parametrize("out_features,in_features,tokens", [(64, 2560, 64), (96, 9216, 17), (256, 2560, 16), (96, 9216, 13)])
-def test_q2_0_prefill_gemm_matches_dense(out_features, in_features, tokens, int8, monkeypatch):
+def test_q2_0_prefill_gemm_matches_dense(out_features, in_features, tokens):
   from infurnace.kernels.quant_gemm import quant_gemm
-  monkeypatch.setenv("INFURNACE_Q2_INT8", "1" if int8 else "0")
   raw, values = q2_blocks(out_features * in_features // 64, seed=tokens)
   dense = Tensor(values, device="NV").reshape(out_features, in_features)
   x = Tensor.randn(tokens, in_features, device="NV").realize()
@@ -63,9 +61,8 @@ def test_q2_0_prefill_gemm_matches_dense(out_features, in_features, tokens, int8
   packed = prepare_q2(Tensor(raw, dtype=dtypes.uint8, device="NV"), in_features=in_features)
   got = quant_gemm(x, packed, out_features=out_features, in_features=in_features,
                    ggml_type=Q2_0)
-  # int8 tensor cores take int8 activations (one scale per 32 values, ~1% of the output scale, as the decode GEMV);
-  # the FP16 kernel multiplies FP16 activations and accumulates in FP32
-  assert ((got - reference).abs().max() / reference.abs().max()).item() < (0.02 if int8 else 1e-3)
+  # int8 tensor cores take int8 activations (one scale per 32 values, ~1% of the output scale, as the decode GEMV)
+  assert ((got - reference).abs().max() / reference.abs().max()).item() < 0.02
 
 def test_q2_0_row_gather_matches_decoding_the_rows():
   from infurnace.kernels.embedding import packed_gather
