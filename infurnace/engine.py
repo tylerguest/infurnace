@@ -174,7 +174,7 @@ class Model:
       x, mask = t.token_embd(ids[:, start_pos:start_pos + size]).float(), None
       for index, block in enumerate(t.blk):
         if index in self.feature_layers: features.append(x)  # tap N is the input of block N
-        x, mask = block(x, start_pos, mask)  # blocks return (output, the indexer's token mask)
+        x, mask, _ = block(x, (start_pos,), mask)  # blocks return (output, the indexer's token mask, hyper-connection state)
     finally:
       for block in t.blk: block._prompt_rows = None
     # The last row's output depends on every layer's cache and state writes; the taps alone would leave out the
@@ -348,7 +348,7 @@ class Model:
 
   def _decode_step(self, ids: Tensor, start_pos: UOp, temperature: Tensor) -> Tensor:
     """One decoding step: the token at start_pos of the device token buffer in, its sample stored at start_pos + 1."""
-    out = self.transformer.forward(ids[:, start_pos:start_pos + 1], start_pos, temperature)
+    out = self.transformer.forward(ids[:, start_pos:start_pos + 1], temperature, start_pos)
     return Tensor(ids.uop.after(ids[:, start_pos + 1:start_pos + 2].uop.store(out.cast(ids.dtype).uop)))
 
   def _decode(self, tokens: list[int], count: int, temperature: float) -> Iterator[int]:
@@ -409,7 +409,7 @@ class Model:
       position = self.read_prompt(first, last) if multirow else first
       for position in range(position, last):
         sp, rows = v_start.bind(position), UOp.variable('toks', 1, 1).bind(1)
-        t(ids[:, sp:sp + rows], sp, temp).realize()
+        t(ids[:, sp:sp + rows], (sp,), temp).realize()
     if point is not None:
       read(start, point)
       self.save_snapshot(tokens[:point])
@@ -496,9 +496,9 @@ class Model:
     t = self.transformer
     # Seeded from tinygrad's seed, so Tensor.manual_seed before loading makes sampled requests reproducible.
     self.sampler = Sampler(self.device, (Tensor._seed * 0xD1B54A32D192ED03 + 0x51A7E) & (2 ** 64 - 1))
-    def forward(tokens: Tensor, start_pos, temperature: Tensor) -> Tensor:
+    def forward(tokens: Tensor, temperature: Tensor, *start_pos) -> Tensor:  # upstream's signature: one position per row
       x, mask = t.token_embd(tokens.to(t.token_embd.weight.device)).float(), None
-      for block in t.blk: x, mask = block(x, start_pos, mask)
+      for block in t.blk: x, mask, _ = block(x, start_pos, mask)
       logits = t.output(t.output_norm(x[:, -1:]))[:, -1, :]
       return self.sampler(logits, temperature).reshape(1, 1).to(tokens.device)
     t.forward, t.prefill_jit, t.rollout_jit = forward, TinyJit(forward), TinyJit(forward)

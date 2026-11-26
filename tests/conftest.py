@@ -4,6 +4,8 @@ Tests live in core/, kernels/ and dflash/. Some files import helpers from
 others by module name (e.g. `from test_qwen35 import checkpoint`), so every group
 directory is importable. Tests marked `nv` need an NVIDIA GPU and run only with
 INFURNACE_TEST_NV=1; select them with `pytest -m nv` or skip with `-m "not nv"`.
+Tests marked `slow` (the full-size models, minutes each) run only with INFURNACE_TEST_SLOW=1 as well: by default the
+model tests run on truncated copies of the same files (core/truncated.py).
 """
 import os
 import sys
@@ -16,12 +18,14 @@ for group in ('core', 'kernels', 'dflash'):
 
 def pytest_configure(config):
   config.addinivalue_line('markers', 'nv: needs an NVIDIA GPU; runs only with INFURNACE_TEST_NV=1')
+  config.addinivalue_line('markers', 'slow: a full-size model, minutes per test; runs only with INFURNACE_TEST_SLOW=1')
 
 def pytest_collection_modifyitems(config, items):
-  if os.environ.get('INFURNACE_TEST_NV'): return
-  skip = pytest.mark.skip(reason='set INFURNACE_TEST_NV=1 on an NV GPU')
+  skips = {'nv': None if os.environ.get('INFURNACE_TEST_NV') else pytest.mark.skip(reason='set INFURNACE_TEST_NV=1 on an NV GPU'),
+           'slow': None if os.environ.get('INFURNACE_TEST_SLOW') else pytest.mark.skip(reason='full-size model: set INFURNACE_TEST_SLOW=1')}
   for item in items:
-    if 'nv' in item.keywords: item.add_marker(skip)
+    for marker, skip in skips.items():
+      if skip is not None and marker in item.keywords: item.add_marker(skip)
 
 @pytest.fixture(autouse=True)
 def _no_installed_dflash_draft(monkeypatch, tmp_path):

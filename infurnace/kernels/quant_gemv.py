@@ -24,12 +24,17 @@ def warp_reduce(val:UOp, maximum:bool = False, full_wave:bool = False) -> UOp:
   """Full-wave (32-lane) xor-shuffle reduction through CUDA ``__shfl_xor_sync``."""
   for offset in ((16, 8, 4, 2, 1) if full_wave else (8, 4, 2, 1)):
     if val.op is Ops.INDEX and val.addrspace == AddrSpace.REG: val = val.load()
-    other = UOp(Ops.CUSTOM, src=(val,), arg=(f"__shfl_xor_sync(0xffffffff, {{0}}, {offset})", dtypes.float))
+    other = c_code(f"__shfl_xor_sync(0xffffffff, {{0}}, {offset})", val, dtype=dtypes.float, inline=False)
     val = val.maximum(other) if maximum else val + other
   return val
 
+def c_code(code: str, *srcs: UOp, dtype, inline: bool = True) -> UOp:
+  """A C expression in the kernel's source, its `{}` filled with `srcs`: inlined where it is used (what tinygrad's CUSTOMI
+  was), or with inline=False its own variable, evaluated once (CUSTOM: warp shuffles, asm that must not repeat)."""
+  return UOp.native(code, shape=(), dtype=dtype, fmt=True).call(*srcs, inline=inline)
+
 def _dp4a(a:UOp, b:UOp, c:UOp) -> UOp:
-  return UOp(Ops.CUSTOMI, src=(a.int(), b.int(), c), arg=("__dp4a({}, {}, {})", dtypes.int32))
+  return c_code("__dp4a({}, {}, {})", a.int(), b.int(), c, dtype=dtypes.int32)
 
 def _load_lanes(ptr: UOp, lanes: int) -> UOp:
   """Load ``lanes`` consecutive elements at a buffer index as a vector value."""
@@ -206,7 +211,7 @@ def _q4_scales(raw:UOp, base:UOp, subgroup:UOp) -> tuple[UOp, UOp, UOp, UOp]:
 def _q8_quantize_kernel(q:UOp, scale:UOp, xsum:UOp, x:UOp, tokens:int, in_features:int) -> UOp:
   """Per-32-group Q8_0-style activation quantize: 8 int8 per 4 lanes, one fp32 scale."""
   groups = in_features // Q8_GROUP_SIZE
-  token_group, lane = UOp.range(tokens * groups, 0), UOp.range(32, 1, axis_type=AxisType.LOCAL)
+  token_group, lane = UOp.range(tokens * groups, 0, AxisType.WEAK), UOp.range(32, 1, axis_type=AxisType.LOCAL)
   token, group = token_group // groups, token_group % groups
   x = x.reshape(tokens, groups, 32)
   group_scale = (warp_reduce(x[token, group, lane].float().abs(), maximum=True, full_wave=True) / 127).maximum(1e-8)
@@ -243,7 +248,7 @@ def _q8_quantize64_kernel(q: UOp, scale: UOp, x: UOp, tokens: int, in_features: 
   """Int8 activations with one FP32 scale per 64 values (a Q2_0 block): a warp per group, two values a lane; lanes
   0-15 each pack four into a word, stored in q8_64_slot order."""
   groups = in_features // 64
-  token_group, lane = UOp.range(tokens * groups, 0), UOp.range(32, 1, axis_type=AxisType.LOCAL)
+  token_group, lane = UOp.range(tokens * groups, 0, AxisType.WEAK), UOp.range(32, 1, axis_type=AxisType.LOCAL)
   token, group = token_group // groups, token_group % groups
   x = x.reshape(tokens, groups, 64)
   biggest = x[token, group, lane].float().abs().maximum(x[token, group, lane + 32].float().abs())
@@ -283,7 +288,7 @@ def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot:Callabl
   chunks = (group_count + 31) // 32
   row_blocks = out_features // warps_per_block
   grid_chunks = 1 if loop_chunks else chunks
-  block = UOp.range((1 if reuse_tokens or local_tokens else out.shape[0])*row_blocks*grid_chunks, 0)
+  block = UOp.range((1 if reuse_tokens or local_tokens else out.shape[0])*row_blocks*grid_chunks, 0, AxisType.WEAK)
   lane = UOp.range(32, -1, axis_type=AxisType.WARP)
   warp = UOp.range(warps_per_block, 1, axis_type=AxisType.LOCAL)
   chunk = UOp.range(chunks, 3, axis_type=AxisType.LOOP) if loop_chunks else block%chunks
@@ -310,7 +315,7 @@ def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot:Callabl
       # A normal ADD is flattened with the last shuffle ADD by tinygrad.
       # The opaque rounded intrinsic preserves each completed warp sum before
       # adding it to the residual/previous chunks, as a stored partial does.
-      added = UOp(Ops.CUSTOMI, src=(acc[0].load(), total), arg=('__fadd_rn({}, {})', dtypes.float32))
+      added = c_code('__fadd_rn({}, {})', acc[0].load(), total, dtype=dtypes.float32)
       value = chunk.eq(0).where(total, added) if residual is None else added
       update = acc[0].store(value).end(chunk)
       summed = acc.after(update)[0].load()
@@ -366,7 +371,7 @@ def _q2_decode_kernel(out: UOp, raw: UOp, xq: UOp, xd: UOp, xs: UOp, *, tokens: 
   done = acc[0].store(total).end(step)
   value = acc.after(done)[0].load()
   for offset in (16, 8):  # the row's four pair quarters
-    value = value + UOp(Ops.CUSTOM, src=(value,), arg=(f"__shfl_xor_sync(0xffffffff, {{0}}, {offset})", dtypes.float))
+    value = value + c_code(f"__shfl_xor_sync(0xffffffff, {{0}}, {offset})", value, dtype=dtypes.float, inline=False)
   if slices > 1:  # each slice's row sums in shared memory; slice 0 adds the others in order
     shared = UOp.placeholder((group_tiles, slices, Q2_TILE_ROWS), dtypes.float32, slot=6, addrspace=AddrSpace.LOCAL)
     written = shared[local_tile, piece, row.valid(lane < Q2_TILE_ROWS)].store(value).barrier()

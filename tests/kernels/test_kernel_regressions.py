@@ -24,7 +24,7 @@ def decode_graph(typ, rows, width):
 def test_decode_graph_keeps_warps_separate_and_eight_integer_dots(typ, rows, width, warps):
   graph = decode_graph(typ, rows, width)
   nodes = list(graph.toposort())
-  dots = [u for u in nodes if u.op is Ops.CUSTOMI and "__dp4a" in str(u.arg)]
+  dots = [u for u in nodes if u.op is Ops.CALL and u.src[0].op is Ops.NATIVE and "__dp4a" in u.src[0].arg.code]
   assert len(dots) == 8  # Q4 sum dots and Q6 signed-byte rebuilding must not return.
   ranges = [u for u in nodes if u.op is Ops.RANGE]
   assert any(getattr(u, 'axis_type', u.arg[-1]) is AxisType.WARP and u.src[0].arg == 32 for u in ranges)

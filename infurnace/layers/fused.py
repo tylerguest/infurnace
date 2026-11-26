@@ -107,6 +107,12 @@ def _norm_rows_q8(layer: _NVLinear, norm: FusibleNorm, source: Tensor, *, half: 
   if symbolic: rows_normed = rows_normed.shrink(tuple((0, size) for size in source.shape))
   return out[:2], rows_normed
 
+def one_position(start_pos):
+  """The single position of tinygrad's per-row `start_pos` tuple (infurnace decodes one sequence)."""
+  if not isinstance(start_pos, tuple): return start_pos
+  if len(start_pos) != 1: raise NotImplementedError('infurnace runs one sequence: one start position')
+  return start_pos[0]
+
 def _rows(x: Tensor, *layers, norm: FusibleNorm | None = None, source: Tensor | None = None, joined: bool = False) -> tuple[Tensor, ...]:
   """Multirow outputs of projections that read the same input: Hadamard-folded Q2_0 weights share one rotated
   int8 input (_NVLinear.rows_q8) instead of each rotating and quantizing it. Other layers go through their own call.
@@ -122,8 +128,8 @@ def fused_feed_forward(block):
   """Upstream's dense feed-forward, with gate and up sharing one Q8 activation for one row."""
   upstream_feed_forward = block._feed_forward
   down = block.ffn_down
-  def feed_forward(x: Tensor) -> Tensor:
-    if hasattr(block, 'ffn_gate_exps'): return upstream_feed_forward(x)
+  def feed_forward(x: Tensor, tokens: Tensor | None = None) -> Tensor:
+    if hasattr(block, 'ffn_gate_exps'): return upstream_feed_forward(x, tokens)
     width = getattr(down, 'in_features', None)
     if not isinstance(x.numel(), int) or x.numel() != getattr(block.ffn_gate, 'in_features', None):
       outs = _rows(x, block.ffn_gate, block.ffn_up, norm=_norm_of(block, 'ffn_norm'), joined=True)
@@ -177,6 +183,7 @@ def fused_attention(block: TransformerBlock):
   def attention_step(x: Tensor, start_pos, idx_mask=None):
     # idx_mask: an indexer's token selection (DeepSeek-style sparse attention), which these models don't have
     if idx_mask is not None: return upstream_attention(x, start_pos, idx_mask)
+    start_pos = one_position(start_pos)
     B, T, _ = x.shape
     if B == 1 and (isinstance(T, UOp) or T > 1) and x.max_shape[1] % PREFILL_ROWS == 0:
       # A prompt chunk (1..16 rows, or up to a prompt chunk's size), padded to its maximum like the GDN prefill. The padding rows come
@@ -189,7 +196,7 @@ def fused_attention(block: TransformerBlock):
       return rows_attention(x, start_pos, *_rows(x, block.attn_q, block.attn_k, block.attn_v, norm=norm, source=source))[:, :T]
     if B != 1 or isinstance(T, UOp) or T != 1:
       if hasattr(block, 'cache_scale'): raise NotImplementedError("upstream attention can't read an int8 KV cache")
-      return upstream_attention(x, start_pos)
+      return upstream_attention(x, (start_pos,))
     outs = _one_row(x, block.attn_q, block.attn_k, block.attn_v, norm=_norm_of(block, 'attn_norm'), joined=True)
     if len(outs) == 1:  # merged: the fused prologue reads the one output, or it is split as three
       if (weights := getattr(block, 'qk_norm_f32', None)) is not None and hasattr(block, 'cache_scale'):

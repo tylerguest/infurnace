@@ -11,15 +11,15 @@ import math
 
 from tinygrad import Tensor, UOp, dtypes
 from tinygrad.dtype import AddrSpace
-from tinygrad.uop.ops import AxisType, KernelInfo, Ops
+from tinygrad.uop.ops import AxisType, KernelInfo
 
-from infurnace.kernels.quant_gemv import _load_lanes, q8_64_slot, warp_reduce
+from infurnace.kernels.quant_gemv import _load_lanes, c_code, q8_64_slot, warp_reduce
 
 VALUES = 8    # values a thread holds in _fwht_q8_kernel: 16 bytes of FP16 input
 SPAN = 256    # values a warp holds there (32 lanes x VALUES)
 
 def _shuffle(value: UOp, mask: int) -> UOp:
-  return UOp(Ops.CUSTOM, src=(value,), arg=(f"__shfl_xor_sync(0xffffffff, {{0}}, {mask})", dtypes.float))
+  return c_code(f"__shfl_xor_sync(0xffffffff, {{0}}, {mask})", value, dtype=dtypes.float, inline=False)
 
 def _vector(ptr: UOp, dtype) -> list[UOp]:
   """VALUES consecutive elements at a buffer index, as FP32, in 16-byte loads."""

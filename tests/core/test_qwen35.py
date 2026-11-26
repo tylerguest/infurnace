@@ -61,7 +61,7 @@ def test_upstream_loader_and_exact_block_types(tmp_path):
     assert type(model.transformer) is Transformer
     assert type(model.transformer.blk[0]) is GatedDeltaNetBlock
     assert type(model.transformer.blk[1]) is TransformerBlock
-    assert type(model.transformer.output).__module__ == 'tinygrad.llm.kernels.amd'
+    assert type(model.transformer.output).__module__ == 'tinygrad.llm.model'  # upstream's Linear (its AMD kernels moved to slopkernels)
     assert model.config.context_length == 8 and model.config.rope_dimension_count == 2
     assert model.transformer.output.weight.uop.key == model.transformer.token_embd.weight.uop.key
     for cap in (0, -1, True):

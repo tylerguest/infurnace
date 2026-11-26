@@ -22,7 +22,7 @@ class BPETokenizer:
   def __init__(self, normal_tokens: dict[str, int], special_tokens: dict[str, int], eos_id: int, eot_id: int | None,
                bos_id: int | None = None):
     # SimpleTokenizer supplies the byte decoder; its own encoder is never used (see from_gguf).
-    self._backend = SimpleTokenizer(normal_tokens, special_tokens, 'qwen2', None, eos_id, eot_id)
+    self._backend = SimpleTokenizer(normal_tokens, special_tokens, 'qwen2', bos_id=None, eos_id=eos_id, eot_id=eot_id)
     self.bos_id, self.eos_id, self.eot_id = bos_id, eos_id, eot_id
 
   @classmethod
@@ -85,6 +85,10 @@ class BPETokenizer:
   def stream_decoder(self) -> Callable[[int | None], str]:
     """New UTF-8 decoder per stream; pass None to flush incomplete bytes."""
     return self._backend.stream_decoder()
+
+  @property
+  def _special_tokens(self) -> dict[str, int]:  # tinygrad's server picks the tool-call format from these
+    return self._backend._special_tokens
 
   def is_end(self, token_id: int) -> bool:
     return token_id in (self.eos_id, self.eot_id)

@@ -6,7 +6,7 @@ import functools
 import os
 from tinygrad import Context, Tensor, UOp, dtypes
 from tinygrad.llm.model import GatedDeltaNetBlock
-from infurnace.layers.fused import PREFILL_ROWS, _norm_of, _norm_q8, _norm_rows_q8, _one_row, _project, _rows
+from infurnace.layers.fused import PREFILL_ROWS, one_position, _norm_of, _norm_q8, _norm_rows_q8, _one_row, _project, _rows
 from infurnace.kernels.gdn import _gated_norm, gdn_gates, gdn_decode, gdn_prefill, gdn_prefill_raw
 from infurnace.models import Family
 from infurnace.weights.tokenizer import BPETokenizer
@@ -92,11 +92,12 @@ def _fused_gdn(block: GatedDeltaNetBlock):
   def attention(x: Tensor, start_pos, idx_mask=None):
     # idx_mask: an indexer's token selection (DeepSeek-style sparse attention), which these models don't have
     if idx_mask is not None: return upstream_attention(x, start_pos, idx_mask)
+    start_pos = one_position(start_pos)
     B, T, _ = x.shape
     if not isinstance(start_pos, UOp): start_pos = UOp.variable('start_pos', 0, block.config.max_context - 1).bind(start_pos)
     multirow = isinstance(T, UOp) or T > 1  # prompt chunks have a symbolic row count
     if B == 1 and multirow and x.max_shape[1] % PREFILL_ROWS == 0: return prefill(x, start_pos)
-    if B != 1 or multirow: return upstream_attention(x, start_pos)
+    if B != 1 or multirow: return upstream_attention(x, (start_pos,))
     initial = Tensor(start_pos).eq(0)
     norm = _norm_of(block, 'attn_norm')
     source, rotation = norm.take(x) if norm is not None else None, block.attn_qkv.rotation

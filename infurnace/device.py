@@ -51,6 +51,25 @@ def use_pip_compiler() -> bool:
 
 use_pip_compiler()
 
+def free_nv_host_mappings() -> None:
+  """Make tinygrad's NV unmap of host memory also free its RM memory object. tinygrad maps CPU buffers into the GPU
+  when an NV kernel or copy reads or writes them (a token read back, an input sent up), and its unmap leaves that
+  object, and its DMA mapping at the CPU address, alive: a CPU buffer later given the same page then fails to map
+  with NV_ERR_NO_MEMORY. Runs after use_pip_compiler, since importing ops_nv can load tinygrad's CUDA compiler."""
+  try: from tinygrad.runtime import ops_nv
+  except ImportError: return  # no NV backend on this platform
+  unmap = ops_nv.NVKIface.unmap
+  def unmap_and_free(self, mapping):
+    unmap(self, mapping)
+    memory, owns_range = mapping.meta
+    if not owns_range: return  # a mapping of NV memory, not a host object this mapping created
+    made = ops_nv.nv_gpu.NVOS00_PARAMETERS(hRoot=self.root, hObjectParent=self.dev.nvdevice, hObjectOld=memory.hMemory)
+    ops_nv.nv_iowr(self.fd_ctl, ops_nv.nv_gpu.NV_ESC_RM_FREE, made)
+    if made.status != 0: raise RuntimeError(f"freeing an NV host mapping returned {ops_nv.get_error_str(made.status)}")
+  ops_nv.NVKIface.unmap = unmap_and_free
+
+free_nv_host_mappings()
+
 def _probe(device: str) -> None:
   # Check actual execution, not just that a driver module can be imported.
   (Tensor([1.0], device=device) + 1).tolist()

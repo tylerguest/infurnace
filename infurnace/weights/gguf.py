@@ -110,8 +110,8 @@ def lazy_upstream_weights(path):
   def cached_parse(fn):
     metadata, entries = parse_gguf(path)
     return metadata, {name: (entry.data, entry.shape, entry.ggml_type) for name, entry in entries.items()}
-  def lazy_shard(entries, devices, shard_map=None):
-    if shard_map or len(devices) != 1: return shard(entries, devices, shard_map)
+  def lazy_shard(entries, devices, shard_map=None, repeats=None):
+    if shard_map or repeats or len(devices) != 1: return shard(entries, devices, shard_map, repeats)
     return {name: decode(data.to(devices[0]).flatten(), math.prod(shape), typ).reshape(shape)
             for name, (data, shape, typ) in entries.items()}
   upstream_model.gguf_parse, upstream_model.gguf_shard = cached_parse, lazy_shard

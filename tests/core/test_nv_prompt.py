@@ -1,24 +1,37 @@
 """Real-model checks for multirow prompt reading, on each family: Qwen3.5-4B (GDN and attention) and Qwen3-4B
 (attention only), both Q4_K_M, and Bonsai-4B (Qwen3.5 with ternary Q2_0 weights and Hadamard-rotated inputs), on NV.
 
-Marked nv (INFURNACE_TEST_NV=1); needs the model files below; loads each (~3 GB) once.
+Marked nv (INFURNACE_TEST_NV=1); needs the model files below. By default each runs truncated to its first layers
+(truncated.py: real shapes, tokenizer and head, ~20 s to load and warm up); the full models are marked slow
+(INFURNACE_TEST_SLOW=1, ~3 GB and minutes each).
 """
 import gc
 from pathlib import Path
 import pytest
 from infurnace.server.chat import user_prompt
 from infurnace.engine import PROMPT_ROWS, SHORT_ROWS
+from truncated import truncate
 
-TARGETS = [Path('models/qwen35-validation/Qwen3.5-4B-Q4_K_M.gguf'), Path('models/Qwen3-4B-Q4_K_M.gguf'),
-           Path.home() / '.local/share/infurnace/models/Ternary-Bonsai-2-4B-Q2_0.gguf']
+QWEN35, QWEN3 = Path('models/qwen35-validation/Qwen3.5-4B-Q4_K_M.gguf'), Path('models/Qwen3-4B-Q4_K_M.gguf')
+BONSAI = Path.home() / '.local/share/infurnace/models/Ternary-Bonsai-2-4B-Q2_0.gguf'
+# (file, layers kept or None for all): Qwen3.5's 4th layer is its first attention layer
+TARGETS = [(QWEN35, 4), (QWEN3, 2), (BONSAI, 4)]
 pytestmark = pytest.mark.nv
 
-@pytest.fixture(scope='module', params=TARGETS, ids=lambda path: path.stem)
+def model_params(targets):
+  """Each target truncated, then each full-size one marked slow."""
+  return [pytest.param((path, layers), id=f'{path.stem}-{layers}L') for path, layers in targets] + \
+         [pytest.param((path, None), id=path.stem, marks=pytest.mark.slow) for path, _ in targets]
+
+def model_file(path, layers):
+  if not path.is_file(): pytest.skip(f'needs {path}')
+  return path if layers is None else truncate(path, layers)
+
+@pytest.fixture(scope='module', params=model_params(TARGETS))
 def loaded(request):
-  if not request.param.is_file(): pytest.skip(f'needs {request.param}')
   from infurnace.loader import load_model
   gc.collect()  # the previous model's GPU memory goes once nothing refers to it (8 GB fit one at a time)
-  model, tokenizer = load_model(str(request.param), 1024, 'NV')
+  model, tokenizer = load_model(str(model_file(*request.param)), 1024, 'NV')
   assert model._multirow_prefill
   # Outside warmup, short prompts never capture the prompt graph; warm up so these tests exercise it.
   model.warmup()
@@ -40,7 +53,7 @@ def last_logits(model, tokens, chunks):
   with Context(DEV='NV'):
     for rows in chunks:
       x, mask = t.token_embd(Tensor([tokens[position:position + rows]], dtype='int32')).float(), None
-      for block in t.blk: x, mask = block(x, position, mask)
+      for block in t.blk: x, mask, _ = block(x, (position,), mask)
       x, position = x.realize(), position + rows
     return t.output(t.output_norm(x[:, -1:]))[0, -1].float().realize()
 
@@ -51,7 +64,7 @@ def one_row_logits(model, tokens):
   if not hasattr(model, '_test_step'):
     def step(token, position):
       x, mask = t.token_embd(token).float(), None
-      for block in t.blk: x, mask = block(x, position, mask)
+      for block in t.blk: x, mask, _ = block(x, (position,), mask)
       return t.output(t.output_norm(x)).reshape(-1).float().contiguous()
     model._test_step = TinyJit(step)
   position = UOp.variable('start_pos', 0, t.max_context - 1)
@@ -62,9 +75,10 @@ def one_row_logits(model, tokens):
 
 def test_multirow_logits_match_one_row(loaded):
   model, tokenizer = loaded
-  tokens = ids(loaded, 'List five facts about the planet Mars, one per line, each with a short explanation of why it matters.')
-  one = last_logits(model, tokens, [1] * len(tokens))
-  multi = last_logits(model, tokens, [16, 16] + [1] * (len(tokens) - 32))  # two chunks through the 16-row kernel
+  tokens = ids(loaded, 'List five facts about the planet Mars, one per line, each with a short explanation of why it matters.')[:33]
+  # Two chunks through the 16-row kernel and a last row, against one row at a time (a captured step: eager steps
+  # take a second each). The model was just warmed up, so no cached prefix is reused.
+  one, multi = one_row_logits(model, tokens), last_logits(model, tokens, [16, 16, 1])
   # One-row projections quantize activations to 8 bits; the 16-row GEMM multiplies in FP16. The results
   # agree to ~1%, so near-ties can flip: this prompt's first token is "1" vs "M", 0.04 logits apart.
   assert ((one - multi).abs().max() / one.abs().max()).item() < 0.03

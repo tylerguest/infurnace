@@ -15,9 +15,9 @@ import gc
 import io
 import json
 import os
+import queue
 import select
 import socket
-import socketserver
 import sys
 import threading
 import time
@@ -26,7 +26,7 @@ from importlib import metadata as _metadata
 from typing import Any, Callable
 
 from tinygrad import Device
-from tinygrad.llm.serve import Handler, LLMServer, normalize_messages
+from tinygrad.llm.serve import Handler, LLMServer, Request, normalize_messages
 from tinygrad.viz.serve import TCPServerWithReuse
 from infurnace.server.chat import ChatTemplate
 
@@ -247,11 +247,15 @@ class RequestHandler(Handler):
     try: temperature = 0.0 if temperature is None else float(temperature)
     except (TypeError, ValueError): temperature = -1.0
     if not 0 <= temperature < float('inf'): return self.send_json({'error': 'options.temperature must be a number >= 0'}, 400)
-    chunks = self.run_model(ids, name, True, max_tokens=max_tokens, temperature=temperature, reasoning=rendered.rstrip().endswith('<think>'))
+    req = Request(ids, self.client_gone, max_tokens=max_tokens, temperature=temperature)  # generated on the main thread (Server.generate)
+    chunks = self.run_model(req, name, True, reasoning=rendered.rstrip().endswith('<think>'))
     text_key = 'response' if generate else 'content'
     def records():
       first, done_reason, usage = None, 'stop', {}
       for chunk in chunks:
+        if 'error' in chunk:  # generation failed: tinygrad reports it as one record
+          yield {'error': chunk['error']['message']}
+          return
         if not chunk['choices']:
           usage = chunk.get('usage', {})
           continue
@@ -286,6 +290,7 @@ class RequestHandler(Handler):
       if self.client_gone():  # nobody is waiting for the reply: free the GPU
         chunks.close()
         return
+      if 'error' in record: return self.send_json(record, 500)
       part = record if generate else record['message']
       if record['done']:
         final = record
@@ -302,7 +307,7 @@ def _arguments(value):
     except ValueError: return value
   return value
 
-class Server(socketserver.ThreadingMixIn, LLMServer):
+class Server(LLMServer):
   """`warmup` runs on a thread from the start, then `idle` (work a request may wait for, e.g. the prompt graph);
   generating requests wait for `ready` and take the `gpu` lock. `info` describes the loaded model for /api/ps and
   /api/show; `installed()` lists downloaded models for /api/tags.
@@ -315,13 +320,20 @@ class Server(socketserver.ThreadingMixIn, LLMServer):
     self.model, self.model_name, self.tok, self.template, self.idle = model, model_name, tok, template, idle
     self.info, self.installed, self.dflash = info or {}, installed or (lambda: []), dflash
     self.loader, self.keep_alive, self.switching, self.last_used = loader, keep_alive, None, time.monotonic()
-    self.waiting, self._waiting = 0, threading.Lock()  # requests waiting for the GPU (background work lets them go first)
+    self.pending, self._pending = 0, threading.Lock()  # requests waiting for the GPU (background work lets them go first)
+    self.waiting = queue.Queue()  # tinygrad's: requests the main thread generates (serve_forever), each holding the GPU lock
     self.ready, self.failure, self.warmup_seconds, self.gpu = threading.Event(), None, None, threading.Lock()
     self.stopping, self.closed, self._finishing = False, threading.Event(), threading.Lock()
     TCPServerWithReuse.__init__(self, server_address, RequestHandler)
     if warmup is None and idle is None: self.ready.set()
     else: threading.Thread(target=self._warm, args=(warmup,), name='infurnace-warmup', daemon=True).start()
     if keep_alive: threading.Thread(target=self._unload_when_idle, name='infurnace-keep-alive', daemon=True).start()
+
+  def generate(self, req):
+    """tinygrad's serve_forever generates each request on the main thread while its handler holds the GPU lock; a client
+    that left (ServerModel's `cancelled`) ends it without the error reply tinygrad would print and send."""
+    try: yield from super().generate(req)
+    except ClientDisconnected: return
 
   def _install(self, model: Loaded):
     self.model, self.model_name, self.tok, self.template = model.model, model.name, model.tokenizer, model.template
@@ -389,7 +401,7 @@ class Server(socketserver.ThreadingMixIn, LLMServer):
     waiting and none for `quiet` seconds (a client that just loaded a model sends its reply's request right after).
     A request that arrives while it runs waits for it. The thread holds no reference to the work while it waits,
     so unloading the model (which drops `self.idle`) frees it; the work is then skipped."""
-    def idle() -> bool: return not self.waiting and time.monotonic() - self.last_used >= quiet
+    def idle() -> bool: return not self.pending and time.monotonic() - self.last_used >= quiet
     while True:
       if idle():
         with self.gpu:
@@ -428,12 +440,12 @@ class Server(socketserver.ThreadingMixIn, LLMServer):
   @contextlib.contextmanager
   def request_gpu(self):
     """The GPU lock for a request, after the warmup; while it waits, background work doesn't start."""
-    with self._waiting: self.waiting += 1
+    with self._pending: self.pending += 1
     try:
       self.ready.wait()
       self.gpu.acquire()
     finally:
-      with self._waiting: self.waiting -= 1
+      with self._pending: self.pending -= 1
     try: yield
     finally: self.gpu.release()
 

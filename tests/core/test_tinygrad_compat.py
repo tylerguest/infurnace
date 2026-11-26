@@ -1,9 +1,11 @@
+import mmap
 import os
 import random
 import struct
 
 import pytest
 from tinygrad import Tensor, TinyJit, dtypes
+from tinygrad.helpers import mv_address
 
 from infurnace.weights.gguf import PackedTensor
 from tinygrad.llm.gguf import ggml_data_to_tensor as _dequant
@@ -110,3 +112,14 @@ def test_nv_quant_eager_and_jit(typ, size, width):
   x = Tensor.ones(2, width, device="NV")
   assert adapter(x).tolist() == original(x).tolist()  # Multi-token prefill fallback.
   assert adapter.original.weight.uop is adapter.weight.uop
+
+@pytest.mark.nv
+def test_nv_maps_a_freed_host_page_again():
+  # tinygrad's NV unmap left a host mapping's RM memory object alive, so mapping the same page again failed with
+  # NV_ERR_NO_MEMORY (one test's token buffer freed, the next test's input landing on its page); infurnace.device frees it.
+  page = mmap.mmap(-1, mmap.PAGESIZE)
+  for step in range(3):
+    page[:4] = struct.pack("<I", step)
+    blob = Tensor.from_blob(mv_address(memoryview(page)), (1024,), dtype=dtypes.uint32, device="CPU")
+    assert (blob.to("NV") + 1).tolist()[:2] == [step + 1, 1]
+    del blob

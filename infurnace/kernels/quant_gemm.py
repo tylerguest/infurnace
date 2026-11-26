@@ -12,9 +12,9 @@ import os
 from tinygrad import Context, Device, Tensor, UOp, dtypes
 from tinygrad.dtype import AddrSpace
 from tinygrad.renderer.cstyle import CUDARenderer
-from tinygrad.uop.ops import AxisType, KernelInfo, Ops
+from tinygrad.uop.ops import AxisType, KernelInfo
 
-from infurnace.kernels.quant_gemv import (Q2_0, Q4_K, Q5_K, Q6_K, Q6_PREPARED_BYTES, QUANT_SIZES, _half, _load_lanes, _q4_scales, _q4_word,
+from infurnace.kernels.quant_gemv import (Q2_0, Q4_K, Q5_K, Q6_K, Q6_PREPARED_BYTES, QUANT_SIZES, _half, c_code, _load_lanes, _q4_scales, _q4_word,
                                           q2_scale, q2_scale_word, q2_word,
                                           q8_quantize64)
 from infurnace.device import nvidia
@@ -128,7 +128,7 @@ _HALF2 = "tg_bitcast<half2>({})"
 _FP16_1024 = 0x64006400  # 1024.0 in both halves: OR-ing a nibble into the mantissa gives 1024 + q exactly
 
 def _h2(op: str, *args: UOp) -> UOp:
-  return UOp(Ops.CUSTOMI, src=args, arg=(f"tg_bitcast<unsigned int>({op}({', '.join([_HALF2] * len(args))}))", dtypes.uint32))
+  return c_code(f"tg_bitcast<unsigned int>({op}({', '.join([_HALF2] * len(args))}))", *args, dtype=dtypes.uint32)
 
 def _halves(pair: UOp) -> list[UOp]:
   return [(pair >> s).cast(dtypes.uint16).bitcast(dtypes.float16) for s in (0, 16)]
@@ -146,7 +146,7 @@ def _q4_scale_pair(head: list[UOp], subgroup: int) -> tuple[UOp, UOp]:
   integers = _h2("__hsub2", scale | (minimum << 16) | _FP16_1024, UOp.const(_FP16_1024, dtypes.uint32))
   products = _h2("__hmul2", integers, head[0])  # (d*scale, dmin*minimum)
   def broadcast(op: str) -> UOp:
-    return UOp(Ops.CUSTOMI, src=(products,), arg=(f"tg_bitcast<unsigned int>({op}({_HALF2}))", dtypes.uint32))
+    return c_code(f"tg_bitcast<unsigned int>({op}({_HALF2}))", products, dtype=dtypes.uint32)
   return broadcast("__low2half2"), broadcast("__high2half2")
 
 def _q4_fragment(word: UOp, nibble: int, scale: UOp, offset: UOp, high: UOp | None = None, subgroup: int = 0) -> UOp:
@@ -162,7 +162,7 @@ def _q4_fragment(word: UOp, nibble: int, scale: UOp, offset: UOp, high: UOp | No
              for w, h in ((word, high), (word >> 8, high >> 8))]
   def dequant(p: UOp) -> UOp:  # (p - 1024) * scale - offset
     q = _h2("__hsub2", p, UOp.const(_FP16_1024, dtypes.uint32))
-    return UOp(Ops.CUSTOMI, src=(q, scale, offset), arg=(f"tg_bitcast<unsigned int>(__hfma2({_HALF2}, {_HALF2}, __hneg2({_HALF2})))", dtypes.uint32))
+    return c_code(f"tg_bitcast<unsigned int>(__hfma2({_HALF2}, {_HALF2}, __hneg2({_HALF2})))", q, scale, offset, dtype=dtypes.uint32)
   pairs = [dequant(p) for p in pairs]
   return UOp.stack(*_halves(pairs[0]), *_halves(pairs[1]))
 
@@ -388,8 +388,7 @@ def _prefill_q6_mma(out: UOp, raw: UOp, x: UOp, *, tokens: int, width: int, rows
       d2 = d | (d << 16)
       # Lane t's scale groups in half h: 8h + t (low nibbles) and 8h + 4 + t (high nibbles), bytes t of words 2h, 2h + 1.
       pair = _q6_scale_pair(words[16+2*h] >> (8*thread), words[17+2*h] >> (8*thread), d2)
-      low, high = (UOp(Ops.CUSTOMI, src=(pair,), arg=(f"tg_bitcast<unsigned int>({op}({_HALF2}))", dtypes.uint32))
-                   for op in ("__low2half2", "__high2half2"))
+      low, high = (c_code(f"tg_bitcast<unsigned int>({op}({_HALF2}))", pair, dtype=dtypes.uint32) for op in ("__low2half2", "__high2half2"))
       factors.append((low, high))
     for nibble in range(2):
       for word in range(4):
@@ -559,7 +558,7 @@ _IMMA = ('[&]() {{ int d0, d1, d2, d3; asm("mma.sync.aligned.m16n8k32.row.col.s3
 def _imma(a: list[UOp], b: list[UOp], c: list[UOp]) -> list[UOp]:
   """D = A x B + C: A four words of 4 int8 (rows g, g+8 at k 4t..; then k 16+4t..), B two (k 4t.., 16+4t.. of column
   g), C and D four int32 (rows g, g+8; columns 2t, 2t+1), for g = lane / 4 and t = lane % 4."""
-  return [UOp(Ops.CUSTOMI, src=(*a, *b, *c), arg=(_IMMA.replace('{index}', str(i)), dtypes.int32)) for i in range(4)]
+  return [c_code(_IMMA.replace('{index}', str(i)), *a, *b, *c, dtype=dtypes.int32) for i in range(4)]
 
 @functools.cache
 def _prefill_q2_imma(out: UOp, raw: UOp, xq: UOp, xd: UOp, *, tokens: int, width: int, rows: int, tiles: int = 1,
@@ -617,7 +616,7 @@ def _prefill_q2_imma(out: UOp, raw: UOp, xq: UOp, xd: UOp, *, tokens: int, width
   zero = UOp.const(0, dtypes.int32)
   for weights, activations in loaded:
     for t, (word, columns) in enumerate(weights):
-      b = [[UOp(Ops.CUSTOMI, src=((word >> (2*(2*step+half))) & 0x03030303,), arg=("__vsub4({0}, 0x01010101u)", dtypes.uint32))
+      b = [[c_code("__vsub4({0}, 0x01010101u)", (word >> (2*(2*step+half))) & 0x03030303, dtype=dtypes.uint32)
             for half in range(2)] for step in range(2)]  # codes 0-2 -> -1..1
       for m, (a, row_scales) in enumerate(activations):
         d = _imma(a[0], b[0], [zero]*4)

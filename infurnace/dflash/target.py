@@ -73,7 +73,7 @@ class TargetObserver:
     for index, block in enumerate(target.blk):
       # GGUF tap N means HF hidden_states[N], i.e. after target block N-1.
       if index in self.layers: features.append(x)
-      x, mask = block(x, position, mask)  # blocks return (output, the indexer's token mask)
+      x, mask, _ = block(x, (position,), mask)  # blocks return (output, the indexer's token mask, hyper-connection state)
     logits = target.output(target.output_norm(x[:, -1:]))[:, -1, :]
     # Identical to plain decoding's sample, including its RNG consumption and tie behavior: the model's device
     # sampler (Model._sample_on_device), else upstream's. Draft argmax never consumes this RNG.

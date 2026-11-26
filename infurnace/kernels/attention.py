@@ -32,14 +32,13 @@ contiguous bytes. Bonsai-4B perplexity (eval.txt, 16-row path), int8 values: 18.
 """
 from __future__ import annotations
 import functools
-import inspect
 import math
 import os
 
 from tinygrad import Tensor, UOp, dtypes
 from tinygrad.dtype import AddrSpace
-from tinygrad.uop.ops import AxisType, KernelInfo, Ops
-from infurnace.kernels.quant_gemv import _load_lanes, warp_reduce
+from tinygrad.uop.ops import AxisType, KernelInfo
+from infurnace.kernels.quant_gemv import _load_lanes, c_code, warp_reduce
 from infurnace.device import nvidia
 
 TILE = 32      # keys staged per step: one per lane
@@ -50,20 +49,16 @@ QUERIES = 8    # packed query vectors per warp, at most
 DECODE_SEGMENT, DECODE_TILE, DECODE_WARPS = 128, 8, 4
 V_BLOCK = 8  # keys a block of an int8 cache's values (dims-major within it)
 _NEG = float('-inf')
-_VARIABLE_PARAM = {'param': True} if 'param' in inspect.signature(UOp.variable).parameters else {}
 
 def _kernel_scalar(value: int | UOp) -> int | UOp:
-  """A bound position as the kernel's own unbound variable (its value is passed at launch)."""
-  if not isinstance(value, UOp): return value
-  value = value.unbind_all()[0]
-  return value.substitute({v: UOp.variable(v.expr, v.vmin, v.vmax, dtype=v.dtype, multiple_of=v.arg.multiple_of, **_VARIABLE_PARAM)
-                           for v in value.toposort() if v.is_variable})
+  """A position as a kernel reads it: a bound variable stays bound, and tinygrad passes its value at each launch (export
+  lifts a kernel's free variables into its arguments), so one captured graph serves every position."""
+  return value
 
 def _launch(outputs: tuple[Tensor, ...], inputs: tuple[Tensor, ...], start: int | UOp, fxn) -> tuple[Tensor, ...]:
   sources = tuple(t.uop for t in outputs + inputs)
   params = tuple(UOp.placeholder_like(s, slot=i) for i, s in enumerate(sources))
-  scalars = tuple(v.cast(dtypes.int32) for v in start.toposort() if v.is_bound_var) if isinstance(start, UOp) else ()
-  call = fxn(*params).call(*sources, *scalars)
+  call = fxn(*params).call(*sources)  # a bound position in the kernel body is lifted into an argument (see _kernel_scalar)
   return tuple(Tensor(t.uop.after(call)) for t in outputs)
 
 def _live(start: int | UOp, rows: int, segment: int) -> int | UOp:
@@ -100,7 +95,7 @@ _E4M3X2_F16X2 = '[&]() {{ unsigned r; asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(r
 
 def _fp8_halves(word: UOp) -> list[UOp]:
   """The four FP8 e4m3 bytes of a uint32 word (byte 0 first) as FP16."""
-  pairs = [UOp(Ops.CUSTOM, src=(word >> shift if shift else word,), arg=(_E4M3X2_F16X2, dtypes.uint32)) for shift in (0, 16)]
+  pairs = [c_code(_E4M3X2_F16X2, word >> shift if shift else word, dtype=dtypes.uint32, inline=False) for shift in (0, 16)]
   return [(p >> s).cast(dtypes.uint16).bitcast(dtypes.float16) for p in pairs for s in (0, 16)]
 
 def _value(kv: UOp, kv_head: UOp, position: UOp, d: UOp, valid: UOp | None = None) -> UOp:
@@ -114,14 +109,14 @@ _LDMATRIX = ('[&]() {{ unsigned a, b; asm volatile("ldmatrix.sync.aligned.m8n8.x
 
 def _ldmatrix_words(ptr: UOp) -> list[UOp]:
   """ldmatrix.x2 as its two 32-bit registers (as _ldmatrix): on int8 rows of 16 bytes, an m16n8k32 B fragment."""
-  pair = UOp(Ops.CUSTOM, src=(ptr,), arg=(_LDMATRIX, dtypes.uint64))
+  pair = c_code(_LDMATRIX, ptr, dtype=dtypes.uint64, inline=False)
   return [pair.cast(dtypes.uint32), (pair >> 32).cast(dtypes.uint32)]
 
 def _ldmatrix(ptr: UOp) -> list[UOp]:
   """ldmatrix.x2: two 8x8 FP16 tiles of shared memory, lanes 0-7 giving the rows of the first and 8-15 of the
   second; each lane gets row lane / 4, columns 2 (lane % 4) and the next of both, as four halves. Emitted once
   (a CUSTOM, not inline): one instruction for an MMA's B fragment in place of two 4-byte loads."""
-  pair = UOp(Ops.CUSTOM, src=(ptr,), arg=(_LDMATRIX, dtypes.uint64))
+  pair = c_code(_LDMATRIX, ptr, dtype=dtypes.uint64, inline=False)
   words = [pair.cast(dtypes.uint32), (pair >> 32).cast(dtypes.uint32)]
   return [(w >> s).cast(dtypes.uint16).bitcast(dtypes.float16) for w in words for s in (0, 16)]
 
@@ -135,7 +130,7 @@ def _fmma(a: list[UOp], b: list[UOp], c: list[UOp] | None = None) -> list[UOp]:
   """D = A x B + C on FP8 e4m3 tensor cores, FP32 out (m16n8k32; fragments as _imma's): 2x the FP16-in, FP32-accumulate
   rate on an RTX 5060. C (zero by default) must not hold another MMA: inline MMA expressions would repeat it."""
   c = c or [UOp.const(0.0, dtypes.float32)] * 4
-  return [UOp(Ops.CUSTOMI, src=(*a, *b, *c), arg=(_FMMA.replace('{index}', str(i)), dtypes.float32)) for i in range(4)]
+  return [c_code(_FMMA.replace('{index}', str(i)), *a, *b, *c, dtype=dtypes.float32) for i in range(4)]
 
 def _extras(extra: tuple[UOp, ...], int8: bool) -> tuple[UOp | None, UOp | None]:
   """A kernel's optional sources after kv: the int8 cache's scales, then the floor."""
@@ -253,7 +248,7 @@ def _tensor_cores(device: str) -> bool:
 def _shuffle_rows(value: UOp, maximum: bool) -> UOp:
   """Reduce across the four lanes that hold one row of an MMA accumulator (lanes 4g..4g+3)."""
   for offset in (1, 2):
-    other = UOp(Ops.CUSTOM, src=(value,), arg=(f"__shfl_xor_sync(0xffffffff, {{0}}, {offset})", dtypes.float))
+    other = c_code(f"__shfl_xor_sync(0xffffffff, {{0}}, {offset})", value, dtype=dtypes.float, inline=False)
     value = value.maximum(other) if maximum else value + other
   return value
 
@@ -617,8 +612,7 @@ def _flash_kernel(part: UOp, stats: UOp, q: UOp, kv: UOp, *extra: UOp, start: in
     for r in range(2):
       for nt in range(2):
         key = wn * 16 + nt * 8 + thread * 2
-        pair = UOp(Ops.CUSTOMI, src=tuple(probs[r][nt * 2 + col] * v_scales[key + col].load() / c_now for col in range(2)),
-                   arg=(_E4M3_F32X2, U32))
+        pair = c_code(_E4M3_F32X2, *(probs[r][nt * 2 + col] * v_scales[key + col].load() / c_now for col in range(2)), dtype=U32)
         written += [p_lds[wm, group + 8 * r, key + col].store(((pair >> (8 * col)) & 255).cast(dtypes.uint8)) for col in range(2)]
     p_now = p_lds.after(UOp.group(*written).barrier())
     # A fragment (k32): rows 0-7 and 8-15 at keys 0-15, then at 16-31
@@ -915,7 +909,7 @@ def _store_kernel(cache: UOp, scales: UOp, k: UOp, v: UOp, *, start: int | UOp, 
   key_scales = [(top(i) / 127).cast(dtypes.float16) for i in range(4)]
   value_scales = [(top(4 + i) / 448).cast(dtypes.float16) for i in range(4)]
   stores = []
-  def down(value: UOp, n: int) -> UOp: return UOp(Ops.CUSTOM, src=(value,), arg=(f"__shfl_down_sync(0xffffffff, {{0}}, {n})", dtypes.int32))
+  def down(value: UOp, n: int) -> UOp: return c_code(f"__shfl_down_sync(0xffffffff, {{0}}, {n})", value, dtype=dtypes.int32, inline=False)
   for i in range(4):
     code = (ks[i] / key_scales[i].float().maximum(1e-30)).round().clip(-127, 127).cast(dtypes.int32)
     word = functools.reduce(lambda a, b: a | b, [((down(code, n) if n else code).cast(dtypes.uint32) & 255) << (8 * n) for n in range(4)])
@@ -925,7 +919,7 @@ def _store_kernel(cache: UOp, scales: UOp, k: UOp, v: UOp, *, start: int | UOp, 
   row, column = _value_word(first.minimum(capacity - 4), d, dim)
   old = cache[1, 0, head, row, column].load()
   codes = [vs[i] / value_scales[i].float().maximum(1e-30) for i in range(4)]
-  pairs = [UOp(Ops.CUSTOMI, src=(codes[2 * j], codes[2 * j + 1]), arg=(_E4M3_F32X2, dtypes.uint32)) for j in range(2)]
+  pairs = [c_code(_E4M3_F32X2, codes[2 * j], codes[2 * j + 1], dtype=dtypes.uint32) for j in range(2)]
   word = functools.reduce(lambda a, b: a | b, [mine[i].where((pairs[i // 2] >> (8 * (i % 2))) & 255, (old >> (8 * i)) & 255) << (8 * i)
                                                for i in range(4)])
   stores.append(cache.after(old)[1, 0, head, row.valid(first < capacity), column].store(word))
@@ -977,13 +971,13 @@ def _prologue_kernel(q_out: UOp, cache: UOp, scales: UOp, joined: UOp, q_w: UOp,
   scale = (block_sum(z.abs(), 2, maximum=True) / is_v.where(UOp.const(448.0, F32), UOp.const(127.0, F32))).cast(dtypes.float16)
   scaled = z / scale.float().maximum(1e-30)
   code = scaled.round().clip(-127, 127).cast(dtypes.int32)
-  def down(value: UOp, n: int) -> UOp: return UOp(Ops.CUSTOM, src=(value,), arg=(f"__shfl_down_sync(0xffffffff, {{0}}, {n})", dtypes.int32))
+  def down(value: UOp, n: int) -> UOp: return c_code(f"__shfl_down_sync(0xffffffff, {{0}}, {n})", value, dtype=dtypes.int32, inline=False)
   word = functools.reduce(lambda a, b: a | b, [((down(code, n) if n else code).cast(dtypes.uint32) & 255) << (8 * n) for n in range(4)])
   stores.append(cache[0, 0, k_head.valid(~is_q & ~is_v & (lane % 4).eq(0)), start, t // 4].store(word))
   # this value's byte into its word of the value blocks (each thread its own dim: its own word)
   row, column = _value_word(start, t, dim)
   old = cache[1, 0, v_head.valid(is_v), row, column].load()
-  fp8 = UOp(Ops.CUSTOMI, src=(scaled, UOp.const(0.0, F32)), arg=(_E4M3_F32X2, dtypes.uint32)) & 255
+  fp8 = c_code(_E4M3_F32X2, scaled, UOp.const(0.0, F32), dtype=dtypes.uint32) & 255
   shift = ((start % 4) * 8).cast(dtypes.uint32) if isinstance(start, UOp) else start % 4 * 8
   stores.append(cache.after(old)[1, 0, v_head.valid(is_v), row, column].store((old & ~(UOp.const(255, dtypes.uint32) << shift)) | (fp8 << shift)))
   stores.append(scales[is_v.cast(dtypes.int32), 0, is_v.where(v_head, k_head).valid(~is_q & t.eq(0)), start].store(scale))

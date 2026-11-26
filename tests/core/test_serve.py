@@ -13,6 +13,7 @@ from infurnace.server.serve import loaded, Server, ServerModel, Speeds
 class Tokenizer:
   bos_id = None
   eos_id, eot_id = 999, None
+  _special_tokens: dict = {}  # tinygrad's server picks the tool-call format from these
 
   def encode(self, text):
     self.rendered = text
