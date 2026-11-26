@@ -465,7 +465,7 @@ def _commit_kernel(state: UOp, conv: UOp, g: UOp, k: UOp, u: UOp, window: UOp, p
   lane = UOp.range(kd, 1, axis_type=AxisType.LOCAL)
   head, first_row = block // tiles, (block % tiles) * tile
   count, initial = params[0].load(), params[1].load().ne(0)
-  F32, zero = dtypes.float32, UOp.const(0.0, dtypes.float32)
+  zero = UOp.const(0.0, dtypes.float32)
   if kheads:
     gs = [g[1, head, j].load() for j in range(rows)]
     for j in range(1, rows): gs[j] = gs[j - 1] + gs[j]
@@ -480,7 +480,7 @@ def _commit_kernel(state: UOp, conv: UOp, g: UOp, k: UOp, u: UOp, window: UOp, p
   stores = []
   for r in range(tile):
     row = first_row + r
-    previous = initial.where(UOp.const(0.0, dtypes.float32), state[0, head, row, lane].load() * decay)
+    previous = initial.where(zero, state[0, head, row, lane].load() * decay)
     total = functools.reduce(lambda a, b: a + b, (u[0, head, j, row].load() * weighted[j] for j in range(rows)), previous)
     stores.append(state[0, head, row, lane].store(total))
   # the conv state: one value per thread of the first CTAs
