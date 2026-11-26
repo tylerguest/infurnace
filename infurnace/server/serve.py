@@ -134,8 +134,34 @@ def _think(body) -> bool | None:
   if isinstance(value, str): return value.lower() not in ('false', 'off', 'none', '')
   return None
 
+class Outputs(queue.Queue):
+  """A request's token queue that remembers when the main thread's end marker (None) was read."""
+  ended = False
+  def get(self, *args, **kwargs):
+    value = super().get(*args, **kwargs)
+    if value is None: self.ended = True
+    return value
+
 class RequestHandler(Handler):
-  """tinygrad's handler, with the request's thinking switch applied while its prompt is rendered, and the /api endpoints."""
+  """tinygrad's handler, with the request's thinking switch applied while its prompt is rendered, and the /api endpoints.
+  tinygrad generates each request on the server's main thread, so a handler that stops reading early (a client that
+  left, an error) waits for the main thread to finish its request before it lets go of the GPU lock (finish_generation):
+  until then the main thread may still run the model, and the request's `cancelled` check is still in use."""
+  generating = None  # the request this handler queued and the main thread hasn't finished
+
+  def run_model(self, req, *args, **kwargs):
+    req.out = Outputs()
+    self.generating = req
+    chunks = super().run_model(req, *args, **kwargs)  # queues req on its first step
+    try: yield from chunks
+    finally:
+      chunks.close()
+      self.finish_generation()
+
+  def finish_generation(self):
+    """Wait until the main thread has finished the queued request, dropping the tokens nobody reads."""
+    req, self.generating = self.generating, None
+    while req is not None and not req.out.ended: req.out.get()
   def send_json(self, value, status_code: int = 200):
     self.send_data(json.dumps(value).encode(), status_code=status_code)
 
@@ -167,7 +193,9 @@ class RequestHandler(Handler):
       elif route == '/api/show': self.send_json(self.server.show())
       elif route in ('/api/chat', '/api/generate'):
         with self.server.request_gpu():
-          if self.usable() and self.use_model(body.get('model'), strict=True): self.api_generate(body, chat=route == '/api/chat')
+          try:
+            if self.usable() and self.use_model(body.get('model'), strict=True): self.api_generate(body, chat=route == '/api/chat')
+          finally: self.finish_generation()
           self.server.last_used = time.monotonic()
       else: self.send_json({'error': f'unknown endpoint {route}'}, 404)
       return
@@ -182,6 +210,7 @@ class RequestHandler(Handler):
       try: super().do_POST()
       except ClientDisconnected: pass
       finally:
+        self.finish_generation()
         model.cancelled = None
         template.request_thinking = None
         self.server.last_used = time.monotonic()

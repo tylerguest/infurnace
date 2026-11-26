@@ -50,15 +50,13 @@ DECODE_SEGMENT, DECODE_TILE, DECODE_WARPS = 128, 8, 4
 V_BLOCK = 8  # keys a block of an int8 cache's values (dims-major within it)
 _NEG = float('-inf')
 
-def _kernel_scalar(value: int | UOp) -> int | UOp:
-  """A position as a kernel reads it: a bound variable stays bound, and tinygrad passes its value at each launch (export
-  lifts a kernel's free variables into its arguments), so one captured graph serves every position."""
-  return value
-
-def _launch(outputs: tuple[Tensor, ...], inputs: tuple[Tensor, ...], start: int | UOp, fxn) -> tuple[Tensor, ...]:
+def _launch(outputs: tuple[Tensor, ...], inputs: tuple[Tensor, ...], fxn) -> tuple[Tensor, ...]:
+  """Run the kernel `fxn` builds over placeholders for `outputs` and `inputs`. A position (a bound variable) used in its
+  body stays bound: tinygrad lifts it into an argument and passes its value at each launch, so one captured graph serves
+  every position."""
   sources = tuple(t.uop for t in outputs + inputs)
   params = tuple(UOp.placeholder_like(s, slot=i) for i, s in enumerate(sources))
-  call = fxn(*params).call(*sources)  # a bound position in the kernel body is lifted into an argument (see _kernel_scalar)
+  call = fxn(*params).call(*sources)
   return tuple(Tensor(t.uop.after(call)) for t in outputs)
 
 def _live(start: int | UOp, rows: int, segment: int) -> int | UOp:
@@ -788,19 +786,19 @@ def attention(q: Tensor, kv: Tensor, start: int | UOp, *, causal: bool = True, w
   if ring and not 0 < window <= capacity - rows: raise ValueError("a ring cache needs a window and room for it plus the rows")
   if not nvidia(q.device) or dim % 32 or not (int8 or kv.dtype == dtypes.float16):
     return _masked(q, dequantize_kv(kv, scales) if int8 else kv, start, causal, window, ring, floor)
-  groups, scalar = heads // kv_heads, _kernel_scalar(start)
+  groups = heads // kv_heads
   extra = ((scales,) if int8 else ()) + ((floor,) if floor is not None else ())
   if rows == 1 and not window and not ring and floor is None and dim // 32 in ((4, 8) if int8 else (2, 4, 8)):
     seg = DECODE_SEGMENT
     entries = -(-capacity // (seg * DECODE_WARPS)) * DECODE_WARPS
     part = Tensor.empty(kv_heads, entries, groups, dim, dtype=dtypes.float32, device=q.device)
     stats = Tensor.empty(kv_heads, entries, groups, 2, dtype=dtypes.float32, device=q.device)
-    part, stats = _launch((part, stats), (q.contiguous(), kv, *extra), start, functools.partial(
-      _decode_kernel, start=scalar, kv_heads=kv_heads, groups=groups, dim=dim, capacity=capacity, segment=seg,
+    part, stats = _launch((part, stats), (q.contiguous(), kv, *extra), functools.partial(
+      _decode_kernel, start=start, kv_heads=kv_heads, groups=groups, dim=dim, capacity=capacity, segment=seg,
       tile=DECODE_TILE, warps=DECODE_WARPS, int8=int8))
     out = Tensor.empty(1, heads, 1, dim, dtype=dtypes.float32, device=q.device)
-    return _launch((out,), (part, stats), start, functools.partial(
-      _merge_kernel, start=scalar, kv_heads=kv_heads, groups=groups, rows=1, dim=dim, window=0, segment=seg))[0]
+    return _launch((out,), (part, stats), functools.partial(
+      _merge_kernel, start=start, kv_heads=kv_heads, groups=groups, rows=1, dim=dim, window=0, segment=seg))[0]
   if rows > 1 and not window and not ring and floor is None and dim % 32 == 0 and _FLASH and _MMA and _tensor_cores(q.device):
     queries = groups * rows
     warps_m = min(-(-queries // 16), 4)
@@ -809,12 +807,12 @@ def attention(q: Tensor, kv: Tensor, start: int | UOp, *, causal: bool = True, w
     parts = max(1, round(FLASH_BLOCKS / (kv_heads * qblocks)))
     part = Tensor.empty(kv_heads, parts, queries, dim, dtype=dtypes.float32, device=q.device)
     stats = Tensor.empty(kv_heads, parts, queries, 2, dtype=dtypes.float32, device=q.device)
-    part, stats = _launch((part, stats), (q.contiguous(), kv, *extra), start, functools.partial(
-      _flash_kernel, start=scalar, kv_heads=kv_heads, groups=groups, rows=rows, dim=dim, causal=causal, capacity=capacity,
+    part, stats = _launch((part, stats), (q.contiguous(), kv, *extra), functools.partial(
+      _flash_kernel, start=start, kv_heads=kv_heads, groups=groups, rows=rows, dim=dim, causal=causal, capacity=capacity,
       parts=parts, warps_m=warps_m, int8=int8))
     out = Tensor.empty(1, heads, rows, dim, dtype=dtypes.float32, device=q.device)
-    return _launch((out,), (part, stats), start, functools.partial(
-      _merge_kernel, start=scalar, kv_heads=kv_heads, groups=groups, rows=rows, dim=dim, window=0, segment=segment, parts=parts))[0]
+    return _launch((out,), (part, stats), functools.partial(
+      _merge_kernel, start=start, kv_heads=kv_heads, groups=groups, rows=rows, dim=dim, window=0, segment=segment, parts=parts))[0]
   # A ring's window can straddle one more segment boundary than its length spans.
   if rows > 16 and not (dim % 16 == 0 and segment % 32 == 0 and _MMA and _tensor_cores(q.device)):
     # The FP32 kernel stages a probability row per query: past 16 rows its shared memory runs out. Slices of
@@ -825,18 +823,18 @@ def attention(q: Tensor, kv: Tensor, start: int | UOp, *, causal: bool = True, w
   part = Tensor.empty(kv_heads, segments, groups * rows, dim, dtype=dtypes.float32, device=q.device)
   stats = Tensor.empty(kv_heads, segments, groups * rows, 2, dtype=dtypes.float32, device=q.device)
   if rows > 1 and dim % 16 == 0 and segment % 32 == 0 and _MMA and _tensor_cores(q.device):
-    part, stats = _launch((part, stats), (q.contiguous(), kv, *extra), start, functools.partial(
-      _mma_kernel, start=scalar, kv_heads=kv_heads, groups=groups, rows=rows, dim=dim, causal=causal, window=window,
+    part, stats = _launch((part, stats), (q.contiguous(), kv, *extra), functools.partial(
+      _mma_kernel, start=start, kv_heads=kv_heads, groups=groups, rows=rows, dim=dim, causal=causal, window=window,
       segment=segment, ring=capacity if ring else 0, capacity=capacity, int8=int8))
     out = Tensor.empty(1, heads, rows, dim, dtype=dtypes.float32, device=q.device)
-    return _launch((out,), (part, stats), start, functools.partial(
-      _merge_kernel, start=scalar, kv_heads=kv_heads, groups=groups, rows=rows, dim=dim, window=window, segment=segment))[0]
-  part, stats = _launch((part, stats), (q.contiguous(), kv, *extra), start, functools.partial(
-    _partial_kernel, start=scalar, kv_heads=kv_heads, groups=groups, rows=rows, dim=dim, causal=causal, window=window, segment=segment,
+    return _launch((out,), (part, stats), functools.partial(
+      _merge_kernel, start=start, kv_heads=kv_heads, groups=groups, rows=rows, dim=dim, window=window, segment=segment))[0]
+  part, stats = _launch((part, stats), (q.contiguous(), kv, *extra), functools.partial(
+    _partial_kernel, start=start, kv_heads=kv_heads, groups=groups, rows=rows, dim=dim, causal=causal, window=window, segment=segment,
     ring=capacity if ring else 0, int8=int8))
   out = Tensor.empty(1, heads, rows, dim, dtype=dtypes.float32, device=q.device)
-  return _launch((out,), (part, stats), start, functools.partial(
-    _merge_kernel, start=scalar, kv_heads=kv_heads, groups=groups, rows=rows, dim=dim, window=window, segment=segment))[0]
+  return _launch((out,), (part, stats), functools.partial(
+    _merge_kernel, start=start, kv_heads=kv_heads, groups=groups, rows=rows, dim=dim, window=window, segment=segment))[0]
 
 @functools.cache
 def _ring_store_kernel(cache: UOp, values: UOp, *, start: int | UOp, kv_heads: int, rows: int, dim: int, length: int) -> UOp:
@@ -852,8 +850,8 @@ def store_rows(cache: Tensor, values: Tensor, start: int | UOp, *, ring: bool = 
   rows, length = values.shape[3], cache.shape[3]
   if not ring: return Tensor(cache.uop.after(cache[:, :, :, start:start + rows].uop.store(values.uop)))
   if nvidia(cache.device):
-    return _launch((cache,), (values.contiguous(),), start, functools.partial(
-      _ring_store_kernel, start=_kernel_scalar(start), kv_heads=cache.shape[2], rows=rows, dim=cache.shape[4], length=length))[0]
+    return _launch((cache,), (values.contiguous(),), functools.partial(
+      _ring_store_kernel, start=start, kv_heads=cache.shape[2], rows=rows, dim=cache.shape[4], length=length))[0]
   offset = (Tensor.arange(length) - Tensor(start) % length + length) % length    # each slot's row, if < rows
   new = (offset < rows).reshape(1, 1, 1, length, 1).where(values[:, :, :, offset.clip(0, rows - 1)], cache).contiguous()
   return Tensor(cache.uop.after(cache.uop.store(new.uop)))
@@ -931,8 +929,8 @@ def store_kv(cache: Tensor, scales: Tensor, k: Tensor, v: Tensor, start: int | U
   Returns both after the write."""
   _, kv_heads, rows, dim = k.shape
   if dim % 32: raise ValueError("an int8 cache needs 32-aligned heads")
-  return _launch((cache, scales), (k.contiguous(), v.contiguous()), start, functools.partial(
-    _store_kernel, start=_kernel_scalar(start), kv_heads=kv_heads, rows=rows, dim=dim))
+  return _launch((cache, scales), (k.contiguous(), v.contiguous()), functools.partial(
+    _store_kernel, start=start, kv_heads=kv_heads, rows=rows, dim=dim))
 
 @functools.cache
 def _prologue_kernel(q_out: UOp, cache: UOp, scales: UOp, joined: UOp, q_w: UOp, k_w: UOp, freqs: UOp, *, start: int | UOp,
@@ -991,5 +989,5 @@ def attention_prologue(joined: Tensor, q_weight: Tensor, k_weight: Tensor, freqs
   if dim % 32 or rope_dim % 2 or rope_dim > dim or joined.numel() != (heads * 2 + kv_heads * 2) * dim:
     raise ValueError("attention_prologue needs gated q, 32-aligned heads and an even rotary width")
   q = Tensor.empty(heads, dim, dtype=dtypes.float32, device=joined.device)
-  return _launch((q, cache, scales), (joined.reshape(-1).contiguous(), q_weight, k_weight, freqs), start, functools.partial(
-    _prologue_kernel, start=_kernel_scalar(start), heads=heads, kv_heads=kv_heads, dim=dim, rope_dim=rope_dim, eps=float(eps)))
+  return _launch((q, cache, scales), (joined.reshape(-1).contiguous(), q_weight, k_weight, freqs), functools.partial(
+    _prologue_kernel, start=start, heads=heads, kv_heads=kv_heads, dim=dim, rope_dim=rope_dim, eps=float(eps)))

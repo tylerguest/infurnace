@@ -282,6 +282,25 @@ def test_openai_non_streamed_reply_stops_when_the_client_leaves(prefix):
     model.release.set()
     stop()
 
+def test_a_handler_that_stops_reading_waits_for_the_main_thread():
+  # tinygrad generates on the server's main thread: a handler that stops reading early (its client left) must not let go
+  # of the GPU lock while the main thread may still be in a model step, so it waits for the request's end marker.
+  from infurnace.server.serve import Outputs, RequestHandler
+  handler, req = RequestHandler.__new__(RequestHandler), SimpleNamespace(out=Outputs())
+  handler.generating = req
+  def main_thread():
+    req.out.put(ord('a'))
+    time.sleep(0.2)  # the last step after the client left
+    req.out.put(None)
+  threading.Thread(target=main_thread, daemon=True).start()
+  started = time.monotonic()
+  handler.finish_generation()
+  assert time.monotonic() - started >= 0.2 and req.out.ended and handler.generating is None
+  # A request whose end marker was already read (a reply read to the end) doesn't wait.
+  handler.generating, started = req, time.monotonic()
+  handler.finish_generation()
+  assert time.monotonic() - started < 0.1
+
 def serving(model, tok, template, **kwargs):
   server = Server(('127.0.0.1', 0), ServerModel(model), 'test', tok, template, **kwargs)
   thread = threading.Thread(target=server.serve_forever, daemon=True)
