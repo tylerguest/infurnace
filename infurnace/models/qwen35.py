@@ -50,7 +50,7 @@ def _fused_gdn(block: GatedDeltaNetBlock):
       conv_state = Tensor(block.conv_state.uop.buf_uop).reshape(block.ssm_conv_kernel - 1, block.conv_channels)
       state = Tensor(block.recurrent_state.uop.buf_uop).reshape(H, V, K)
       o = gdn_prefill_raw(rows, conv_state, conv_w, gdn_gates(x.reshape(T, -1), gates), block.ssm_dt['bias'], block.ssm_a,
-                          state, Tensor.full((1,), T if live is None else live, dtype=dtypes.int32), keep, kheads=block.num_k_heads)
+                          state, Tensor.full((1,), T if live is None else live, dtype=dtypes.int32, device=x.device), keep, kheads=block.num_k_heads)
       o = o.reshape(1, T, H * V)
       if joined is not None and block.ssm_out.rows_quantized:
         # the gated RMSNorm in ssm_out's rotate-and-quantize kernel, the gate read from the merged projection's output
@@ -75,7 +75,7 @@ def _fused_gdn(block: GatedDeltaNetBlock):
     out_gate, beta = out_gate.pad_to((B, T_pad, H, V)), beta.pad_to((B, T_pad, H))
     log_alpha = log_alpha.pad_to((B, T_pad, *log_alpha.shape[2:]))
     if live is not None:
-      prompt = Tensor.arange(T_pad).reshape(1, T_pad, 1) < Tensor(live)
+      prompt = Tensor.arange(T_pad, device=x.device).reshape(1, T_pad, 1) < Tensor(live, device=x.device)
       beta, log_alpha = prompt.where(beta, 0), prompt.unsqueeze(-1).where(log_alpha, 0)
     q, k, v = conv_out.split([block.q_dim, block.q_dim, block.conv_channels - 2 * block.q_dim], dim=-1)
     q, k = (z.reshape(B, T_pad, block.num_k_heads, K).normalize(dim=-1, eps=1e-6).repeat(1, 1, H // block.num_k_heads, 1)

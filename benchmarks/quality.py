@@ -33,7 +33,7 @@ def chunk_nll(model, step_rows: int):
   t = model.transformer
   def step(ids: Tensor, targets: Tensor, start_pos: UOp) -> Tensor:
     x, mask = t.token_embd(ids).float(), None
-    for block in t.blk: x, mask = block(x, start_pos, mask)
+    for block in t.blk: x, mask, _ = block(x, (start_pos,), mask)
     logits = t.output(t.output_norm(x)).reshape(step_rows, -1).float()
     return -logits.log_softmax(-1).gather(-1, targets.reshape(step_rows, 1)).reshape(step_rows).contiguous()
   return TinyJit(step)
